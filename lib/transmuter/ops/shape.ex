@@ -71,6 +71,9 @@ defmodule Transmuter.Ops.Shape do
 
   defp op(%{op_type: "Size"}, [a]), do: static_tensor(Nx.size(a), :s64)
 
+  # :empty does not keep its shape, so it reads as a 1-D tensor of size 0.
+  defp op(%{op_type: "Shape"}, [:empty]), do: static_tensor([0], :s64)
+
   defp op(%{op_type: "Shape"}, [a]),
     do: a |> Nx.shape() |> Tuple.to_list() |> static_tensor(:s64)
 
@@ -254,6 +257,8 @@ defmodule Transmuter.Ops.Shape do
     |> Nx.transpose(axes: [0, 3, 5, 1, 2, 4])
     |> Nx.reshape({n, c * b * b, div(h, b), div(w, b)})
   end
+
+  defp op(%{op_type: "ScatterElements"}, [data, :empty, :empty]), do: data
 
   # Each update goes to its own coordinates with the index replacing the axis coordinate.
   # Scatter is the old name of ScatterElements.

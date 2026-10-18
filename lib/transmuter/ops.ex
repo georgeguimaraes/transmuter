@@ -52,8 +52,27 @@ defmodule Transmuter.Ops do
     end
   end
 
+  # Positions of the inputs whose zero size makes every output zero size, so the
+  # operator passes :empty on. Detection models run per-class branches with no boxes.
+  @empty_through %{
+    "Unsqueeze" => [0],
+    "Squeeze" => [0],
+    "Transpose" => [0],
+    "Reshape" => [0],
+    "Slice" => [0],
+    "Expand" => [0],
+    "Gather" => [0, 1],
+    "NonMaxSuppression" => [0, 1],
+    "RoiAlign" => [0, 1, 2]
+  }
+
   defp dispatch(node, inputs, opset) do
+    empty_through = Map.get(@empty_through, node.op_type, [])
+
     cond do
+      Enum.any?(empty_through, &(Enum.at(inputs, &1) == :empty)) ->
+        Enum.map(node.output, fn _ -> :empty end)
+
       node.op_type in ["Softmax", "LogSoftmax", "Hardmax"] ->
         [along_axis(node, hd(inputs), opset)]
 
