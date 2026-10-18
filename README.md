@@ -7,8 +7,7 @@ Transmuter does not port model architectures. The ONNX file contains the forward
 ## Example
 
 ```elixir
-model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"})
-params = Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, EMLX.Backend)} end)
+model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"}, backend: EMLX.Backend)
 
 inputs = %{
   "input_ids" => Nx.tensor([[101, 7592, 2088, 102]]),
@@ -16,21 +15,23 @@ inputs = %{
   "token_type_ids" => Nx.tensor([[0, 0, 0, 0]])
 }
 
-run = Nx.Defn.compile(&Transmuter.run(model, &1, &2), [params, inputs], compiler: EMLX)
-%{"last_hidden_state" => hidden} = run.(params, inputs)
+run = Transmuter.compile(model, inputs, compiler: EMLX)
+%{"last_hidden_state" => hidden} = run.(inputs)
 ```
 
-Shapes are resolved when the function is traced. Each new input shape compiles again, so keep one compiled function per shape. `Nx.Defn.jit/2` with a closure over the model compiles on every call.
+`Transmuter.compile/3` compiles for the shapes of the inputs that you give it, so compile again for other shapes. `Transmuter.run/4` is the uncompiled function, for `Nx.Defn.jit/2`, gradients or eager execution.
 
 ## Static inputs
 
-Some graphs read input values to decide a shape or a branch. Give these inputs as `Nx.BinaryBackend` tensors in the fourth argument of `Transmuter.run/4`:
+Some graphs read input values to decide a shape or a branch. Give these inputs as `Nx.BinaryBackend` tensors in the `:static_inputs` option of `Transmuter.compile/3`, or in the fourth argument of `Transmuter.run/4`:
 
 - `use_cache_branch` in merged decoder exports, which selects an `If` branch.
 - `num_logits_to_keep` in some decoder exports, which sets a slice length.
 - `input_ids` in Grounding DINO, which feed `NonZero`.
 
 Each new value of a static input compiles again.
+
+When a value that decides a shape is computed inside the graph, call `Transmuter.run/4` without compiling it. Kokoro text-to-speech needs this: the length of its audio comes from predicted phoneme durations. In eager mode, Transmuter reads such values as the model runs. On an Apple silicon GPU, Kokoro makes 4.45 seconds of audio in 1.4 seconds.
 
 ## Precision and quantization
 
@@ -41,13 +42,13 @@ Quantized exports run with their weights dequantized inside the graph:
 - `model_q4.onnx` and `model_q4f16.onnx`: 4-bit weights with `MatMulNBits` and `GatherBlockQuantized`, including int4 tables.
 - `model_quantized.onnx` and `model_int8.onnx`: dynamic int8 with `DynamicQuantizeLinear`, `MatMulInteger` and `ConvInteger`.
 
-On EMLX, use `Transmuter.EMLX.params(model)` instead of moving `model.params` yourself. It keeps `MatMulNBits` weights packed as MLX quantized tensors, so `mx::quantized_matmul` reads the 4-bit or 8-bit weights directly. Without it, the weights are dequantized to floats in every forward pass. Measured on an Apple silicon GPU with one 8-token forward pass:
+With `backend: EMLX.Backend`, `Transmuter.load!/2` keeps `MatMulNBits` weights packed as MLX quantized tensors, so `mx::quantized_matmul` reads the 4-bit or 8-bit weights directly. On other backends, the weights are dequantized to floats in every forward pass. Measured on an Apple silicon GPU with one 8-token forward pass:
 
 | Model | Weights | Peak memory | Time |
 |---|---|---|---|
 | Qwen3-0.6B fp32 | 2,294 MB | 2,321 MB | 34 ms |
 | Qwen3-0.6B q4, dequantized in the graph | 876 MB | 1,612 MB | 64 ms |
-| Qwen3-0.6B q4, `Transmuter.EMLX.params` | 981 MB | 1,005 MB | 28 ms |
+| Qwen3-0.6B q4, kept packed on EMLX | 981 MB | 1,005 MB | 28 ms |
 
 Dynamic int8 requantizes every activation. A change of one f32 rounding step can move a value to the next int8 step, and later layers amplify that change. Compare these models with their own noise: scaling all weights of SmolLM2 int8 by 1 + 1e-7 changes its logits by 22.
 
@@ -73,6 +74,12 @@ To run the matrix:
 
 If a case does not match, run `bench/coverage/debug_ort.py` and `bench/coverage/debug_case.exs`. They show the first node where Transmuter and ONNX Runtime give different values.
 
+## Fine-tuning
+
+`Transmuter.run/4` is plain Nx, so `Nx.Defn.value_and_grad/2` differentiates through the graph, and an optimizer such as Polaris updates the params. Load the model with `trainable: true`, so small weights such as a 1-element bias are params and not constants. `bench/finetune.exs` fine-tunes a MiniLM cross-encoder: its gradients and its 30-step AdamW loss curve match PyTorch.
+
+Fine-tune an fp32 export. Inference exports have no dropout, and quantized weights have no gradients.
+
 ## Tests
 
-`mix test` downloads four models and compares them with ONNX Runtime. `test/support/reference.py` prints the reference values.
+`mix test` downloads five models and compares them with ONNX Runtime. `test/support/reference.py` prints the reference values.

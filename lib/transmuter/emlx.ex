@@ -8,9 +8,9 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     exist in memory. ONNX packs the lowest bits first, which is also the MLX
     order, and an ONNX zero point becomes the MLX bias `-zero_point * scale`.
 
-        model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"})
-        params = Transmuter.EMLX.params(model)
-        run = Nx.Defn.jit(&Transmuter.run(model, &1, &2), compiler: EMLX)
+        model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"}, backend: EMLX.Backend)
+
+    `Transmuter.load!/2` with `backend: EMLX.Backend` calls `params/2` for you.
 
     Weights that MLX cannot hold (other bit widths, group sizes other than 32,
     64 or 128, or a K that is not a whole number of groups) stay packed bytes

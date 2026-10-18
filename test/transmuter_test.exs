@@ -5,10 +5,11 @@ defmodule TransmuterTest do
   # see test/support/reference.py. The first run downloads the models.
   @moduletag timeout: 900_000
 
-  @backend {EMLX.Backend, device: :gpu}
+  # Metal on macOS; the CPU device elsewhere, such as Linux CI.
+  @backend {EMLX.Backend, device: if(match?({:unix, :darwin}, :os.type()), do: :gpu, else: :cpu)}
 
   test "runs a BERT encoder" do
-    {model, params} = load("Xenova/all-MiniLM-L6-v2", "onnx/model.onnx")
+    model = load("Xenova/all-MiniLM-L6-v2", "onnx/model.onnx")
     ids = Nx.tensor([[101, 7592, 2088, 2003, 1037, 3231, 102]], type: :s64, backend: @backend)
 
     inputs = %{
@@ -17,7 +18,7 @@ defmodule TransmuterTest do
       "token_type_ids" => Nx.broadcast(Nx.tensor(0, type: :s64, backend: @backend), {1, 7})
     }
 
-    %{"last_hidden_state" => hidden} = run(model, params, inputs)
+    %{"last_hidden_state" => hidden} = run(model, inputs)
 
     assert_all_close(hidden[[0, 0..2, 0..2]], [
       [0.2091, -0.0291, 0.0011],
@@ -27,8 +28,8 @@ defmodule TransmuterTest do
   end
 
   test "resizes with interpolation matrices" do
-    {model, params} = load("Xenova/segformer-b0-finetuned-ade-512-512", "onnx/model.onnx")
-    %{"logits" => logits} = run(model, params, %{"pixel_values" => pattern({1, 3, 512, 512})})
+    model = load("Xenova/segformer-b0-finetuned-ade-512-512", "onnx/model.onnx")
+    %{"logits" => logits} = run(model, %{"pixel_values" => pattern({1, 3, 512, 512})})
 
     assert_all_close(logits[[0, 0..2, 0, 0..2]], [
       [-5.9847, -6.1833, -6.5003],
@@ -38,7 +39,7 @@ defmodule TransmuterTest do
   end
 
   test "selects an If branch from a static input" do
-    {model, params} = load("Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx")
+    model = load("Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx")
 
     past =
       for name <- model.inputs, String.starts_with?(name, "past_key_values"), into: %{} do
@@ -52,16 +53,16 @@ defmodule TransmuterTest do
       })
 
     flag = Nx.tensor([1], type: :u8, backend: Nx.BinaryBackend)
-    %{"logits" => logits} = run(model, params, inputs, %{"use_cache_branch" => flag})
+    %{"logits" => logits} = run(model, inputs, %{"use_cache_branch" => flag})
     assert_all_close(logits[[0, 0, 0..4]], [11.7904, 7.4783, 7.9252, 8.0604, 6.4908])
 
     assert_raise RuntimeError, ~r/If needs a static condition/, fn ->
-      run(model, params, Map.put(inputs, "use_cache_branch", Nx.backend_copy(flag, @backend)))
+      run(model, Map.put(inputs, "use_cache_branch", Nx.backend_copy(flag, @backend)))
     end
   end
 
   test "generates with a static KV cache like transformers" do
-    {model, params} = load("HuggingFaceTB/SmolLM2-135M-Instruct", "onnx/model.onnx")
+    model = load("HuggingFaceTB/SmolLM2-135M-Instruct", "onnx/model.onnx")
 
     prompt = [
       1,
@@ -129,11 +130,8 @@ defmodule TransmuterTest do
       })
     end
 
-    fun = &Transmuter.run(model, &1, &2)
-    prefill = Nx.Defn.compile(fun, [params, step_inputs.(prompt, 0, cache)], compiler: EMLX)
-
-    decode =
-      Nx.Defn.compile(fun, [params, step_inputs.([0], length(prompt), cache)], compiler: EMLX)
+    prefill = Transmuter.compile(model, step_inputs.(prompt, 0, cache), compiler: EMLX)
+    decode = Transmuter.compile(model, step_inputs.([0], length(prompt), cache), compiler: EMLX)
 
     next_cache = fn out ->
       for {"present." <> rest, t} <- out, into: %{}, do: {"past_key_values." <> rest, t}
@@ -141,24 +139,80 @@ defmodule TransmuterTest do
 
     next_token = fn out -> out["logits"][[0, -1]] |> Nx.argmax() |> Nx.to_number() end
 
-    out = prefill.(params, step_inputs.(prompt, 0, cache))
+    out = prefill.(step_inputs.(prompt, 0, cache))
 
     {tokens, _} =
       Enum.reduce(1..7, {[next_token.(out)], next_cache.(out)}, fn i, {tokens, cache} ->
-        out = decode.(params, step_inputs.([hd(tokens)], length(prompt) + i - 1, cache))
+        out = decode.(step_inputs.([hd(tokens)], length(prompt) + i - 1, cache))
         {[next_token.(out) | tokens], next_cache.(out)}
       end)
 
     assert Enum.reverse(tokens) == [504, 6376, 4541, 4461, 975, 260, 2591, 506]
   end
 
-  defp load(repo, file) do
-    model = Transmuter.load!({:hf, repo, file})
-    {model, Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, @backend)} end)}
+  # The BERT pooler gathers the first token on axis 1, a path whose gradient EMLX 0.5
+  # scatters to the wrong place. Autodiff must match central finite differences.
+  test "computes gradients that match finite differences" do
+    model = load("Xenova/ms-marco-MiniLM-L-6-v2", "onnx/model.onnx", trainable: true)
+    params = model.params
+
+    # Two sequences: with a batch of 1 the misplaced gradient happens to land correctly.
+    ids =
+      Nx.tensor(
+        [
+          [101, 2054, 2003, 1041, 102, 3793, 2003, 1037, 2653, 102],
+          [101, 3007, 1997, 2605, 102, 3000, 2003, 1996, 3007, 102]
+        ],
+        type: :s64,
+        backend: @backend
+      )
+
+    segments = Nx.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], type: :s64, backend: @backend)
+
+    inputs = %{
+      "input_ids" => ids,
+      "attention_mask" => Nx.broadcast(Nx.tensor(1, type: :s64, backend: @backend), {2, 10}),
+      "token_type_ids" => Nx.broadcast(segments, {2, 10})
+    }
+
+    score = fn p, i -> Transmuter.run(model, p, i)["logits"] |> Nx.sum() end
+    forward = Nx.Defn.jit(score, compiler: EMLX)
+
+    {_, grads} =
+      Nx.Defn.jit(&Nx.Defn.value_and_grad(&1, fn p -> score.(p, &2) end), compiler: EMLX).(
+        params,
+        inputs
+      )
+
+    name = "bert.embeddings.LayerNorm.weight"
+
+    bump = fn delta ->
+      Map.update!(
+        params,
+        name,
+        &Nx.indexed_add(
+          &1,
+          Nx.tensor([[1]], backend: @backend),
+          Nx.tensor([delta], backend: @backend)
+        )
+      )
+    end
+
+    numeric =
+      (Nx.to_number(forward.(bump.(1.0e-2), inputs)) -
+         Nx.to_number(forward.(bump.(-1.0e-2), inputs))) / 2.0e-2
+
+    autodiff = grads[name] |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.to_flat_list() |> Enum.at(1)
+
+    assert_in_delta autodiff, numeric, 0.02 * abs(numeric) + 1.0e-3
   end
 
-  defp run(model, params, inputs, static_inputs \\ %{}) do
-    Nx.Defn.jit(&Transmuter.run(model, &1, &2, static_inputs), compiler: EMLX).(params, inputs)
+  defp load(repo, file, opts \\ []) do
+    Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
+  end
+
+  defp run(model, inputs, static_inputs \\ %{}) do
+    Transmuter.compile(model, inputs, compiler: EMLX, static_inputs: static_inputs).(inputs)
   end
 
   # sin(i * 0.01) * 0.5, the same pattern that test/support/reference.py feeds to ORT.

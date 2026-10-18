@@ -6,15 +6,14 @@ defmodule Transmuter do
   turns its graph into Nx operations. It does not port model architectures. The
   graph that the exporter traced is the model.
 
-      model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"})
-      params = Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, EMLX.Backend)} end)
+      model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"}, backend: EMLX.Backend)
+      run = Transmuter.compile(model, inputs, compiler: EMLX)
+      %{"last_hidden_state" => hidden} = run.(inputs)
 
-      run = Nx.Defn.jit(&Transmuter.run(model, &1, &2), compiler: EMLX)
-      %{"last_hidden_state" => hidden} = run.(params, %{"input_ids" => ids, "attention_mask" => mask, "token_type_ids" => types})
-
-  Shapes are resolved when the function is traced, so each new input shape
-  compiles again. Use `Nx.Defn.compile/3` and keep one compiled function per
-  shape.
+  Shapes are resolved when the function is compiled, so `compile/3` returns a
+  function for the shapes of the inputs it was given. Compile again for other
+  shapes. `run/4` is the uncompiled function, for `Nx.Defn.jit/2`, gradients or
+  eager execution.
   """
 
   alias Transmuter.Onnx.ModelProto
@@ -37,6 +36,11 @@ defmodule Transmuter do
 
     * `:cache_dir` - the directory for Hub downloads
 
+    * `:backend` - moves the params to this backend, for example `EMLX.Backend`
+      or `{EXLA.Backend, client: :cuda}`. On EMLX, 4-bit and 8-bit `MatMulNBits`
+      weights stay packed, see `Transmuter.EMLX`. By default the params stay on
+      `Nx.BinaryBackend`.
+
     * `:compute_type` - runs f16 and bf16 graphs in this type, for example `:f32`.
       ONNX Runtime on the CPU computes half-precision graphs in f32, so use `:f32`
       to match it. By default the graph keeps its own types.
@@ -47,7 +51,7 @@ defmodule Transmuter do
 
   Returns a map with:
 
-    * `:params` - float weights, which you move to your backend and pass to `run/4`
+    * `:params` - the weights, on the `:backend` when it is given
     * `:inputs` and `:outputs` - the graph input and output names
   """
   def load!(source, opts \\ [])
@@ -70,7 +74,7 @@ defmodule Transmuter do
     inputs = for i <- graph.input, i.name not in initializers, do: i.name
     compute_type = opts[:compute_type]
 
-    %{
+    model = %{
       nodes: toposort(graph.node, inputs ++ initializers),
       static: Map.new(static, fn {k, t} -> {k, upcast(t, compute_type)} end),
       params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end),
@@ -80,6 +84,26 @@ defmodule Transmuter do
       opset:
         Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
     }
+
+    if backend = opts[:backend], do: %{model | params: move_params(model, backend)}, else: model
+  end
+
+  @doc """
+  Compiles the model for the shapes and types of `inputs`.
+
+  Returns a function that takes the inputs and returns the outputs. The params
+  are the model's own, so load it with `:backend` first.
+
+  ## Options
+
+    * `:static_inputs` - inputs known when the model compiles, see `run/4`
+
+  Other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX`.
+  """
+  def compile(model, inputs, opts \\ []) do
+    {static_inputs, opts} = Keyword.pop(opts, :static_inputs, %{})
+    fun = Nx.Defn.compile(&run(model, &1, &2, static_inputs), [model.params, inputs], opts)
+    fn inputs -> fun.(model.params, inputs) end
   end
 
   @doc """
@@ -204,6 +228,15 @@ defmodule Transmuter do
       end
 
     carried ++ stacked
+  end
+
+  # On EMLX, Transmuter.EMLX keeps quantized weights packed.
+  defp move_params(model, backend) do
+    {module, backend_opts} = if is_atom(backend), do: {backend, []}, else: backend
+
+    if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
+      do: Transmuter.EMLX.params(model, backend_opts),
+      else: Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, backend)} end)
   end
 
   defp static_initializer?(:empty, _trainable), do: true
