@@ -1,4 +1,4 @@
-"""Dump per-node output stats from ORT for one case. Usage: debug_ort.py case_dir"""
+"""Dump per-node output stats from ORT for one case. Usage: trace_ort.py case_dir"""
 import json
 import os
 import sys
@@ -31,7 +31,7 @@ for name in names:
     idx = [(k * 2654435761) % flat.size for k in range(1024)] if flat.size else []
     stats[name] = {"shape": list(a.shape), "absmax": float(np.abs(a).max()) if a.size else 0.0, "abssum": float(np.abs(a).sum()), "sample": [float(flat[i]) for i in idx]}
 json.dump(stats, open(os.path.join(case, "ort_trace.json"), "w"))
-# DUMP=name,name saves those node outputs in full, for debug_case.exs OVERRIDE.
+# DUMP=name,name saves those node outputs in full, for find_divergence.exs OVERRIDE.
 for name in filter(None, os.environ.get("DUMP", "").split(",")):
     a = np.ascontiguousarray(np.asarray(outs[name], dtype=np.float32))
     a.tofile(os.path.join(case, "full_" + name.replace("/", "_") + ".bin"))

@@ -3,7 +3,7 @@ defmodule Transmuter.OpsTest do
 
   # Each fixture is one small ONNX graph around one operator variant, with reference
   # outputs from ONNX Runtime (graph optimizations off) or from the ONNX reference
-  # evaluator. test/support/op_cases.py writes them, so these tests need no Python.
+  # evaluator. test/support/make_op_fixtures.py writes them, so these tests need no Python.
   @fixtures Path.expand("../fixtures/ops", __DIR__)
 
   @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||

@@ -2,7 +2,7 @@ defmodule TransmuterTest do
   use ExUnit.Case, async: true
 
   # Reference values come from ONNX Runtime with graph optimizations disabled,
-  # see test/support/reference.py. The first run downloads the models.
+  # see test/support/model_references.py. The first run downloads the models.
   @moduletag timeout: 900_000
 
   # Metal on macOS; the CPU device elsewhere, such as Linux CI. The EMLX compiler
@@ -263,7 +263,7 @@ defmodule TransmuterTest do
     Transmuter.compile(model, inputs, [static_inputs: static_inputs] ++ @compiler).(inputs)
   end
 
-  # sin(i * 0.01) * 0.5, the same pattern that test/support/reference.py feeds to ORT.
+  # sin(i * 0.01) * 0.5, the same pattern that test/support/model_references.py feeds to ORT.
   defp pattern(shape) do
     {Tuple.product(shape)}
     |> Nx.iota(type: :f32, backend: @backend)

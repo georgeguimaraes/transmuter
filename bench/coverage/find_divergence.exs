@@ -1,6 +1,6 @@
 # Runs one case eagerly and prints the first node whose output differs from ORT.
-# Run debug_ort.py on the case first to write ort_trace.json.
-# Usage: mix run bench/coverage/debug_case.exs CASE_DIR
+# Run trace_ort.py on the case first to write ort_trace.json.
+# Usage: mix run bench/coverage/find_divergence.exs CASE_DIR
 
 [case_dir] = System.argv()
 meta = case_dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
@@ -69,7 +69,7 @@ Enum.reduce_while(model.nodes, env, fn node, env ->
         {true, shape, sample, diff} <- [diverged?.(name, t)],
         do: {name, shape, sample, diff}
 
-  # OVERRIDE=name,name replaces our values with ORT's full outputs (dumped by debug_ort.py DUMP=...),
+  # OVERRIDE=name,name replaces our values with ORT's full outputs (dumped by trace_ort.py DUMP=...),
   # to look past a divergence that is only precision.
   overrides = System.get_env("OVERRIDE", "") |> String.split(",", trim: true)
 

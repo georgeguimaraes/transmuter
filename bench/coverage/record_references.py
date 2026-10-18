@@ -1,6 +1,6 @@
 """Download each corpus file, generate inputs, run ORT and save the reference outputs.
 
-Usage: prepare.py corpus.json cases_dir
+Usage: record_references.py corpus.json cases_dir
 """
 
 import json

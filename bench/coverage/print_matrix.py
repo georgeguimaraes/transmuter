@@ -1,4 +1,4 @@
-"""Summarize the coverage run. Usage: report.py cases_dir [report.json]"""
+"""Summarize the coverage run. Usage: print_matrix.py cases_dir [report.json]"""
 
 import glob
 import json

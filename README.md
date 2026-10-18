@@ -142,18 +142,18 @@ These models do not match by position, or do not run with compilation:
 
 To run the matrix:
 
-1. Run `bench/coverage/select_corpus.py` to select the models.
-2. Run `bench/coverage/prepare.py` to download them and record the ONNX Runtime outputs.
-3. Run `bench/coverage/run_all.py` to run each case through Transmuter.
-4. Run `bench/coverage/report.py` to show the matrix.
+1. Run `bench/coverage/select_models.py` to select the models.
+2. Run `bench/coverage/record_references.py` to download them and record the ONNX Runtime outputs.
+3. Run `bench/coverage/run_cases.py` to run each case through Transmuter.
+4. Run `bench/coverage/print_matrix.py` to show the matrix.
 
-If a case does not match, run `bench/coverage/debug_ort.py` and `bench/coverage/debug_case.exs`. They show the first node where Transmuter and ONNX Runtime give different values.
+If a case does not match, run `bench/coverage/trace_ort.py` and `bench/coverage/find_divergence.exs`. They show the first node where Transmuter and ONNX Runtime give different values.
 
 ## Tests
 
-`mix test` downloads five models and compares them with ONNX Runtime. `test/support/reference.py` shows the reference values.
+`mix test` downloads five models and compares them with ONNX Runtime. `test/support/model_references.py` shows the reference values.
 
-`mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/op_cases.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator. For random operators, the tests check the shape, the type and the distribution of the values.
+`mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/make_op_fixtures.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator. For random operators, the tests check the shape, the type and the distribution of the values.
 
 On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` uses the EMLX CPU device. But EMLX 0.5 runs compiled functions on the GPU when Metal is available, also with `device: :cpu`. Thus only the Linux CI tests the CPU fully.
 

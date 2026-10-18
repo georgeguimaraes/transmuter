@@ -1,6 +1,6 @@
 """Run every ORT-validated case without missing ops through the Elixir importer.
 
-Usage: run_all.py cases_dir [--rerun]
+Usage: run_cases.py cases_dir [--rerun]
 """
 
 import glob

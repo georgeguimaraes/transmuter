@@ -1,6 +1,6 @@
 """Prints ORT reference values for test/transmuter_test.exs. Inputs follow the same patterns as the tests.
 
-Usage: uv run --with onnxruntime --with numpy --with huggingface_hub python -I test/support/reference.py
+Usage: uv run --with onnxruntime --with numpy --with huggingface_hub python -I test/support/model_references.py
 """
 
 import numpy as np

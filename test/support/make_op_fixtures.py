@@ -1,11 +1,11 @@
 """Builds the op-level test fixtures: one small ONNX graph per operator variant, with
-its inputs and reference outputs, in the layout of bench/coverage/prepare.py.
+its inputs and reference outputs, in the layout of bench/coverage/record_references.py.
 
 The reference is ONNX Runtime with graph optimizations off, or the ONNX reference
 evaluator for operators that ONNX Runtime does not have yet. test/transmuter/ops_test.exs
 runs every fixture, so a mismatch points at one operator.
 
-Usage: uv run --with onnx --with onnxruntime --with numpy --with pillow python -I test/support/op_cases.py [output_dir]
+Usage: uv run --with onnx --with onnxruntime --with numpy --with pillow python -I test/support/make_op_fixtures.py [output_dir]
 The default output_dir is test/fixtures/ops.
 """
 
