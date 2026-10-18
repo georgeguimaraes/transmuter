@@ -1,6 +1,6 @@
 # ⚗️ Transmuter
 
-Transmuter runs ONNX models on Nx. Load a model from the Hugging Face Hub and run it on any Nx backend: EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
+Transmuter runs ONNX models on Nx. Load a model from Hugging Face and run it on any Nx backend: EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
 
 Transmuter does not port model architectures. An ONNX file contains the forward pass that the exporter traced from the original model. Transmuter changes each ONNX operator into Nx operations. A new architecture needs no new Elixir code. It needs only the operators that its export uses.
 
@@ -8,7 +8,7 @@ Transmuter does not port model architectures. An ONNX file contains the forward 
 
 Elixir has three ways to run Hugging Face models today. Each way has a limit:
 
-- **Bumblebee** runs models with good accuracy on all Nx backends. But a person must port each architecture to Axon by hand, and a port takes weeks of work and review. The Hub gets new architectures faster than people can port them.
+- **Bumblebee** runs models with good accuracy on all Nx backends. But a person must port each architecture to Axon by hand, and a port takes weeks of work and review. Hugging Face gets new architectures faster than people can port them.
 - **Ortex** runs ONNX models with ONNX Runtime. But it runs outside of Nx: you cannot put it in a `defn` function, it has no Apple silicon GPU path, and it is in maintenance mode.
 - **axon_onnx** changed ONNX graphs into Axon models. It stopped in 2024. It set all shapes when it loaded a model, and many ONNX graphs need shapes that change.
 
@@ -18,7 +18,7 @@ Transmuter fills this gap. It runs the exported graph directly as Nx operations,
 - The result is plain Nx. It runs on EMLX and EXLA, it works with `Nx.Serving`, and `Nx.Defn.grad` can differentiate it.
 - Shapes are set when the function compiles, not when the model loads. Thus decoders with a KV cache and graphs with `If` branches work.
 
-When a model has no ONNX file on the Hub, export it one time with [Optimum](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model). In the 300 most downloaded transformers models, 62% of downloads already have an ONNX file on the Hub.
+When a model has no ONNX file on Hugging Face, export it one time with [Optimum](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model). In the 300 most downloaded transformers models, 62% of downloads already have an ONNX file on Hugging Face.
 
 ## Example
 
@@ -91,11 +91,11 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 
 ## Coverage
 
-`bench/coverage` runs the most downloaded ONNX exports for each Hub task. It compares each output with ONNX Runtime. The reference is ONNX Runtime with graph optimizations off, because its default optimizer gives wrong results for some exports. For `MatMulNBits`, the reference uses `accuracy_level` 0. At level 4, ONNX Runtime quantizes the activations to int8, and that result is an approximation.
+`bench/coverage` runs the most downloaded ONNX exports for each Hugging Face task. It compares each output with ONNX Runtime. The reference is ONNX Runtime with graph optimizations off, because its default optimizer gives wrong results for some exports. For `MatMulNBits`, the reference uses `accuracy_level` 0. At level 4, ONNX Runtime quantizes the activations to int8, and that result is an approximation.
 
 | Corpus | Result |
 |---|---|
-| Top exports for each Hub task | 75 of 77 repositories, 112 of 114 files match |
+| Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
 | Models requested in Bumblebee issues | 11 of 12 files match |
 | One graph for each operator variant | 60 of 60 match |
