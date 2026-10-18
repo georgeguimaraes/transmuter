@@ -1,0 +1,105 @@
+[
+ {
+  "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_q4f16.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Qwen3-0.6B-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/gemma-3-270m-it-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/LFM2-350M-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/embeddinggemma-300m-ONNX",
+  "task": "feature-extraction",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_no_gather_q4.onnx",
+   "onnx/model_quantized.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/all-MiniLM-L6-v2",
+  "task": "feature-extraction",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_int8.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bert-base-uncased",
+  "task": "fill-mask",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/vit-base-patch16-224",
+  "task": "image-classification",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/detr-resnet-50",
+  "task": "object-detection",
+  "downloads": 0,
+  "files": [
+   "onnx/model_q4.onnx",
+   "onnx/model_quantized.onnx",
+   "onnx/model_fp16.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/whisper-tiny.en",
+  "task": "automatic-speech-recognition",
+  "downloads": 0,
+  "files": [
+   "onnx/encoder_model_quantized.onnx",
+   "onnx/encoder_model_q4.onnx",
+   "onnx/encoder_model_fp16.onnx",
+   "onnx/decoder_model_merged_q4.onnx",
+   "onnx/decoder_model_merged_quantized.onnx",
+   "onnx/decoder_model_merged_fp16.onnx"
+  ]
+ }
+]

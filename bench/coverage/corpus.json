@@ -1,0 +1,655 @@
+[
+ {
+  "repo": "Xenova/ast-finetuned-audioset-10-10-0.4593",
+  "task": "audio-classification",
+  "downloads": 30070,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX",
+  "task": "audio-classification",
+  "downloads": 3311,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/whisper-tiny.en",
+  "task": "automatic-speech-recognition",
+  "downloads": 786560,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/whisper-base",
+  "task": "automatic-speech-recognition",
+  "downloads": 137347,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/depth-anything-v2-small",
+  "task": "depth-estimation",
+  "downloads": 111376,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/depth-anything-small-hf",
+  "task": "depth-estimation",
+  "downloads": 11025,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/depth-anything-v2-base",
+  "task": "depth-estimation",
+  "downloads": 1744,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/all-MiniLM-L6-v2",
+  "task": "feature-extraction",
+  "downloads": 4461214,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bge-base-en-v1.5",
+  "task": "feature-extraction",
+  "downloads": 2358903,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bge-small-en-v1.5",
+  "task": "feature-extraction",
+  "downloads": 611927,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bert-base-uncased",
+  "task": "fill-mask",
+  "downloads": 5126,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased",
+  "task": "fill-mask",
+  "downloads": 768,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bert-base-multilingual-cased",
+  "task": "fill-mask",
+  "downloads": 440,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/vit-base-violence-detection-ONNX",
+  "task": "image-classification",
+  "downloads": 4953,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/facial_emotions_image_detection",
+  "task": "image-classification",
+  "downloads": 3859,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/vit-base-patch16-224",
+  "task": "image-classification",
+  "downloads": 3088,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/dinov2-small",
+  "task": "image-feature-extraction",
+  "downloads": 41824,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/dino-vits16",
+  "task": "image-feature-extraction",
+  "downloads": 9111,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/segformer-b0-finetuned-ade-512-512",
+  "task": "image-segmentation",
+  "downloads": 188705,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/modnet",
+  "task": "image-segmentation",
+  "downloads": 127715,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/ormbg-ONNX",
+  "task": "image-segmentation",
+  "downloads": 24494,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/tiny-random-LlavaForConditionalGeneration",
+  "task": "image-text-to-text",
+  "downloads": 1768,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/embed_tokens.onnx",
+   "onnx/vision_encoder.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/tiny-random-Florence2ForConditionalGeneration",
+  "task": "image-text-to-text",
+  "downloads": 1324,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/embed_tokens.onnx",
+   "onnx/encoder_model.onnx",
+   "onnx/vision_encoder.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/swin2SR-classical-sr-x2-64",
+  "task": "image-to-image",
+  "downloads": 6840,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/swin2SR-lightweight-x2-64",
+  "task": "image-to-image",
+  "downloads": 2900,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+  "task": "image-to-image",
+  "downloads": 2422,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/trocr-small-handwritten",
+  "task": "image-to-text",
+  "downloads": 5490,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/manga-ocr-base-ONNX",
+  "task": "image-to-text",
+  "downloads": 351,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/vitpose-base-simple",
+  "task": "keypoint-detection",
+  "downloads": 275,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/slimsam-77-uniform",
+  "task": "mask-generation",
+  "downloads": 70629,
+  "files": [
+   "onnx/prompt_encoder_mask_decoder.onnx",
+   "onnx/vision_encoder.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/sam-vit-base",
+  "task": "mask-generation",
+  "downloads": 2394,
+  "files": [
+   "onnx/model.onnx",
+   "onnx/prompt_encoder_mask_decoder.onnx",
+   "onnx/vision_encoder.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/slimsam-50-uniform",
+  "task": "mask-generation",
+  "downloads": 1378,
+  "files": [
+   "onnx/prompt_encoder_mask_decoder.onnx",
+   "onnx/vision_encoder.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/tiny-random-RoFormerForMultipleChoice",
+  "task": "multiple-choice",
+  "downloads": 33,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/detr-resnet-50",
+  "task": "object-detection",
+  "downloads": 13243,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/yolos-tiny",
+  "task": "object-detection",
+  "downloads": 9061,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/rfdetr_nano-ONNX",
+  "task": "object-detection",
+  "downloads": 1714,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased-distilled-squad",
+  "task": "question-answering",
+  "downloads": 1567,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/distilbert-base-cased-distilled-squad",
+  "task": "question-answering",
+  "downloads": 986,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/roberta-base-squad2-ONNX",
+  "task": "question-answering",
+  "downloads": 323,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/ruri-v3-30m-ONNX",
+  "task": "sentence-similarity",
+  "downloads": 1264,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/USER2-small-ONNX",
+  "task": "sentence-similarity",
+  "downloads": 750,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/paraphrase-multilingual-MiniLM-L12-v2-ONNX",
+  "task": "sentence-similarity",
+  "downloads": 506,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/text_summarization-ONNX",
+  "task": "summarization",
+  "downloads": 80,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Text-Summarizer-t5-small-ONNX",
+  "task": "summarization",
+  "downloads": 64,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/ms-marco-MiniLM-L-6-v2",
+  "task": "text-classification",
+  "downloads": 683515,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/distilbert-multilingual-toxicity-classifier-ONNX",
+  "task": "text-classification",
+  "downloads": 195780,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/ModernBERT-base-nli-ONNX",
+  "task": "text-classification",
+  "downloads": 86947,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/llama2.c-stories15M",
+  "task": "text-generation",
+  "downloads": 28011,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/tiny-random-Phi3ForCausalLM",
+  "task": "text-generation",
+  "downloads": 9793,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/tiny-random-GemmaForCausalLM",
+  "task": "text-generation",
+  "downloads": 7103,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Kokoro-82M-v1.0-ONNX",
+  "task": "text-to-speech",
+  "downloads": 695357,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/granite-timeseries-patchtst",
+  "task": "time-series-forecasting",
+  "downloads": 442,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/granite-timeseries-patchtsmixer",
+  "task": "time-series-forecasting",
+  "downloads": 416,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bert-base-NER",
+  "task": "token-classification",
+  "downloads": 43158,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/bert-base-multilingual-cased-ner-hrl",
+  "task": "token-classification",
+  "downloads": 15341,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/distilbert-base-multilingual-cased-ner-hrl",
+  "task": "token-classification",
+  "downloads": 5722,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/opus-mt-en-ROMANCE",
+  "task": "translation",
+  "downloads": 8155,
+  "files": [
+   "onnx/decoder_model.onnx",
+   "onnx/decoder_model_merged.onnx",
+   "onnx/decoder_with_past_model.onnx",
+   "onnx/encoder_model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/timesformer-base-finetuned-k400",
+  "task": "video-classification",
+  "downloads": 20,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/smart-turn-v3-ONNX",
+  "task": "voice-activity-detection",
+  "downloads": 114,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased-mnli",
+  "task": "zero-shot-classification",
+  "downloads": 35731,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/mobilebert-uncased-mnli",
+  "task": "zero-shot-classification",
+  "downloads": 15926,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/nli-deberta-v3-xsmall",
+  "task": "zero-shot-classification",
+  "downloads": 15412,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/mobileclip_s0",
+  "task": "zero-shot-image-classification",
+  "downloads": 9133,
+  "files": [
+   "onnx/text_model.onnx",
+   "onnx/vision_model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/chinese-clip-vit-base-patch16",
+  "task": "zero-shot-image-classification",
+  "downloads": 2888,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/mobileclip_s2",
+  "task": "zero-shot-image-classification",
+  "downloads": 1752,
+  "files": [
+   "onnx/text_model.onnx",
+   "onnx/vision_model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/owlvit-base-patch32",
+  "task": "zero-shot-object-detection",
+  "downloads": 10079,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/grounding-dino-tiny-ONNX",
+  "task": "zero-shot-object-detection",
+  "downloads": 5692,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/owlv2-base-patch16-ensemble",
+  "task": "zero-shot-object-detection",
+  "downloads": 2069,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "HuggingFaceTB/SmolLM2-360M-Instruct",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Qwen2.5-0.5B-Instruct",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Qwen3-0.6B-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/gemma-3-270m-it-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/LFM2-350M-ONNX",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/gpt2",
+  "task": "text-generation",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/embeddinggemma-300m-ONNX",
+  "task": "feature-extraction",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+  "task": "feature-extraction",
+  "downloads": 0,
+  "files": [
+   "onnx/model.onnx"
+  ]
+ }
+]

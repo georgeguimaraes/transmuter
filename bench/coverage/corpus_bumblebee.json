@@ -1,0 +1,95 @@
+[
+ {
+  "repo": "onnx-community/silero-vad",
+  "task": "voice-activity-detection #379",
+  "files": [
+   "onnx/model.onnx"
+  ],
+  "dims": {
+   "seq": 512
+  }
+ },
+ {
+  "repo": "Carve/LaMa-ONNX",
+  "task": "inpainting #432",
+  "files": [
+   "lama_fp32.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/sam3-tracker-ONNX",
+  "task": "mask-generation SAM3 #432",
+  "files": [
+   "onnx/vision_encoder.onnx",
+   "onnx/prompt_encoder_mask_decoder.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/stable-diffusion-v1-5-ONNX",
+  "task": "text-to-image #120",
+  "files": [
+   "text_encoder/model.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-community/stable-diffusion-v1-5-ONNX",
+  "task": "text-to-image #120",
+  "files": [
+   "vae_decoder/model.onnx",
+   "unet/model.onnx"
+  ],
+  "dims": {
+   "height": 64,
+   "width": 64,
+   "decoder_channels": 4,
+   "unet_sample_channels": 4,
+   "decoder_height": 64,
+   "decoder_width": 64,
+   "unet_sample_height": 64,
+   "unet_sample_width": 64
+  }
+ },
+ {
+  "repo": "onnx-community/stable-diffusion-v1-5-ONNX",
+  "task": "text-to-image #120",
+  "files": [
+   "vae_encoder/model.onnx"
+  ],
+  "dims": {
+   "height": 256,
+   "width": 256
+  }
+ },
+ {
+  "repo": "export/really-tiny-falcon",
+  "task": "text-generation Falcon #215",
+  "local_dir": "/private/tmp/claude-502/-Users-george-code/23a9f9f8-f488-40ff-bed8-554e67848e8e/scratchpad/exports/optimum-intel-internal-testing__really-tiny-falcon-testing",
+  "files": [
+   "model.onnx"
+  ]
+ },
+ {
+  "repo": "export/tiny-random-GPTJ",
+  "task": "text-generation GPT-J #154",
+  "local_dir": "/private/tmp/claude-502/-Users-george-code/23a9f9f8-f488-40ff-bed8-554e67848e8e/scratchpad/exports/optimum-intel-internal-testing__tiny-random-GPTJModel",
+  "files": [
+   "model.onnx"
+  ]
+ },
+ {
+  "repo": "export/google-bigbird-roberta-base",
+  "task": "fill-mask BigBird #125",
+  "local_dir": "/private/tmp/claude-502/-Users-george-code/23a9f9f8-f488-40ff-bed8-554e67848e8e/scratchpad/exports/google__bigbird-roberta-base",
+  "files": [
+   "model.onnx"
+  ]
+ },
+ {
+  "repo": "export/microsoft-markuplm-base",
+  "task": "feature-extraction MarkupLM #195",
+  "local_dir": "/private/tmp/claude-502/-Users-george-code/23a9f9f8-f488-40ff-bed8-554e67848e8e/scratchpad/exports/markuplm-base",
+  "files": [
+   "model.onnx"
+  ]
+ }
+]

@@ -1,0 +1,306 @@
+defmodule Transmuter do
+  @moduledoc """
+  Runs ONNX models on any Nx backend.
+
+  Transmuter reads an ONNX file, such as an export from the Hugging Face Hub, and
+  turns its graph into Nx operations. It does not port model architectures. The
+  graph that the exporter traced is the model.
+
+      model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"})
+      params = Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, EMLX.Backend)} end)
+
+      run = Nx.Defn.jit(&Transmuter.run(model, &1, &2), compiler: EMLX)
+      %{"last_hidden_state" => hidden} = run.(params, %{"input_ids" => ids, "attention_mask" => mask, "token_type_ids" => types})
+
+  Shapes are resolved when the function is traced, so each new input shape
+  compiles again. Use `Nx.Defn.compile/3` and keep one compiled function per
+  shape.
+  """
+
+  alias Transmuter.Onnx.ModelProto
+  alias Transmuter.Ops
+
+  @max_loop_iterations 100_000
+
+  # Small initializers and integer initializers are shape data, so they stay static.
+  # Large integer initializers are packed quantized weights, so they are params.
+  @static_max_size 16
+  @static_int_max_size 4096
+
+  @doc """
+  Loads an ONNX model.
+
+  The source is a local path or `{:hf, repo, file}`. Hub files are downloaded
+  once into `~/.cache/transmuter`, together with their external data files.
+
+  ## Options
+
+    * `:cache_dir` - the directory for Hub downloads
+
+    * `:compute_type` - runs f16 and bf16 graphs in this type, for example `:f32`.
+      ONNX Runtime on the CPU computes half-precision graphs in f32, so use `:f32`
+      to match it. By default the graph keeps its own types.
+
+    * `:trainable` - when `true`, every float initializer is a param, so small
+      weights such as a 1-element bias get gradients. By default float
+      initializers with up to 16 elements are folded as constants.
+
+  Returns a map with:
+
+    * `:params` - float weights, which you move to your backend and pass to `run/4`
+    * `:inputs` and `:outputs` - the graph input and output names
+  """
+  def load!(source, opts \\ [])
+
+  def load!({:hf, repo, file}, opts), do: repo |> download!(file, opts) |> load!(opts)
+
+  def load!(path, opts) when is_binary(path) do
+    dir = Path.dirname(path)
+    model = ModelProto.decode!(File.read!(path))
+    graph = model.graph
+
+    trainable = Keyword.get(opts, :trainable, false)
+
+    {static, params} =
+      graph.initializer
+      |> Enum.map(&{&1.name, Ops.tensor(&1, dir)})
+      |> Enum.split_with(fn {_, t} -> static_initializer?(t, trainable) end)
+
+    initializers = Enum.map(graph.initializer, & &1.name)
+    inputs = for i <- graph.input, i.name not in initializers, do: i.name
+    compute_type = opts[:compute_type]
+
+    %{
+      nodes: toposort(graph.node, inputs ++ initializers),
+      static: Map.new(static, fn {k, t} -> {k, upcast(t, compute_type)} end),
+      params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end),
+      compute_type: compute_type,
+      inputs: inputs,
+      outputs: Enum.map(graph.output, & &1.name),
+      opset:
+        Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
+    }
+  end
+
+  @doc """
+  Runs the model graph. Call it inside `Nx.Defn.jit/2` or `Nx.Defn.compile/3`.
+
+  `static_inputs` are graph inputs whose values are known when the function is
+  traced. Give them as `Nx.BinaryBackend` tensors. Use them for flags that select
+  a branch, such as `use_cache_branch`, and for inputs that decide an output
+  shape, such as the `input_ids` that feed `NonZero` in Grounding DINO. Each new
+  value compiles again.
+
+  Outputs that are empty are left out of the result.
+  """
+  def run(model, params, inputs, static_inputs \\ %{}) do
+    ctx = %{opset: model.opset, compute_type: model[:compute_type]}
+    cast = &Map.new(&1, fn {k, t} -> {k, upcast(t, ctx.compute_type)} end)
+
+    env =
+      model.static
+      |> Map.merge(params)
+      |> Map.merge(cast.(inputs))
+      |> Map.merge(cast.(static_inputs))
+
+    env = run_nodes(model.nodes, env, ctx)
+    for name <- model.outputs, (t = Map.fetch!(env, name)) != :empty, into: %{}, do: {name, t}
+  end
+
+  defp run_nodes(nodes, env, ctx) do
+    Enum.reduce(nodes, env, fn node, env ->
+      inputs =
+        Enum.map(node.input, fn
+          "" -> nil
+          name -> Map.fetch!(env, name)
+        end)
+
+      outputs =
+        try do
+          cond do
+            node.op_type == "If" ->
+              run_if(node, inputs, env, ctx)
+
+            node.op_type == "Loop" ->
+              run_loop(node, inputs, env, ctx)
+
+            Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
+              Nx.with_default_backend(Nx.BinaryBackend, fn ->
+                Ops.apply(node, inputs, ctx.opset)
+              end)
+
+            true ->
+              Ops.apply(node, inputs, ctx.opset)
+          end
+          |> Enum.map(&upcast(&1, ctx.compute_type))
+        rescue
+          e ->
+            shapes =
+              Enum.map(inputs, fn
+                %Nx.Tensor{} = t -> Nx.shape(t)
+                other -> other
+              end)
+
+            message =
+              "#{node.op_type} #{node.name} with inputs #{inspect(shapes)}: #{Exception.message(e)}"
+
+            reraise RuntimeError, message, __STACKTRACE__
+        end
+
+      Map.merge(env, Map.new(Enum.zip(node.output, outputs)))
+    end)
+  end
+
+  defp run_if(node, [condition], env, ctx) do
+    unless Ops.known?(condition) do
+      raise ArgumentError,
+            "If needs a static condition, pass the graph inputs it depends on as static_inputs"
+    end
+
+    branch =
+      if Nx.to_number(Nx.any(condition)) == 1,
+        do: Ops.attr(node, "then_branch"),
+        else: Ops.attr(node, "else_branch")
+
+    env = Enum.reduce(branch.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+    env = run_nodes(branch.node, env, ctx)
+    Enum.map(branch.output, &Map.fetch!(env, &1.name))
+  end
+
+  # Unrolls the loop while tracing, so the trip count and the condition must be static.
+  defp run_loop(node, [trip_count, condition | initial], env, ctx) do
+    body = Ops.attr(node, "body")
+    [counter, condition_name | carried_names] = Enum.map(body.input, & &1.name)
+    trips = if trip_count, do: Nx.to_number(trip_count), else: @max_loop_iterations
+    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+
+    {carried, scans} =
+      Enum.reduce_while(0..(trips - 1)//1, {initial, [], condition}, fn i,
+                                                                        {carried, scans,
+                                                                         condition} ->
+        if condition != nil and Nx.to_number(Nx.any(static!(condition, "Loop"))) == 0 do
+          {:halt, {carried, scans, condition}}
+        else
+          step =
+            env
+            |> Map.merge(Map.new(Enum.zip(carried_names, carried)))
+            |> Map.merge(%{counter => Ops.static_tensor(i, :s64), condition_name => condition})
+
+          [next_condition | outputs] =
+            body.node
+            |> run_nodes(step, ctx)
+            |> then(&Enum.map(body.output, fn o -> Map.fetch!(&1, o.name) end))
+
+          {next_carried, scan_values} = Enum.split(outputs, length(carried))
+          {:cont, {next_carried, [scan_values | scans], next_condition}}
+        end
+      end)
+      |> then(fn {carried, scans, _} -> {carried, scans} end)
+
+    stacked =
+      case scans do
+        [] -> []
+        _ -> scans |> Enum.reverse() |> Enum.zip_with(&Nx.stack/1)
+      end
+
+    carried ++ stacked
+  end
+
+  defp static_initializer?(:empty, _trainable), do: true
+
+  defp static_initializer?(t, trainable) do
+    if Nx.Type.integer?(Nx.type(t)),
+      do: Nx.size(t) <= @static_int_max_size,
+      else: not trainable and Nx.size(t) <= @static_max_size
+  end
+
+  defp upcast(t = %Nx.Tensor{}, type) when type != nil do
+    if Nx.type(t) in [{:f, 16}, {:bf, 16}], do: Nx.as_type(t, type), else: t
+  end
+
+  defp upcast(t, _type), do: t
+
+  defp static!(t, op) do
+    unless Ops.known?(t) do
+      raise ArgumentError,
+            "#{op} needs a static condition, pass the graph inputs it depends on as static_inputs"
+    end
+
+    t
+  end
+
+  # Some exports list nodes out of order, so sort them by data dependencies.
+  defp toposort(nodes, known) do
+    {sorted, _, []} =
+      {[], MapSet.new(known), nodes}
+      |> Stream.iterate(fn {done, known, pending} ->
+        {ready, waiting} =
+          Enum.split_with(pending, fn n ->
+            Enum.all?(dependencies(n), &(&1 == "" or &1 in known))
+          end)
+
+        if ready == [], do: raise(ArgumentError, "the graph has a cycle or an undefined input")
+
+        {done ++ ready, Enum.reduce(ready, known, &MapSet.union(&2, MapSet.new(&1.output))),
+         waiting}
+      end)
+      |> Enum.find(fn {_, _, pending} -> pending == [] end)
+
+    sorted
+  end
+
+  # A node with subgraphs (If branches) also depends on the outer values its branches read.
+  defp dependencies(node) do
+    outer =
+      for %{g: graph} when graph != nil <- node.attribute,
+          name <- outer_reads(graph),
+          do: name
+
+    node.input ++ outer
+  end
+
+  defp outer_reads(graph) do
+    local = Enum.map(graph.initializer, & &1.name) ++ Enum.map(graph.input, & &1.name)
+    produced = Enum.flat_map(graph.node, & &1.output)
+    Enum.uniq(Enum.flat_map(graph.node, &dependencies/1)) -- (local ++ produced)
+  end
+
+  defp download!(repo, file, opts) do
+    dir =
+      Path.join(
+        opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"]),
+        repo
+      )
+
+    path = Path.join(dir, file)
+
+    unless File.exists?(path) do
+      %{"siblings" => siblings} = hub_get!("https://huggingface.co/api/models/#{repo}").body
+
+      data_files =
+        for %{"rfilename" => f} <- siblings,
+            String.starts_with?(f, file <> "_data") or f == file <> ".data",
+            do: f
+
+      for f <- data_files ++ [file] do
+        target = Path.join(dir, f)
+        File.mkdir_p!(Path.dirname(target))
+
+        hub_get!("https://huggingface.co/#{repo}/resolve/main/#{f}",
+          into: File.stream!(target <> ".part")
+        )
+
+        File.rename!(target <> ".part", target)
+      end
+    end
+
+    path
+  end
+
+  defp hub_get!(url, opts \\ []) do
+    headers =
+      if token = System.get_env("HF_TOKEN"), do: [authorization: "Bearer #{token}"], else: []
+
+    Req.get!(url, [headers: headers, receive_timeout: 600_000, redirect_log_level: false] ++ opts)
+  end
+end

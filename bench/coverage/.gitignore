@@ -1,0 +1,4 @@
+cases/
+models/
+*.log
+report.json
