@@ -52,7 +52,7 @@ defmodule Transmuter.Ops.Text do
 
     padded =
       if width == 0 do
-        :empty
+        {:empty, List.to_tuple(Tuple.to_list(shape) ++ [0])}
       else
         values = Enum.flat_map(substrings, &(&1 ++ List.duplicate("", width - length(&1))))
         {:strings, List.to_tuple(Tuple.to_list(shape) ++ [width]), values}

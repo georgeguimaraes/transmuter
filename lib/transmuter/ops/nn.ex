@@ -4,7 +4,7 @@ defmodule Transmuter.Ops.NN do
   # Neural network layers: convolutions, pooling, unpooling, normalizations, Resize,
   # Upsample, GridSample, LRN, Dropout and the classification losses.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, empty?: 1, ints!: 1, static_tensor: 2]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
@@ -244,12 +244,12 @@ defmodule Transmuter.Ops.NN do
     in_shape = Tuple.to_list(Nx.shape(x))
 
     scales =
-      if scales != nil and scales != :empty and Nx.size(scales) > 0,
+      if scales != nil and not empty?(scales) and Nx.size(scales) > 0,
         do: ints!(scales),
         else: nil
 
     sizes =
-      if sizes != nil and sizes != :empty,
+      if sizes != nil and not empty?(sizes),
         do: ints!(sizes),
         else: Enum.zip_with(in_shape, scales, &floor(&1 * &2))
 

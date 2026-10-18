@@ -319,7 +319,7 @@ defmodule Transmuter.Ops.Vision do
         end
 
       {:error, _reason} ->
-        :empty
+        {:empty, {0}}
     end
   end
 
@@ -377,7 +377,7 @@ defmodule Transmuter.Ops.Vision do
         |> Enum.map(&[batch, rem(row, classes), &1])
       end)
 
-    if selected == [], do: :empty, else: static_tensor(selected, :s64)
+    if selected == [], do: {:empty, {0, 3}}, else: static_tensor(selected, :s64)
   end
 
   # Corners and area in f32 arithmetic, so IoU ties fall the same way as in ONNX Runtime.

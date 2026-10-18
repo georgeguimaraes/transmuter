@@ -144,7 +144,7 @@ defmodule Transmuter.OpsTest do
 
   defp read(dir, %{"file" => file, "dtype" => type, "shape" => shape}, backend) do
     if 0 in shape do
-      :empty
+      {:empty, List.to_tuple(shape)}
     else
       dir
       |> Path.join(file)

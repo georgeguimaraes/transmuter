@@ -3,7 +3,7 @@ defmodule Transmuter.Ops do
 
   # ONNX operators as Nx calls. Values known at trace time live on Nx.BinaryBackend
   # ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no
-  # zero-size tensors, so an empty static value is the atom :empty.
+  # zero-size tensors, so a zero-size value is {:empty, shape}.
 
   alias Transmuter.Ops.{
     Elementwise,
@@ -52,14 +52,13 @@ defmodule Transmuter.Ops do
     end
   end
 
-  # Positions of the inputs whose zero size makes every output zero size, so the
-  # operator passes :empty on. Detection models run per-class branches with no boxes.
+  # Positions of the inputs whose zero size makes the output zero size, so the operator
+  # only computes the output shape. Detection models run per-class branches with no boxes.
   @empty_through %{
     "Unsqueeze" => [0],
     "Squeeze" => [0],
     "Transpose" => [0],
     "Reshape" => [0],
-    "Slice" => [0],
     "Expand" => [0],
     "Gather" => [0, 1],
     "NonMaxSuppression" => [0, 1],
@@ -70,8 +69,8 @@ defmodule Transmuter.Ops do
     empty_through = Map.get(@empty_through, node.op_type, [])
 
     cond do
-      Enum.any?(empty_through, &(Enum.at(inputs, &1) == :empty)) ->
-        Enum.map(node.output, fn _ -> :empty end)
+      Enum.any?(empty_through, &empty?(Enum.at(inputs, &1))) ->
+        [{:empty, node |> empty_shape(inputs) |> List.to_tuple()}]
 
       node.op_type in ["Softmax", "LogSoftmax", "Hardmax"] ->
         [along_axis(node, hd(inputs), opset)]
@@ -114,11 +113,95 @@ defmodule Transmuter.Ops do
     end
   end
 
-  # Values that Nx cannot hold live in the graph environment as host terms: a string
-  # tensor is {:strings, shape, values}, a sequence is {:sequence, elements} and an
-  # empty optional is :none.
+  defp empty_shape(node = %{op_type: "Unsqueeze"}, [x | rest]) do
+    axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
+    rank = length(shape_list(x)) + length(axes)
+
+    axes
+    |> Enum.map(&normalize_axis(&1, rank))
+    |> Enum.sort()
+    |> Enum.reduce(shape_list(x), &List.insert_at(&2, &1, 1))
+  end
+
+  defp empty_shape(node = %{op_type: "Squeeze"}, [x | rest]) do
+    dims = shape_list(x)
+    axes = if rest in [[], [nil]], do: attr(node, "axes"), else: ints!(hd(rest))
+
+    if axes do
+      axes = Enum.map(axes, &normalize_axis(&1, length(dims)))
+      for {d, i} <- Enum.with_index(dims), i not in axes, do: d
+    else
+      Enum.reject(dims, &(&1 == 1))
+    end
+  end
+
+  defp empty_shape(node = %{op_type: "Transpose"}, [x]) do
+    dims = shape_list(x)
+    perm = attr(node, "perm", Enum.reverse(0..(length(dims) - 1)//1))
+    Enum.map(perm, &Enum.at(dims, &1))
+  end
+
+  defp empty_shape(node = %{op_type: "Reshape"}, [x, shape]) do
+    dims = shape_list(x)
+    copy? = attr(node, "allowzero", 0) == 0
+
+    target =
+      shape
+      |> ints!()
+      |> Enum.with_index()
+      |> Enum.map(fn
+        {0, i} when copy? -> Enum.at(dims, i)
+        {d, _} -> d
+      end)
+
+    known = target |> Enum.reject(&(&1 == -1)) |> Enum.product()
+    Enum.map(target, &if(&1 == -1, do: div(Enum.product(dims), max(known, 1)), else: &1))
+  end
+
+  # A dimension of 1 takes the target size, any other dimension stays, also 0.
+  defp empty_shape(%{op_type: "Expand"}, [x, shape]) do
+    {dims, target} = {shape_list(x), ints!(shape)}
+    rank = max(length(dims), length(target))
+    pad = &(List.duplicate(1, rank - length(&1)) ++ &1)
+    Enum.zip_with(pad.(dims), pad.(target), fn d, t -> if d == 1, do: t, else: d end)
+  end
+
+  defp empty_shape(node = %{op_type: "Gather"}, [data, indices]) do
+    dims = shape_list(data)
+
+    {before, [_ | after_axis]} =
+      Enum.split(dims, normalize_axis(attr(node, "axis", 0), length(dims)))
+
+    before ++ shape_list(indices) ++ after_axis
+  end
+
+  defp empty_shape(%{op_type: "NonMaxSuppression"}, _inputs), do: [0, 3]
+
+  defp empty_shape(node = %{op_type: "RoiAlign"}, [x, rois | _]) do
+    [
+      hd(shape_list(rois)),
+      Enum.at(shape_list(x), 1),
+      attr(node, "output_height", 1),
+      attr(node, "output_width", 1)
+    ]
+  end
+
+  defp shape_list(t), do: t |> shape_of() |> Tuple.to_list()
+
   @doc false
-  def static?(:empty), do: true
+  def empty?({:empty, _shape}), do: true
+  def empty?(_), do: false
+
+  # The shape of a tensor or of a zero-size value.
+  @doc false
+  def shape_of({:empty, shape}), do: shape
+  def shape_of(t), do: Nx.shape(t)
+
+  # Values that Nx cannot hold live in the graph environment as host terms: a string
+  # tensor is {:strings, shape, values}, a sequence is {:sequence, elements}, an empty
+  # optional is :none and a zero-size tensor is {:empty, shape}.
+  @doc false
+  def static?({:empty, _shape}), do: true
   def static?(:none), do: true
   def static?({:strings, _shape, _values}), do: true
   def static?({:sequence, elements}), do: Enum.all?(elements, &static?/1)
@@ -126,7 +209,7 @@ defmodule Transmuter.Ops do
   def static?(_), do: false
 
   @doc false
-  def ints!(:empty), do: []
+  def ints!({:empty, _shape}), do: []
 
   def ints!(t) do
     unless known?(t) do
@@ -142,7 +225,7 @@ defmodule Transmuter.Ops do
   # Concrete values can be read on the host: static ones, and every tensor when the
   # model runs eagerly. Only values inside a traced function are unknown.
   @doc false
-  def known?(:empty), do: true
+  def known?({:empty, _shape}), do: true
   def known?(:none), do: true
   def known?({:strings, _shape, _values}), do: true
   def known?({:sequence, elements}), do: Enum.all?(elements, &known?/1)
@@ -265,7 +348,7 @@ defmodule Transmuter.Ops do
   end
 
   def tensor(%{dims: dims} = t, dir) when dims != [] do
-    if 0 in dims, do: :empty, else: tensor_data(t, dir)
+    if 0 in dims, do: {:empty, List.to_tuple(dims)}, else: tensor_data(t, dir)
   end
 
   def tensor(t, dir), do: tensor_data(t, dir)

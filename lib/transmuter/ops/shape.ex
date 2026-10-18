@@ -9,9 +9,11 @@ defmodule Transmuter.Ops.Shape do
       attr: 2,
       attr: 3,
       dtype: 1,
+      empty?: 1,
       ints!: 1,
       known?: 1,
       normalize_axis: 2,
+      shape_of: 1,
       static_tensor: 2,
       tensor: 1
     ]
@@ -27,7 +29,7 @@ defmodule Transmuter.Ops.Shape do
   @doc false
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
-  defp op(%{op_type: "Cast"}, [:empty]), do: :empty
+  defp op(%{op_type: "Cast"}, [empty = {:empty, _shape}]), do: empty
   defp op(node = %{op_type: "Cast"}, [a]), do: Nx.as_type(a, dtype(attr(node, "to")))
   defp op(node = %{op_type: "BitCast"}, [a]), do: Nx.bitcast(a, dtype(attr(node, "to")))
 
@@ -48,7 +50,10 @@ defmodule Transmuter.Ops.Shape do
       node |> attr("value") |> then(&if(&1, do: tensor(&1), else: static_tensor([0.0], :f32)))
 
     dims = ints!(shape)
-    if 0 in dims, do: :empty, else: value |> Nx.reshape({}) |> Nx.broadcast(List.to_tuple(dims))
+
+    if 0 in dims,
+      do: {:empty, List.to_tuple(dims)},
+      else: value |> Nx.reshape({}) |> Nx.broadcast(List.to_tuple(dims))
   end
 
   defp op(%{op_type: "Expand"}, [a, shape]) do
@@ -71,8 +76,8 @@ defmodule Transmuter.Ops.Shape do
 
   defp op(%{op_type: "Size"}, [a]), do: static_tensor(Nx.size(a), :s64)
 
-  # :empty does not keep its shape, so it reads as a 1-D tensor of size 0.
-  defp op(%{op_type: "Shape"}, [:empty]), do: static_tensor([0], :s64)
+  defp op(%{op_type: "Shape"}, [{:empty, shape}]),
+    do: shape |> Tuple.to_list() |> static_tensor(:s64)
 
   defp op(%{op_type: "Shape"}, [a]),
     do: a |> Nx.shape() |> Tuple.to_list() |> static_tensor(:s64)
@@ -103,9 +108,18 @@ defmodule Transmuter.Ops.Shape do
     end
   end
 
-  # Nx has no zero-size tensors, so an empty static 1-D slice is :empty and Concat drops it.
-  defp op(node = %{op_type: "Concat"}, inputs),
-    do: inputs |> Enum.reject(&(&1 == :empty)) |> Nx.concatenate(axis: attr(node, "axis"))
+  # Zero-size inputs add nothing, so Concat drops them.
+  defp op(node = %{op_type: "Concat"}, inputs) do
+    case Enum.reject(inputs, &empty?/1) do
+      [] ->
+        shapes = Enum.map(inputs, &shape_of/1)
+        axis = normalize_axis(attr(node, "axis"), tuple_size(hd(shapes)))
+        {:empty, put_elem(hd(shapes), axis, shapes |> Enum.map(&elem(&1, axis)) |> Enum.sum())}
+
+      tensors ->
+        Nx.concatenate(tensors, axis: attr(node, "axis"))
+    end
+  end
 
   defp op(node = %{op_type: "Unsqueeze"}, [a | rest]) do
     axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
@@ -143,8 +157,9 @@ defmodule Transmuter.Ops.Shape do
     [starts, ends, axes, steps]
     |> Enum.zip()
     |> Enum.reduce(data, fn {s, e, ax, step}, acc ->
-      ax = if ax < 0, do: ax + Nx.rank(acc), else: ax
-      dim = Nx.axis_size(acc, ax)
+      shape = shape_of(acc)
+      ax = normalize_axis(ax, tuple_size(shape))
+      dim = elem(shape, ax)
       s = if s < 0, do: s + dim, else: s
       e = if e < 0, do: e + dim, else: e
 
@@ -154,7 +169,7 @@ defmodule Transmuter.Ops.Shape do
           else: Enum.to_list(min(max(s, 0), dim - 1)..(min(max(e, -1), dim - 1) + 1)//step)
 
       cond do
-        indices == [] -> :empty
+        indices == [] or empty?(acc) -> {:empty, put_elem(shape, ax, length(indices))}
         step == 1 -> Nx.slice_along_axis(acc, hd(indices), length(indices), axis: ax)
         true -> Nx.take(acc, static_tensor(indices, :s64), axis: ax)
       end
@@ -258,7 +273,7 @@ defmodule Transmuter.Ops.Shape do
     |> Nx.reshape({n, c * b * b, div(h, b), div(w, b)})
   end
 
-  defp op(%{op_type: "ScatterElements"}, [data, :empty, :empty]), do: data
+  defp op(%{op_type: "ScatterElements"}, [data, {:empty, _}, {:empty, _}]), do: data
 
   # Each update goes to its own coordinates with the index replacing the axis coordinate.
   # Scatter is the old name of ScatterElements.
@@ -387,7 +402,7 @@ defmodule Transmuter.Ops.Shape do
       |> Enum.map(&unravel(elem(&1, 1), Nx.shape(a)))
 
     if coords == [],
-      do: :empty,
+      do: {:empty, {Nx.rank(a), 0}},
       else: coords |> Enum.zip_with(& &1) |> static_tensor(:s64)
   end
 
@@ -454,7 +469,7 @@ defmodule Transmuter.Ops.Shape do
       |> Enum.flat_map(fn {keep, i} -> if keep != 0, do: [i], else: [] end)
 
     if indices == [],
-      do: :empty,
+      do: {:empty, x |> Nx.shape() |> put_elem(axis, 0)},
       else: Nx.take(x, static_tensor(indices, :s64), axis: axis)
   end
 

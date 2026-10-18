@@ -705,3 +705,16 @@ case("SoftmaxCrossEntropyLoss_mean_ignore", [node("SoftmaxCrossEntropyLoss", ["x
 r = rng_for("RoiAlign_opset10")
 case("RoiAlign_opset10", [node("RoiAlign", ["x", "rois", "idx"], ["y"], output_height=3, output_width=2, sampling_ratio=2, spatial_scale=0.5)],
      {"x": r.standard_normal((2, 3, 10, 10)).astype(np.float32), "rois": rois * 2, "idx": np.array([0, 1, 0], np.int64)}, opset=10)
+
+# A zero-size value keeps its shape through Slice, Transpose and Unsqueeze, as Mask R-CNN needs.
+r = rng_for("Shape_of_zero_size")
+case("Shape_of_zero_size", [
+    node("Slice", ["x", "starts", "ends", "axes"], ["empty"]),
+    node("Shape", ["empty"], ["shape"]),
+    node("Gather", ["shape", "last"], ["size"]),
+    node("Transpose", ["empty"], ["moved"], perm=[2, 0, 1]),
+    node("Unsqueeze", ["moved", "axes"], ["wider"]),
+    node("Shape", ["wider"], ["wider_shape"]),
+], {"x": r.standard_normal((3, 4, 5)).astype(np.float32)},
+     {"starts": np.array([2], np.int64), "ends": np.array([2], np.int64), "axes": np.array([1], np.int64), "last": np.array(2, np.int64)},
+     outputs=["shape", "size", "wider_shape"])

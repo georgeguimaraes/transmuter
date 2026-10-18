@@ -5,7 +5,8 @@ defmodule Transmuter.Ops.Sequence do
   # optional is :none. The list work happens while tracing, so positions and split
   # sizes must be static, but the elements can be traced tensors.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2, static_tensor: 2]
+  import Transmuter.Ops,
+    only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize_axis: 2, static_tensor: 2]
 
   @op_types ~w(SequenceEmpty SequenceConstruct SequenceAt SequenceInsert SequenceErase
                SequenceLength SplitToSequence ConcatFromSequence Optional OptionalHasElement
@@ -67,7 +68,7 @@ defmodule Transmuter.Ops.Sequence do
   end
 
   defp op(node = %{op_type: "ConcatFromSequence"}, [{:sequence, elements}]) do
-    elements = Enum.reject(elements, &(&1 == :empty))
+    elements = Enum.reject(elements, &empty?/1)
     rank = Nx.rank(hd(elements))
 
     if attr(node, "new_axis", 0) == 1,

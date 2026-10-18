@@ -127,7 +127,7 @@ defmodule Transmuter do
   shape, such as the `input_ids` that feed `NonZero` in Grounding DINO. Each new
   value compiles again.
 
-  Outputs that are empty are left out of the result.
+  Outputs with a zero-size dimension are left out of the result.
 
   Random operators draw from the `Nx.Random` key in the `"#{@random_key}"` input.
   Without it, each call makes a new key. A function that you compile yourself makes
@@ -147,7 +147,9 @@ defmodule Transmuter do
 
     env = run_nodes(model.nodes, env, ctx)
 
-    for(name <- model.outputs, (t = Map.fetch!(env, name)) != :empty, into: %{}, do: {name, t})
+    model.outputs
+    |> Map.new(&{&1, Map.fetch!(env, &1)})
+    |> Map.reject(fn {_name, t} -> Ops.empty?(t) end)
     |> host_outputs(Compiler.current())
     |> tag_literals(Compiler.current())
   end
@@ -336,7 +338,7 @@ defmodule Transmuter do
       else: Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, backend)} end)
   end
 
-  defp static_initializer?(:empty, _trainable), do: true
+  defp static_initializer?({:empty, _shape}, _trainable), do: true
   defp static_initializer?({:strings, _shape, _values}, _trainable), do: true
 
   defp static_initializer?(t, trainable) do
