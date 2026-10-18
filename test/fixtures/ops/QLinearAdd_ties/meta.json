@@ -1,0 +1,35 @@
+{
+ "repo": "op/QLinearAdd_ties",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:QLinearAdd": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "a",
+   "file": "in_0.bin",
+   "dtype": "u8",
+   "shape": [
+    64,
+    4096
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "c",
+   "file": "out_0.bin",
+   "dtype": "u8",
+   "shape": [
+    64,
+    4096
+   ]
+  }
+ ],
+ "ort_ok": true
+}
