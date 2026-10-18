@@ -1,0 +1,24 @@
+{
+ "repo": "op/HammingWindow_periodic",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "HammingWindow": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    16
+   ]
+  }
+ ],
+ "ort_ok": true
+}

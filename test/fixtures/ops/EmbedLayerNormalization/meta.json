@@ -1,0 +1,62 @@
+{
+ "repo": "op/EmbedLayerNormalization",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:EmbedLayerNormalization": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "ids",
+   "file": "in_0.bin",
+   "dtype": "s32",
+   "shape": [
+    2,
+    5
+   ]
+  },
+  {
+   "name": "seg",
+   "file": "in_1.bin",
+   "dtype": "s32",
+   "shape": [
+    2,
+    5
+   ]
+  },
+  {
+   "name": "mask",
+   "file": "in_2.bin",
+   "dtype": "s32",
+   "shape": [
+    2,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    16
+   ]
+  },
+  {
+   "name": "mask_index",
+   "file": "out_1.bin",
+   "dtype": "s32",
+   "shape": [
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

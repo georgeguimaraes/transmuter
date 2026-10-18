@@ -1,5 +1,5 @@
 defmodule TransmuterTest do
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   # Reference values come from ONNX Runtime with graph optimizations disabled,
   # see test/support/reference.py. The first run downloads the models.

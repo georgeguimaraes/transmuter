@@ -1,0 +1,37 @@
+{
+ "repo": "op/MatMulNBits_b4_bs32_none_bias",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:MatMulNBits": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "A",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    72
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "Y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    16
+   ]
+  }
+ ],
+ "ort_ok": true
+}

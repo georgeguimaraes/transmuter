@@ -1,0 +1,25 @@
+{
+ "repo": "op/MelWeightMatrix",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "MelWeightMatrix": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ]
+  }
+ ],
+ "ort_ok": true
+}

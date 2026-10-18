@@ -1,7 +1,12 @@
-"""Builds single-op ONNX cases with ORT reference outputs, in the layout of prepare.py.
+"""Builds the op-level test fixtures: one small ONNX graph per operator variant, with
+its inputs and reference outputs, in the layout of bench/coverage/prepare.py.
 
-Each case is a small graph around one operator, so a mismatch points at that operator.
-Usage: op_cases.py cases_dir
+The reference is ONNX Runtime with graph optimizations off, or the ONNX reference
+evaluator for operators that ONNX Runtime does not have yet. test/transmuter/ops_test.exs
+runs every fixture, so a mismatch points at one operator.
+
+Usage: uv run --with onnx --with onnxruntime --with numpy python -I test/support/op_cases.py [output_dir]
+The default output_dir is test/fixtures/ops.
 """
 
 import json
@@ -14,9 +19,9 @@ import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper
 
-cases_dir = sys.argv[1]
+cases_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures", "ops")
 rng = np.random.default_rng(0)
-NX = {"int64": "s64", "int32": "s32", "float32": "f32", "uint8": "u8", "int8": "s8", "bool": "u8", "float16": "f16"}
+NX = {"int64": "s64", "int32": "s32", "float32": "f32", "uint8": "u8", "int8": "s8", "bool": "u8", "float16": "f16", "uint32": "u32", "uint16": "u16", "uint64": "u64", "int16": "s16"}
 MS = "com.microsoft"
 
 
@@ -41,14 +46,23 @@ def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=Fals
     os.makedirs(path, exist_ok=True)
     onnx_path = os.path.join(path, "model.onnx")
     onnx.save(model, onnx_path)
-    meta = {"repo": "op/" + name, "task": "op", "file": "model.onnx", "onnx_path": onnx_path, "unoptimized_ref": True,
+    meta = {"repo": "op/" + name, "task": "op", "file": "model.onnx", "onnx_path": "model.onnx", "unoptimized_ref": True,
             "ops": dict(Counter((f"{n.domain}:" if n.domain else "") + n.op_type for n in nodes)), "static_inputs": list(static)}
     try:
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        opts.log_severity_level = 3
-        sess = ort.InferenceSession(onnx_path, opts, providers=["CPUExecutionProvider"])
-        outs = sess.run(outputs, inputs)
+        try:
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            opts.log_severity_level = 3
+            sess = ort.InferenceSession(onnx_path, opts, providers=["CPUExecutionProvider"])
+            outs = sess.run(outputs, inputs)
+            meta["reference"] = "onnxruntime"
+        except Exception as ort_error:
+            # ONNX Runtime does not have the newest operators yet, so ONNX's reference evaluator is the reference.
+            from onnx.reference import ReferenceEvaluator
+            if ms:
+                raise ort_error
+            outs = ReferenceEvaluator(model).run(outputs, inputs)
+            meta["reference"] = "onnx.reference: " + str(ort_error).splitlines()[0][:120]
         save = lambda a, f: (np.ascontiguousarray(a.astype(np.uint8) if a.dtype == np.bool_ else a).tofile(os.path.join(path, f)), {"dtype": NX[str(a.dtype)], "shape": list(a.shape)})[1]
         meta["inputs"] = [{"name": k, "file": f"in_{i}.bin", **save(v, f"in_{i}.bin")} for i, (k, v) in enumerate(inputs.items())]
         meta["outputs"] = [{"name": k, "file": f"out_{i}.bin", **save(np.asarray(v), f"out_{i}.bin")} for i, (k, v) in enumerate(zip(outputs, outs))]
@@ -234,3 +248,85 @@ body = helper.make_graph(
      helper.make_tensor_value_info("scan", TensorProto.FLOAT, [3])])
 case("Loop_static_trip_count", [node("Loop", ["M", "cond", "acc0"], ["acc", "scans"], body=body)],
      {"x": f32(3), "acc0": f32(3)}, {"M": np.array(4, np.int64), "cond": np.array(True)})
+
+# ---------- group 1: elementwise, reductions, pooling, windows ----------
+
+pos = (rng.random((3, 5)) * 0.9 + 0.05).astype(np.float32)
+for op in ["Acos", "Asin", "Atanh"]:
+    case(op, [node(op, ["x"], ["y"])], {"x": (pos * 2 - 1).astype(np.float32)})
+for op in ["Tan", "Cosh", "Sinh", "Asinh"]:
+    case(op, [node(op, ["x"], ["y"])], {"x": f32(3, 5)})
+case("Acosh", [node("Acosh", ["x"], ["y"])], {"x": (pos + 1.5).astype(np.float32)})
+ints = lambda *shape: rng.integers(0, 200, shape).astype(np.int32)
+for op in ["BitwiseAnd", "BitwiseOr", "BitwiseXor"]:
+    case(op, [node(op, ["a", "b"], ["y"])], {"a": ints(3, 4), "b": ints(3, 4)}, opset=18)
+case("BitwiseNot", [node("BitwiseNot", ["a"], ["y"])], {"a": ints(3, 4)}, opset=18)
+case("BitShift_left", [node("BitShift", ["a", "b"], ["y"], direction="LEFT")], {"a": rng.integers(0, 50, (3, 4)).astype(np.uint8), "b": rng.integers(0, 3, (3, 4)).astype(np.uint8)})
+case("BitShift_right", [node("BitShift", ["a", "b"], ["y"], direction="RIGHT")], {"a": rng.integers(0, 250, (3, 4)).astype(np.uint32), "b": rng.integers(0, 5, (3, 4)).astype(np.uint32)})
+case("Celu", [node("Celu", ["x"], ["y"], alpha=0.7)], {"x": f32(3, 6)}, opset=12)
+case("Swish", [node("Swish", ["x"], ["y"], alpha=1.3)], {"x": f32(3, 6)}, opset=24)
+case("SwiGLU", [node("SwiGLU", ["a", "b"], ["y"])], {"a": f32(3, 6), "b": f32(3, 6)}, opset=28)
+case("Shrink", [node("Shrink", ["x"], ["y"], bias=0.3, lambd=0.4)], {"x": f32(3, 6)})
+case("Mean", [node("Mean", ["a", "b", "c"], ["y"])], {"a": f32(3, 4), "b": f32(1, 4), "c": f32(3, 1)})
+case("Sum", [node("Sum", ["a", "b"], ["y"])], {"a": f32(2, 3, 4), "b": f32(4)})
+case("Dropout_inference", [node("Dropout", ["x"], ["y", "mask"])], {"x": f32(3, 4)})
+case("LogSoftmax", [node("LogSoftmax", ["x"], ["y"], axis=1)], {"x": f32(2, 5, 3)})
+case("LogSoftmax_opset11_flatten", [node("LogSoftmax", ["x"], ["y"], axis=1)], {"x": f32(2, 5, 3)}, opset=11)
+case("Hardmax", [node("Hardmax", ["x"], ["y"], axis=-1)], {"x": f32(3, 7)})
+case("CumProd_exclusive_reverse", [node("CumProd", ["x", "axis"], ["y"], exclusive=1, reverse=1)], {"x": (pos + 0.5).astype(np.float32)}, {"axis": np.array(1, np.int64)}, opset=26)
+for op in ["ReduceL1", "ReduceLogSumExp"]:
+    case(op, [node(op, ["x", "axes"], ["y"], keepdims=0)], {"x": f32(3, 4, 5)}, {"axes": np.array([1, 2], np.int64)})
+case("ReduceLogSum", [node("ReduceLogSum", ["x", "axes"], ["y"])], {"x": (pos + 0.1).astype(np.float32)}, {"axes": np.array([1], np.int64)})
+case("LRN", [node("LRN", ["x"], ["y"], size=3, alpha=1e-3, beta=0.75, bias=2.0)], {"x": f32(2, 6, 5, 5)})
+case("LpPool", [node("LpPool", ["x"], ["y"], kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1], p=3)], {"x": f32(1, 2, 7, 7)})
+case("GlobalLpPool", [node("GlobalLpPool", ["x"], ["y"], p=2)], {"x": f32(2, 3, 5, 5)}, opset=18)
+case("MeanVarianceNormalization", [node("MeanVarianceNormalization", ["x"], ["y"])], {"x": f32(2, 3, 4, 4)})
+case("ReverseSequence", [node("ReverseSequence", ["x", "lens"], ["y"], batch_axis=1, time_axis=0)], {"x": f32(5, 3, 2), "lens": np.array([5, 2, 3], np.int64)})
+case("Det", [node("Det", ["x"], ["y"])], {"x": f32(2, 3, 3)})
+case("RNN_bidirectional", [node("RNN", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=4, direction="bidirectional")],
+     {"x": f32(5, 2, 3)}, {"w": f32(2, 4, 3, scale=0.5), "r": f32(2, 4, 4, scale=0.5), "b": f32(2, 8)})
+for op in ["HannWindow", "HammingWindow", "BlackmanWindow"]:
+    case(op + "_periodic", [node(op, ["n"], ["y"])], {}, {"n": np.array(16, np.int64)}, opset=17)
+    case(op + "_symmetric", [node(op, ["n"], ["y"], periodic=0)], {}, {"n": np.array(10, np.int64)}, opset=17)
+case("MelWeightMatrix", [node("MelWeightMatrix", ["bins", "dft", "rate", "low", "high"], ["y"])], {},
+     {"bins": np.array(8, np.int64), "dft": np.array(64, np.int64), "rate": np.array(16000, np.int64), "low": np.array(20.0, np.float32), "high": np.array(7600.0, np.float32)}, opset=17)
+
+# ---------- group 2: vision, quantized, Scan ----------
+
+case("AffineGrid_2d", [node("AffineGrid", ["theta", "size"], ["y"])], {"theta": f32(2, 2, 3)}, {"size": np.array([2, 3, 4, 5], np.int64)}, opset=20)
+case("AffineGrid_3d_align", [node("AffineGrid", ["theta", "size"], ["y"], align_corners=1)], {"theta": f32(1, 3, 4)}, {"size": np.array([1, 1, 3, 4, 5], np.int64)}, opset=20)
+case("CenterCropPad", [node("CenterCropPad", ["x", "shape"], ["y"], axes=[1, 2])], {"x": f32(2, 7, 4)}, {"shape": np.array([4, 7], np.int64)}, opset=18)
+case("Col2Im", [node("Col2Im", ["x", "image", "block"], ["y"], strides=[1, 2], pads=[1, 0, 1, 1])],
+     {"x": f32(2, 3 * 2 * 3, 5 * 3)}, {"image": np.array([4, 6], np.int64), "block": np.array([2, 3], np.int64)}, opset=18)
+rois = np.array([[1.0, 1.5, 6.0, 7.0], [0.0, 0.0, 9.0, 9.0], [2.5, 3.0, 4.0, 8.5]], np.float32)
+case("RoiAlign_avg", [node("RoiAlign", ["x", "rois", "idx"], ["y"], output_height=3, output_width=2, sampling_ratio=2, spatial_scale=0.5)],
+     {"x": f32(2, 3, 10, 10), "rois": rois * 2, "idx": np.array([0, 1, 0], np.int64)}, opset=16)
+# Adaptive sampling (sampling_ratio 0) depends on the ROI sizes, so the ROIs are static.
+case("RoiAlign_adaptive_avg", [node("RoiAlign", ["x", "rois", "idx"], ["y"], output_height=2, output_width=2, sampling_ratio=0)],
+     {"x": f32(1, 2, 10, 10), "rois": rois, "idx": np.array([0, 0, 0], np.int64)}, opset=16, static=("rois",))
+# ORT warns that its max mode is wrong for sampling ratios other than 1.
+case("RoiAlign_max", [node("RoiAlign", ["x", "rois", "idx"], ["y"], output_height=2, output_width=3, sampling_ratio=1, mode="max")],
+     {"x": f32(1, 2, 10, 10), "rois": rois, "idx": np.array([0, 0, 0], np.int64)}, opset=16)
+case("MaxRoiPool", [node("MaxRoiPool", ["x", "rois"], ["y"], pooled_shape=[2, 3], spatial_scale=1.0)],
+     {"x": f32(2, 3, 8, 8), "rois": np.array([[0, 1, 1, 5, 6], [1, 0, 2, 7, 7]], np.float32)}, opset=18)
+K = 3
+case("DeformConv", [node("DeformConv", ["x", "w", "offset", "b", "mask"], ["y"], kernel_shape=[K, K], pads=[1, 1, 1, 1], strides=[1, 1])],
+     {"x": f32(1, 4, 6, 6), "offset": f32(1, 2 * K * K, 6, 6, scale=0.7), "mask": rng.random((1, K * K, 6, 6)).astype(np.float32)},
+     {"w": f32(5, 4, K, K, scale=0.3), "b": f32(5)}, opset=19)
+case("DeformConv_groups", [node("DeformConv", ["x", "w", "offset"], ["y"], kernel_shape=[2, 2], group=2, offset_group=2, strides=[2, 2])],
+     {"x": f32(1, 4, 7, 7), "offset": f32(1, 2 * 2 * 4, 3, 3, scale=0.7)}, {"w": f32(6, 2, 2, 2, scale=0.3)}, opset=19)
+q = lambda *shape: rng.integers(0, 255, shape).astype(np.uint8)
+case("QLinearMatMul", [node("QLinearMatMul", ["a", "as", "az", "b", "bs", "bz", "ys", "yz"], ["y"])],
+     {"a": q(2, 3, 8)}, {"as": np.array(0.02, np.float32), "az": np.array(120, np.uint8), "b": q(8, 4), "bs": np.array(0.03, np.float32),
+                         "bz": np.array(128, np.uint8), "ys": np.array(0.5, np.float32), "yz": np.array(100, np.uint8)})
+case("QLinearConv_per_channel", [node("QLinearConv", ["x", "xs", "xz", "w", "ws", "wz", "ys", "yz", "b"], ["y"], pads=[1, 1, 1, 1])],
+     {"x": q(1, 3, 6, 6)}, {"xs": np.array(0.02, np.float32), "xz": np.array(110, np.uint8), "w": rng.integers(-60, 60, (4, 3, 3, 3)).astype(np.int8),
+                            "ws": (rng.random(4) * 0.02 + 0.005).astype(np.float32), "wz": np.zeros(4, np.int8), "ys": np.array(0.15, np.float32),
+                            "yz": np.array(128, np.uint8), "b": rng.integers(-500, 500, 4).astype(np.int32)})
+scan_body = helper.make_graph(
+    [node("Add", ["sum_in", "x_t"], ["sum_out"]), node("Mul", ["sum_out", "x_t"], ["scan_t"])],
+    "scan_body",
+    [helper.make_tensor_value_info("sum_in", TensorProto.FLOAT, [3]), helper.make_tensor_value_info("x_t", TensorProto.FLOAT, [3])],
+    [helper.make_tensor_value_info("sum_out", TensorProto.FLOAT, [3]), helper.make_tensor_value_info("scan_t", TensorProto.FLOAT, [3])])
+case("Scan_reverse", [node("Scan", ["init", "xs"], ["final", "ys"], body=scan_body, num_scan_inputs=1, scan_input_directions=[1], scan_output_axes=[1])],
+     {"init": f32(3), "xs": f32(5, 3)})

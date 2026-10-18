@@ -1,0 +1,44 @@
+{
+ "repo": "op/SwiGLU",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SwiGLU": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from /Users/george/code/transmuter/test/support/../fixtures/ops/SwiGLU/model.",
+ "inputs": [
+  {
+   "name": "a",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ]
+  },
+  {
+   "name": "b",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ]
+  }
+ ],
+ "ort_ok": true
+}

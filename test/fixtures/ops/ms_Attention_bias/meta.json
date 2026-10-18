@@ -1,0 +1,48 @@
+{
+ "repo": "op/ms_Attention_bias",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:Attention": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    32
+   ]
+  },
+  {
+   "name": "bias",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    4,
+    5,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    32
+   ]
+  }
+ ],
+ "ort_ok": true
+}
