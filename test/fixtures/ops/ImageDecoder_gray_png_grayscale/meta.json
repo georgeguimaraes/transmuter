@@ -1,0 +1,36 @@
+{
+ "repo": "op/ImageDecoder_gray_png_grayscale",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "ImageDecoder": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnx.reference: [ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : Could not find an implementation for ImageDecoder(20) node with name ''",
+ "inputs": [
+  {
+   "name": "data",
+   "file": "in_0.bin",
+   "dtype": "u8",
+   "shape": [
+    166
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "image",
+   "file": "out_0.bin",
+   "dtype": "u8",
+   "shape": [
+    24,
+    20,
+    1
+   ]
+  }
+ ],
+ "ort_ok": true
+}

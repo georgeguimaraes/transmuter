@@ -1,0 +1,45 @@
+{
+ "repo": "op/StringNormalizer_upper_case_sensitive",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringNormalizer": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    1,
+    4
+   ],
+   "values": [
+    "monday",
+    "Monday",
+    "stra\u00dfe",
+    "\u00dcn\u00efcode"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    1,
+    3
+   ],
+   "values": [
+    "MONDAY",
+    "STRA\u00dfE",
+    "\u00dcN\u00cfCODE"
+   ]
+  }
+ ],
+ "ort_ok": true
+}

@@ -1,0 +1,47 @@
+{
+ "repo": "op/StringNormalizer_lower_stopwords",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringNormalizer": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    7
+   ],
+   "values": [
+    "The",
+    "Cat",
+    "and",
+    "THE",
+    "Hat",
+    "a b",
+    ""
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    4
+   ],
+   "values": [
+    "cat",
+    "hat",
+    "a b",
+    ""
+   ]
+  }
+ ],
+ "ort_ok": true
+}

@@ -1,0 +1,58 @@
+{
+ "repo": "op/StringConcat_broadcast",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringConcat": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    2,
+    1
+   ],
+   "values": [
+    "a",
+    "\u00e9"
+   ]
+  },
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    3
+   ],
+   "values": [
+    "-1",
+    "",
+    "\ud83d\ude00"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "z",
+   "dtype": "string",
+   "shape": [
+    2,
+    3
+   ],
+   "values": [
+    "a-1",
+    "a",
+    "a\ud83d\ude00",
+    "\u00e9-1",
+    "\u00e9",
+    "\u00e9\ud83d\ude00"
+   ]
+  }
+ ],
+ "ort_ok": true
+}

@@ -28,6 +28,7 @@ defmodule Transmuter.MixProject do
       {:protox, "~> 1.7"},
       {:req, "~> 0.5"},
       {:emlx, "~> 0.5", optional: true},
+      {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", only: [:dev, :test]},
       {:polaris, "~> 0.1", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

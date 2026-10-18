@@ -1,0 +1,72 @@
+{
+ "repo": "op/StringSplit_delimiter_maxsplit",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringSplit": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    2,
+    3
+   ],
+   "values": [
+    "a::b::c::d",
+    "::x::",
+    "",
+    "a:b",
+    "a::::b",
+    "::"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    2,
+    3,
+    3
+   ],
+   "values": [
+    "a",
+    "b",
+    "c::d",
+    "",
+    "x",
+    "",
+    "",
+    "",
+    "",
+    "a:b",
+    "",
+    "",
+    "a",
+    "",
+    "b",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "z",
+   "file": "out_1.bin",
+   "dtype": "s64",
+   "shape": [
+    2,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

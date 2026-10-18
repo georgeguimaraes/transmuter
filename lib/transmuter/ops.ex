@@ -13,6 +13,7 @@ defmodule Transmuter.Ops do
     Reduction,
     Shape,
     Signal,
+    Text,
     Transformer,
     Vision
   }
@@ -66,6 +67,9 @@ defmodule Transmuter.Ops do
 
       node.op_type in Vision.op_types() ->
         Vision.apply(node, inputs)
+
+      node.op_type in Text.op_types() ->
+        Text.apply(node, inputs)
 
       node.op_type in Elementwise.op_types() ->
         Elementwise.apply(node, inputs)

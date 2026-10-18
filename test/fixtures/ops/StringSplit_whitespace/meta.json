@@ -1,0 +1,61 @@
+{
+ "repo": "op/StringSplit_whitespace",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringSplit": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    4
+   ],
+   "values": [
+    "  hello   world ! ",
+    "",
+    "one",
+    "a b"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    4,
+    3
+   ],
+   "values": [
+    "hello",
+    "world",
+    "!",
+    "",
+    "",
+    "",
+    "one",
+    "",
+    "",
+    "a",
+    "b",
+    ""
+   ]
+  },
+  {
+   "name": "z",
+   "file": "out_1.bin",
+   "dtype": "s64",
+   "shape": [
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}
