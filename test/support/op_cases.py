@@ -5,7 +5,7 @@ The reference is ONNX Runtime with graph optimizations off, or the ONNX referenc
 evaluator for operators that ONNX Runtime does not have yet. test/transmuter/ops_test.exs
 runs every fixture, so a mismatch points at one operator.
 
-Usage: uv run --with onnx --with onnxruntime --with numpy python -I test/support/op_cases.py [output_dir]
+Usage: uv run --with onnx --with onnxruntime --with numpy --with pillow python -I test/support/op_cases.py [output_dir]
 The default output_dir is test/fixtures/ops.
 """
 
@@ -551,3 +551,75 @@ weights = np.array([[1, 2, 3, 4], [7, 1, 1, 1]], np.float32)
 # ONNX Runtime 1.31 has Multinomial only up to opset 21, and the reference evaluator does not have it.
 case("Multinomial", [node("Multinomial", ["x"], ["y"], sample_size=10000)], {"x": np.log(weights) + np.float32(5)}, opset=21,
      extra={"distribution": {"frequencies": (weights / weights.sum(axis=1, keepdims=True)).tolist()}})
+
+
+# ---------- strings and ImageDecoder ----------
+
+def strings(values):
+    return np.array(values, dtype=object)
+
+
+def image_bytes(image, fmt):
+    import io
+
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, format=fmt)
+    return np.frombuffer(buffer.getvalue(), np.uint8)
+
+
+case("StringNormalizer_lower_stopwords", [node("StringNormalizer", ["x"], ["y"], case_change_action="LOWER", stopwords=["the", "And"])],
+     {"x": strings(["The", "Cat", "and", "THE", "Hat", "a b", ""])}, opset=10, eager=True)
+case("StringNormalizer_upper_case_sensitive", [node("StringNormalizer", ["x"], ["y"], case_change_action="UPPER", is_case_sensitive=1,
+     stopwords=["monday"], locale="en_US")], {"x": strings([["monday", "Monday", "straße", "Ünïcode"]])}, opset=10, eager=True)
+case("StringNormalizer_all_stopwords_1d", [node("StringNormalizer", ["x"], ["y"], stopwords=["monday"])],
+     {"x": strings(["monday", "MONDAY"])}, opset=10, eager=True)
+case("StringNormalizer_all_stopwords_2d", [node("StringNormalizer", ["x"], ["y"], case_change_action="LOWER", stopwords=["monday"])],
+     {"x": strings([["Monday", "monday"]])}, opset=10, eager=True)
+case("StringConcat_broadcast", [node("StringConcat", ["x", "y"], ["z"])],
+     {"x": strings([["a"], ["é"]]), "y": strings(["-1", "", "😀"])}, opset=20, eager=True)
+case("StringConcat_scalar", [node("StringConcat", ["x", "y"], ["z"])],
+     {"x": strings([["a", "b"], ["c", ""]]), "y": strings("!")}, opset=20, eager=True)
+case("StringSplit_delimiter_maxsplit", [node("StringSplit", ["x"], ["y", "z"], delimiter="::", maxsplit=2)],
+     {"x": strings([["a::b::c::d", "::x::", ""], ["a:b", "a::::b", "::"]])}, opset=20, eager=True)
+case("StringSplit_whitespace", [node("StringSplit", ["x"], ["y", "z"])],
+     {"x": strings(["  hello   world ! ", "", "one", "a b"])}, opset=20, eager=True)
+case("StringSplit_whitespace_maxsplit", [node("StringSplit", ["x"], ["y", "z"], delimiter="", maxsplit=1)],
+     {"x": strings(["  a  b  c ", "x", "   ", "p q"])}, opset=20, eager=True)
+case("StringSplit_count", [node("StringSplit", ["x"], ["y", "z"], delimiter=",")],
+     {"x": strings([["a,b", ",,,", "x"], ["", "1,2,3,4", "q,"]])}, outputs=["z"], opset=20)
+case("RegexFullMatch_basic", [node("RegexFullMatch", ["x"], ["y"], pattern=r"[a-z]+@\w+\.(com|org)|\d{3}|é.")],
+     {"x": strings([["abc@mail.com", "abc@mail.net", "123"], ["1234", "٣٣٣", "éa"], ["ab@x_y.org", "Ab@x.com", "é\n"]])}, opset=20)
+
+
+def tfidf(name, x, mode, pool, counts, indexes, eager=False, **attrs):
+    key = "pool_strings" if x.dtype == object else "pool_int64s"
+    case(name, [node("TfIdfVectorizer", ["x"], ["y"], mode=mode, ngram_counts=counts, ngram_indexes=indexes, **{key: pool}, **attrs)],
+         {"x": x}, opset=9, eager=eager, static=() if eager else ("x",))
+
+
+r = rng_for("TfIdfVectorizer_tf_int_skip")
+tfidf("TfIdfVectorizer_tf_int_skip", r.integers(0, 5, (2, 10)).astype(np.int32), "TF", [1, 2, 3, 1, 2, 2, 3, 3, 3, 4, 1], [0, 3],
+      [6, 0, 5, 1, 4, 2, 7], min_gram_length=1, max_gram_length=2, max_skip_count=2)
+r = rng_for("TfIdfVectorizer_idf_weights_unigrams")
+tfidf("TfIdfVectorizer_idf_weights_unigrams", r.integers(0, 4, 12).astype(np.int64), "IDF", [0, 1, 3, 0, 1, 1, 3], [0, 3],
+      [2, 0, 4, 1, 3], min_gram_length=1, max_gram_length=1, max_skip_count=0, weights=[0.5, 1.5, 2.0, 0.25, 3.0])
+r = rng_for("TfIdfVectorizer_idf_eager")
+tfidf("TfIdfVectorizer_idf_eager", r.integers(0, 3, 14).astype(np.int64), "IDF", [0, 1, 0, 1, 1, 2, 2, 2, 0, 1, 2, 2, 1, 0], [0, 2, 8],
+      [0, 1, 2, 3, 4, 5, 6, 7], eager=True, min_gram_length=2, max_gram_length=3, max_skip_count=1)
+r = rng_for("TfIdfVectorizer_tfidf_strings")
+tfidf("TfIdfVectorizer_tfidf_strings", r.choice(["a", "b", "c", "dé"], (3, 7)).astype(object), "TFIDF",
+      ["a", "dé", "a", "b", "b", "a", "dé", "c"], [0, 2], [3, 0, 1, 4, 2], min_gram_length=1, max_gram_length=2,
+      max_skip_count=1, weights=[0.5, 2.0, 1.25, 3.0, 0.75])
+r = rng_for("TfIdfVectorizer_tf_strings_1d")
+tfidf("TfIdfVectorizer_tf_strings_1d", r.choice(["x", "y", "z"], 9).astype(object), "TF",
+      ["x", "z", "x", "y", "z", "z"], [0, 2], [0, 1, 2, 3], min_gram_length=1, max_gram_length=2, max_skip_count=0)
+
+r = rng_for("ImageDecoder")
+picture = np.repeat(np.repeat(r.integers(0, 256, (6, 5, 3), dtype=np.uint8), 4, axis=0), 4, axis=1)
+for fmt, atol in [("PNG", None), ("JPEG", 2)]:
+    for pixel_format in ["RGB", "BGR", "Grayscale"]:
+        case(f"ImageDecoder_{fmt.lower()}_{pixel_format.lower()}", [node("ImageDecoder", ["data"], ["image"], pixel_format=pixel_format)],
+             {"data": image_bytes(picture, fmt)}, opset=20, static=("data",), atol=atol)
+case("ImageDecoder_gray_png_grayscale", [node("ImageDecoder", ["data"], ["image"], pixel_format="Grayscale")],
+     {"data": image_bytes(picture[:, :, 0], "PNG")}, opset=20, eager=True)

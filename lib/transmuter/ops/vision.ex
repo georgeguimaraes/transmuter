@@ -1,12 +1,14 @@
 defmodule Transmuter.Ops.Vision do
   @moduledoc false
 
-  # Spatial operators: sampling grids, crops, patch folding, region pooling and
-  # deformable convolution. Sizes that decide output shapes must be static.
+  # Spatial operators: sampling grids, crops, patch folding, region pooling,
+  # deformable convolution and image decoding. Sizes that decide output shapes must be static.
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
 
-  @op_types ~w(AffineGrid CenterCropPad Col2Im RoiAlign MaxRoiPool DeformConv)
+  @compile {:no_warn_undefined, StbImage}
+
+  @op_types ~w(AffineGrid CenterCropPad Col2Im RoiAlign MaxRoiPool DeformConv ImageDecoder)
 
   @doc false
   def op_types, do: @op_types
@@ -269,6 +271,40 @@ defmodule Transmuter.Ops.Vision do
     if bias, do: Nx.add(out, Nx.reshape(bias, {1, m, 1, 1})), else: out
   end
 
+  # Decodes to {H, W, C} u8. An image that cannot be decoded gives an empty tensor, as the spec says.
+  defp op(node = %{op_type: "ImageDecoder"}, [encoded]) do
+    unless Code.ensure_loaded?(StbImage) do
+      raise ArgumentError,
+            ~s(ImageDecoder needs the optional stb_image dependency, add {:stb_image, "~> 1.0"} to your deps)
+    end
+
+    unless Transmuter.Ops.known?(encoded) do
+      raise ArgumentError,
+            "ImageDecoder decodes on the host, pass the encoded image as a static input or run eagerly"
+    end
+
+    # stb_image 1.0 returns the wrong shape when asked to convert channels, so the
+    # source channels (gray, gray and alpha, RGB or RGBA) become RGB here.
+    case StbImage.read_binary(Nx.to_binary(encoded)) do
+      {:ok, %{data: data, shape: shape = {h, w, c}}} ->
+        pixels = data |> Nx.from_binary(:u8, backend: Nx.BinaryBackend) |> Nx.reshape(shape)
+
+        rgb =
+          if c < 3,
+            do: pixels |> Nx.slice_along_axis(0, 1, axis: 2) |> Nx.broadcast({h, w, 3}),
+            else: Nx.slice_along_axis(pixels, 0, 3, axis: 2)
+
+        case attr(node, "pixel_format", "RGB") do
+          "RGB" -> rgb
+          "BGR" -> Nx.reverse(rgb, axes: [2])
+          "Grayscale" -> luma(rgb)
+        end
+
+      {:error, _reason} ->
+        :empty
+    end
+  end
+
   # Samples per bin: the fixed sampling ratio, or ceil(bin size) from the known ROI.
   defp sampling_grid(nil, _out, ratio, _scale, _half_pixel?), do: {ratio, ratio}
 
@@ -410,6 +446,17 @@ defmodule Transmuter.Ops.Vision do
     ]
     |> Enum.reduce(&Nx.add/2)
     |> Nx.multiply(Nx.as_type(inside, Nx.type(image)))
+  end
+
+  # ITU-R 601-2 luma in 16-bit fixed point, rounded, as Pillow converts RGB to L.
+  defp luma(rgb) do
+    rgb
+    |> Nx.as_type(:u32)
+    |> Nx.dot(static_tensor([19_595, 38_470, 7_471], :u32))
+    |> Nx.add(32_768)
+    |> Nx.right_shift(16)
+    |> Nx.as_type(:u8)
+    |> Nx.new_axis(-1)
   end
 
   # Normalized coordinate of pixel i of dim pixels, in [-1, 1].

@@ -1,0 +1,39 @@
+{
+ "repo": "op/StringNormalizer_all_stopwords_1d",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "StringNormalizer": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    2
+   ],
+   "values": [
+    "monday",
+    "MONDAY"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "dtype": "string",
+   "shape": [
+    1
+   ],
+   "values": [
+    ""
+   ]
+  }
+ ],
+ "ort_ok": true
+}

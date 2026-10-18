@@ -1,0 +1,45 @@
+{
+ "repo": "op/RegexFullMatch_basic",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "RegexFullMatch": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    3,
+    3
+   ],
+   "values": [
+    "abc@mail.com",
+    "abc@mail.net",
+    "123",
+    "1234",
+    "\u0663\u0663\u0663",
+    "\u00e9a",
+    "ab@x_y.org",
+    "Ab@x.com",
+    "\u00e9\n"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "u8",
+   "shape": [
+    3,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

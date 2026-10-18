@@ -1,0 +1,59 @@
+{
+ "repo": "op/TfIdfVectorizer_tfidf_strings",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "TfIdfVectorizer": 1
+ },
+ "static_inputs": [
+  "x"
+ ],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "dtype": "string",
+   "shape": [
+    3,
+    7
+   ],
+   "values": [
+    "b",
+    "b",
+    "d\u00e9",
+    "b",
+    "c",
+    "c",
+    "b",
+    "a",
+    "c",
+    "a",
+    "a",
+    "c",
+    "c",
+    "d\u00e9",
+    "d\u00e9",
+    "c",
+    "c",
+    "b",
+    "b",
+    "c",
+    "b"
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    5
+   ]
+  }
+ ],
+ "ort_ok": true
+}
