@@ -175,7 +175,6 @@ defmodule Transmuter.Ops.Quantized do
     |> saturate(Nx.type(a))
   end
 
-  # Integer convolution with per-tensor or per-output-channel weight scales, then requantized.
   defp op(node = %{op_type: "QLinearConv"}, [
          x,
          x_scale,

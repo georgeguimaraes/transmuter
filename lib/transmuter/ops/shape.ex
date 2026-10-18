@@ -381,7 +381,6 @@ defmodule Transmuter.Ops.Shape do
       else: coords |> Enum.zip_with(& &1) |> static_tensor(:s64)
   end
 
-  # Reverses the first sequence_lens[b] steps along the time axis of each batch item.
   defp op(node = %{op_type: "ReverseSequence"}, [x, lens]) do
     {batch_axis, time_axis} = {attr(node, "batch_axis", 1), attr(node, "time_axis", 0)}
     shape = Nx.shape(x)

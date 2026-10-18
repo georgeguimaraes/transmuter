@@ -17,7 +17,6 @@ defmodule Transmuter.Ops.NN do
   @doc false
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
-  # Integer convolution, accumulated in f32 like MatMulInteger.
   defp op(node = %{op_type: "ConvInteger"}, [x, w | zero_points]) do
     [x_zero, w_zero] = Enum.take(zero_points ++ [nil, nil], 2)
     x = Nx.as_type(x, :f32)
@@ -346,7 +345,6 @@ defmodule Transmuter.Ops.NN do
   defp op(%{op_type: "Dropout"}, [x | _]),
     do: [x, Nx.broadcast(Nx.tensor(1, type: :u8), Nx.shape(x))]
 
-  # Local response normalization over a window of channels.
   defp op(node = %{op_type: "LRN"}, [x]) do
     size = attr(node, "size")
 

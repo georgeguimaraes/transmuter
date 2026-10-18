@@ -34,7 +34,6 @@ defmodule Transmuter.Ops.Vision do
     Nx.reshape(grid, List.to_tuple([n | spatial] ++ [length(spatial)]))
   end
 
-  # Crops or zero-pads each axis to the target size, keeping the center.
   defp op(node = %{op_type: "CenterCropPad"}, [x, shape]) do
     targets = ints!(shape)
     rank = Nx.rank(x)
@@ -215,7 +214,6 @@ defmodule Transmuter.Ops.Vision do
     Nx.select(Nx.broadcast(empty, {r, c, ph, pw}), Nx.tensor(0, type: Nx.type(x)), pooled)
   end
 
-  # Deformable convolution: each kernel tap samples the input at a learned offset.
   defp op(node = %{op_type: "DeformConv"}, [x, w, offset | rest]) do
     [bias, mask] = Enum.take(rest ++ [nil, nil], 2)
     {n, c, h, wd} = Nx.shape(x)
@@ -311,7 +309,6 @@ defmodule Transmuter.Ops.Vision do
     {y_lo, y_hi, wy, y_ok} = roi_axis_taps(ys, h)
     {x_lo, x_hi, wx, x_ok} = roi_axis_taps(xs, w)
 
-    # Gather the four corners for every (out_h, grid_h, out_w, grid_w) sample.
     flat = Nx.reshape(image, {:auto, h * w})
 
     at = fn yi, xi ->
