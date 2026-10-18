@@ -16,6 +16,7 @@ defmodule Transmuter do
   eager execution.
   """
 
+  alias Nx.Defn.{Compiler, Composite, Expr, Tree}
   alias Transmuter.Onnx.ModelProto
   alias Transmuter.Ops
 
@@ -128,8 +129,40 @@ defmodule Transmuter do
       |> Map.merge(cast.(static_inputs))
 
     env = run_nodes(model.nodes, env, ctx)
-    for name <- model.outputs, (t = Map.fetch!(env, name)) != :empty, into: %{}, do: {name, t}
+
+    for(name <- model.outputs, (t = Map.fetch!(env, name)) != :empty, into: %{}, do: {name, t})
+    |> tag_literals(Compiler.current())
   end
+
+  # EMLX 0.5 keys its compile cache by the structure of the graph, and a literal tensor
+  # adds only its shape and type to the key. Two graphs that differ only in literal
+  # values then share one compiled program. A metadata node with a hash of the value
+  # puts the value in the key. EMLX compiles a metadata node as its inner node.
+  defp tag_literals(outputs, EMLX) do
+    {outputs, _seen} = Composite.traverse(outputs, %{}, &tag_literal/2)
+    outputs
+  end
+
+  defp tag_literals(outputs, _compiler), do: outputs
+
+  defp tag_literal(t = %Nx.Tensor{data: %Expr{id: id, op: op, args: args}}, seen) do
+    case seen do
+      %{^id => tagged} ->
+        {tagged, seen}
+
+      %{} when op == :tensor ->
+        tagged = Expr.metadata(t, %{literal: :erlang.md5(Nx.to_binary(hd(args)))})
+        {tagged, Map.put(seen, id, tagged)}
+
+      %{} ->
+        {args, seen} = Tree.apply_args(t, :all, seen, &tag_literal/2)
+        tagged = put_in(t.data.args, args)
+        {tagged, Map.put(seen, id, tagged)}
+    end
+  end
+
+  defp tag_literal(t = %Nx.Tensor{shape: {}}, seen), do: {t, seen}
+  defp tag_literal(t = %Nx.Tensor{}, seen), do: tag_literal(Expr.tensor(t), seen)
 
   defp run_nodes(nodes, env, ctx) do
     Enum.reduce(nodes, env, fn node, env ->
