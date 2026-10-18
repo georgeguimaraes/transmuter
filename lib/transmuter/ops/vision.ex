@@ -4,11 +4,12 @@ defmodule Transmuter.Ops.Vision do
   # Spatial operators: sampling grids, crops, patch folding, region pooling,
   # deformable convolution and image decoding. Sizes that decide output shapes must be static.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, known?: 1, static_tensor: 2]
 
   @compile {:no_warn_undefined, StbImage}
 
-  @op_types ~w(AffineGrid CenterCropPad Col2Im RoiAlign MaxRoiPool DeformConv ImageDecoder)
+  @op_types ~w(AffineGrid CenterCropPad Col2Im RoiAlign MaxRoiPool DeformConv ImageDecoder
+               NonMaxSuppression)
 
   @doc false
   def op_types, do: @op_types
@@ -303,6 +304,93 @@ defmodule Transmuter.Ops.Vision do
       {:error, _reason} ->
         :empty
     end
+  end
+
+  # Greedy per batch and class, as the ONNX Runtime CPU kernel does it. The number of
+  # selected boxes depends on the values, so the boxes and scores must be known.
+  defp op(node = %{op_type: "NonMaxSuppression"}, [boxes, scores | rest]) do
+    [max_boxes, iou, score_threshold] = Enum.take(rest ++ [nil, nil, nil], 3)
+
+    unless Enum.all?([boxes, scores | rest], &(&1 == nil or known?(&1))) do
+      raise ArgumentError,
+            "NonMaxSuppression needs known boxes and scores, pass the graph inputs they " <>
+              "depend on as static_inputs or call Transmuter.run/4 without Nx.Defn.jit"
+    end
+
+    limit = if max_boxes, do: max(hd(ints!(max_boxes)), 0), else: 0
+    iou = if iou, do: hd(Nx.to_flat_list(iou)), else: 0.0
+    score_threshold = score_threshold && hd(Nx.to_flat_list(score_threshold))
+    center? = attr(node, "center_point_box", 0) == 1
+    {_batches, classes, count} = Nx.shape(scores)
+
+    corners =
+      boxes
+      |> Nx.to_flat_list()
+      |> Enum.chunk_every(4)
+      |> Enum.map(&box_corners(&1, center?))
+      |> Enum.chunk_every(count)
+      |> Enum.map(&List.to_tuple/1)
+
+    selected =
+      scores
+      |> Nx.to_flat_list()
+      |> Enum.chunk_every(count)
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {class_scores, row} ->
+        batch = div(row, classes)
+        batch_boxes = Enum.at(corners, batch)
+
+        class_scores
+        |> Enum.with_index()
+        |> Enum.filter(fn {s, _} -> score_threshold == nil or s > score_threshold end)
+        |> Enum.sort_by(fn {s, i} -> {-s, i} end)
+        |> Enum.reduce_while([], fn {_, i}, kept ->
+          cond do
+            length(kept) == limit ->
+              {:halt, kept}
+
+            Enum.any?(kept, &suppress?(elem(batch_boxes, i), elem(batch_boxes, &1), iou)) ->
+              {:cont, kept}
+
+            true ->
+              {:cont, [i | kept]}
+          end
+        end)
+        |> Enum.reverse()
+        |> Enum.map(&[batch, rem(row, classes), &1])
+      end)
+
+    if selected == [], do: :empty, else: static_tensor(selected, :s64)
+  end
+
+  # Corners and area in f32 arithmetic, so IoU ties fall the same way as in ONNX Runtime.
+  defp box_corners([y1, x1, y2, x2], false),
+    do: corners_area(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+  defp box_corners([xc, yc, w, h], true) do
+    {half_w, half_h} = {f32(w / 2), f32(h / 2)}
+    corners_area(f32(xc - half_w), f32(yc - half_h), f32(xc + half_w), f32(yc + half_h))
+  end
+
+  defp corners_area(x_min, y_min, x_max, y_max),
+    do: {x_min, y_min, x_max, y_max, f32(f32(x_max - x_min) * f32(y_max - y_min))}
+
+  defp suppress?({ax0, ay0, ax1, ay1, area_a}, {bx0, by0, bx1, by1, area_b}, threshold) do
+    {x0, x1} = {max(ax0, bx0), min(ax1, bx1)}
+    {y0, y1} = {max(ay0, by0), min(ay1, by1)}
+
+    if x1 <= x0 or y1 <= y0 or area_a <= 0 or area_b <= 0 do
+      false
+    else
+      inter = f32(f32(x1 - x0) * f32(y1 - y0))
+      union = f32(f32(area_a + area_b) - inter)
+      union > 0 and f32(inter / union) > threshold
+    end
+  end
+
+  defp f32(x) do
+    <<y::float-32>> = <<x::float-32>>
+    y
   end
 
   # Samples per bin: the fixed sampling ratio, or ceil(bin size) from the known ROI.

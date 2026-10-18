@@ -19,7 +19,7 @@ defmodule Transmuter.Ops.Shape do
   @op_types ~w(Cast Constant ConstantOfShape Expand Tile Squeeze Size Shape Gather Concat
                Unsqueeze Reshape Slice Transpose Identity CastLike Range Split Pad DepthToSpace
                SpaceToDepth ScatterElements GatherND ScatterND Flatten Trilu OneHot
-               GatherElements EyeLike NonZero ReverseSequence Scatter BitCast)
+               GatherElements EyeLike NonZero ReverseSequence Scatter BitCast Unique Compress)
 
   @doc false
   def op_types, do: @op_types
@@ -384,6 +384,73 @@ defmodule Transmuter.Ops.Shape do
     if coords == [],
       do: :empty,
       else: coords |> Enum.zip_with(& &1) |> static_tensor(:s64)
+  end
+
+  # Slices along the axis (or values of the flattened input) are compared as lists, in
+  # the same lexicographic order as ONNX Runtime.
+  defp op(node = %{op_type: "Unique"}, [x]) do
+    unless known?(x) do
+      raise ArgumentError,
+            "Unique needs a static input, pass the graph inputs it depends on as static_inputs"
+    end
+
+    {x, axis} =
+      case attr(node, "axis") do
+        nil -> {Nx.reshape(x, {:auto}), 0}
+        axis -> {x, normalize_axis(axis, Nx.rank(x))}
+      end
+
+    rows =
+      x
+      |> Nx.transpose(axes: [axis | Enum.to_list(0..(Nx.rank(x) - 1)) -- [axis]])
+      |> Nx.reshape({Nx.axis_size(x, axis), :auto})
+      |> Nx.to_list()
+      |> Enum.with_index()
+
+    groups =
+      Enum.reduce(rows, %{}, fn {row, i}, acc ->
+        Map.update(acc, row, {i, 1}, fn {first, n} -> {first, n + 1} end)
+      end)
+
+    order =
+      if attr(node, "sorted", 1) == 1,
+        do: groups |> Map.keys() |> Enum.sort(),
+        else: groups |> Enum.sort_by(fn {_, {first, _}} -> first end) |> Enum.map(&elem(&1, 0))
+
+    position = order |> Enum.with_index() |> Map.new()
+    firsts = Enum.map(order, &elem(groups[&1], 0))
+
+    [
+      Nx.take(x, static_tensor(firsts, :s64), axis: axis),
+      static_tensor(firsts, :s64),
+      static_tensor(Enum.map(rows, fn {row, _} -> position[row] end), :s64),
+      static_tensor(Enum.map(order, &elem(groups[&1], 1)), :s64)
+    ]
+  end
+
+  # Only the condition decides the output size, so the data can be traced.
+  defp op(node = %{op_type: "Compress"}, [x, condition]) do
+    unless known?(condition) do
+      raise ArgumentError,
+            "Compress needs a static condition, pass the graph inputs it depends on as static_inputs"
+    end
+
+    {x, axis} =
+      case attr(node, "axis") do
+        nil -> {Nx.reshape(x, {:auto}), 0}
+        axis -> {x, normalize_axis(axis, Nx.rank(x))}
+      end
+
+    indices =
+      condition
+      |> Nx.to_flat_list()
+      |> Enum.take(Nx.axis_size(x, axis))
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {keep, i} -> if keep != 0, do: [i], else: [] end)
+
+    if indices == [],
+      do: :empty,
+      else: Nx.take(x, static_tensor(indices, :s64), axis: axis)
   end
 
   defp op(node = %{op_type: "ReverseSequence"}, [x, lens]) do

@@ -623,3 +623,49 @@ for fmt, atol in [("PNG", None), ("JPEG", 2)]:
              {"data": image_bytes(picture, fmt)}, opset=20, static=("data",), atol=atol)
 case("ImageDecoder_gray_png_grayscale", [node("ImageDecoder", ["data"], ["image"], pixel_format="Grayscale")],
      {"data": image_bytes(picture[:, :, 0], "PNG")}, opset=20, eager=True)
+
+# ---------- group 3: data-dependent outputs ----------
+
+# Boxes 1 and 2 have flipped corners, 6 and 7 have an IoU of exactly 0.5 and 8 ties with 0 on the score.
+nms_boxes = np.array([[[0, 0, 1, 1], [1, 1.1, 0, 0.1], [0, 0.9, 1, -0.1], [0, 10, 1, 11], [0, 10.1, 1, 11.1],
+                       [0, 100, 1, 101], [0, 20, 1, 21], [0, 20, 2, 21], [0, 0.05, 1, 1.05]]], np.float32)
+nms_scores = np.array([[[0.9, 0.75, 0.6, 0.95, 0.5, 0.3, 0.8, 0.7, 0.9]]], np.float32)
+
+
+def nms_limits(m, iou, score=None):
+    limits = {"m": np.array([m], np.int64), "iou": np.array([iou], np.float32)}
+    return limits if score is None else {**limits, "score": np.array([score], np.float32)}
+
+
+case("NonMaxSuppression_corners_ties", [node("NonMaxSuppression", ["boxes", "scores", "m", "iou"], ["y"])],
+     {"boxes": nms_boxes, "scores": nms_scores}, nms_limits(10, 0.5), static=("boxes", "scores"))
+case("NonMaxSuppression_score_threshold_max", [node("NonMaxSuppression", ["boxes", "scores", "m", "iou", "score"], ["y"])],
+     {"boxes": nms_boxes, "scores": nms_scores}, nms_limits(3, 0.4, 0.6), static=("boxes", "scores"))
+case("NonMaxSuppression_no_max_boxes", [node("NonMaxSuppression", ["boxes", "scores"], ["y"])],
+     {"boxes": nms_boxes, "scores": nms_scores}, static=("boxes", "scores"))
+r = rng_for("NonMaxSuppression_center_point_box")
+case("NonMaxSuppression_center_point_box", [node("NonMaxSuppression", ["boxes", "scores", "m", "iou", "score"], ["y"], center_point_box=1)],
+     {"boxes": np.concatenate([r.random((1, 30, 2)) * 10, r.random((1, 30, 2)) * 4 + 0.5], axis=2).astype(np.float32),
+      "scores": r.random((1, 2, 30)).astype(np.float32)}, nms_limits(8, 0.3, 0.2), static=("boxes", "scores"))
+r = rng_for("NonMaxSuppression_batches_classes")
+case("NonMaxSuppression_batches_classes", [node("NonMaxSuppression", ["boxes", "scores", "m", "iou", "score"], ["y"])],
+     {"boxes": (r.random((2, 40, 4)) * 10).astype(np.float32), "scores": np.round(r.random((2, 3, 40)), 1).astype(np.float32)},
+     nms_limits(5, 0.2, 0.3), static=("boxes", "scores"))
+
+unique_outputs = ["y", "indices", "inverse", "counts"]
+case("Unique_sorted_flatten", [node("Unique", ["x"], unique_outputs)],
+     {"x": np.array([[2, 1, 1.5], [3, 1, 2], [-1, 1.5, 0]], np.float32)}, static=("x",))
+case("Unique_unsorted_flatten", [node("Unique", ["x"], unique_outputs, sorted=0)],
+     {"x": np.array([4, 2, 4, 9, 2, 2, -3], np.int64)}, static=("x",))
+case("Unique_sorted_axis", [node("Unique", ["x"], unique_outputs, axis=0)],
+     {"x": np.array([[1, 0, 0], [1, 0, 0], [2, 3, 4], [0, 5, 1], [2, 3, 4]], np.float32)}, static=("x",))
+case("Unique_unsorted_negative_axis", [node("Unique", ["x"], unique_outputs, axis=-1, sorted=0)],
+     {"x": np.array([[[1, 1, 0, 1], [2, 2, 3, 2]], [[5, 5, 1, 5], [0, 0, 4, 0]]], np.int64)}, static=("x",))
+
+r = rng_for("Compress")
+case("Compress_axis_short_condition", [node("Compress", ["x", "c"], ["y"], axis=-1)],
+     {"x": r.standard_normal((2, 3, 6)).astype(np.float32), "c": np.array([0, 1, 1, 0, 1], bool)}, static=("c",))
+case("Compress_axis_0", [node("Compress", ["x", "c"], ["y"], axis=0)],
+     {"x": r.standard_normal((4, 3)).astype(np.float32), "c": np.array([1, 0, 0, 1], bool)}, static=("c",))
+case("Compress_flatten", [node("Compress", ["x", "c"], ["y"])],
+     {"x": r.standard_normal((3, 4)).astype(np.float32), "c": np.array([1, 0, 1, 1, 0, 0, 1], bool)}, static=("c",))
