@@ -40,6 +40,7 @@ defmodule Transmuter.OpsTest do
              "#{spec["name"]}: shape #{inspect(Nx.shape(actual))}, expected #{inspect(Nx.shape(expected))}"
 
       {max_diff, tolerance} = difference(actual, expected)
+      tolerance = if Nx.Type.integer?(Nx.type(expected)), do: 0, else: tolerance
 
       assert max_diff <= tolerance,
              "#{spec["name"]}: max difference #{max_diff}, tolerance #{tolerance}"
@@ -47,7 +48,8 @@ defmodule Transmuter.OpsTest do
   end
 
   # Largest difference, with equal infinities and matching NaNs counted as equal, and
-  # the tolerance 1e-4 + 1e-3 * max |expected| over the finite expected values.
+  # the tolerance 1e-4 + 1e-3 * max |expected| over the finite expected values. Integer
+  # outputs must be equal.
   defp difference(actual, expected) do
     actual = Nx.as_type(actual, :f64)
     expected = Nx.as_type(expected, :f64)

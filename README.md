@@ -112,7 +112,8 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
 | Models requested in Bumblebee issues | 11 of 12 files match |
-| One graph for each operator variant | 115 of 115 match |
+| Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 8 of 8 match |
+| One graph for each operator variant | 122 of 122 match |
 
 These models do not match by position, or do not run with compilation:
 

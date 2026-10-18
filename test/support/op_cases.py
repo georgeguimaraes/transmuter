@@ -341,3 +341,11 @@ case("QLinearMul_int8", [node("QLinearMul", ["a", "as", "az", "b", "bs", "bz", "
 case("QLinearAdd_ties", [node("QLinearAdd", ["a", "as", "az", "b", "bs", "bz", "cs", "cz"], ["c"], domain=MS)],
      {"a": q(64, 4096)}, {"as": np.array(2.4697657 * 0.05, np.float32), "az": np.array(152, np.uint8), "b": q(4096), "bs": np.array(0.008398832 * 0.05, np.float32),
                           "bz": np.array(128, np.uint8), "cs": np.array(0.05, np.float32), "cz": np.array(0, np.uint8)}, ms=True)
+# MLX uses Winograd on the GPU for 3x3 kernels when C and O are multiples of 32, C + O >= 256 and
+# N * H * W >= 4096. Winograd is not exact for integer sums, so this case needs the tap-wise integer conv.
+case("ConvInteger_winograd_shape", [node("ConvInteger", ["x", "w", "xz", "wz"], ["y"], pads=[1, 1, 1, 1])],
+     {"x": q(1, 224, 64, 64)}, {"w": q(32, 224, 3, 3), "xz": np.array(0, np.uint8), "wz": np.array(128, np.uint8)})
+case("ConvInteger_groups_strides_dilations", [node("ConvInteger", ["x", "w", "xz"], ["y"], group=2, strides=[2, 1], dilations=[1, 2], pads=[1, 0, 1, 2])],
+     {"x": q(1, 4, 9, 9)}, {"w": q(6, 2, 3, 3), "xz": np.array(100, np.uint8)})
+case("Conv_auto_pad_same_upper", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_UPPER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})
+case("Conv_auto_pad_same_lower", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_LOWER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})

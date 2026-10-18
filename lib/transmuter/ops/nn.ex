@@ -41,24 +41,16 @@ defmodule Transmuter.Ops.NN do
           )
       end
 
-    %{node | op_type: "Conv"} |> op([x, w]) |> Nx.round() |> Nx.as_type(:s32)
+    integer_conv(node, x, w)
   end
 
   defp op(node = %{op_type: "Conv"}, [x, w | b]) do
     spatial = Nx.rank(x) - 2
-    pads = attr(node, "pads")
-
-    padding =
-      case {attr(node, "auto_pad", "NOTSET"), pads} do
-        {"VALID", _} -> :valid
-        {"NOTSET", nil} -> :valid
-        {"NOTSET", pads} -> Enum.zip(Enum.take(pads, spatial), Enum.drop(pads, spatial))
-      end
 
     out =
       Nx.conv(x, w,
         strides: attr(node, "strides", List.duplicate(1, spatial)),
-        padding: padding,
+        padding: conv_padding(node, x, w),
         kernel_dilation: attr(node, "dilations", List.duplicate(1, spatial)),
         feature_group_size: attr(node, "group", 1)
       )
@@ -372,6 +364,100 @@ defmodule Transmuter.Ops.NN do
       x |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.subtract(Nx.pow(mean, 2))
 
     Nx.divide(Nx.subtract(x, mean), Nx.add(Nx.sqrt(variance), 1.0e-9))
+  end
+
+  # A convolution of zero-shifted integers, with x and w as f32, to s32. It is one matrix
+  # product per kernel tap, and f32 matrix products of integers are exact below 2^24.
+  # A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels,
+  # and is off by up to 15 on sums of about 1.6e6.
+  @doc false
+  def integer_conv(node, x, w) do
+    [n, c | _] = Tuple.to_list(Nx.shape(x))
+    [o, group_c | kernel] = Tuple.to_list(Nx.shape(w))
+    spatial = length(kernel)
+    strides = attr(node, "strides", List.duplicate(1, spatial))
+    dilations = attr(node, "dilations", List.duplicate(1, spatial))
+    groups = div(c, group_c)
+
+    x =
+      Nx.pad(x, 0.0, [
+        {0, 0, 0},
+        {0, 0, 0} | for({lo, hi} <- conv_padding(node, x, w), do: {lo, hi, 0})
+      ])
+
+    padded = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+
+    out =
+      Enum.zip_with([padded, kernel, strides, dilations], fn [size, k, s, d] ->
+        div(size - (k - 1) * d - 1, s) + 1
+      end)
+
+    # Groups lead, because Nx batches dot products on leading axes.
+    x =
+      x
+      |> Nx.reshape(List.to_tuple([n, groups, group_c | padded]))
+      |> Nx.transpose(axes: [1, 0, 2 | Enum.to_list(3..(spatial + 2))])
+
+    w = Nx.reshape(w, List.to_tuple([groups, div(o, groups), group_c | kernel]))
+
+    sum =
+      kernel
+      |> Enum.map(&Enum.to_list(0..(&1 - 1)))
+      |> Enum.reduce([[]], fn range, taps -> for tap <- taps, i <- range, do: tap ++ [i] end)
+      |> Enum.map(fn tap ->
+        starts = Enum.zip_with(tap, dilations, &(&1 * &2))
+        lengths = Enum.zip_with(out, strides, &((&1 - 1) * &2 + 1))
+
+        window =
+          Nx.slice(x, [0, 0, 0 | starts], [groups, n, group_c | lengths],
+            strides: [1, 1, 1 | strides]
+          )
+
+        tap_w =
+          w
+          |> Nx.slice([0, 0, 0 | tap], [
+            groups,
+            div(o, groups),
+            group_c | List.duplicate(1, spatial)
+          ])
+          |> Nx.reshape({groups, div(o, groups), group_c})
+
+        tap_w |> Nx.dot([2], [0], window, [2], [0]) |> Nx.as_type(:s32)
+      end)
+      |> Enum.reduce(&Nx.add/2)
+
+    # {groups, o / groups, n, out...} -> {n, o, out...}
+    sum
+    |> Nx.transpose(axes: [2, 0, 1 | Enum.to_list(3..(spatial + 2))])
+    |> Nx.reshape(List.to_tuple([n, o | out]))
+  end
+
+  # {low, high} padding per spatial axis. SAME_UPPER and SAME_LOWER pad so the output
+  # size is ceil(input / stride), with the odd padding at the end or at the start.
+  defp conv_padding(node, x, w) do
+    sizes = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+    kernel = w |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+    spatial = length(sizes)
+    strides = attr(node, "strides", List.duplicate(1, spatial))
+    dilations = attr(node, "dilations", List.duplicate(1, spatial))
+
+    case {attr(node, "auto_pad", "NOTSET"), attr(node, "pads")} do
+      {"NOTSET", nil} ->
+        List.duplicate({0, 0}, spatial)
+
+      {"NOTSET", pads} ->
+        Enum.zip(Enum.take(pads, spatial), Enum.drop(pads, spatial))
+
+      {"VALID", _} ->
+        List.duplicate({0, 0}, spatial)
+
+      {same, _} ->
+        Enum.zip_with([sizes, kernel, strides, dilations], fn [size, k, s, d] ->
+          total = max((div(size + s - 1, s) - 1) * s + (k - 1) * d + 1 - size, 0)
+          small = div(total, 2)
+          if same == "SAME_UPPER", do: {small, total - small}, else: {total - small, small}
+        end)
+    end
   end
 
   defp conv_transpose(node, x, w, b) do

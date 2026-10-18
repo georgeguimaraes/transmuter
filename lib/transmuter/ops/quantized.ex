@@ -7,6 +7,8 @@ defmodule Transmuter.Ops.Quantized do
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]
 
+  alias Transmuter.Ops.NN
+
   @op_types ~w(MatMulNBits GatherBlockQuantized DequantizeLinear QuantizeLinear
                DynamicQuantizeLinear MatMulInteger QLinearMatMul QLinearConv QLinearAdd QLinearMul)
 
@@ -187,9 +189,7 @@ defmodule Transmuter.Ops.Quantized do
        ]) do
     x = Nx.subtract(Nx.as_type(x, :f32), Nx.as_type(Nx.reshape(x_zero, {}), :f32))
     w = Nx.subtract(Nx.as_type(w, :f32), per_axis(w_zero, Nx.rank(w), 0))
-    # The sum of integer products is an integer, but a large f32 convolution can be off
-    # by a fraction (seen on the MLX GPU in vgg16-12-int8), so the sum is rounded back.
-    acc = Transmuter.Ops.apply(%{node | op_type: "Conv"}, [x, w], 13) |> hd() |> Nx.round()
+    acc = node |> NN.integer_conv(x, w) |> Nx.as_type(:f32)
     channel = &per_axis(&1, Nx.rank(acc), 1)
     bias = List.first(bias)
     acc = if bias, do: Nx.add(acc, channel.(bias)), else: acc
