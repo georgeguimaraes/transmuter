@@ -7,7 +7,7 @@ defmodule Transmuter.Ops.Signal do
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
 
-  @op_types ~w(LSTM GRU STFT DFT)
+  @op_types ~w(LSTM GRU RNN STFT DFT HannWindow HammingWindow BlackmanWindow MelWeightMatrix)
 
   @doc false
   def op_types, do: @op_types
@@ -57,6 +57,81 @@ defmodule Transmuter.Ops.Signal do
 
     {y, finals} = recur(node, x, {w, r, bias}, lengths, [h0], step)
     [y | finals]
+  end
+
+  # ONNX RNN: one gate, h = f(x W + h R + Wb + Rb).
+  defp op(node = %{op_type: "RNN"}, [x, w, r | rest]) do
+    [bias, lengths, h0] = Enum.take(rest ++ List.duplicate(nil, 3), 3)
+    0 = attr(node, "layout", 0)
+    [f] = activations(node, ["Tanh"])
+
+    step = fn x_gates, r, rb, {h_prev} ->
+      {f.(x_gates |> Nx.add(Nx.dot(h_prev, [1], r, [1])) |> Nx.add(rb))}
+    end
+
+    {y, finals} = recur(node, x, {w, r, bias}, lengths, [h0], step)
+    [y | finals]
+  end
+
+  defp op(node = %{op_type: window}, [size])
+       when window in ["HannWindow", "HammingWindow", "BlackmanWindow"] do
+    [n] = ints!(size)
+    denominator = if attr(node, "periodic", 1) == 1, do: n, else: n - 1
+
+    values =
+      for i <- 0..(n - 1) do
+        angle = 2 * :math.pi() * i / denominator
+
+        case window do
+          "HannWindow" -> :math.pow(:math.sin(:math.pi() * i / denominator), 2)
+          "HammingWindow" -> 25 / 46 - (1 - 25 / 46) * :math.cos(angle)
+          "BlackmanWindow" -> 0.42 - 0.5 * :math.cos(angle) + 0.08 * :math.cos(2 * angle)
+        end
+      end
+
+    values
+    |> static_tensor(:f64)
+    |> Nx.as_type(Transmuter.Ops.dtype(attr(node, "output_datatype", 1)))
+  end
+
+  # Triangular mel filters, {dft_length / 2 + 1, num_mel_bins}, as the ONNX reference builds them.
+  defp op(node = %{op_type: "MelWeightMatrix"}, [bins, dft_length, sample_rate, low, high]) do
+    [bins, dft_length, sample_rate] =
+      Enum.map([bins, dft_length, sample_rate], &(&1 |> ints!() |> hd()))
+
+    [low, high] = Enum.map([low, high], &(&1 |> ints!() |> hd()))
+    to_mel = &(2595 * :math.log10(1 + &1 / 700))
+    {low_mel, high_mel} = {to_mel.(low), to_mel.(high)}
+    step = (high_mel - low_mel) / (bins + 2)
+
+    points =
+      for i <- 0..(bins + 1) do
+        hz = 700 * (:math.pow(10, (i * step + low_mel) / 2595) - 1)
+        trunc(Float.floor((dft_length + 1) * hz / sample_rate))
+      end
+
+    columns =
+      for i <- 0..(bins - 1) do
+        [left, center, right] = Enum.slice(points, i, 3)
+
+        rising =
+          if center == left,
+            do: %{center => 1.0},
+            else: Map.new(left..center, &{&1, (&1 - left) / (center - left)})
+
+        falling =
+          if right > center,
+            do: Map.new(center..(right - 1)//1, &{&1, (right - &1) / (right - center)}),
+            else: %{}
+
+        Map.merge(rising, falling)
+      end
+
+    rows = for j <- 0..div(dft_length, 2), do: Enum.map(columns, &Map.get(&1, j, 0.0))
+
+    rows
+    |> static_tensor(:f64)
+    |> Nx.as_type(Transmuter.Ops.dtype(attr(node, "output_datatype", 1)))
   end
 
   # STFT of signal {B, L, 1 or 2}. Output {B, frames, bins, 2}.

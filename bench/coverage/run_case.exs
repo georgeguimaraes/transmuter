@@ -25,7 +25,7 @@ static? = fn spec ->
 end
 
 try do
-  {load_ms, model} = timed.(fn -> Transmuter.load!(meta["onnx_path"], compute_type: :f32) end)
+  {load_ms, model} = timed.(fn -> Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32) end)
   # EMLX_QUANTIZED=1 keeps MatMulNBits weights packed as MLX quantized tensors.
   params =
     if System.get_env("EMLX_QUANTIZED") == "1",
