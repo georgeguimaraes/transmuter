@@ -177,7 +177,6 @@ defmodule Transmuter.Ops do
     Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
   end
 
-  # One-hot of the first maximum along the last axis.
   defp hardmax_last(a) do
     last = Nx.rank(a) - 1
     first = Nx.argmax(a, axis: last, keep_axis: true, tie_break: :low)
