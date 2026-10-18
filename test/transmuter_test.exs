@@ -5,8 +5,14 @@ defmodule TransmuterTest do
   # see test/support/reference.py. The first run downloads the models.
   @moduletag timeout: 900_000
 
-  # Metal on macOS; the CPU device elsewhere, such as Linux CI.
-  @backend {EMLX.Backend, device: if(match?({:unix, :darwin}, :os.type()), do: :gpu, else: :cpu)}
+  # Metal on macOS; the CPU device elsewhere, such as Linux CI. The EMLX compiler
+  # takes the device too, because it defaults to the GPU.
+  # TRANSMUTER_TEST_DEVICE=cpu runs the CI configuration on a Mac.
+  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
+             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
+          |> String.to_existing_atom()
+  @backend {EMLX.Backend, device: @device}
+  @compiler [compiler: EMLX, device: @device]
 
   test "runs a BERT encoder" do
     model = load("Xenova/all-MiniLM-L6-v2", "onnx/model.onnx")
@@ -130,8 +136,8 @@ defmodule TransmuterTest do
       })
     end
 
-    prefill = Transmuter.compile(model, step_inputs.(prompt, 0, cache), compiler: EMLX)
-    decode = Transmuter.compile(model, step_inputs.([0], length(prompt), cache), compiler: EMLX)
+    prefill = Transmuter.compile(model, step_inputs.(prompt, 0, cache), @compiler)
+    decode = Transmuter.compile(model, step_inputs.([0], length(prompt), cache), @compiler)
 
     next_cache = fn out ->
       for {"present." <> rest, t} <- out, into: %{}, do: {"past_key_values." <> rest, t}
@@ -176,10 +182,10 @@ defmodule TransmuterTest do
     }
 
     score = fn p, i -> Transmuter.run(model, p, i)["logits"] |> Nx.sum() end
-    forward = Nx.Defn.jit(score, compiler: EMLX)
+    forward = Nx.Defn.jit(score, @compiler)
 
     {_, grads} =
-      Nx.Defn.jit(&Nx.Defn.value_and_grad(&1, fn p -> score.(p, &2) end), compiler: EMLX).(
+      Nx.Defn.jit(&Nx.Defn.value_and_grad(&1, fn p -> score.(p, &2) end), @compiler).(
         params,
         inputs
       )
@@ -212,7 +218,7 @@ defmodule TransmuterTest do
   end
 
   defp run(model, inputs, static_inputs \\ %{}) do
-    Transmuter.compile(model, inputs, compiler: EMLX, static_inputs: static_inputs).(inputs)
+    Transmuter.compile(model, inputs, [static_inputs: static_inputs] ++ @compiler).(inputs)
   end
 
   # sin(i * 0.01) * 0.5, the same pattern that test/support/reference.py feeds to ORT.
