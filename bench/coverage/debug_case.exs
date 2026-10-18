@@ -28,16 +28,22 @@ inputs =
     {spec["name"], read.(spec, if(static?.(spec), do: Nx.BinaryBackend, else: backend))}
   end)
 
+# The sample can miss a few changed values, so integer outputs must also match the
+# whole-tensor sum of absolute values exactly.
 diverged? = fn name, t ->
   r = ref[name]
+  integer? = Nx.Type.integer?(Nx.type(t))
   t = Nx.as_type(t, :f64)
+  abssum = t |> Nx.abs() |> Nx.sum() |> Nx.to_number()
   t = t |> then(&Nx.select(Nx.is_nan(&1), 0, &1)) |> Nx.clip(-3.0e38, 3.0e38)
   flat = Nx.reshape(t, {:auto})
   idx = for k <- 0..1023, do: rem(k * 2_654_435_761, Nx.size(t))
   sample = flat |> Nx.take(Nx.tensor(idx)) |> Nx.to_flat_list()
   diff = Enum.zip_with(sample, r["sample"], fn a, b -> if a == b, do: 0, else: abs(a - b) end) |> Enum.max()
   shape = Tuple.to_list(Nx.shape(t))
-  {shape != r["shape"] or diff > 1.0e-3 * max(r["absmax"], 1.0), shape, sample, diff}
+  sum_diff? = integer? and r["abssum"] != nil and abssum != r["abssum"]
+  diff = if sum_diff?, do: max(diff, abs(abssum - r["abssum"])), else: diff
+  {shape != r["shape"] or sum_diff? or diff > 1.0e-3 * max(r["absmax"], 1.0), shape, sample, diff}
 end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
