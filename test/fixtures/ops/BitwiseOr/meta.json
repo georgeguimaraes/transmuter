@@ -1,0 +1,44 @@
+{
+ "repo": "op/BitwiseOr",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "BitwiseOr": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "a",
+   "file": "in_0.bin",
+   "dtype": "s32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  {
+   "name": "b",
+   "file": "in_1.bin",
+   "dtype": "s32",
+   "shape": [
+    3,
+    4
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "s32",
+   "shape": [
+    3,
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

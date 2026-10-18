@@ -1,0 +1,61 @@
+{
+ "repo": "op/DeformConv",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "DeformConv": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    4,
+    6,
+    6
+   ]
+  },
+  {
+   "name": "offset",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    18,
+    6,
+    6
+   ]
+  },
+  {
+   "name": "mask",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    9,
+    6,
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    6,
+    6
+   ]
+  }
+ ],
+ "ort_ok": true
+}
