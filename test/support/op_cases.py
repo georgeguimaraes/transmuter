@@ -624,7 +624,7 @@ for fmt, atol in [("PNG", None), ("JPEG", 2)]:
 case("ImageDecoder_gray_png_grayscale", [node("ImageDecoder", ["data"], ["image"], pixel_format="Grayscale")],
      {"data": image_bytes(picture[:, :, 0], "PNG")}, opset=20, eager=True)
 
-# ---------- group 3: data-dependent outputs ----------
+# ---------- group 3: data-dependent outputs and losses ----------
 
 # Boxes 1 and 2 have flipped corners, 6 and 7 have an IoU of exactly 0.5 and 8 ties with 0 on the score.
 nms_boxes = np.array([[[0, 0, 1, 1], [1, 1.1, 0, 0.1], [0, 0.9, 1, -0.1], [0, 10, 1, 11], [0, 10.1, 1, 11.1],
@@ -669,3 +669,34 @@ case("Compress_axis_0", [node("Compress", ["x", "c"], ["y"], axis=0)],
      {"x": r.standard_normal((4, 3)).astype(np.float32), "c": np.array([1, 0, 0, 1], bool)}, static=("c",))
 case("Compress_flatten", [node("Compress", ["x", "c"], ["y"])],
      {"x": r.standard_normal((3, 4)).astype(np.float32), "c": np.array([1, 0, 1, 1, 0, 0, 1], bool)}, static=("c",))
+
+r = rng_for("losses")
+
+
+def loss_x(*shape):
+    return r.standard_normal(shape).astype(np.float32)
+
+
+def loss_t(classes, *shape, ignore=None):
+    t = r.integers(0, classes, shape)
+    return (t if ignore is None else np.where(r.random(shape) < 0.3, ignore, t)).astype(np.int64)
+
+
+case("NegativeLogLikelihoodLoss_mean", [node("NegativeLogLikelihoodLoss", ["x", "t"], ["y"])], {"x": loss_x(4, 5), "t": loss_t(5, 4)})
+case("NegativeLogLikelihoodLoss_sum_weight", [node("NegativeLogLikelihoodLoss", ["x", "t", "w"], ["y"], reduction="sum")],
+     {"x": loss_x(4, 5), "t": loss_t(5, 4), "w": r.random(5).astype(np.float32)})
+case("NegativeLogLikelihoodLoss_mean_weight_ignore", [node("NegativeLogLikelihoodLoss", ["x", "t", "w"], ["y"], ignore_index=2)],
+     {"x": loss_x(3, 4, 6), "t": loss_t(4, 3, 6, ignore=2), "w": r.random(4).astype(np.float32)})
+case("NegativeLogLikelihoodLoss_none_ignore_4d", [node("NegativeLogLikelihoodLoss", ["x", "t"], ["y"], reduction="none", ignore_index=-100)],
+     {"x": loss_x(2, 3, 4, 5), "t": loss_t(3, 2, 4, 5, ignore=-100)})
+case("NegativeLogLikelihoodLoss_mean_ignore_int32", [node("NegativeLogLikelihoodLoss", ["x", "t"], ["y"], ignore_index=0)],
+     {"x": loss_x(6, 3), "t": np.array([0, 1, 2, 0, 2, 2], np.int32)})
+case("SoftmaxCrossEntropyLoss_mean", [node("SoftmaxCrossEntropyLoss", ["x", "t"], ["y"])], {"x": loss_x(4, 5), "t": loss_t(5, 4)})
+case("SoftmaxCrossEntropyLoss_sum_log_prob", [node("SoftmaxCrossEntropyLoss", ["x", "t"], ["y", "log_prob"], reduction="sum")],
+     {"x": loss_x(3, 4, 2), "t": loss_t(4, 3, 2)})
+case("SoftmaxCrossEntropyLoss_mean_weight_ignore_4d", [node("SoftmaxCrossEntropyLoss", ["x", "t", "w"], ["y", "log_prob"], ignore_index=-1)],
+     {"x": loss_x(2, 3, 4, 5), "t": loss_t(3, 2, 4, 5, ignore=-1), "w": r.random(3).astype(np.float32)})
+case("SoftmaxCrossEntropyLoss_none_weight", [node("SoftmaxCrossEntropyLoss", ["x", "t", "w"], ["y"], reduction="none")],
+     {"x": loss_x(5, 4), "t": loss_t(4, 5), "w": r.random(4).astype(np.float32)})
+case("SoftmaxCrossEntropyLoss_mean_ignore", [node("SoftmaxCrossEntropyLoss", ["x", "t"], ["y"], ignore_index=1)],
+     {"x": loss_x(6, 3), "t": loss_t(3, 6, ignore=1)})

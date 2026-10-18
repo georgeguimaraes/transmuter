@@ -1,0 +1,40 @@
+{
+ "repo": "op/NegativeLogLikelihoodLoss_mean_ignore_int32",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "NegativeLogLikelihoodLoss": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    6,
+    3
+   ]
+  },
+  {
+   "name": "t",
+   "file": "in_1.bin",
+   "dtype": "s32",
+   "shape": [
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": []
+  }
+ ],
+ "ort_ok": true
+}

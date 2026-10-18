@@ -1,0 +1,48 @@
+{
+ "repo": "op/NegativeLogLikelihoodLoss_sum_weight",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "NegativeLogLikelihoodLoss": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    5
+   ]
+  },
+  {
+   "name": "t",
+   "file": "in_1.bin",
+   "dtype": "s64",
+   "shape": [
+    4
+   ]
+  },
+  {
+   "name": "w",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": []
+  }
+ ],
+ "ort_ok": true
+}

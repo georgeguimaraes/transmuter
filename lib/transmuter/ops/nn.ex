@@ -2,14 +2,15 @@ defmodule Transmuter.Ops.NN do
   @moduledoc false
 
   # Neural network layers: convolutions, pooling, unpooling, normalizations, Resize,
-  # Upsample, GridSample, LRN and Dropout.
+  # Upsample, GridSample, LRN, Dropout and the classification losses.
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
                Resize GridSample Dropout LRN GlobalLpPool MeanVarianceNormalization MaxPool
-               AveragePool LpPool Upsample MaxUnpool CausalConvWithState)
+               AveragePool LpPool Upsample MaxUnpool CausalConvWithState NegativeLogLikelihoodLoss
+               SoftmaxCrossEntropyLoss)
 
   @doc false
   def op_types, do: @op_types
@@ -427,6 +428,42 @@ defmodule Transmuter.Ops.NN do
       x |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.subtract(Nx.pow(mean, 2))
 
     Nx.divide(Nx.subtract(x, mean), Nx.add(Nx.sqrt(variance), 1.0e-9))
+  end
+
+  defp op(node = %{op_type: "NegativeLogLikelihoodLoss"}, [x, target | weight]),
+    do: nll_loss(node, x, target, List.first(weight))
+
+  defp op(node = %{op_type: "SoftmaxCrossEntropyLoss"}, [scores, labels | weight]) do
+    shifted = Nx.subtract(scores, Nx.reduce_max(scores, axes: [1], keep_axes: true))
+    log_prob = Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [1], keep_axes: true)))
+    [nll_loss(node, log_prob, labels, List.first(weight)), log_prob]
+  end
+
+  # x is {N, C, d...} and target {N, d...}. Ignored targets get weight 0, and the mean
+  # divides by the sum of the weights that the targets pick.
+  defp nll_loss(node, x, target, weight) do
+    type = Nx.type(x)
+    index = Nx.clip(target, 0, Nx.axis_size(x, 1) - 1)
+    picked = x |> Nx.take_along_axis(Nx.new_axis(index, 1), axis: 1) |> Nx.squeeze(axes: [1])
+
+    weights =
+      if weight,
+        do: Nx.take(weight, index),
+        else: Nx.broadcast(Nx.tensor(1, type: type), Nx.shape(target))
+
+    weights =
+      case attr(node, "ignore_index") do
+        nil -> weights
+        ignore -> Nx.select(Nx.equal(target, ignore), Nx.tensor(0, type: type), weights)
+      end
+
+    loss = Nx.multiply(Nx.negate(picked), weights)
+
+    case attr(node, "reduction", "mean") do
+      "none" -> loss
+      "sum" -> Nx.sum(loss)
+      "mean" -> Nx.divide(Nx.sum(loss), Nx.sum(weights))
+    end
   end
 
   # A convolution of zero-shifted integers, with x and w as f32, to s32. It is one matrix
