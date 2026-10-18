@@ -1,0 +1,57 @@
+{
+ "repo": "op/CausalConvWithState_state_bias_silu",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "CausalConvWithState": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from test/fixtures/ops/CausalConvWithState_state_bias_silu/model.onnx failed:",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    2
+   ]
+  },
+  {
+   "name": "past",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    2
+   ]
+  },
+  {
+   "name": "state",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

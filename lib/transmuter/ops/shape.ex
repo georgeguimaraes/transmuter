@@ -19,7 +19,7 @@ defmodule Transmuter.Ops.Shape do
   @op_types ~w(Cast Constant ConstantOfShape Expand Tile Squeeze Size Shape Gather Concat
                Unsqueeze Reshape Slice Transpose Identity CastLike Range Split Pad DepthToSpace
                SpaceToDepth ScatterElements GatherND ScatterND Flatten Trilu OneHot
-               GatherElements EyeLike NonZero ReverseSequence)
+               GatherElements EyeLike NonZero ReverseSequence Scatter BitCast)
 
   @doc false
   def op_types, do: @op_types
@@ -29,6 +29,7 @@ defmodule Transmuter.Ops.Shape do
 
   defp op(%{op_type: "Cast"}, [:empty]), do: :empty
   defp op(node = %{op_type: "Cast"}, [a]), do: Nx.as_type(a, dtype(attr(node, "to")))
+  defp op(node = %{op_type: "BitCast"}, [a]), do: Nx.bitcast(a, dtype(attr(node, "to")))
 
   defp op(node = %{op_type: "Constant"}, []) do
     case node.attribute do
@@ -255,7 +256,9 @@ defmodule Transmuter.Ops.Shape do
   end
 
   # Each update goes to its own coordinates with the index replacing the axis coordinate.
-  defp op(node = %{op_type: "ScatterElements"}, [data, indices, updates]) do
+  # Scatter is the old name of ScatterElements.
+  defp op(node = %{op_type: scatter}, [data, indices, updates])
+       when scatter in ["ScatterElements", "Scatter"] do
     rank = Nx.rank(data)
     axis = normalize_axis(attr(node, "axis", 0), rank)
     dim = Nx.axis_size(data, axis)

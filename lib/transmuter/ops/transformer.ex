@@ -1,15 +1,15 @@
 defmodule Transmuter.Ops.Transformer do
   @moduledoc false
 
-  # Attention, rotary embedding and normalization. The same op type can be the ONNX
-  # standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain
-  # decides the input layout.
+  # Attention, linear attention, KV cache writes, rotary embedding and normalization. The
+  # same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT
+  # exporters, so the domain decides the input layout.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, softmax_last: 1]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2, softmax_last: 1]
 
   @op_types ~w(Attention GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
-               EmbedLayerNormalization)
+               EmbedLayerNormalization TensorScatter LinearAttention)
 
   @doc false
   def op_types, do: @op_types
@@ -161,6 +161,85 @@ defmodule Transmuter.Ops.Transformer do
       |> from_heads()
 
     [out, k, v]
+  end
+
+  # Writes update into the cache along the sequence axis from each batch's write index.
+  # Circular mode wraps the positions around the cache length.
+  defp op(node = %{op_type: "TensorScatter"}, [cache, update | write_indices]) do
+    rank = Nx.rank(cache)
+    axis = normalize_axis(attr(node, "axis", -2), rank)
+    shape = Nx.shape(update)
+    batch = elem(shape, 0)
+
+    start =
+      (List.first(write_indices) || Nx.broadcast(Nx.tensor(0, type: :s64), {batch}))
+      |> Nx.as_type(:s64)
+      |> Nx.reshape(List.to_tuple([batch | List.duplicate(1, rank - 1)]))
+
+    positions = Nx.add(Nx.iota(shape, axis: axis, type: :s64), start)
+
+    positions =
+      if attr(node, "mode", "linear") == "circular",
+        do: Nx.remainder(positions, Nx.axis_size(cache, axis)),
+        else: positions
+
+    coords =
+      for a <- 0..(rank - 1) do
+        if a == axis, do: positions, else: Nx.iota(shape, axis: a, type: :s64)
+      end
+      |> Nx.stack(axis: -1)
+      |> Nx.reshape({:auto, rank})
+
+    Nx.indexed_put(cache, coords, Nx.reshape(update, {:auto}))
+  end
+
+  # The recurrence runs token by token in f32 on a {B, H_kv, d_k, d_v} state. Gated rules
+  # decay the state by exp(decay), delta rules add beta * (v - S^T k) in place of v.
+  defp op(node = %{op_type: "LinearAttention"}, [query, key, value | optional]) do
+    [past, decay, beta] = pad(optional, 3)
+    heads = attr(node, "q_num_heads")
+    kv_heads = attr(node, "kv_num_heads")
+    rule = attr(node, "update_rule", "gated_delta")
+    q = f32_heads(query, heads)
+    k = f32_heads(key, kv_heads)
+    v = f32_heads(value, kv_heads)
+    {b, _, t, d_k} = Nx.shape(q)
+    scale = nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(d_k)
+    decay = rule in ["gated", "gated_delta"] && f32_heads(decay, kv_heads)
+    beta = rule in ["delta", "gated_delta"] && f32_heads(beta, Nx.axis_size(beta, 2))
+
+    state =
+      if past,
+        do: Nx.as_type(past, :f32),
+        else: Nx.broadcast(Nx.tensor(0.0, type: :f32), {b, kv_heads, d_k, Nx.axis_size(v, 3)})
+
+    at = fn x, i -> x |> Nx.slice_along_axis(i, 1, axis: 2) |> Nx.squeeze(axes: [2]) end
+
+    {outputs, state} =
+      Enum.map_reduce(0..(t - 1), state, fn i, state ->
+        state =
+          if decay,
+            do: Nx.multiply(state, decay |> at.(i) |> Nx.exp() |> Nx.new_axis(-1)),
+            else: state
+
+        k_i = at.(k, i)
+        v_i = at.(v, i)
+
+        v_i =
+          if beta do
+            retrieved = Nx.dot(state, [2], [0, 1], k_i, [2], [0, 1])
+            Nx.multiply(at.(beta, i), Nx.subtract(v_i, retrieved))
+          else
+            v_i
+          end
+
+        state = Nx.add(state, Nx.multiply(Nx.new_axis(k_i, -1), Nx.new_axis(v_i, -2)))
+        out = q |> at.(i) |> Nx.dot([2], [0, 1], repeat_kv(state, heads), [2], [0, 1])
+        {Nx.multiply(out, scale), state}
+      end)
+
+    out = outputs |> Nx.stack(axis: 2) |> from_heads() |> Nx.as_type(Nx.type(query))
+    [out, Nx.as_type(state, Nx.type(past || query))]
   end
 
   defp op(node = %{op_type: "RotaryEmbedding", domain: "com.microsoft"}, [
@@ -418,6 +497,8 @@ defmodule Transmuter.Ops.Transformer do
       {b, s, _} -> t |> Nx.reshape({b, s, heads, :auto}) |> Nx.transpose(axes: [0, 2, 1, 3])
     end
   end
+
+  defp f32_heads(t, heads), do: t |> to_heads(heads) |> Nx.as_type(:f32)
 
   defp from_heads(t) do
     {b, heads, s, head_size} = Nx.shape(t)

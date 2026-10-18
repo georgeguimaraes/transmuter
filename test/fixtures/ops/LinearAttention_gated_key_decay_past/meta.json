@@ -1,0 +1,89 @@
+{
+ "repo": "op/LinearAttention_gated_key_decay_past",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "LinearAttention": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from test/fixtures/ops/LinearAttention_gated_key_decay_past/model.onnx failed",
+ "inputs": [
+  {
+   "name": "q",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    8
+   ]
+  },
+  {
+   "name": "k",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    8
+   ]
+  },
+  {
+   "name": "v",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    6
+   ]
+  },
+  {
+   "name": "past",
+   "file": "in_3.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    4,
+    3
+   ]
+  },
+  {
+   "name": "decay",
+   "file": "in_4.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    8
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    6
+   ]
+  },
+  {
+   "name": "state",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    4,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}
