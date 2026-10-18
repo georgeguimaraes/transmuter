@@ -148,6 +148,9 @@ defmodule Transmuter do
             node.op_type == "Loop" ->
               run_loop(node, inputs, env, ctx)
 
+            node.op_type == "Scan" ->
+              run_scan(node, inputs, env, ctx)
+
             Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
               Nx.with_default_backend(Nx.BinaryBackend, fn ->
                 Ops.apply(node, inputs, ctx.opset)
@@ -252,6 +255,70 @@ defmodule Transmuter do
   end
 
   defp upcast(t, _type), do: t
+
+  # Unrolls Scan over the static length of its scan inputs. Each step takes one slice of
+  # every scan input; per-step outputs are stacked along their output axes.
+  defp run_scan(node, inputs, env, ctx) do
+    body = Ops.attr(node, "body")
+    scan_count = Ops.attr(node, "num_scan_inputs")
+    {states, scans} = Enum.split(inputs, length(inputs) - scan_count)
+    {state_names, scan_names} = body.input |> Enum.map(& &1.name) |> Enum.split(length(states))
+
+    in_axes =
+      node
+      |> Ops.attr("scan_input_axes", List.duplicate(0, scan_count))
+      |> Enum.zip_with(scans, &normalize_axis(&1, Nx.rank(&2)))
+
+    in_reversed =
+      node
+      |> Ops.attr("scan_input_directions", List.duplicate(0, scan_count))
+      |> Enum.map(&(&1 == 1))
+
+    length = Nx.axis_size(hd(scans), hd(in_axes))
+    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+
+    {steps, final_states} =
+      Enum.map_reduce(0..(length - 1), states, fn t, states ->
+        slices =
+          for {x, axis, reversed} <- Enum.zip([scans, in_axes, in_reversed]) do
+            x
+            |> Nx.slice_along_axis(if(reversed, do: length - 1 - t, else: t), 1, axis: axis)
+            |> Nx.squeeze(axes: [axis])
+          end
+
+        step =
+          env
+          |> Map.merge(Map.new(Enum.zip(state_names, states)))
+          |> Map.merge(Map.new(Enum.zip(scan_names, slices)))
+
+        result = run_nodes(body.node, step, ctx)
+
+        {new_states, outputs} =
+          body.output |> Enum.map(&Map.fetch!(result, &1.name)) |> Enum.split(length(states))
+
+        {outputs, new_states}
+      end)
+
+    output_count = length(body.output) - length(states)
+    out_axes = Ops.attr(node, "scan_output_axes", List.duplicate(0, output_count))
+
+    out_reversed =
+      node
+      |> Ops.attr("scan_output_directions", List.duplicate(0, output_count))
+      |> Enum.map(&(&1 == 1))
+
+    stacked =
+      for {j, axis, reversed} <- Enum.zip([0..(output_count - 1)//1, out_axes, out_reversed]) do
+        values = Enum.map(steps, &Enum.at(&1, j))
+        values = if reversed, do: Enum.reverse(values), else: values
+        Nx.stack(values, axis: normalize_axis(axis, Nx.rank(hd(values)) + 1))
+      end
+
+    final_states ++ stacked
+  end
+
+  defp normalize_axis(axis, rank) when axis < 0, do: axis + rank
+  defp normalize_axis(axis, _rank), do: axis
 
   defp static!(t, op) do
     unless Ops.known?(t) do

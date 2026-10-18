@@ -8,7 +8,7 @@ defmodule Transmuter.Ops.Quantized do
   import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]
 
   @op_types ~w(MatMulNBits GatherBlockQuantized DequantizeLinear QuantizeLinear
-               DynamicQuantizeLinear MatMulInteger)
+               DynamicQuantizeLinear MatMulInteger QLinearMatMul QLinearConv)
 
   @doc false
   def op_types, do: @op_types
@@ -100,6 +100,59 @@ defmodule Transmuter.Ops.Quantized do
     a |> matmul(b) |> Nx.round() |> Nx.as_type(:s32)
   end
 
+  # Integer matmul on zero-shifted values, then requantized: y = round(acc * a_scale * b_scale / y_scale) + y_zero.
+  defp op(%{op_type: "QLinearMatMul"}, [a, a_scale, a_zero, b, b_scale, b_zero, y_scale, y_zero]) do
+    a = a |> Nx.as_type(:f32) |> subtract_zero(a_zero, Nx.rank(a) - 2)
+    b = b |> Nx.as_type(:f32) |> subtract_zero(b_zero, Nx.rank(b) - 1)
+    acc = matmul(a, b)
+
+    multiplier =
+      Nx.divide(
+        Nx.multiply(
+          per_axis(a_scale, Nx.rank(acc), Nx.rank(acc) - 2),
+          per_axis(b_scale, Nx.rank(acc), Nx.rank(acc) - 1)
+        ),
+        y_scale
+      )
+
+    acc
+    |> Nx.multiply(multiplier)
+    |> round_half_even()
+    |> Nx.add(Nx.as_type(y_zero, :f32))
+    |> saturate(Nx.type(y_zero))
+  end
+
+  # Integer convolution with per-tensor or per-output-channel weight scales, then requantized.
+  defp op(node = %{op_type: "QLinearConv"}, [
+         x,
+         x_scale,
+         x_zero,
+         w,
+         w_scale,
+         w_zero,
+         y_scale,
+         y_zero | bias
+       ]) do
+    x = Nx.subtract(Nx.as_type(x, :f32), Nx.as_type(Nx.reshape(x_zero, {}), :f32))
+    w = Nx.subtract(Nx.as_type(w, :f32), per_axis(w_zero, Nx.rank(w), 0))
+    acc = Transmuter.Ops.apply(%{node | op_type: "Conv"}, [x, w], 13) |> hd()
+    channel = &per_axis(&1, Nx.rank(acc), 1)
+    bias = List.first(bias)
+    acc = if bias, do: Nx.add(acc, channel.(bias)), else: acc
+
+    multiplier =
+      Nx.divide(
+        Nx.multiply(Nx.as_type(x_scale, :f32), channel.(w_scale)),
+        Nx.as_type(y_scale, :f32)
+      )
+
+    acc
+    |> Nx.multiply(multiplier)
+    |> round_half_even()
+    |> Nx.add(Nx.as_type(y_zero, :f32))
+    |> saturate(Nx.type(y_zero))
+  end
+
   defp dequantized_matmul(a, b, scales, zero_points, bias, {k, n, bits, block_size, blocks, type}) do
     q = b |> unpack(bits) |> Nx.reshape({n, blocks, block_size}) |> Nx.as_type(type)
     scales = scales |> Nx.reshape({n, blocks, 1}) |> Nx.as_type(type)
@@ -115,6 +168,19 @@ defmodule Transmuter.Ops.Quantized do
 
     out = Nx.dot(a, [-1], w, [1])
     if bias, do: Nx.add(out, bias), else: out
+  end
+
+  # A scalar, or a 1-D tensor laid along one axis of a rank-r result, as f32.
+  defp per_axis(t, rank, axis) do
+    t = Nx.as_type(t, :f32)
+
+    if Nx.size(t) == 1,
+      do: Nx.reshape(t, {}),
+      else:
+        Nx.reshape(
+          t,
+          1 |> List.duplicate(rank) |> List.replace_at(axis, :auto) |> List.to_tuple()
+        )
   end
 
   # Unpacks bits-wide unsigned values from the last axis of a u8 tensor.

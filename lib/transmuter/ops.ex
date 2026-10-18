@@ -5,7 +5,7 @@ defmodule Transmuter.Ops do
   # ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no
   # zero-size tensors, so an empty static value is the atom :empty.
 
-  alias Transmuter.Ops.{Quantized, Signal, Transformer}
+  alias Transmuter.Ops.{Quantized, Signal, Transformer, Vision}
 
   # Sums, norms and softmax lose too much precision in f16 and bf16, so these ops
   # run in f32 and cast their outputs back.
@@ -42,11 +42,23 @@ defmodule Transmuter.Ops do
 
   defp dispatch(node, inputs, opset) do
     cond do
-      node.op_type == "Softmax" -> [softmax(node, hd(inputs), opset)]
-      node.op_type in Transformer.op_types() -> Transformer.apply(node, inputs)
-      node.op_type in Quantized.op_types() -> Quantized.apply(node, inputs)
-      node.op_type in Signal.op_types() -> Signal.apply(node, inputs)
-      true -> node |> op(inputs) |> List.wrap()
+      node.op_type in ["Softmax", "LogSoftmax", "Hardmax"] ->
+        [along_axis(node, hd(inputs), opset)]
+
+      node.op_type in Transformer.op_types() ->
+        Transformer.apply(node, inputs)
+
+      node.op_type in Quantized.op_types() ->
+        Quantized.apply(node, inputs)
+
+      node.op_type in Signal.op_types() ->
+        Signal.apply(node, inputs)
+
+      node.op_type in Vision.op_types() ->
+        Vision.apply(node, inputs)
+
+      true ->
+        node |> op(inputs) |> List.wrap()
     end
   end
 
@@ -518,7 +530,7 @@ defmodule Transmuter.Ops do
   defp op(%{op_type: "GlobalMaxPool"}, [x]),
     do: Nx.reduce_max(x, axes: Enum.to_list(2..(Nx.rank(x) - 1)), keep_axes: true)
 
-  defp op(node = %{op_type: pool}, [x]) when pool in ["MaxPool", "AveragePool"] do
+  defp op(node = %{op_type: pool}, [x]) when pool in ["MaxPool", "AveragePool", "LpPool"] do
     kernel = attr(node, "kernel_shape")
     spatial = length(kernel)
     strides = attr(node, "strides", List.duplicate(1, spatial))
@@ -550,22 +562,28 @@ defmodule Transmuter.Ops do
     window = List.to_tuple([1, 1 | kernel])
     opts = [strides: [1, 1 | strides], padding: padding]
 
-    if pool == "MaxPool" do
-      Nx.window_max(x, window, opts)
-    else
-      sum = Nx.window_sum(x, window, opts)
+    cond do
+      pool == "MaxPool" ->
+        Nx.window_max(x, window, opts)
 
-      if attr(node, "count_include_pad", 0) == 1 or Enum.all?(pads, &(&1 == 0)),
-        do: Nx.divide(sum, Enum.product(kernel)),
-        else:
-          Nx.divide(
-            sum,
-            Nx.window_sum(
-              Nx.broadcast(Nx.tensor(1.0, type: Nx.type(x)), Nx.shape(x)),
-              window,
-              opts
+      pool == "LpPool" ->
+        p = attr(node, "p", 2)
+        x |> Nx.abs() |> Nx.pow(p) |> Nx.window_sum(window, opts) |> Nx.pow(1 / p)
+
+      true ->
+        sum = Nx.window_sum(x, window, opts)
+
+        if attr(node, "count_include_pad", 0) == 1 or Enum.all?(pads, &(&1 == 0)),
+          do: Nx.divide(sum, Enum.product(kernel)),
+          else:
+            Nx.divide(
+              sum,
+              Nx.window_sum(
+                Nx.broadcast(Nx.tensor(1.0, type: Nx.type(x)), Nx.shape(x)),
+                window,
+                opts
+              )
             )
-          )
     end
   end
 
@@ -766,7 +784,16 @@ defmodule Transmuter.Ops do
   end
 
   defp op(node = %{op_type: reduce}, [a | rest])
-       when reduce in ["ReduceMax", "ReduceMin", "ReduceProd", "ReduceL2", "ReduceSumSquare"] do
+       when reduce in [
+              "ReduceMax",
+              "ReduceMin",
+              "ReduceProd",
+              "ReduceL2",
+              "ReduceSumSquare",
+              "ReduceL1",
+              "ReduceLogSum",
+              "ReduceLogSumExp"
+            ] do
     axes = if rest == [] or rest == [nil], do: attr(node, "axes"), else: ints!(hd(rest))
 
     opts =
@@ -779,6 +806,9 @@ defmodule Transmuter.Ops do
       "ReduceProd" -> Nx.product(a, opts)
       "ReduceL2" -> a |> Nx.pow(2) |> Nx.sum(opts) |> Nx.sqrt()
       "ReduceSumSquare" -> a |> Nx.pow(2) |> Nx.sum(opts)
+      "ReduceL1" -> a |> Nx.abs() |> Nx.sum(opts)
+      "ReduceLogSum" -> a |> Nx.sum(opts) |> Nx.log()
+      "ReduceLogSumExp" -> log_sum_exp(a, opts)
     end
   end
 
@@ -978,6 +1008,141 @@ defmodule Transmuter.Ops do
       else: coords |> Enum.zip_with(& &1) |> static_tensor(:s64)
   end
 
+  defp op(%{op_type: "Acos"}, [a]), do: Nx.acos(a)
+  defp op(%{op_type: "Acosh"}, [a]), do: Nx.acosh(a)
+  defp op(%{op_type: "Asin"}, [a]), do: Nx.asin(a)
+  defp op(%{op_type: "Asinh"}, [a]), do: Nx.asinh(a)
+  defp op(%{op_type: "Atanh"}, [a]), do: Nx.atanh(a)
+  defp op(%{op_type: "Tan"}, [a]), do: Nx.tan(a)
+  defp op(%{op_type: "Cosh"}, [a]), do: Nx.cosh(a)
+  defp op(%{op_type: "Sinh"}, [a]), do: Nx.sinh(a)
+  defp op(%{op_type: "BitwiseAnd"}, [a, b]), do: Nx.bitwise_and(a, b)
+  defp op(%{op_type: "BitwiseOr"}, [a, b]), do: Nx.bitwise_or(a, b)
+  defp op(%{op_type: "BitwiseXor"}, [a, b]), do: Nx.bitwise_xor(a, b)
+  defp op(%{op_type: "BitwiseNot"}, [a]), do: Nx.bitwise_not(a)
+
+  defp op(node = %{op_type: "BitShift"}, [a, b]) do
+    if attr(node, "direction") == "LEFT",
+      do: Nx.left_shift(a, b),
+      else: Nx.right_shift(a, b)
+  end
+
+  defp op(node = %{op_type: "Celu"}, [x]) do
+    alpha = attr(node, "alpha", 1.0)
+
+    Nx.add(
+      Nx.max(x, 0),
+      Nx.min(0, Nx.multiply(alpha, Nx.subtract(Nx.exp(Nx.divide(x, alpha)), 1)))
+    )
+  end
+
+  defp op(node = %{op_type: "Swish"}, [x]), do: swish(x, attr(node, "alpha", 1.0))
+
+  defp op(node = %{op_type: "SwiGLU"}, [a, b]),
+    do: Nx.multiply(swish(a, attr(node, "alpha", 1.0)), b)
+
+  defp op(node = %{op_type: "Shrink"}, [x]) do
+    {bias, lambd} = {attr(node, "bias", 0.0), attr(node, "lambd", 0.5)}
+    zero = Nx.tensor(0, type: Nx.type(x))
+
+    Nx.select(
+      Nx.less(x, -lambd),
+      Nx.add(x, bias),
+      Nx.select(Nx.greater(x, lambd), Nx.subtract(x, bias), zero)
+    )
+  end
+
+  defp op(%{op_type: "Sum"}, inputs), do: Enum.reduce(inputs, &Nx.add(&2, &1))
+
+  defp op(%{op_type: "Mean"}, inputs),
+    do: inputs |> Enum.reduce(&Nx.add(&2, &1)) |> Nx.divide(length(inputs))
+
+  # Inference only: the output is the input and the mask is all true.
+  defp op(%{op_type: "Dropout"}, [x | _]),
+    do: [x, Nx.broadcast(Nx.tensor(1, type: :u8), Nx.shape(x))]
+
+  defp op(node = %{op_type: "CumProd"}, [x, axis]) do
+    axis = normalize_axis(axis |> ints!() |> hd(), Nx.rank(x))
+    reverse = attr(node, "reverse", 0) == 1
+    x = if reverse, do: Nx.reverse(x, axes: [axis]), else: x
+    product = Nx.cumulative_product(x, axis: axis)
+
+    product =
+      if attr(node, "exclusive", 0) == 1 do
+        ones = x |> Nx.slice_along_axis(0, 1, axis: axis) |> Nx.multiply(0) |> Nx.add(1)
+
+        Nx.concatenate(
+          [ones, Nx.slice_along_axis(product, 0, Nx.axis_size(x, axis) - 1, axis: axis)],
+          axis: axis
+        )
+      else
+        product
+      end
+
+    if reverse, do: Nx.reverse(product, axes: [axis]), else: product
+  end
+
+  # Local response normalization over a window of channels.
+  defp op(node = %{op_type: "LRN"}, [x]) do
+    size = attr(node, "size")
+
+    {alpha, beta, bias} =
+      {attr(node, "alpha", 1.0e-4), attr(node, "beta", 0.75), attr(node, "bias", 1.0)}
+
+    rank = Nx.rank(x)
+    window = List.to_tuple([1, size | List.duplicate(1, rank - 2)])
+    padding = [{0, 0}, {div(size - 1, 2), div(size, 2)} | List.duplicate({0, 0}, rank - 2)]
+    square_sum = Nx.window_sum(Nx.pow(x, 2), window, padding: padding)
+    Nx.divide(x, Nx.pow(Nx.add(bias, Nx.multiply(alpha / size, square_sum)), beta))
+  end
+
+  defp op(node = %{op_type: "GlobalLpPool"}, [x]) do
+    p = attr(node, "p", 2)
+    axes = Enum.to_list(2..(Nx.rank(x) - 1))
+    x |> Nx.abs() |> Nx.pow(p) |> Nx.sum(axes: axes, keep_axes: true) |> Nx.pow(1 / p)
+  end
+
+  defp op(node = %{op_type: "MeanVarianceNormalization"}, [x]) do
+    axes = attr(node, "axes", [0, 2, 3])
+    mean = Nx.mean(x, axes: axes, keep_axes: true)
+
+    variance =
+      x |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.subtract(Nx.pow(mean, 2))
+
+    Nx.divide(Nx.subtract(x, mean), Nx.add(Nx.sqrt(variance), 1.0e-9))
+  end
+
+  # Reverses the first sequence_lens[b] steps along the time axis of each batch item.
+  defp op(node = %{op_type: "ReverseSequence"}, [x, lens]) do
+    {batch_axis, time_axis} = {attr(node, "batch_axis", 1), attr(node, "time_axis", 0)}
+    shape = Nx.shape(x)
+    t = Nx.iota(shape, axis: time_axis, type: :s64)
+
+    lens_shape =
+      shape
+      |> Tuple.to_list()
+      |> Enum.map(fn _ -> 1 end)
+      |> List.replace_at(batch_axis, :auto)
+      |> List.to_tuple()
+
+    lens = lens |> Nx.as_type(:s64) |> Nx.reshape(lens_shape)
+    index = Nx.select(Nx.less(t, lens), Nx.subtract(Nx.subtract(lens, 1), t), t)
+    Nx.take_along_axis(x, index, axis: time_axis)
+  end
+
+  defp op(%{op_type: "Det"}, [x]) do
+    case Nx.shape(x) do
+      {_, _} ->
+        Nx.LinAlg.determinant(x)
+
+      shape ->
+        {batch, [n, n]} = shape |> Tuple.to_list() |> Enum.split(-2)
+        flat = Nx.reshape(x, {:auto, n, n})
+        dets = for i <- 0..(Nx.axis_size(flat, 0) - 1), do: Nx.LinAlg.determinant(flat[i])
+        dets |> Nx.stack() |> Nx.reshape(List.to_tuple(batch))
+    end
+  end
+
   defp op(%{op_type: type}, _), do: raise(ArgumentError, "unsupported ONNX op #{type}")
 
   defp conv_transpose(node, x, w, b) do
@@ -1018,6 +1183,15 @@ defmodule Transmuter.Ops do
   defp add_channel_bias(out, b),
     do:
       Nx.add(out, Nx.reshape(b, List.to_tuple([1, :auto] ++ List.duplicate(1, Nx.rank(out) - 2))))
+
+  defp swish(x, alpha), do: Nx.multiply(x, Nx.sigmoid(Nx.multiply(x, alpha)))
+
+  defp log_sum_exp(a, opts) do
+    keep = Keyword.put(opts, :keep_axes, true)
+    max = Nx.reduce_max(a, keep)
+    sum = a |> Nx.subtract(max) |> Nx.exp() |> Nx.sum(keep) |> Nx.log() |> Nx.add(max)
+    if opts[:keep_axes], do: sum, else: Nx.squeeze(sum, axes: opts[:axes] || Nx.axes(a))
+  end
 
   defp add_optional(t, nil), do: t
   defp add_optional(t, other), do: Nx.add(t, other)
@@ -1062,25 +1236,46 @@ defmodule Transmuter.Ops do
     end
   end
 
-  defp softmax(node, a, opset) do
+  # Softmax, LogSoftmax and Hardmax work on one axis from opset 13. Before opset 13
+  # they flatten the input to 2-D at the axis and work on the second dimension.
+  defp along_axis(node, a, opset) do
     rank = Nx.rank(a)
-    axis = attr(node, "axis", -1)
+    axis = attr(node, "axis", if(opset >= 13, do: -1, else: 1))
     axis = if axis < 0, do: axis + rank, else: axis
+
+    last =
+      case node.op_type do
+        "Softmax" -> &softmax_last/1
+        "LogSoftmax" -> &log_softmax_last/1
+        "Hardmax" -> &hardmax_last/1
+      end
 
     cond do
       axis == rank - 1 ->
-        softmax_last(a)
+        last.(a)
 
       opset >= 13 ->
         perm = (Enum.to_list(0..(rank - 1)) -- [axis]) ++ [axis]
         inverse = perm |> Enum.with_index() |> Enum.sort() |> Enum.map(&elem(&1, 1))
-        a |> Nx.transpose(axes: perm) |> softmax_last() |> Nx.transpose(axes: inverse)
+        a |> Nx.transpose(axes: perm) |> last.() |> Nx.transpose(axes: inverse)
 
       true ->
         shape = Nx.shape(a)
         outer = shape |> Tuple.to_list() |> Enum.take(axis) |> Enum.product()
-        a |> Nx.reshape({outer, :auto}) |> softmax_last() |> Nx.reshape(shape)
+        a |> Nx.reshape({outer, :auto}) |> last.() |> Nx.reshape(shape)
     end
+  end
+
+  defp log_softmax_last(a) do
+    shifted = Nx.subtract(a, Nx.reduce_max(a, axes: [-1], keep_axes: true))
+    Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+  end
+
+  # One-hot of the first maximum along the last axis.
+  defp hardmax_last(a) do
+    last = Nx.rank(a) - 1
+    first = Nx.argmax(a, axis: last, keep_axis: true, tie_break: :low)
+    a |> Nx.shape() |> Nx.iota(axis: last) |> Nx.equal(first) |> Nx.as_type(Nx.type(a))
   end
 
   defp einsum([term], [a], output) do

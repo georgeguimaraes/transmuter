@@ -9,7 +9,7 @@ import onnxruntime as ort
 
 case = sys.argv[1]
 meta = json.load(open(os.path.join(case, "meta.json")))
-model = onnx.load(meta["onnx_path"])
+model = onnx.load(os.path.join(case, meta["onnx_path"]))
 names = [o for n in model.graph.node for o in n.output if o]
 existing = {o.name for o in model.graph.output}
 for name in names:
