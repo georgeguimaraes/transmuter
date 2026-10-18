@@ -47,14 +47,22 @@ diverged? = fn name, t ->
 end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
+key = Nx.Random.key(System.unique_integer([:positive]))
 
 Enum.reduce_while(model.nodes, env, fn node, env ->
   ins = Enum.map(node.input, fn "" -> nil; name -> Map.fetch!(env, name) end)
 
   outs =
-    if Enum.all?(ins, &(&1 == nil or Transmuter.Ops.static?(&1))),
-      do: Nx.with_default_backend(Nx.BinaryBackend, fn -> Transmuter.Ops.apply(node, ins, model.opset) end),
-      else: Transmuter.Ops.apply(node, ins, model.opset)
+    cond do
+      node.op_type in Transmuter.Ops.Random.op_types() ->
+        Transmuter.Ops.Random.apply(node, ins, key)
+
+      Enum.all?(ins, &(&1 == nil or Transmuter.Ops.static?(&1))) ->
+        Nx.with_default_backend(Nx.BinaryBackend, fn -> Transmuter.Ops.apply(node, ins, model.opset) end)
+
+      true ->
+        Transmuter.Ops.apply(node, ins, model.opset)
+    end
 
   bad =
     for {name, t} <- Enum.zip(node.output, outs), is_struct(t), Map.has_key?(ref, name),
