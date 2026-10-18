@@ -8,7 +8,7 @@ defmodule Transmuter.Ops.Quantized do
   import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]
 
   @op_types ~w(MatMulNBits GatherBlockQuantized DequantizeLinear QuantizeLinear
-               DynamicQuantizeLinear MatMulInteger QLinearMatMul QLinearConv)
+               DynamicQuantizeLinear MatMulInteger QLinearMatMul QLinearConv QLinearAdd QLinearMul)
 
   @doc false
   def op_types, do: @op_types
@@ -122,6 +122,39 @@ defmodule Transmuter.Ops.Quantized do
     |> saturate(Nx.type(y_zero))
   end
 
+  # com.microsoft QLinearAdd, in the order of the ONNX Runtime kernel:
+  # c = a * a_scale / c_scale + b * b_scale / c_scale + (c_zero - a_zero * a_ratio - b_zero * b_ratio).
+  defp op(%{op_type: "QLinearAdd"}, [a, a_scale, a_zero, b, b_scale, b_zero, c_scale | rest]) do
+    {a_ratio, b_ratio} = {Nx.divide(a_scale, c_scale), Nx.divide(b_scale, c_scale)}
+
+    fixed =
+      rest
+      |> List.first()
+      |> zero_or()
+      |> Nx.subtract(Nx.multiply(zero_or(a_zero), a_ratio))
+      |> Nx.subtract(Nx.multiply(zero_or(b_zero), b_ratio))
+
+    a
+    |> Nx.as_type(:f32)
+    |> Nx.multiply(a_ratio)
+    |> Nx.add(Nx.multiply(Nx.as_type(b, :f32), b_ratio))
+    |> Nx.add(fixed)
+    |> round_half_even()
+    |> saturate(Nx.type(a))
+  end
+
+  # com.microsoft QLinearMul: c = (a - a_zero) * (b - b_zero) * a_scale * b_scale / c_scale + c_zero.
+  defp op(%{op_type: "QLinearMul"}, [a, a_scale, a_zero, b, b_scale, b_zero, c_scale | rest]) do
+    a
+    |> Nx.as_type(:f32)
+    |> Nx.subtract(zero_or(a_zero))
+    |> Nx.multiply(Nx.subtract(Nx.as_type(b, :f32), zero_or(b_zero)))
+    |> Nx.multiply(Nx.divide(Nx.multiply(a_scale, b_scale), c_scale))
+    |> round_half_even()
+    |> Nx.add(zero_or(List.first(rest)))
+    |> saturate(Nx.type(a))
+  end
+
   # Integer convolution with per-tensor or per-output-channel weight scales, then requantized.
   defp op(node = %{op_type: "QLinearConv"}, [
          x,
@@ -171,6 +204,9 @@ defmodule Transmuter.Ops.Quantized do
   end
 
   # A scalar, or a 1-D tensor laid along one axis of a rank-r result, as f32.
+  defp zero_or(nil), do: 0
+  defp zero_or(zero), do: Nx.as_type(zero, :f32)
+
   defp per_axis(t, rank, axis) do
     t = Nx.as_type(t, :f32)
 
