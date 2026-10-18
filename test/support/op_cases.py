@@ -700,3 +700,8 @@ case("SoftmaxCrossEntropyLoss_none_weight", [node("SoftmaxCrossEntropyLoss", ["x
      {"x": loss_x(5, 4), "t": loss_t(4, 5), "w": r.random(4).astype(np.float32)})
 case("SoftmaxCrossEntropyLoss_mean_ignore", [node("SoftmaxCrossEntropyLoss", ["x", "t"], ["y"], ignore_index=1)],
      {"x": loss_x(6, 3), "t": loss_t(3, 6, ignore=1)})
+
+# RoiAlign before opset 16 has no coordinate_transformation_mode and does not shift by half a pixel.
+r = rng_for("RoiAlign_opset10")
+case("RoiAlign_opset10", [node("RoiAlign", ["x", "rois", "idx"], ["y"], output_height=3, output_width=2, sampling_ratio=2, spatial_scale=0.5)],
+     {"x": r.standard_normal((2, 3, 10, 10)).astype(np.float32), "rois": rois * 2, "idx": np.array([0, 1, 0], np.int64)}, opset=10)

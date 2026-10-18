@@ -15,7 +15,24 @@ defmodule Transmuter.Ops.Vision do
   def op_types, do: @op_types
 
   @doc false
-  def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
+  def apply(node, inputs, opset), do: node |> version_defaults(opset) |> op(inputs) |> List.wrap()
+
+  # RoiAlign before opset 16 has no coordinate_transformation_mode and works as output_half_pixel.
+  defp version_defaults(node = %{op_type: "RoiAlign"}, opset) when opset < 16 do
+    if attr(node, "coordinate_transformation_mode") do
+      node
+    else
+      mode = %Transmuter.Onnx.AttributeProto{
+        name: "coordinate_transformation_mode",
+        type: :STRING,
+        s: "output_half_pixel"
+      }
+
+      %{node | attribute: [mode | node.attribute]}
+    end
+  end
+
+  defp version_defaults(node, _opset), do: node
 
   # Sampling grid {N, H, W, 2} (or {N, D, H, W, 3}) of theta times the normalized
   # coordinates (x, y[, z], 1) of every output pixel.

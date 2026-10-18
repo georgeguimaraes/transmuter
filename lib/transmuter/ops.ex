@@ -67,7 +67,7 @@ defmodule Transmuter.Ops do
         Signal.apply(node, inputs)
 
       node.op_type in Vision.op_types() ->
-        Vision.apply(node, inputs)
+        Vision.apply(node, inputs, opset)
 
       node.op_type in Text.op_types() ->
         Text.apply(node, inputs)
