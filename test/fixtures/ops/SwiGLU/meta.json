@@ -8,7 +8,7 @@
   "SwiGLU": 1
  },
  "static_inputs": [],
- "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from /Users/george/code/transmuter/test/support/../fixtures/ops/SwiGLU/model.",
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from model.onnx failed:/Users/cloudtest/vss/_work/1/s/onnxruntime/core/graph/",
  "inputs": [
   {
    "name": "a",

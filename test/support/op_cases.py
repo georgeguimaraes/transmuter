@@ -101,7 +101,7 @@ def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=Fals
             if ms:
                 raise ort_error
             outs = ReferenceEvaluator(model).run(outputs, inputs)
-            meta["reference"] = "onnx.reference: " + str(ort_error).splitlines()[0][:120]
+            meta["reference"] = "onnx.reference: " + str(ort_error).replace(onnx_path, "model.onnx").splitlines()[0][:120]
         meta["inputs"] = [{"name": k, **save(v, f"in_{i}")} for i, (k, v) in enumerate(inputs.items())]
         meta["outputs"] = [{"name": k, **save(v, f"out_{i}")} for i, (k, v) in enumerate(zip(outputs, outs))]
         meta["ort_ok"] = True
