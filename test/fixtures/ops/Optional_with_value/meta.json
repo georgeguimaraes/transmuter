@@ -1,0 +1,43 @@
+{
+ "repo": "op/Optional_with_value",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Optional": 1,
+  "OptionalHasElement": 1,
+  "OptionalGetElement": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "has",
+   "file": "out_0.bin",
+   "dtype": "u8",
+   "shape": []
+  },
+  {
+   "name": "y",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

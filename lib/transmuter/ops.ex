@@ -11,6 +11,7 @@ defmodule Transmuter.Ops do
     NN,
     Quantized,
     Reduction,
+    Sequence,
     Shape,
     Signal,
     Transformer,
@@ -81,6 +82,9 @@ defmodule Transmuter.Ops do
 
       node.op_type in NN.op_types() ->
         NN.apply(node, inputs)
+
+      node.op_type in Sequence.op_types() ->
+        Sequence.apply(node, inputs)
 
       true ->
         raise ArgumentError, "unsupported ONNX op #{node.op_type}"

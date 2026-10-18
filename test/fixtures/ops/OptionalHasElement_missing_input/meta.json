@@ -1,0 +1,22 @@
+{
+ "repo": "op/OptionalHasElement_missing_input",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "OptionalHasElement": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [],
+ "outputs": [
+  {
+   "name": "has",
+   "file": "out_0.bin",
+   "dtype": "u8",
+   "shape": []
+  }
+ ],
+ "ort_ok": true
+}

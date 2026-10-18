@@ -388,3 +388,58 @@ case("ConvInteger_groups_strides_dilations", [node("ConvInteger", ["x", "w", "xz
 case("Conv_auto_pad_same_upper", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_UPPER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})
 case("Conv_auto_pad_same_lower", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_LOWER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})
 case("Identity_strings", [node("Identity", ["x"], ["y"])], {"x": np.array([["a", "bc"], ["", "déf"]], dtype=object)}, eager=True)
+
+# ---------- sequences and optionals ----------
+
+# A sequence cannot leave a compiled function, so cases that end in a sequence run eagerly.
+seq_info = lambda name, t=TensorProto.FLOAT: {name: helper.make_tensor_sequence_value_info(name, t, None)}
+r = rng_for("sequences")
+sf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+case("SequenceConstruct_ConcatFromSequence", [node("SequenceConstruct", ["a", "b", "c"], ["s"]), node("ConcatFromSequence", ["s"], ["y"], axis=1)],
+     {"a": sf32(2, 3), "b": sf32(2, 1), "c": sf32(2, 4)})
+case("ConcatFromSequence_new_axis", [node("SequenceConstruct", ["a", "b", "c"], ["s"]), node("ConcatFromSequence", ["s"], ["y"], axis=-1, new_axis=1)],
+     {"a": sf32(2, 3), "b": sf32(2, 3), "c": sf32(2, 3)})
+case("SequenceAt_negative", [node("SequenceConstruct", ["a", "b", "c"], ["s"]), node("SequenceAt", ["s", "i"], ["y"])],
+     {"a": sf32(2, 3), "b": sf32(4), "c": sf32(1, 2)}, {"i": np.array(-2, np.int64)})
+case("SequenceEmpty_Insert_Length", [node("SequenceEmpty", [], ["s0"], dtype=TensorProto.FLOAT), node("SequenceInsert", ["s0", "a"], ["s1"]),
+                                     node("SequenceInsert", ["s1", "b", "zero"], ["s2"]), node("SequenceLength", ["s2"], ["n"]),
+                                     node("ConcatFromSequence", ["s2"], ["y"], axis=0)],
+     {"a": sf32(2, 3), "b": sf32(1, 3)}, {"zero": np.array(0, np.int64)}, outputs=["n", "y"])
+case("SequenceEmpty", [node("SequenceEmpty", [], ["s"])], {}, eager=True, output_infos=seq_info("s"))
+case("SequenceInsert_negative", [node("SequenceInsert", ["s", "t", "i"], ["y"])],
+     {"s": [sf32(2), sf32(3), sf32(4)], "t": sf32(5), "i": np.array(-1, np.int64)}, eager=True, output_infos=seq_info("y"))
+case("SequenceErase_negative", [node("SequenceErase", ["s", "i"], ["y"])],
+     {"s": [sf32(2), sf32(3), sf32(4)], "i": np.array(-3, np.int64)}, eager=True, output_infos=seq_info("y"))
+case("SequenceErase_default", [node("SequenceErase", ["s"], ["y"])],
+     {"s": [sf32(2), sf32(3), sf32(4)]}, eager=True, output_infos=seq_info("y"))
+case("SplitToSequence_scalar", [node("SplitToSequence", ["x", "split"], ["y"], axis=0)],
+     {"x": sf32(7, 3)}, {"split": np.array(3, np.int64)}, eager=True, output_infos=seq_info("y"))
+case("SplitToSequence_list", [node("SplitToSequence", ["x", "split"], ["y"], axis=-1)],
+     {"x": sf32(2, 5)}, {"split": np.array([1, 4], np.int64)}, eager=True, output_infos=seq_info("y"))
+case("SplitToSequence_keepdims", [node("SplitToSequence", ["x"], ["y"], axis=1)], {"x": sf32(2, 3, 2)}, eager=True, output_infos=seq_info("y"))
+case("SplitToSequence_no_keepdims", [node("SplitToSequence", ["x"], ["y"], axis=1, keepdims=0)], {"x": sf32(2, 3, 2)}, eager=True, output_infos=seq_info("y"))
+case("SplitToSequence_ConcatFromSequence", [node("SplitToSequence", ["x"], ["s"], axis=1, keepdims=0), node("ConcatFromSequence", ["s"], ["y"], axis=1, new_axis=1)],
+     {"x": sf32(2, 3, 2)})
+
+square_body = helper.make_graph(
+    [node("Mul", ["x", "x"], ["sq"]), node("Shape", ["x"], ["shape"])], "square_body",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, None)],
+    [helper.make_tensor_value_info("sq", TensorProto.FLOAT, None), helper.make_tensor_value_info("shape", TensorProto.INT64, None)])
+case("SequenceMap_one_input", [node("SequenceMap", ["s"], ["squares", "shapes"], body=square_body)],
+     {"s": [sf32(2), sf32(3, 2), sf32(1)]}, eager=True, opset=17, output_infos={**seq_info("squares"), **seq_info("shapes", TensorProto.INT64)})
+add_body = helper.make_graph(
+    [node("Add", ["x", "t"], ["y"])], "add_body",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, None), helper.make_tensor_value_info("t", TensorProto.FLOAT, None)],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)])
+case("SequenceMap_sequence_and_tensor", [node("SequenceMap", ["s", "t"], ["y"], body=add_body)],
+     {"s": [sf32(2, 3), sf32(1, 3), sf32(4, 3)], "t": sf32(3)}, eager=True, opset=17, output_infos=seq_info("y"))
+case("SequenceMap_compiled", [node("SplitToSequence", ["x"], ["s"], axis=0), node("SequenceMap", ["s", "t"], ["m"], body=add_body),
+                              node("ConcatFromSequence", ["m"], ["y"], axis=0)],
+     {"x": sf32(3, 4), "t": sf32(4)}, opset=17)
+
+optional_float = helper.make_optional_type_proto(helper.make_tensor_type_proto(TensorProto.FLOAT, None))
+case("Optional_with_value", [node("Optional", ["x"], ["o"]), node("OptionalHasElement", ["o"], ["has"]), node("OptionalGetElement", ["o"], ["y"])],
+     {"x": sf32(2, 3)}, outputs=["has", "y"])
+case("Optional_empty", [node("Optional", [], ["o"], type=helper.make_tensor_type_proto(TensorProto.FLOAT, None)), node("OptionalHasElement", ["o"], ["has"])],
+     {}, outputs=["o", "has"], eager=True, output_infos={"o": helper.make_value_info("o", optional_float)})
+case("OptionalHasElement_missing_input", [node("OptionalHasElement", [], ["has"])], {}, opset=18)

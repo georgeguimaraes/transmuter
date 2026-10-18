@@ -1,0 +1,98 @@
+{
+ "repo": "op/SequenceMap_one_input",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SequenceMap": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "s",
+   "sequence": [
+    {
+     "file": "in_0_0.bin",
+     "dtype": "f32",
+     "shape": [
+      2
+     ]
+    },
+    {
+     "file": "in_0_1.bin",
+     "dtype": "f32",
+     "shape": [
+      3,
+      2
+     ]
+    },
+    {
+     "file": "in_0_2.bin",
+     "dtype": "f32",
+     "shape": [
+      1
+     ]
+    }
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "squares",
+   "sequence": [
+    {
+     "file": "out_0_0.bin",
+     "dtype": "f32",
+     "shape": [
+      2
+     ]
+    },
+    {
+     "file": "out_0_1.bin",
+     "dtype": "f32",
+     "shape": [
+      3,
+      2
+     ]
+    },
+    {
+     "file": "out_0_2.bin",
+     "dtype": "f32",
+     "shape": [
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "shapes",
+   "sequence": [
+    {
+     "file": "out_1_0.bin",
+     "dtype": "s64",
+     "shape": [
+      1
+     ]
+    },
+    {
+     "file": "out_1_1.bin",
+     "dtype": "s64",
+     "shape": [
+      2
+     ]
+    },
+    {
+     "file": "out_1_2.bin",
+     "dtype": "s64",
+     "shape": [
+      1
+     ]
+    }
+   ]
+  }
+ ],
+ "ort_ok": true
+}

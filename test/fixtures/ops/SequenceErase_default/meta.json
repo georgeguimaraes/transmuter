@@ -1,0 +1,63 @@
+{
+ "repo": "op/SequenceErase_default",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SequenceErase": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "s",
+   "sequence": [
+    {
+     "file": "in_0_0.bin",
+     "dtype": "f32",
+     "shape": [
+      2
+     ]
+    },
+    {
+     "file": "in_0_1.bin",
+     "dtype": "f32",
+     "shape": [
+      3
+     ]
+    },
+    {
+     "file": "in_0_2.bin",
+     "dtype": "f32",
+     "shape": [
+      4
+     ]
+    }
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "sequence": [
+    {
+     "file": "out_0_0.bin",
+     "dtype": "f32",
+     "shape": [
+      2
+     ]
+    },
+    {
+     "file": "out_0_1.bin",
+     "dtype": "f32",
+     "shape": [
+      3
+     ]
+    }
+   ]
+  }
+ ],
+ "ort_ok": true
+}

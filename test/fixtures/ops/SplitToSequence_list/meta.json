@@ -1,0 +1,48 @@
+{
+ "repo": "op/SplitToSequence_list",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SplitToSequence": 1
+ },
+ "static_inputs": [],
+ "eager": true,
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "sequence": [
+    {
+     "file": "out_0_0.bin",
+     "dtype": "f32",
+     "shape": [
+      2,
+      1
+     ]
+    },
+    {
+     "file": "out_0_1.bin",
+     "dtype": "f32",
+     "shape": [
+      2,
+      4
+     ]
+    }
+   ]
+  }
+ ],
+ "ort_ok": true
+}

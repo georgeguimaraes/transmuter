@@ -208,6 +208,9 @@ defmodule Transmuter do
             node.op_type == "Scan" ->
               run_scan(node, inputs, env, ctx)
 
+            node.op_type == "SequenceMap" ->
+              run_sequence_map(node, inputs, env, ctx)
+
             Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
               Nx.with_default_backend(Nx.BinaryBackend, fn ->
                 Ops.apply(node, inputs, ctx.opset)
@@ -375,6 +378,28 @@ defmodule Transmuter do
       end
 
     final_states ++ stacked
+  end
+
+  # Runs the body once per element. Sequence inputs give one element to each run, and
+  # tensor inputs go to every run. Each body output becomes a sequence.
+  defp run_sequence_map(node, inputs = [{:sequence, first} | _], env, ctx) do
+    body = Ops.attr(node, "body")
+    names = Enum.map(body.input, & &1.name)
+    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+
+    steps =
+      for i <- 0..(length(first) - 1)//1 do
+        values =
+          Enum.map(inputs, fn
+            {:sequence, elements} -> Enum.at(elements, i)
+            tensor -> tensor
+          end)
+
+        result = run_nodes(body.node, Map.merge(env, Map.new(Enum.zip(names, values))), ctx)
+        Enum.map(body.output, &Map.fetch!(result, &1.name))
+      end
+
+    for j <- 0..(length(body.output) - 1), do: {:sequence, Enum.map(steps, &Enum.at(&1, j))}
   end
 
   defp normalize_axis(axis, rank) when axis < 0, do: axis + rank

@@ -1,0 +1,52 @@
+{
+ "repo": "op/SequenceAt_negative",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SequenceConstruct": 1,
+  "SequenceAt": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "a",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  {
+   "name": "b",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  },
+  {
+   "name": "c",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}
