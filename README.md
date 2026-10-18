@@ -35,7 +35,12 @@ run = Transmuter.compile(model, inputs, compiler: EMLX)
 %{"last_hidden_state" => hidden} = run.(inputs)
 ```
 
-`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. For other shapes, compile again. `Transmuter.run/4` is the function before compilation. Use it with `Nx.Defn.jit/2`, with gradients or with eager execution.
+`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. For other shapes, compile again.
+
+`Transmuter.run/4` is the function that `Transmuter.compile/3` compiles. It reads the ONNX graph and calls one Nx function for each operator. You can use it in two ways:
+
+- Call it directly. Each operator runs immediately, one after the other. This is eager execution. It is slower, but the model can read values while it runs.
+- Give it to `Nx.Defn.jit/2` or `Nx.Defn.value_and_grad/2`. Nx then records the operators as one graph, and the backend compiles that graph.
 
 ## Installation
 
