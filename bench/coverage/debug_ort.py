@@ -29,7 +29,7 @@ for name in names:
     a = np.clip(np.nan_to_num(np.asarray(outs[name], dtype=np.float64), nan=0.0, posinf=3e38, neginf=-3e38), -3e38, 3e38)
     flat = a.reshape(-1)
     idx = [(k * 2654435761) % flat.size for k in range(1024)] if flat.size else []
-    stats[name] = {"shape": list(a.shape), "absmax": float(np.abs(a).max()) if a.size else 0.0, "sample": [float(flat[i]) for i in idx]}
+    stats[name] = {"shape": list(a.shape), "absmax": float(np.abs(a).max()) if a.size else 0.0, "abssum": float(np.abs(a).sum()), "sample": [float(flat[i]) for i in idx]}
 json.dump(stats, open(os.path.join(case, "ort_trace.json"), "w"))
 # DUMP=name,name saves those node outputs in full, for debug_case.exs OVERRIDE.
 for name in filter(None, os.environ.get("DUMP", "").split(",")):
