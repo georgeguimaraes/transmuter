@@ -76,6 +76,23 @@ Each new value of a static input compiles the model again.
 
 Some graphs calculate a shape inside the graph. For these graphs, call `Transmuter.run/4` without compilation. Then Transmuter reads the values while the model runs. Kokoro text-to-speech needs this, because the length of its audio comes from the predicted duration of each phoneme. On an Apple silicon GPU, Kokoro makes 4.45 seconds of audio in 1.4 seconds.
 
+`NonMaxSuppression`, `Unique`, `Compress`, `NonZero` and `TfIdfVectorizer` also read their input values, so they need static inputs or a run without compilation. Faster R-CNN and Mask R-CNN from the ONNX Model Zoo run this way.
+
+## Strings, sequences and random values
+
+Nx tensors hold only numbers. Transmuter keeps other ONNX values in the graph as Elixir terms:
+
+- A string tensor is `{:strings, shape, values}`, with the values as a flat list of binaries.
+- A sequence is a list of tensors.
+- An empty optional is `:none`.
+- A tensor with a dimension of 0 is `{:empty, shape}`, because Nx has no zero-size tensors.
+
+Give string and sequence inputs as `:static_inputs`. A compiled function returns only tensors, so call `Transmuter.run/4` without compilation to read string or sequence outputs.
+
+Random operators draw from `Nx.Random`. Each call of a compiled model draws new values. A node with a `seed` attribute draws the same values on each call. The values cannot be the same as in ONNX Runtime, because the random number generators are different.
+
+`ImageDecoder` needs the optional `stb_image` dependency.
+
 ## Precision and quantization
 
 Half-precision exports (`model_fp16.onnx`) run in f16 or bf16. Sums, normalizations, softmax and attention scores use f32 inside the operation. ONNX Runtime on the CPU calculates half-precision graphs in f32. To get the same result, use `Transmuter.load!(source, compute_type: :f32)`.
@@ -113,7 +130,10 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
 | Models requested in Bumblebee issues | 11 of 12 files match |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 8 of 8 match |
-| One graph for each operator variant | 122 of 122 match |
+| Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo, without compilation | 3 of 3 match |
+| One graph for each operator variant | 215 of 215 match |
+
+Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use.
 
 These models do not match by position, or do not run with compilation:
 
@@ -133,7 +153,7 @@ If a case does not match, run `bench/coverage/debug_ort.py` and `bench/coverage/
 
 `mix test` downloads five models and compares them with ONNX Runtime. `test/support/reference.py` shows the reference values.
 
-`mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/op_cases.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator.
+`mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/op_cases.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator. For random operators, the tests check the shape, the type and the distribution of the values.
 
 On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` uses the EMLX CPU device. But EMLX 0.5 runs compiled functions on the GPU when Metal is available, also with `device: :cpu`. Thus only the Linux CI tests the CPU fully.
 
