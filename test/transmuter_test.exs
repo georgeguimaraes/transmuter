@@ -213,6 +213,19 @@ defmodule TransmuterTest do
     assert_in_delta autodiff, numeric, 0.02 * abs(numeric) + 1.0e-3
   end
 
+  test "returns a string output only without compiling" do
+    model = Transmuter.load!(Path.expand("fixtures/ops/Identity_strings/model.onnx", __DIR__))
+    strings = %{"x" => {:strings, {2}, ["a", "b"]}}
+
+    assert Transmuter.run(model, model.params, %{}, strings) == %{
+             "y" => {:strings, {2}, ["a", "b"]}
+           }
+
+    assert_raise ArgumentError, ~r/output y is a string tensor/, fn ->
+      Transmuter.compile(model, %{}, [static_inputs: strings] ++ @compiler).(%{})
+    end
+  end
+
   defp load(repo, file, opts \\ []) do
     Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
   end

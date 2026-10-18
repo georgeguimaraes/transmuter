@@ -12,6 +12,7 @@ The default output_dir is test/fixtures/ops.
 import json
 import os
 import sys
+import zlib
 from collections import Counter
 
 import numpy as np
@@ -29,15 +30,36 @@ def f32(*shape, scale=1.0):
     return (rng.standard_normal(shape) * scale).astype(np.float32)
 
 
-def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=False, static=()):
-    """inputs/initializers: dict name -> array. outputs: list of names (defaults to last node outputs)."""
+def rng_for(name):
+    """A generator seeded by the case name, so a new case does not change the data of other cases."""
+    return np.random.default_rng(zlib.crc32(name.encode()))
+
+
+def tensor_type(a):
+    return TensorProto.STRING if a.dtype.kind in "OUS" else helper.np_dtype_to_tensor_dtype(a.dtype)
+
+
+def value_info(name, v):
+    """A list is a sequence of tensors, any other value is a tensor."""
+    if isinstance(v, list):
+        return helper.make_tensor_sequence_value_info(name, tensor_type(np.asarray(v[0])) if v else TensorProto.FLOAT, None)
+    return helper.make_tensor_value_info(name, tensor_type(v), v.shape)
+
+
+def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=False, static=(), eager=False, atol=None,
+         output_infos=None, extra=None):
+    """inputs/initializers: dict name -> value. A value is an array (a string array for STRING tensors) or a
+    list of arrays (a sequence). outputs: list of names (defaults to last node outputs). output_infos: dict
+    name -> ValueInfoProto for outputs that need a type, such as optionals. eager: the test runs the model
+    without compiling. atol: an absolute tolerance instead of the default one. extra: more meta.json keys."""
     initializers = initializers or {}
     outputs = outputs or [o for o in nodes[-1].output if o]
+    output_infos = output_infos or {}
     graph = helper.make_graph(
         nodes,
         name,
-        [helper.make_tensor_value_info(k, helper.np_dtype_to_tensor_dtype(v.dtype), v.shape) for k, v in inputs.items()],
-        [onnx.ValueInfoProto(name=o) for o in outputs],
+        [value_info(k, v) for k, v in inputs.items()],
+        [output_infos.get(o, onnx.ValueInfoProto(name=o)) for o in outputs],
         [numpy_helper.from_array(v, k) for k, v in initializers.items()],
     )
     imports = [helper.make_opsetid("", opset)] + ([helper.make_opsetid(MS, 1)] if ms else [])
@@ -48,6 +70,23 @@ def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=Fals
     onnx.save(model, onnx_path)
     meta = {"repo": "op/" + name, "task": "op", "file": "model.onnx", "onnx_path": "model.onnx", "unoptimized_ref": True,
             "ops": dict(Counter((f"{n.domain}:" if n.domain else "") + n.op_type for n in nodes)), "static_inputs": list(static)}
+    if eager:
+        meta["eager"] = True
+    if atol is not None:
+        meta["atol"] = atol
+    meta.update(extra or {})
+
+    def save(v, stem):
+        if v is None:
+            return {"none": True}
+        if isinstance(v, list):
+            return {"sequence": [save(e, f"{stem}_{j}") for j, e in enumerate(v)]}
+        a = np.asarray(v)
+        if a.dtype.kind in "OUS":
+            return {"dtype": "string", "shape": list(a.shape), "values": [x.decode() if isinstance(x, bytes) else str(x) for x in a.reshape(-1)]}
+        np.ascontiguousarray(a.astype(np.uint8) if a.dtype == np.bool_ else a).tofile(os.path.join(path, stem + ".bin"))
+        return {"file": stem + ".bin", "dtype": NX[str(a.dtype)], "shape": list(a.shape)}
+
     try:
         try:
             opts = ort.SessionOptions()
@@ -63,9 +102,8 @@ def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=Fals
                 raise ort_error
             outs = ReferenceEvaluator(model).run(outputs, inputs)
             meta["reference"] = "onnx.reference: " + str(ort_error).splitlines()[0][:120]
-        save = lambda a, f: (np.ascontiguousarray(a.astype(np.uint8) if a.dtype == np.bool_ else a).tofile(os.path.join(path, f)), {"dtype": NX[str(a.dtype)], "shape": list(a.shape)})[1]
-        meta["inputs"] = [{"name": k, "file": f"in_{i}.bin", **save(v, f"in_{i}.bin")} for i, (k, v) in enumerate(inputs.items())]
-        meta["outputs"] = [{"name": k, "file": f"out_{i}.bin", **save(np.asarray(v), f"out_{i}.bin")} for i, (k, v) in enumerate(zip(outputs, outs))]
+        meta["inputs"] = [{"name": k, **save(v, f"in_{i}")} for i, (k, v) in enumerate(inputs.items())]
+        meta["outputs"] = [{"name": k, **save(v, f"out_{i}")} for i, (k, v) in enumerate(zip(outputs, outs))]
         meta["ort_ok"] = True
     except Exception as e:
         meta["ort_ok"] = False
@@ -349,3 +387,4 @@ case("ConvInteger_groups_strides_dilations", [node("ConvInteger", ["x", "w", "xz
      {"x": q(1, 4, 9, 9)}, {"w": q(6, 2, 3, 3), "xz": np.array(100, np.uint8)})
 case("Conv_auto_pad_same_upper", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_UPPER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})
 case("Conv_auto_pad_same_lower", [node("Conv", ["x", "w"], ["y"], auto_pad="SAME_LOWER", strides=[2, 2])], {"x": f32(1, 2, 8, 8)}, {"w": f32(3, 2, 3, 3)})
+case("Identity_strings", [node("Identity", ["x"], ["y"])], {"x": np.array([["a", "bc"], ["", "déf"]], dtype=object)}, eager=True)

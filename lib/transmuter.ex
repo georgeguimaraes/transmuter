@@ -131,8 +131,32 @@ defmodule Transmuter do
     env = run_nodes(model.nodes, env, ctx)
 
     for(name <- model.outputs, (t = Map.fetch!(env, name)) != :empty, into: %{}, do: {name, t})
+    |> host_outputs(Compiler.current())
     |> tag_literals(Compiler.current())
   end
+
+  # Strings, sequences and empty optionals cannot leave a compiled function. Without a
+  # compiler, a sequence comes back as a list.
+  defp host_outputs(outputs, nil) do
+    Map.new(outputs, fn
+      {name, {:sequence, elements}} -> {name, elements}
+      other -> other
+    end)
+  end
+
+  defp host_outputs(outputs, _compiler) do
+    for {name, value} <- outputs, not is_struct(value, Nx.Tensor) do
+      raise ArgumentError,
+            "output #{name} is #{describe(value)}, which cannot leave a compiled function. " <>
+              "Call Transmuter.run/4 without compiling to read it"
+    end
+
+    outputs
+  end
+
+  defp describe({:strings, _shape, _values}), do: "a string tensor"
+  defp describe({:sequence, _elements}), do: "a sequence"
+  defp describe(:none), do: "an empty optional"
 
   # EMLX 0.5 keys its compile cache by the structure of the graph, and a literal tensor
   # adds only its shape and type to the key. Two graphs that differ only in literal
@@ -198,6 +222,8 @@ defmodule Transmuter do
             shapes =
               Enum.map(inputs, fn
                 %Nx.Tensor{} = t -> Nx.shape(t)
+                {:strings, shape, _values} -> {:strings, shape}
+                {:sequence, elements} -> {:sequence, length(elements)}
                 other -> other
               end)
 
@@ -276,6 +302,7 @@ defmodule Transmuter do
   end
 
   defp static_initializer?(:empty, _trainable), do: true
+  defp static_initializer?({:strings, _shape, _values}, _trainable), do: true
 
   defp static_initializer?(t, trainable) do
     if Nx.Type.integer?(Nx.type(t)),

@@ -25,31 +25,63 @@ defmodule Transmuter.OpsTest do
     model =
       Transmuter.load!(Path.join(dir, meta["onnx_path"]), backend: @backend, compute_type: :f32)
 
-    {static, inputs} = Enum.split_with(meta["inputs"], &(&1["name"] in meta["static_inputs"]))
+    # Strings, sequences and empty optionals cannot be compiled inputs, so they are static.
+    {static, inputs} =
+      Enum.split_with(
+        meta["inputs"],
+        &(&1["name"] in meta["static_inputs"] or not Map.has_key?(&1, "file"))
+      )
+
     inputs = Map.new(inputs, &{&1["name"], read(dir, &1, @backend)})
     static_inputs = Map.new(static, &{&1["name"], read(dir, &1, Nx.BinaryBackend)})
 
     outputs =
-      Transmuter.compile(model, inputs, [static_inputs: static_inputs] ++ @compiler).(inputs)
+      if meta["eager"] do
+        Transmuter.run(model, model.params, inputs, static_inputs)
+      else
+        Transmuter.compile(model, inputs, [static_inputs: static_inputs] ++ @compiler).(inputs)
+      end
 
-    for spec <- meta["outputs"] do
+    for spec <- meta["outputs"], not zero_size?(spec) or Map.has_key?(outputs, spec["name"]) do
       expected = read(dir, spec, Nx.BinaryBackend)
-      actual = outputs |> Map.fetch!(spec["name"]) |> Nx.backend_copy(Nx.BinaryBackend)
-
-      assert Nx.shape(actual) == Nx.shape(expected),
-             "#{spec["name"]}: shape #{inspect(Nx.shape(actual))}, expected #{inspect(Nx.shape(expected))}"
-
-      {max_diff, tolerance} = difference(actual, expected)
-      tolerance = if Nx.Type.integer?(Nx.type(expected)), do: 0, else: tolerance
-
-      assert max_diff <= tolerance,
-             "#{spec["name"]}: max difference #{max_diff}, tolerance #{tolerance}"
+      assert_same(spec["name"], Map.fetch!(outputs, spec["name"]), expected, meta["atol"])
     end
+  end
+
+  defp zero_size?(spec), do: 0 in Map.get(spec, "shape", [1])
+
+  defp assert_same(name, actual, {:sequence, expected}, atol) do
+    assert is_list(actual), "#{name}: expected a sequence, got #{inspect(actual)}"
+    assert length(actual) == length(expected), "#{name}: sequence length"
+
+    for {a, e, i} <- Enum.zip([actual, expected, 0..(length(expected) - 1)//1]),
+        do: assert_same("#{name}[#{i}]", a, e, atol)
+  end
+
+  defp assert_same(name, actual, expected, _atol) when not is_struct(expected, Nx.Tensor),
+    do: assert(actual == expected, "#{name}: #{inspect(actual)}, expected #{inspect(expected)}")
+
+  defp assert_same(name, actual, expected, atol) do
+    actual = Nx.backend_copy(actual, Nx.BinaryBackend)
+
+    assert Nx.shape(actual) == Nx.shape(expected),
+           "#{name}: shape #{inspect(Nx.shape(actual))}, expected #{inspect(Nx.shape(expected))}"
+
+    {max_diff, tolerance} = difference(actual, expected)
+
+    tolerance =
+      cond do
+        atol -> atol
+        Nx.Type.integer?(Nx.type(expected)) -> 0
+        true -> tolerance
+      end
+
+    assert max_diff <= tolerance, "#{name}: max difference #{max_diff}, tolerance #{tolerance}"
   end
 
   # Largest difference, with equal infinities and matching NaNs counted as equal, and
   # the tolerance 1e-4 + 1e-3 * max |expected| over the finite expected values. Integer
-  # outputs must be equal.
+  # outputs must be equal, unless the fixture sets atol.
   defp difference(actual, expected) do
     actual = Nx.as_type(actual, :f64)
     expected = Nx.as_type(expected, :f64)
@@ -68,11 +100,23 @@ defmodule Transmuter.OpsTest do
     {if(diff == :nan, do: :infinity, else: diff), 1.0e-4 + 1.0e-3 * scale}
   end
 
+  defp read(_dir, %{"none" => true}, _backend), do: :none
+
+  defp read(dir, %{"sequence" => elements}, backend),
+    do: {:sequence, Enum.map(elements, &read(dir, &1, backend))}
+
+  defp read(_dir, %{"dtype" => "string", "shape" => shape, "values" => values}, _backend),
+    do: {:strings, List.to_tuple(shape), values}
+
   defp read(dir, %{"file" => file, "dtype" => type, "shape" => shape}, backend) do
-    dir
-    |> Path.join(file)
-    |> File.read!()
-    |> Nx.from_binary(String.to_atom(type), backend: backend)
-    |> Nx.reshape(List.to_tuple(shape))
+    if 0 in shape do
+      :empty
+    else
+      dir
+      |> Path.join(file)
+      |> File.read!()
+      |> Nx.from_binary(String.to_atom(type), backend: backend)
+      |> Nx.reshape(List.to_tuple(shape))
+    end
   end
 end

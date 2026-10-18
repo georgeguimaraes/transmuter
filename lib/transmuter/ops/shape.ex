@@ -37,6 +37,8 @@ defmodule Transmuter.Ops.Shape do
       [%{name: "value_ints", ints: ints}] -> static_tensor(ints, :s64)
       [%{name: "value_float", f: f}] -> static_tensor(f, :f32)
       [%{name: "value_floats", floats: fs}] -> static_tensor(fs, :f32)
+      [%{name: "value_string", s: s}] -> {:strings, {}, [s]}
+      [%{name: "value_strings", strings: values}] -> {:strings, {length(values)}, values}
     end
   end
 

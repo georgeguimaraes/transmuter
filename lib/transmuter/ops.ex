@@ -87,8 +87,14 @@ defmodule Transmuter.Ops do
     end
   end
 
+  # Values that Nx cannot hold live in the graph environment as host terms: a string
+  # tensor is {:strings, shape, values}, a sequence is {:sequence, elements} and an
+  # empty optional is :none.
   @doc false
   def static?(:empty), do: true
+  def static?(:none), do: true
+  def static?({:strings, _shape, _values}), do: true
+  def static?({:sequence, elements}), do: Enum.all?(elements, &static?/1)
   def static?(%Nx.Tensor{data: %Nx.BinaryBackend{}}), do: true
   def static?(_), do: false
 
@@ -110,6 +116,9 @@ defmodule Transmuter.Ops do
   # model runs eagerly. Only values inside a traced function are unknown.
   @doc false
   def known?(:empty), do: true
+  def known?(:none), do: true
+  def known?({:strings, _shape, _values}), do: true
+  def known?({:sequence, elements}), do: Enum.all?(elements, &known?/1)
   def known?(%Nx.Tensor{data: %Nx.Defn.Expr{}}), do: false
   def known?(%Nx.Tensor{}), do: true
 
@@ -210,6 +219,7 @@ defmodule Transmuter.Ops do
       %{type: :FLOATS, floats: fs} -> fs
       %{type: :TENSOR, t: t} -> t
       %{type: :STRING, s: s} -> s
+      %{type: :STRINGS, strings: strings} -> strings
       %{type: :GRAPH, g: g} -> g
     end
   end
@@ -227,10 +237,17 @@ defmodule Transmuter.Ops do
     tensor(%{t | data_location: :DEFAULT, raw_data: raw}, dir)
   end
 
-  def tensor(%{dims: dims}, _dir) when dims != [] and hd(dims) == 0, do: :empty
+  def tensor(%{dims: dims} = t, dir) when dims != [] do
+    if 0 in dims, do: :empty, else: tensor_data(t, dir)
+  end
+
+  def tensor(t, dir), do: tensor_data(t, dir)
+
+  defp tensor_data(%{data_type: 8, string_data: values, dims: dims}, _dir),
+    do: {:strings, List.to_tuple(dims), values}
 
   # 4-bit tensors stay packed two values per byte: signed int4 as s8, uint4 as u8.
-  def tensor(%{raw_data: raw, data_type: dt, dims: dims}, _dir) when dt in [21, 22] do
+  defp tensor_data(%{raw_data: raw, data_type: dt, dims: dims}, _dir) when dt in [21, 22] do
     {last, outer} = List.pop_at(dims, -1)
 
     raw
@@ -238,7 +255,7 @@ defmodule Transmuter.Ops do
     |> Nx.reshape(List.to_tuple(outer ++ [div(last + 1, 2)]))
   end
 
-  def tensor(t = %{raw_data: raw, data_type: dt, dims: dims}, _dir) do
+  defp tensor_data(t = %{raw_data: raw, data_type: dt, dims: dims}, _dir) do
     type = dtype(dt)
 
     flat =
