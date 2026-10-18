@@ -122,36 +122,56 @@ defmodule Transmuter.Ops.Quantized do
     |> saturate(Nx.type(y_zero))
   end
 
-  # com.microsoft QLinearAdd, in the order of the ONNX Runtime kernel:
-  # c = a * a_scale / c_scale + b * b_scale / c_scale + (c_zero - a_zero * a_ratio - b_zero * b_ratio).
+  # com.microsoft QLinearAdd: c = (a - a_zero) * a_scale / c_scale + (b - b_zero) * b_scale / c_scale + c_zero.
+  # ONNX Runtime on ARM adds in fixed point when both scale ratios fit a 22-bit multiplier,
+  # and so does this clause. Integer math gives the same result on every device. The
+  # x86 kernel of ONNX Runtime adds in f32, and can round a tie to the other integer.
   defp op(%{op_type: "QLinearAdd"}, [a, a_scale, a_zero, b, b_scale, b_zero, c_scale | rest]) do
-    {a_ratio, b_ratio} = {Nx.divide(a_scale, c_scale), Nx.divide(b_scale, c_scale)}
+    c_zero = List.first(rest)
+    type = Nx.type(a)
 
-    fixed =
-      rest
-      |> List.first()
-      |> zero_or()
-      |> Nx.subtract(Nx.multiply(zero_or(a_zero), a_ratio))
-      |> Nx.subtract(Nx.multiply(zero_or(b_zero), b_ratio))
+    case add_multipliers(a_scale, b_scale, c_scale) do
+      {shift, a_multiplier, b_multiplier} ->
+        shifted = &(&1 |> Nx.as_type(:s32) |> Nx.subtract(int_zero(&2)))
 
-    a
-    |> Nx.as_type(:f32)
-    |> Nx.multiply(a_ratio)
-    |> Nx.add(Nx.multiply(Nx.as_type(b, :f32), b_ratio))
-    |> Nx.add(fixed)
-    |> round_half_even()
-    |> saturate(Nx.type(a))
+        acc =
+          Nx.add(
+            Nx.multiply(shifted.(a, a_zero), a_multiplier),
+            Nx.multiply(shifted.(b, b_zero), b_multiplier)
+          )
+
+        # Subtract 1 from a negative sum, then shift right with rounding, so a tie rounds away from zero.
+        acc
+        |> Nx.add(Nx.right_shift(acc, 31))
+        |> Nx.as_type(:s64)
+        |> Nx.add(2 ** (shift - 1))
+        |> Nx.right_shift(shift)
+        |> Nx.clip(-32_768, 32_767)
+        |> Nx.add(int_zero(c_zero))
+        |> saturate(type)
+
+      nil ->
+        dequantize = &(&1 |> Nx.as_type(:f32) |> Nx.subtract(zero_or(&3)) |> Nx.multiply(&2))
+
+        dequantize.(a, a_scale, a_zero)
+        |> Nx.add(dequantize.(b, b_scale, b_zero))
+        |> Nx.divide(c_scale)
+        |> Nx.add(zero_or(c_zero))
+        |> round_half_even()
+        |> saturate(type)
+    end
   end
 
-  # com.microsoft QLinearMul: c = (a - a_zero) * (b - b_zero) * a_scale * b_scale / c_scale + c_zero.
+  # com.microsoft QLinearMul: c = (a - a_zero) * (b - b_zero) * a_scale * b_scale / c_scale + c_zero,
+  # with the zero point added before the rounding, as in ONNX Runtime.
   defp op(%{op_type: "QLinearMul"}, [a, a_scale, a_zero, b, b_scale, b_zero, c_scale | rest]) do
     a
     |> Nx.as_type(:f32)
     |> Nx.subtract(zero_or(a_zero))
     |> Nx.multiply(Nx.subtract(Nx.as_type(b, :f32), zero_or(b_zero)))
     |> Nx.multiply(Nx.divide(Nx.multiply(a_scale, b_scale), c_scale))
-    |> round_half_even()
     |> Nx.add(zero_or(List.first(rest)))
+    |> round_half_even()
     |> saturate(Nx.type(a))
   end
 
@@ -168,7 +188,9 @@ defmodule Transmuter.Ops.Quantized do
        ]) do
     x = Nx.subtract(Nx.as_type(x, :f32), Nx.as_type(Nx.reshape(x_zero, {}), :f32))
     w = Nx.subtract(Nx.as_type(w, :f32), per_axis(w_zero, Nx.rank(w), 0))
-    acc = Transmuter.Ops.apply(%{node | op_type: "Conv"}, [x, w], 13) |> hd()
+    # The sum of integer products is an integer, but a large f32 convolution can be off
+    # by a fraction (seen on the MLX GPU in vgg16-12-int8), so the sum is rounded back.
+    acc = Transmuter.Ops.apply(%{node | op_type: "Conv"}, [x, w], 13) |> hd() |> Nx.round()
     channel = &per_axis(&1, Nx.rank(acc), 1)
     bias = List.first(bias)
     acc = if bias, do: Nx.add(acc, channel.(bias)), else: acc
@@ -203,10 +225,44 @@ defmodule Transmuter.Ops.Quantized do
     if bias, do: Nx.add(out, bias), else: out
   end
 
-  # A scalar, or a 1-D tensor laid along one axis of a rank-r result, as f32.
   defp zero_or(nil), do: 0
   defp zero_or(zero), do: Nx.as_type(zero, :f32)
 
+  defp int_zero(nil), do: 0
+  defp int_zero(zero), do: Nx.as_type(zero, :s32)
+
+  # The fixed-point parameters of MlasCalcQLinearAddParameters in ONNX Runtime, or nil
+  # when the scales are not known or the ratios are out of its range.
+  defp add_multipliers(a_scale, b_scale, c_scale) do
+    if Enum.all?([a_scale, b_scale, c_scale], &Transmuter.Ops.known?/1) do
+      [a_ratio, b_ratio] =
+        for scale <- [a_scale, b_scale] do
+          Nx.divide(f32_host(scale), f32_host(c_scale)) |> Nx.to_number()
+        end
+
+      <<_sign::1, exponent::8, _fraction::23>> = <<max(a_ratio, b_ratio)::float-32>>
+      shift = 21 - (exponent - 127)
+      multiplier = &(&1 |> Kernel.*(2 ** shift) |> round_even())
+      {a_multiplier, b_multiplier} = {multiplier.(a_ratio), multiplier.(b_ratio)}
+
+      if Enum.all?([a_ratio, b_ratio], &(&1 >= 2 ** -14 and &1 < 256)) and shift in 13..31 and
+           max(a_multiplier, b_multiplier) in 0x200000..0x3FFFFF,
+         do: {shift, a_multiplier, b_multiplier}
+    end
+  end
+
+  defp f32_host(t),
+    do: t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.as_type(:f32) |> Nx.reshape({})
+
+  defp round_even(x) do
+    rounded = round(x)
+    if abs(x - trunc(x)) == 0.5 and rem(rounded, 2) != 0, do: rounded - sign(x), else: rounded
+  end
+
+  defp sign(x) when x < 0, do: -1
+  defp sign(_x), do: 1
+
+  # A scalar, or a 1-D tensor laid along one axis of a rank-r result, as f32.
   defp per_axis(t, rank, axis) do
     t = Nx.as_type(t, :f32)
 

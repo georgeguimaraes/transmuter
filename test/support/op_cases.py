@@ -337,3 +337,7 @@ s8 = lambda *shape: rng.integers(-128, 127, shape).astype(np.int8)
 case("QLinearMul_int8", [node("QLinearMul", ["a", "as", "az", "b", "bs", "bz", "cs", "cz"], ["c"], domain=MS)],
      {"a": s8(3, 8), "b": s8(3, 8)}, {"as": np.array(0.02, np.float32), "az": np.array(-5, np.int8), "bs": np.array(0.03, np.float32),
                                       "bz": np.array(3, np.int8), "cs": np.array(0.05, np.float32), "cz": np.array(-10, np.int8)}, ms=True)
+# Scales and zero points from the first dense layer of the ONNX Model Zoo vgg16-12-int8, where values land on rounding ties.
+case("QLinearAdd_ties", [node("QLinearAdd", ["a", "as", "az", "b", "bs", "bz", "cs", "cz"], ["c"], domain=MS)],
+     {"a": q(64, 4096)}, {"as": np.array(2.4697657 * 0.05, np.float32), "az": np.array(152, np.uint8), "b": q(4096), "bs": np.array(0.008398832 * 0.05, np.float32),
+                          "bz": np.array(128, np.uint8), "cs": np.array(0.05, np.float32), "cz": np.array(0, np.uint8)}, ms=True)
