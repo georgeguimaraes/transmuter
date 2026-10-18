@@ -8,7 +8,7 @@ Transmuter does not port model architectures. An ONNX file contains the forward 
 
 Elixir has three ways to run Hugging Face models today. Each way has a limit:
 
-- **Bumblebee** runs models with good accuracy on all Nx backends. But a person must port each architecture to Axon by hand, and a port takes weeks of work and review. Hugging Face gets new architectures faster than people can port them.
+- **Bumblebee** runs models with great accuracy on all Nx backends. But a person must port each architecture to Axon by hand, and a port takes weeks of work and review. Hugging Face gets new architectures faster than people can port them.
 - **Ortex** runs ONNX models with ONNX Runtime. But it runs outside of Nx: you cannot put it in a `defn` function, it has no Apple silicon GPU path, and it is in maintenance mode.
 - **axon_onnx** changed ONNX graphs into Axon models. It stopped in 2024. It set all shapes when it loaded a model, and many ONNX graphs need shapes that change.
 
@@ -33,7 +33,16 @@ inputs = %{
 
 run = Transmuter.compile(model, inputs, compiler: EMLX)
 %{"last_hidden_state" => hidden} = run.(inputs)
+
+# Sentence embedding: mean of the token vectors, then L2 normalization.
+mask = Nx.new_axis(inputs["attention_mask"], -1)
+embedding = Nx.sum(Nx.multiply(hidden, mask), axes: [1]) |> Nx.divide(Nx.sum(mask, axes: [1]))
+embedding = Nx.divide(embedding, Nx.LinAlg.norm(embedding, axes: [1], keep_axes: true))
 ```
+
+The export sets the names of the inputs and outputs. `model.inputs` and `model.outputs` show them. For this export, `model.outputs` is `["last_hidden_state"]`.
+
+Transmuter runs the graph that is in the file, and nothing more. The graph of all-MiniLM-L6-v2 stops at the token vectors, because sentence-transformers adds the pooling outside of the model. Thus the example above does the pooling. Bumblebee servings, such as `Bumblebee.Text.text_embedding/3`, also do the tokenization, pooling and batching for you. Transmuter has no servings yet. For tokenization, use [tokenizers](https://github.com/elixir-nx/tokenizers).
 
 `Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. For other shapes, compile again.
 
@@ -103,7 +112,7 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
 | Models requested in Bumblebee issues | 11 of 12 files match |
-| One graph for each operator variant | 60 of 60 match |
+| One graph for each operator variant | 115 of 115 match |
 
 These models do not match by position, or do not run with compilation:
 
@@ -121,7 +130,11 @@ If a case does not match, run `bench/coverage/debug_ort.py` and `bench/coverage/
 
 ## Tests
 
-`mix test` downloads five models and compares them with ONNX Runtime. `test/support/reference.py` shows the reference values. On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` runs the tests on the CPU, as the Linux CI does.
+`mix test` downloads five models and compares them with ONNX Runtime. `test/support/reference.py` shows the reference values.
+
+`mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/op_cases.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator.
+
+On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` runs the tests on the CPU, as the Linux CI does.
 
 ## License
 
