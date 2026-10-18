@@ -330,3 +330,10 @@ scan_body = helper.make_graph(
     [helper.make_tensor_value_info("sum_out", TensorProto.FLOAT, [3]), helper.make_tensor_value_info("scan_t", TensorProto.FLOAT, [3])])
 case("Scan_reverse", [node("Scan", ["init", "xs"], ["final", "ys"], body=scan_body, num_scan_inputs=1, scan_input_directions=[1], scan_output_axes=[1])],
      {"init": f32(3), "xs": f32(5, 3)})
+case("QLinearAdd_broadcast", [node("QLinearAdd", ["a", "as", "az", "b", "bs", "bz", "cs", "cz"], ["c"], domain=MS)],
+     {"a": q(2, 3, 8)}, {"as": np.array(0.02, np.float32), "az": np.array(120, np.uint8), "b": q(8), "bs": np.array(0.03, np.float32),
+                         "bz": np.array(128, np.uint8), "cs": np.array(0.04, np.float32), "cz": np.array(100, np.uint8)}, ms=True)
+s8 = lambda *shape: rng.integers(-128, 127, shape).astype(np.int8)
+case("QLinearMul_int8", [node("QLinearMul", ["a", "as", "az", "b", "bs", "bz", "cs", "cz"], ["c"], domain=MS)],
+     {"a": s8(3, 8), "b": s8(3, 8)}, {"as": np.array(0.02, np.float32), "az": np.array(-5, np.int8), "bs": np.array(0.03, np.float32),
+                                      "bz": np.array(3, np.int8), "cs": np.array(0.05, np.float32), "cz": np.array(-10, np.int8)}, ms=True)
