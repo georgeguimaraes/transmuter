@@ -443,3 +443,82 @@ case("Optional_with_value", [node("Optional", ["x"], ["o"]), node("OptionalHasEl
 case("Optional_empty", [node("Optional", [], ["o"], type=helper.make_tensor_type_proto(TensorProto.FLOAT, None)), node("OptionalHasElement", ["o"], ["has"])],
      {}, outputs=["o", "has"], eager=True, output_infos={"o": helper.make_value_info("o", optional_float)})
 case("OptionalHasElement_missing_input", [node("OptionalHasElement", [], ["has"])], {}, opset=18)
+||||||| d248a79
+
+# ---------- the seven other operators ----------
+
+r = rng_for("Upsample_nearest_opset7")
+case("Upsample_nearest_opset7", [node("Upsample", ["x"], ["y"], scales=[1.0, 1.0, 1.5, 2.5])], {"x": r.standard_normal((1, 2, 3, 4)).astype(np.float32)}, opset=7)
+r = rng_for("Upsample_linear_opset9")
+case("Upsample_linear_opset9", [node("Upsample", ["x", "scales"], ["y"], mode="linear")],
+     {"x": r.standard_normal((1, 2, 3, 4)).astype(np.float32)}, {"scales": np.array([1, 1, 2.5, 1.5], np.float32)}, opset=9)
+r = rng_for("Scatter_opset10")
+case("Scatter_opset10", [node("Scatter", ["d", "i", "u"], ["y"], axis=1)],
+     {"d": r.standard_normal((3, 5)).astype(np.float32), "u": r.standard_normal((3, 2)).astype(np.float32)},
+     {"i": np.array([[0, 4], [3, 1], [2, 0]], np.int64)}, opset=10)
+
+
+def max_pool(x, **attrs):
+    """MaxPool values and flat indices from ONNX Runtime, as MaxUnpool inputs."""
+    g = helper.make_graph([node("MaxPool", ["x"], ["y", "i"], **attrs)], "pool", [value_info("x", x)], [onnx.ValueInfoProto(name="y"), onnx.ValueInfoProto(name="i")])
+    model = helper.make_model(g, opset_imports=[helper.make_opsetid("", 22)], ir_version=10)
+    y, i = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})
+    return {"x": y, "i": i}
+
+
+r = rng_for("MaxUnpool")
+case("MaxUnpool", [node("MaxUnpool", ["x", "i"], ["y"], kernel_shape=[2, 2], strides=[2, 2])],
+     max_pool(r.standard_normal((2, 3, 4, 4)).astype(np.float32), kernel_shape=[2, 2], strides=[2, 2]))
+r = rng_for("MaxUnpool_pads")
+case("MaxUnpool_pads", [node("MaxUnpool", ["x", "i"], ["y"], kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])],
+     max_pool(r.standard_normal((2, 2, 5, 5)).astype(np.float32), kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1]))
+r = rng_for("MaxUnpool_output_shape")
+case("MaxUnpool_output_shape", [node("MaxUnpool", ["x", "i", "shape"], ["y"], kernel_shape=[2, 2], strides=[2, 2])],
+     max_pool(r.standard_normal((1, 2, 5, 5)).astype(np.float32), kernel_shape=[2, 2], strides=[2, 2]), {"shape": np.array([1, 2, 5, 5], np.int64)})
+r = rng_for("BitCast_float_to_int32")
+case("BitCast_float_to_int32", [node("BitCast", ["x"], ["y"], to=TensorProto.INT32)], {"x": r.standard_normal((3, 4)).astype(np.float32)}, opset=26)
+r = rng_for("BitCast_uint8_to_int8")
+case("BitCast_uint8_to_int8", [node("BitCast", ["x"], ["y"], to=TensorProto.INT8)], {"x": r.integers(0, 256, (3, 4)).astype(np.uint8)}, opset=26)
+r = rng_for("TensorScatter_linear")
+case("TensorScatter_linear", [node("TensorScatter", ["cache", "update", "idx"], ["y"])],
+     {"cache": r.standard_normal((2, 3, 8, 4)).astype(np.float32), "update": r.standard_normal((2, 3, 3, 4)).astype(np.float32), "idx": np.array([1, 5], np.int64)}, opset=24)
+r = rng_for("TensorScatter_no_indices")
+case("TensorScatter_no_indices", [node("TensorScatter", ["cache", "update"], ["y"])],
+     {"cache": r.standard_normal((2, 6, 3)).astype(np.float32), "update": r.standard_normal((2, 2, 3)).astype(np.float32)}, opset=24)
+r = rng_for("TensorScatter_circular_axis")
+case("TensorScatter_circular_axis", [node("TensorScatter", ["cache", "update", "idx"], ["y"], mode="circular", axis=1)],
+     {"cache": r.standard_normal((2, 6, 2, 3)).astype(np.float32), "update": r.standard_normal((2, 4, 2, 3)).astype(np.float32), "idx": np.array([4, 7], np.int64)}, opset=24)
+r = rng_for("CausalConvWithState")
+case("CausalConvWithState", [node("CausalConvWithState", ["x", "w"], ["y", "state"])],
+     {"x": r.standard_normal((2, 4, 6)).astype(np.float32)}, {"w": r.standard_normal((4, 1, 3)).astype(np.float32)}, opset=27)
+# The input is shorter than k - 1, so the present state keeps part of the past state.
+r = rng_for("CausalConvWithState_state_bias_silu")
+case("CausalConvWithState_state_bias_silu", [node("CausalConvWithState", ["x", "w", "b", "past"], ["y", "state"], activation="silu")],
+     {"x": r.standard_normal((2, 4, 2)).astype(np.float32), "past": r.standard_normal((2, 4, 3)).astype(np.float32)},
+     {"w": r.standard_normal((4, 1, 4)).astype(np.float32), "b": r.standard_normal(4).astype(np.float32)}, opset=27)
+
+
+def linear_attention(name, rule, q_heads, kv_heads, past=False, decay=None, beta=None, **attrs):
+    """decay and beta are the last dimension of those inputs, or None to leave them out."""
+    r = rng_for(name)
+    b, t, d_k, d_v = 2, 5, 4, 3
+    keys = r.standard_normal((b, t, kv_heads, d_k)).astype(np.float32)
+    keys /= np.linalg.norm(keys, axis=-1, keepdims=True)
+    inputs = {"q": r.standard_normal((b, t, q_heads * d_k)).astype(np.float32), "k": keys.reshape(b, t, -1),
+              "v": r.standard_normal((b, t, kv_heads * d_v)).astype(np.float32)}
+    if past:
+        inputs["past"] = r.standard_normal((b, kv_heads, d_k, d_v)).astype(np.float32)
+    if decay:
+        inputs["decay"] = (-r.random((b, t, decay)) * 0.5).astype(np.float32)
+    if beta:
+        inputs["beta"] = r.random((b, t, beta)).astype(np.float32)
+    names = ["q", "k", "v"] + [n if n in inputs else "" for n in ["past", "decay", "beta"]]
+    while names[-1] == "":
+        names.pop()
+    case(name, [node("LinearAttention", names, ["y", "state"], update_rule=rule, q_num_heads=q_heads, kv_num_heads=kv_heads, **attrs)], inputs, opset=27)
+
+
+linear_attention("LinearAttention_linear", "linear", 2, 2)
+linear_attention("LinearAttention_gated_key_decay_past", "gated", 2, 2, past=True, decay=2 * 4)
+linear_attention("LinearAttention_delta_gqa_scale", "delta", 4, 2, beta=1, scale=0.5)
+linear_attention("LinearAttention_gated_delta_gqa_past", "gated_delta", 4, 2, past=True, decay=2, beta=2)

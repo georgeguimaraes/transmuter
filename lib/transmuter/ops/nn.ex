@@ -1,15 +1,15 @@
 defmodule Transmuter.Ops.NN do
   @moduledoc false
 
-  # Neural network layers: convolutions, pooling, normalizations, Resize, GridSample,
-  # LRN and Dropout.
+  # Neural network layers: convolutions, pooling, unpooling, normalizations, Resize,
+  # Upsample, GridSample, LRN and Dropout.
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
                Resize GridSample Dropout LRN GlobalLpPool MeanVarianceNormalization MaxPool
-               AveragePool LpPool)
+               AveragePool LpPool Upsample MaxUnpool CausalConvWithState)
 
   @doc false
   def op_types, do: @op_types
@@ -244,7 +244,7 @@ defmodule Transmuter.Ops.NN do
 
     scales =
       if scales != nil and scales != :empty and Nx.size(scales) > 0,
-        do: Nx.to_flat_list(scales),
+        do: ints!(scales),
         else: nil
 
     sizes =
@@ -264,6 +264,69 @@ defmodule Transmuter.Ops.NN do
       {{in_size, out_size, scale}, axis}, acc ->
         resize_axis(acc, node, axis, in_size, out_size, scale)
     end)
+  end
+
+  # Upsample maps coordinates like Resize before opset 11: asymmetric, and nearest rounds
+  # down. Opset 7 has the scales as an attribute, opset 9 as an input.
+  defp op(node = %{op_type: "Upsample"}, [x | scales]) do
+    scales = List.first(scales) || static_tensor(attr(node, "scales"), :f32)
+    mode = if attr(node, "mode", "nearest") == "nearest", do: "nearest", else: "linear"
+
+    resize = %{
+      node
+      | op_type: "Resize",
+        attribute: [
+          %{name: "mode", type: :STRING, s: mode},
+          %{name: "coordinate_transformation_mode", type: :STRING, s: "asymmetric"},
+          %{name: "nearest_mode", type: :STRING, s: "floor"}
+        ]
+    }
+
+    op(resize, [x, scales])
+  end
+
+  # The indices are flat over the whole output, as MaxPool gives them.
+  defp op(node = %{op_type: "MaxUnpool"}, [x, indices | output_shape]) do
+    kernel = attr(node, "kernel_shape")
+    spatial = length(kernel)
+    strides = attr(node, "strides", List.duplicate(1, spatial))
+    pads = attr(node, "pads", List.duplicate(0, 2 * spatial))
+    [n, c | sizes] = Tuple.to_list(Nx.shape(x))
+
+    shape =
+      if s = List.first(output_shape),
+        do: ints!(s),
+        else: [
+          n,
+          c
+          | Enum.zip_with(
+              [sizes, kernel, strides, Enum.take(pads, spatial), Enum.drop(pads, spatial)],
+              fn [size, k, st, lo, hi] -> (size - 1) * st - lo - hi + k end
+            )
+        ]
+
+    Nx.tensor(0, type: Nx.type(x))
+    |> Nx.broadcast({Enum.product(shape)})
+    |> Nx.indexed_put(Nx.reshape(indices, {:auto, 1}), Nx.reshape(x, {:auto}))
+    |> Nx.reshape(List.to_tuple(shape))
+  end
+
+  # Depthwise causal Conv1d over the past state and the input. The present state is the
+  # last k - 1 positions of that sequence.
+  defp op(node = %{op_type: "CausalConvWithState"}, [x, w | rest]) do
+    [bias, past] = Enum.take(rest ++ [nil, nil], 2)
+    {b, c, _} = Nx.shape(x)
+    k = Nx.axis_size(w, 2)
+    past = past || Nx.broadcast(Nx.tensor(0, type: Nx.type(x)), {b, c, k - 1})
+    padded = Nx.concatenate([past, x], axis: 2)
+    out = padded |> Nx.conv(w, feature_group_size: c) |> add_channel_bias(bias)
+
+    out =
+      if attr(node, "activation", "none") in ["silu", "swish"],
+        do: Nx.multiply(out, Nx.sigmoid(out)),
+        else: out
+
+    [out, Nx.slice_along_axis(padded, Nx.axis_size(padded, 2) - (k - 1), k - 1, axis: 2)]
   end
 
   # 2-D GridSample: bilinear or nearest, zeros or border padding.

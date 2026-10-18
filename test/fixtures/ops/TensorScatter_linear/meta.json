@@ -1,0 +1,58 @@
+{
+ "repo": "op/TensorScatter_linear",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "TensorScatter": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "cache",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    8,
+    4
+   ]
+  },
+  {
+   "name": "update",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    3,
+    4
+   ]
+  },
+  {
+   "name": "idx",
+   "file": "in_2.bin",
+   "dtype": "s64",
+   "shape": [
+    2
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    8,
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}
