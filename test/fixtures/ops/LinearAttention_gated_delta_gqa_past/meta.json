@@ -8,7 +8,7 @@
   "LinearAttention": 1
  },
  "static_inputs": [],
- "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from test/fixtures/ops/LinearAttention_gated_delta_gqa_past/model.onnx failed",
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from model.onnx failed:/Users/cloudtest/vss/_work/1/s/onnxruntime/core/graph/",
  "inputs": [
   {
    "name": "q",

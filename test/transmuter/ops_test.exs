@@ -44,7 +44,41 @@ defmodule Transmuter.OpsTest do
 
     for spec <- meta["outputs"], not zero_size?(spec) or Map.has_key?(outputs, spec["name"]) do
       expected = read(dir, spec, Nx.BinaryBackend)
-      assert_same(spec["name"], Map.fetch!(outputs, spec["name"]), expected, meta["atol"])
+      actual = Map.fetch!(outputs, spec["name"])
+
+      if distribution = meta["distribution"],
+        do: assert_distribution(spec["name"], actual, expected, distribution),
+        else: assert_same(spec["name"], actual, expected, meta["atol"])
+    end
+  end
+
+  # Random outputs match the reference only in shape and dtype. Their statistics must be
+  # within 0.05 standard deviations (0.025 for rates), about 5 standard errors for
+  # 10,000 samples.
+  defp assert_distribution(name, actual, expected, distribution) do
+    actual = Nx.backend_copy(actual, Nx.BinaryBackend)
+    assert {Nx.shape(actual), Nx.type(actual)} == {Nx.shape(expected), Nx.type(expected)}, name
+    values = Nx.as_type(actual, :f64)
+    stat = &Nx.to_number(&1.(values))
+
+    case distribution do
+      %{"frequencies" => rows} ->
+        for {row, b} <- Enum.with_index(rows), {frequency, class} <- Enum.with_index(row) do
+          actual_frequency = values[b] |> Nx.equal(class) |> Nx.mean() |> Nx.to_number()
+          assert_in_delta actual_frequency, frequency, 0.025, "#{name}[#{b}] class #{class}"
+        end
+
+      %{"rate" => rate} ->
+        assert_in_delta stat.(&Nx.mean/1), rate, 0.025, name
+
+      %{"mean" => mean, "std" => std} ->
+        assert_in_delta stat.(&Nx.mean/1), mean, 0.05 * std, "#{name} mean"
+        assert_in_delta stat.(&Nx.standard_deviation/1), std, 0.05 * std, "#{name} std"
+
+        if low = distribution["low"] do
+          assert stat.(&Nx.reduce_min/1) >= low and stat.(&Nx.reduce_max/1) < distribution["high"],
+                 "#{name} range"
+        end
     end
   end
 

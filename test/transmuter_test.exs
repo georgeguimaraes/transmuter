@@ -226,6 +226,35 @@ defmodule TransmuterTest do
     end
   end
 
+  test "draws new random values on each call" do
+    model = load_fixture("RandomNormal_mean_scale")
+    compiled = Transmuter.compile(model, %{}, @compiler)
+    assert different?(compiled.(%{})["y"], compiled.(%{})["y"])
+
+    eager = fn -> Transmuter.run(model, model.params, %{})["y"] end
+    assert different?(eager.(), eager.())
+  end
+
+  test "draws the same values on each call from a seed" do
+    model = load_fixture("RandomNormal_seed")
+    compiled = Transmuter.compile(model, %{}, @compiler)
+    first = compiled.(%{})["y"]
+    refute different?(first, compiled.(%{})["y"])
+    refute different?(first, Transmuter.compile(model, %{}, @compiler).(%{})["y"])
+  end
+
+  test "draws different values in two random nodes" do
+    model = load_fixture("RandomUniform_two_nodes")
+    %{"a" => a, "b" => b} = Transmuter.compile(model, %{}, @compiler).(%{})
+    assert different?(a, b)
+  end
+
+  defp load_fixture(name) do
+    Transmuter.load!(Path.expand("fixtures/ops/#{name}/model.onnx", __DIR__), backend: @backend)
+  end
+
+  defp different?(a, b), do: Nx.to_number(Nx.all(Nx.equal(a, b))) == 0
+
   defp load(repo, file, opts \\ []) do
     Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
   end

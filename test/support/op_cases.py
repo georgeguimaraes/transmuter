@@ -443,7 +443,6 @@ case("Optional_with_value", [node("Optional", ["x"], ["o"]), node("OptionalHasEl
 case("Optional_empty", [node("Optional", [], ["o"], type=helper.make_tensor_type_proto(TensorProto.FLOAT, None)), node("OptionalHasElement", ["o"], ["has"])],
      {}, outputs=["o", "has"], eager=True, output_infos={"o": helper.make_value_info("o", optional_float)})
 case("OptionalHasElement_missing_input", [node("OptionalHasElement", [], ["has"])], {}, opset=18)
-||||||| d248a79
 
 # ---------- the seven other operators ----------
 
@@ -522,3 +521,33 @@ linear_attention("LinearAttention_linear", "linear", 2, 2)
 linear_attention("LinearAttention_gated_key_decay_past", "gated", 2, 2, past=True, decay=2 * 4)
 linear_attention("LinearAttention_delta_gqa_scale", "delta", 4, 2, beta=1, scale=0.5)
 linear_attention("LinearAttention_gated_delta_gqa_past", "gated_delta", 4, 2, past=True, decay=2, beta=2)
+
+# ---------- random ----------
+# Values cannot match ONNX Runtime, so ops_test.exs checks the reference shape and dtype and the
+# statistics in "distribution" over at least 10,000 samples.
+def uniform_stats(low, high):
+    return {"low": low, "high": high, "mean": (low + high) / 2, "std": (high - low) / np.sqrt(12)}
+
+
+case("RandomNormal_mean_scale", [node("RandomNormal", [], ["y"], shape=[100, 100], mean=2.0, scale=3.0)], {},
+     extra={"distribution": {"mean": 2.0, "std": 3.0}})
+case("RandomNormalLike", [node("RandomNormalLike", ["x"], ["y"], mean=-1.0, scale=0.5)],
+     {"x": rng_for("RandomNormalLike").standard_normal((4, 50, 50)).astype(np.float32)},
+     extra={"distribution": {"mean": -1.0, "std": 0.5}})
+case("RandomUniform_low_high", [node("RandomUniform", [], ["y"], shape=[100, 120], low=-2.0, high=4.0)], {},
+     extra={"distribution": uniform_stats(-2.0, 4.0)})
+case("RandomUniformLike_dtype", [node("RandomUniformLike", ["x"], ["y"], dtype=TensorProto.FLOAT)],
+     {"x": rng_for("RandomUniformLike_dtype").integers(0, 9, (100, 100)).astype(np.int32)},
+     extra={"distribution": uniform_stats(0.0, 1.0)})
+p = rng_for("Bernoulli").uniform(0, 1, (100, 100)).astype(np.float32)
+case("Bernoulli", [node("Bernoulli", ["p"], ["y"])], {"p": p}, extra={"distribution": {"rate": float(p.mean())}})
+case("Bernoulli_bool", [node("Bernoulli", ["p"], ["y"], dtype=TensorProto.BOOL)], {"p": np.full((100, 100), 0.3, np.float32)},
+     extra={"distribution": {"rate": 0.3}})
+case("RandomNormal_seed", [node("RandomNormal", [], ["y"], shape=[100, 100], seed=7.0)], {},
+     extra={"distribution": {"mean": 0.0, "std": 1.0}})
+case("RandomUniform_two_nodes", [node("RandomUniform", [], ["a"], shape=[100, 100]), node("RandomUniform", [], ["b"], shape=[100, 100])],
+     {}, outputs=["a", "b"], extra={"distribution": uniform_stats(0.0, 1.0)})
+weights = np.array([[1, 2, 3, 4], [7, 1, 1, 1]], np.float32)
+# ONNX Runtime 1.31 has Multinomial only up to opset 21, and the reference evaluator does not have it.
+case("Multinomial", [node("Multinomial", ["x"], ["y"], sample_size=10000)], {"x": np.log(weights) + np.float32(5)}, opset=21,
+     extra={"distribution": {"frequencies": (weights / weights.sum(axis=1, keepdims=True)).tolist()}})

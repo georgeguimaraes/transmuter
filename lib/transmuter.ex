@@ -19,6 +19,7 @@ defmodule Transmuter do
   alias Nx.Defn.{Compiler, Composite, Expr, Tree}
   alias Transmuter.Onnx.ModelProto
   alias Transmuter.Ops
+  alias Transmuter.Ops.Random
 
   @max_loop_iterations 100_000
 
@@ -26,6 +27,8 @@ defmodule Transmuter do
   # Large integer initializers are packed quantized weights, so they are params.
   @static_max_size 16
   @static_int_max_size 4096
+
+  @random_key "transmuter.random_key"
 
   @doc """
   Loads an ONNX model.
@@ -100,11 +103,19 @@ defmodule Transmuter do
     * `:static_inputs` - inputs known when the model compiles, see `run/4`
 
   Other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX`.
+
+  Each call of a model with random operators draws new values.
   """
   def compile(model, inputs, opts \\ []) do
     {static_inputs, opts} = Keyword.pop(opts, :static_inputs, %{})
-    fun = Nx.Defn.compile(&run(model, &1, &2, static_inputs), [model.params, inputs], opts)
-    fn inputs -> fun.(model.params, inputs) end
+
+    with_key =
+      if random?(model.nodes), do: &Map.put(&1, @random_key, random_key()), else: & &1
+
+    fun =
+      Nx.Defn.compile(&run(model, &1, &2, static_inputs), [model.params, with_key.(inputs)], opts)
+
+    fn inputs -> fun.(model.params, with_key.(inputs)) end
   end
 
   @doc """
@@ -117,9 +128,15 @@ defmodule Transmuter do
   value compiles again.
 
   Outputs that are empty are left out of the result.
+
+  Random operators draw from the `Nx.Random` key in the `"#{@random_key}"` input.
+  Without it, each call makes a new key. A function that you compile yourself makes
+  the key when it is traced, so it gives the same values on every call unless you
+  pass the key.
   """
   def run(model, params, inputs, static_inputs \\ %{}) do
-    ctx = %{opset: model.opset, compute_type: model[:compute_type]}
+    {key, inputs} = Map.pop_lazy(inputs, @random_key, &random_key/0)
+    ctx = %{opset: model.opset, compute_type: model[:compute_type], key: key}
     cast = &Map.new(&1, fn {k, t} -> {k, upcast(t, ctx.compute_type)} end)
 
     env =
@@ -211,6 +228,9 @@ defmodule Transmuter do
             node.op_type == "SequenceMap" ->
               run_sequence_map(node, inputs, env, ctx)
 
+            node.op_type in Random.op_types() ->
+              Random.apply(node, inputs, ctx.key)
+
             Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
               Nx.with_default_backend(Nx.BinaryBackend, fn ->
                 Ops.apply(node, inputs, ctx.opset)
@@ -293,6 +313,18 @@ defmodule Transmuter do
       end
 
     carried ++ stacked
+  end
+
+  # A key is two u32 words. It is on the default backend, so eager runs draw there.
+  defp random_key do
+    Nx.tensor([:rand.uniform(2 ** 32) - 1, :rand.uniform(2 ** 32) - 1], type: :u32)
+  end
+
+  defp random?(nodes) do
+    Enum.any?(nodes, fn node ->
+      node.op_type in Random.op_types() or
+        Enum.any?(node.attribute, &(&1.g != nil and random?(&1.g.node)))
+    end)
   end
 
   # On EMLX, Transmuter.EMLX keeps quantized weights packed.
