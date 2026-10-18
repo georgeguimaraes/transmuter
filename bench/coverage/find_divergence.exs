@@ -33,13 +33,21 @@ inputs =
 diverged? = fn name, t ->
   r = ref[name]
   integer? = Nx.Type.integer?(Nx.type(t))
+  # An integer sum on the binary backend is exact. EMLX has no exact f64.
+  abssum =
+    if integer?,
+      do: t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.abs() |> Nx.sum() |> Nx.to_number()
+
   t = Nx.as_type(t, :f64)
-  abssum = t |> Nx.abs() |> Nx.sum() |> Nx.to_number()
   t = t |> then(&Nx.select(Nx.is_nan(&1), 0, &1)) |> Nx.clip(-3.0e38, 3.0e38)
   flat = Nx.reshape(t, {:auto})
   idx = for k <- 0..1023, do: rem(k * 2_654_435_761, Nx.size(t))
   sample = flat |> Nx.take(Nx.tensor(idx)) |> Nx.to_flat_list()
-  diff = Enum.zip_with(sample, r["sample"], fn a, b -> if a == b, do: 0, else: abs(a - b) end) |> Enum.max()
+
+  diff =
+    Enum.zip_with(sample, r["sample"], fn a, b -> if a == b, do: 0, else: abs(a - b) end)
+    |> Enum.max()
+
   shape = Tuple.to_list(Nx.shape(t))
   sum_diff? = integer? and r["abssum"] != nil and abssum != r["abssum"]
   diff = if sum_diff?, do: max(diff, abs(abssum - r["abssum"])), else: diff
@@ -50,7 +58,11 @@ env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
 
 Enum.reduce_while(model.nodes, env, fn node, env ->
-  ins = Enum.map(node.input, fn "" -> nil; name -> Map.fetch!(env, name) end)
+  ins =
+    Enum.map(node.input, fn
+      "" -> nil
+      name -> Map.fetch!(env, name)
+    end)
 
   outs =
     cond do
@@ -58,14 +70,18 @@ Enum.reduce_while(model.nodes, env, fn node, env ->
         Transmuter.Ops.Random.apply(node, ins, key)
 
       Enum.all?(ins, &(&1 == nil or Transmuter.Ops.static?(&1))) ->
-        Nx.with_default_backend(Nx.BinaryBackend, fn -> Transmuter.Ops.apply(node, ins, model.opset) end)
+        Nx.with_default_backend(Nx.BinaryBackend, fn ->
+          Transmuter.Ops.apply(node, ins, model.opset)
+        end)
 
       true ->
         Transmuter.Ops.apply(node, ins, model.opset)
     end
 
   bad =
-    for {name, t} <- Enum.zip(node.output, outs), is_struct(t), Map.has_key?(ref, name),
+    for {name, t} <- Enum.zip(node.output, outs),
+        is_struct(t),
+        Map.has_key?(ref, name),
         {true, shape, sample, diff} <- [diverged?.(name, t)],
         do: {name, shape, sample, diff}
 
@@ -77,7 +93,12 @@ Enum.reduce_while(model.nodes, env, fn node, env ->
     Enum.zip_with(node.output, outs, fn name, t ->
       if name in overrides do
         file = Path.join(case_dir, "full_" <> String.replace(name, "/", "_") <> ".bin")
-        file |> File.read!() |> Nx.from_binary(:f32, backend: backend) |> Nx.reshape(Nx.shape(t))
+
+        file
+        |> File.read!()
+        |> Nx.from_binary(:f32, backend: backend)
+        |> Nx.reshape(Nx.shape(t))
+        |> Nx.as_type(Nx.type(t))
       else
         t
       end
@@ -92,9 +113,19 @@ Enum.reduce_while(model.nodes, env, fn node, env ->
     [{name, shape, sample, diff} | _] ->
       IO.puts("FIRST DIVERGENCE at #{node.op_type} #{node.name} -> #{name}")
       IO.puts("  ours: shape=#{inspect(shape)} sample=#{inspect(Enum.take(sample, 8))}")
-      IO.puts("  ort:  shape=#{inspect(ref[name]["shape"])} sample=#{inspect(Enum.take(ref[name]["sample"], 8))} max sample diff=#{diff}")
-      IO.puts("  attrs: #{inspect(Enum.map(node.attribute, &{&1.name, &1.i, &1.ints, &1.f, &1.s}))}")
-      IO.puts("  inputs: #{inspect(Enum.map(ins, &(&1 && (is_struct(&1) && Nx.shape(&1) || &1))))}")
+
+      IO.puts(
+        "  ort:  shape=#{inspect(ref[name]["shape"])} sample=#{inspect(Enum.take(ref[name]["sample"], 8))} max sample diff=#{diff}"
+      )
+
+      IO.puts(
+        "  attrs: #{inspect(Enum.map(node.attribute, &{&1.name, &1.i, &1.ints, &1.f, &1.s}))}"
+      )
+
+      IO.puts(
+        "  inputs: #{inspect(Enum.map(ins, &(&1 && ((is_struct(&1) && Nx.shape(&1)) || &1))))}"
+      )
+
       {:halt, env}
   end
 end)
