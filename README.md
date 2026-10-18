@@ -135,7 +135,7 @@ If a case does not match, run `bench/coverage/debug_ort.py` and `bench/coverage/
 
 `mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/op_cases.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator.
 
-On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` runs the tests on the CPU, as the Linux CI does.
+On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` uses the EMLX CPU device. But EMLX 0.5 runs compiled functions on the GPU when Metal is available, also with `device: :cpu`. Thus only the Linux CI tests the CPU fully.
 
 ## License
 
