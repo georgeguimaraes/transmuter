@@ -237,7 +237,25 @@ defmodule Transmuter.Ops do
     axis = if axis < 0, do: axis + Nx.rank(data), else: axis
     dim = Nx.axis_size(data, axis)
 
-    Nx.take(data, Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices), axis: axis)
+    indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices)
+
+    # EMLX 0.5 scatters gradients to the wrong place when the gathered axis is not 0,
+    # so other axes move to the front, gather there and move back.
+    if axis == 0 do
+      Nx.take(data, indices, axis: 0)
+    else
+      rank = Nx.rank(data)
+      front = [axis | Enum.to_list(0..(rank - 1)) -- [axis]]
+      gathered = data |> Nx.transpose(axes: front) |> Nx.take(indices, axis: 0)
+      index_rank = Nx.rank(indices)
+
+      back =
+        Enum.to_list(index_rank..(index_rank + axis - 1)//1) ++
+          Enum.to_list(0..(index_rank - 1)//1) ++
+          Enum.to_list((index_rank + axis)..(Nx.rank(gathered) - 1)//1)
+
+      Nx.transpose(gathered, axes: back)
+    end
   end
 
   # Nx has no zero-size tensors, so an empty static 1-D slice is :empty and Concat drops it.
