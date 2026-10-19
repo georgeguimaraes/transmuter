@@ -1,6 +1,6 @@
 """Prints the reference values of test/transmuter/text_test.exs and test/transmuter/vision_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses python -I test/support/pipeline_references.py
 
 Transformers 5 removed the question answering pipeline, so the script uses transformers 4.
 """
@@ -131,3 +131,13 @@ labels = ["cats", "dogs", "a remote control", "a couch"]
 for repo in ["openai/clip-vit-base-patch32", "google/siglip-base-patch16-224"]:
     classify = pipeline("zero-shot-image-classification", model=repo, image_processor=processor(repo), device="cpu")
     print(repo, [(p["label"], round(p["score"], 6)) for p in classify(image, candidate_labels=labels)])
+
+# Text-to-text: greedy, as Transmuter.Text.text_to_text/2 with strategy: :greedy.
+from transformers import AutoModelForSeq2SeqLM
+
+sentence = "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
+for repo, text in [("google-t5/t5-small", "translate English to German: The house is wonderful."), ("google-t5/t5-small", "translate English to German: " + sentence), ("Helsinki-NLP/opus-mt-en-de", sentence)]:
+    tokenizer = AutoTokenizer.from_pretrained(repo)
+    model = AutoModelForSeq2SeqLM.from_pretrained(repo)
+    output = model.generate(**tokenizer(text, return_tensors="pt"), do_sample=False, num_beams=1, max_new_tokens=64)
+    print(repo, repr(tokenizer.decode(output[0], skip_special_tokens=True)))

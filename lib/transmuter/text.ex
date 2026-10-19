@@ -164,4 +164,25 @@ defmodule Transmuter.Text do
   `:compile` does not apply to generation, which runs one input at a time. The other options are those of the module documentation.
   """
   defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
+
+  @doc """
+  Builds a serving that generates text from a source text with an encoder-decoder model, such as T5 or Marian for translation.
+
+  The input is a string, `%{text: string}` or a list of them. A map input can also have `:seed`. The result is `%{results: [%{text: text, token_summary: %{input: count, output: count, padding: count}}]}`. `padding` is the number of pad tokens that the source text gets.
+
+  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the exports of Xenova and onnx-community. The default variant is fp32. The settings come from `generation_config.json`, as in `generation/2`. The serving does not do beam search. It ignores `num_beams`.
+
+      serving = Transmuter.Text.text_to_text({:hf, "Xenova/t5-small"})
+      Nx.Serving.run(serving, "translate English to German: The house is wonderful.")
+      #=> %{results: [%{text: "Das Haus ist wunderbar.", token_summary: %{input: 11, output: 5, padding: 21}}]}
+
+  ## Options
+
+    * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits.
+
+    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty` and `:seed` - as in `generation/2`.
+
+  The other options are those of the module documentation, but `:model` does not apply.
+  """
+  defdelegate text_to_text(source, opts \\ []), to: Transmuter.Text.TextToText
 end

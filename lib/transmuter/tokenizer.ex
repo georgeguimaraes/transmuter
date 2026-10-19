@@ -49,7 +49,22 @@ defmodule Transmuter.Tokenizer do
             ~s(Transmuter.Tokenizer needs the optional tokenizers dependency, add {:tokenizers, "~> 0.5"} to your deps)
     end
 
-    {:ok, native} = Tokenizer.from_file(Hub.fetch!(repo.source, "tokenizer.json", repo.opts))
+    path = Hub.fetch!(repo.source, "tokenizer.json", repo.opts)
+
+    {:ok, native} =
+      case Hub.fetch(repo.source, "source.spm", repo.opts) do
+        {:ok, spm} ->
+          path
+          |> File.read!()
+          |> JSON.decode!()
+          |> source_model(File.read!(spm))
+          |> JSON.encode!()
+          |> Tokenizer.from_buffer()
+
+        :error ->
+          Tokenizer.from_file(path)
+      end
+
     # Exports often save a fixed padding in tokenizer.json, and encode/3 pads on its own.
     native = Tokenizer.disable_padding(native)
 
@@ -94,6 +109,69 @@ defmodule Transmuter.Tokenizer do
     do: [lowercase: Map.get(config, "do_lower_case", true)]
 
   defp canonicalize(_config), do: nil
+
+  # Marian encodes the source text with the SentencePiece model in source.spm and looks up the
+  # pieces in the shared vocabulary, as MarianTokenizer of transformers. tokenizer.json has
+  # the shared vocabulary, so its pieces get the scores and the normalizer of source.spm. A
+  # piece that source.spm does not have gets a score that the search does not pick.
+  defp source_model(json, spm) do
+    fields = protobuf(spm)
+
+    scores =
+      for {1, piece} <- fields, into: %{} do
+        %{1 => text, 2 => <<score::float-little-32>>} = Map.new(protobuf(piece))
+        {text, score}
+      end
+
+    {3, normalizer} = List.keyfind(fields, 3, 0)
+    {2, charsmap} = List.keyfind(protobuf(normalizer), 2, 0)
+
+    vocab =
+      for [piece, _score] <- json["model"]["vocab"], do: [piece, Map.get(scores, piece, -1.0e6)]
+
+    json
+    |> put_in(["model", "vocab"], vocab)
+    |> Map.put("normalizer", %{
+      "type" => "Precompiled",
+      "precompiled_charsmap" => Base.encode64(charsmap)
+    })
+  end
+
+  # The fields of a protobuf message as {number, value}. A value is an integer (varint) or the
+  # bytes of the field.
+  defp protobuf(<<>>), do: []
+
+  defp protobuf(binary) do
+    {key, rest} = varint(binary)
+
+    {value, rest} =
+      case Bitwise.band(key, 7) do
+        0 ->
+          varint(rest)
+
+        1 ->
+          <<value::binary-8, rest::binary>> = rest
+          {value, rest}
+
+        2 ->
+          {length, rest} = varint(rest)
+          <<value::binary-size(^length), rest::binary>> = rest
+          {value, rest}
+
+        5 ->
+          <<value::binary-4, rest::binary>> = rest
+          {value, rest}
+      end
+
+    [{Bitwise.bsr(key, 3), value} | protobuf(rest)]
+  end
+
+  defp varint(<<0::1, n::7, rest::binary>>), do: {n, rest}
+
+  defp varint(<<1::1, n::7, rest::binary>>) do
+    {high, rest} = varint(rest)
+    {n + Bitwise.bsl(high, 7), rest}
+  end
 
   defp special_tokens(repo) do
     for name <- @special_tokens,

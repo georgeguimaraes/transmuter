@@ -2,10 +2,12 @@ defmodule Transmuter.Serving do
   @moduledoc """
   Builds the `Nx.Serving` of a task from a model, a tokenizer or a featurizer, and the functions of the task.
 
-  The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
+  `text/7` and `image/6` build the servings that run the model once. The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
+
+  `generation/6` builds the servings that generate tokens with `Transmuter.Generation`, one input at a time.
   """
 
-  alias Transmuter.{Featurizer, Repo, Tokenizer}
+  alias Transmuter.{Featurizer, Generation, Repo, Tokenizer}
 
   @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
 
@@ -59,7 +61,7 @@ defmodule Transmuter.Serving do
     compile =
       Keyword.validate!(opts[:compile] || [],
         batch_size: 1,
-        sequence_length: lengths(repo, opts[:max_length])
+        sequence_length: sequence_lengths(repo, opts[:max_length])
       )
 
     batch_size = compile[:batch_size]
@@ -183,8 +185,68 @@ defmodule Transmuter.Serving do
     parts
   end
 
-  # Powers of 4 from 32, up to the longest input of the model.
-  defp lengths(repo, max_length) do
+  @doc """
+  Loads the repository of `source`, its encoder (`encoder_model`) and its merged decoder (`decoder_model_merged`). The default variant is fp32.
+  """
+  def load_encoder_decoder!(source, opts) do
+    repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    model_opts = Keyword.take(opts, [:backend, :compute_type])
+    encoder = Repo.load_component!(repo, "encoder_model", :fp32, model_opts)
+    decoder = Repo.load_component!(repo, "decoder_model_merged", :fp32, model_opts)
+    {repo, encoder, decoder}
+  end
+
+  @doc """
+  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`, one input at a time.
+
+  `validate` takes one input and returns `{:ok, input}` or `{:error, message}`. `preprocess` takes a valid input and returns a map of `Nx.BinaryBackend` tensors without a batch axis: the prompt of the decoder in `"prompt"`, the seed of sampling in `"seed"`, and other tensors for `init`.
+
+  `init` takes the defn options and returns a function. The serving calls `init` in its process, so it can compile models there. The function takes the map of `preprocess` with a batch axis and returns the other inputs of the decoder, such as the outputs of an encoder.
+
+  `postprocess` takes the new token ids and the map of `preprocess`, and returns the result.
+  """
+  def generation(ctx, init, validate, preprocess, postprocess, defn_options) do
+    Nx.Serving.new(
+      fn _key, defn_options ->
+        given = init.(defn_options)
+        ctx = Generation.compile(ctx, defn_options)
+
+        fn batch ->
+          inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+          {%{"prompt" => prompt, "seed" => seed}, rest} = Map.split(inputs, ["prompt", "seed"])
+          ids = Nx.to_flat_list(prompt)
+          generated = Generation.generate(ctx, ids, Nx.to_number(seed[0]), given.(rest))
+          padded = generated ++ List.duplicate(0, ctx.max_new_tokens - length(generated))
+
+          %{
+            ids: Nx.tensor([padded], type: :s64, backend: Nx.BinaryBackend),
+            length: Nx.tensor([length(generated)], backend: Nx.BinaryBackend)
+          }
+        end
+      end,
+      defn_options
+    )
+    |> Nx.Serving.batch_size(1)
+    |> Nx.Serving.client_preprocessing(fn input ->
+      {inputs, multi?} = validate!(input, validate)
+      prepared = Enum.map(inputs, preprocess)
+      {Enum.map(prepared, &Nx.Batch.stack([&1])), {multi?, prepared}}
+    end)
+    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, prepared} ->
+      results =
+        for {item, i} <- Enum.with_index(prepared) do
+          count = Nx.to_number(outputs.length[i])
+          postprocess.(outputs.ids[i] |> Nx.to_flat_list() |> Enum.take(count), item)
+        end
+
+      if multi?, do: results, else: hd(results)
+    end)
+  end
+
+  @doc """
+  The default sequence lengths of a text task: powers of 4 from 32, up to the smallest of `max_length` and the limits in `tokenizer_config.json` and `config.json`.
+  """
+  def sequence_lengths(repo, max_length) do
     max =
       [
         max_length,

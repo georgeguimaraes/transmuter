@@ -55,6 +55,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `fill_mask/2` | text with `[MASK]` | `%{predictions: [%{score: score, token: token}]}` |
 | `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
+| `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task.
 
@@ -146,6 +147,23 @@ The prompt runs in parts with a power-of-two length, and each new token is a par
 
 The serving runs one input at a time and does not stream tokens.
 
+### Translation and other text-to-text tasks
+
+```elixir
+serving = Transmuter.Text.text_to_text({:hf, "Xenova/opus-mt-en-de"})
+Nx.Serving.run(serving, "The house is wonderful.")
+```
+
+The serving runs an encoder-decoder model, such as T5 or Marian. The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`. The serving does these steps:
+
+1. It encodes the text and pads it to a length of `:compile`, as the other text tasks.
+2. It runs the encoder once.
+3. It starts the decoder from `decoder_start_token_id`. The first step of the decoder computes the cross-attention cache from the outputs of the encoder. The later steps use this cache again.
+
+T5 takes the task in the text, for example `"translate English to German: The house is wonderful."`. A Marian model translates one language pair, and its tokenizer encodes the text with `source.spm`, as `MarianTokenizer` of Python transformers.
+
+The settings of `generation_config.json` apply, as for `generation/2`. The serving does not do beam search, so it ignores `num_beams`. With `strategy: :greedy`, the text is the same as the `generate` function of transformers with `num_beams=1`.
+
 ## Images
 
 The servings of `Transmuter.Vision` take a `StbImage` struct or a tensor of shape `{height, width, channels}` of type `:u8`. To read image files, add `{:stb_image, "~> 1.0"}` to your deps:
@@ -204,7 +222,7 @@ The scores are a softmax over the labels for CLIP. For SigLIP, the scores are a 
 
 ## Options of all tasks
 
-- `:compile`: `:batch_size` (the default is 1) and, for text, `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the maximum length of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. Generation does not use this option.
+- `:compile`: `:batch_size` (the default is 1) and, for text, `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the maximum length of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. Generation does not use this option. Text-to-text uses only `:sequence_length`, for the encoder.
 - `:backend` and `:compute_type`: options of `Transmuter.load!/2`.
 - `:defn_options`: options of `Transmuter.compile/3`, such as `compiler: EMLX`.
 - `:variant` and `:cache_dir`: see above and `Transmuter.Hub`.

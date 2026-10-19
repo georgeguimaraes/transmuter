@@ -31,55 +31,20 @@ defmodule Transmuter.Text.Generation do
     {repo, model, tokenizer} = Serving.load!(source, opts, :q4, ["model", "decoder_model_merged"])
     ctx = Generation.context(repo, model, opts)
 
-    Nx.Serving.new(
-      fn _key, defn_options -> run_fun(ctx, defn_options) end,
-      opts[:defn_options]
-    )
-    |> Nx.Serving.batch_size(1)
-    |> Nx.Serving.client_preprocessing(fn input ->
-      {inputs, multi?} = validate!(input)
-
-      prompts =
-        for input <- inputs do
-          {text, special?} = prompt(repo, input, opts)
-          seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
-          ids = Nx.tensor(token_ids(tokenizer, text, special?, ctx.bos), type: :s64)
-          %{"ids" => ids, "seed" => Nx.tensor(seed, type: :s64)}
-        end
-
-      batches = Enum.map(prompts, &Nx.Batch.stack([&1]))
-      {batches, {multi?, Enum.map(prompts, &Nx.size(&1["ids"]))}}
-    end)
-    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, input_lengths} ->
-      results =
-        for {length, i} <- Enum.with_index(input_lengths) do
-          count = Nx.to_number(outputs.length[i])
-          ids = outputs.ids[i] |> Nx.to_flat_list() |> Enum.take(count)
-          summary = %{input: length, output: count, padding: 0}
-          %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
-        end
-
-      if multi?, do: results, else: hd(results)
-    end)
-  end
-
-  # The function of a batch.
-  defp run_fun(ctx, defn_options) do
-    ctx = Generation.compile(ctx, defn_options)
-
-    fn batch ->
-      %{"ids" => ids, "seed" => seed} =
-        Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-
-      ids = Nx.to_flat_list(ids)
-      generated = Generation.generate(ctx, ids, Nx.to_number(seed[0]))
-      padded = generated ++ List.duplicate(0, ctx.max_new_tokens - length(generated))
-
-      %{
-        ids: Nx.tensor([padded], type: :s64, backend: Nx.BinaryBackend),
-        length: Nx.tensor([length(generated)], backend: Nx.BinaryBackend)
-      }
+    preprocess = fn input ->
+      {text, special?} = prompt(repo, input, opts)
+      seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
+      ids = token_ids(tokenizer, text, special?, ctx.bos)
+      %{"prompt" => Nx.tensor(ids, type: :s64), "seed" => Nx.tensor(seed, type: :s64)}
     end
+
+    postprocess = fn ids, %{"prompt" => prompt} ->
+      summary = %{input: Nx.size(prompt), output: length(ids), padding: 0}
+      %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
+    end
+
+    no_inputs = fn _defn_options -> fn _inputs -> %{} end end
+    Serving.generation(ctx, no_inputs, &validate/1, preprocess, postprocess, opts[:defn_options])
   end
 
   # A chat goes through the chat template, which adds the special tokens itself.
@@ -113,15 +78,12 @@ defmodule Transmuter.Text.Generation do
     end
   end
 
-  defp validate!(inputs) when is_list(inputs), do: {Enum.map(inputs, &validate_one!/1), true}
-  defp validate!(input), do: {[validate_one!(input)], false}
+  defp validate(text) when is_binary(text), do: {:ok, %{text: text}}
+  defp validate(input = %{text: text}) when is_binary(text), do: {:ok, input}
+  defp validate(input = %{messages: [_ | _]}), do: {:ok, input}
 
-  defp validate_one!(text) when is_binary(text), do: %{text: text}
-  defp validate_one!(input = %{text: text}) when is_binary(text), do: input
-  defp validate_one!(input = %{messages: [_ | _]}), do: input
-
-  defp validate_one!(input) do
-    raise ArgumentError,
-          "expected a string, %{text: string} or %{messages: [%{role: role, content: content}]}, got: #{inspect(input)}"
+  defp validate(input) do
+    {:error,
+     "expected a string, %{text: string} or %{messages: [%{role: role, content: content}]}, got: #{inspect(input)}"}
   end
 end

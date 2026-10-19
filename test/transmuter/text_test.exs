@@ -313,6 +313,30 @@ defmodule Transmuter.TextTest do
     assert text.(1) != text.(2)
   end
 
+  test "greedy text-to-text matches transformers for T5 and Marian" do
+    sentence =
+      "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
+
+    # Marian encodes with source.spm. The vocabulary of tokenizer.json gives "▁Trans", "mut",
+    # "er" for "Transmuter", and then the translation starts with "Transmuter läuft".
+    for {repo, input, expected} <- [
+          {"Xenova/t5-small", "translate English to German: The house is wonderful.",
+           "Das Haus ist wunderbar."},
+          {"Xenova/t5-small", "translate English to German: " <> sentence,
+           "Transmuter läuft ONNX-Modelle auf jedem Nx-Backend, ohne Code für jede Architektur."},
+          {"Xenova/opus-mt-en-de", sentence,
+           "Transmuter führt ONNX-Modelle auf jedem Nx-Backend aus, ohne Code für jede Architektur."}
+        ] do
+      serving =
+        Transmuter.Text.text_to_text(
+          {:hf, repo},
+          [strategy: :greedy, max_new_tokens: 64] ++ @opts
+        )
+
+      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, input)
+    end
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 

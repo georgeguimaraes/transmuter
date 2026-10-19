@@ -102,6 +102,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Text.QuestionAnswering,
           Transmuter.Text.TextClassification,
           Transmuter.Text.TextEmbedding,
+          Transmuter.Text.TextToText,
           Transmuter.Text.TokenClassification,
           Transmuter.Text.ZeroShotClassification,
           Transmuter.Vision.ImageClassification,
