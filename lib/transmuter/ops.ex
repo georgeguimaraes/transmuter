@@ -211,15 +211,14 @@ defmodule Transmuter.Ops do
   @doc false
   def ints!({:empty, _shape}), do: []
 
-  def ints!(t) do
-    unless known?(t) do
-      raise ArgumentError,
-            "this value decides a shape but is only known when the model runs. " <>
-              "Pass the graph inputs it depends on as static_inputs, or call Transmuter.run/4 " <>
-              "without Nx.Defn.jit so values are read as the model runs"
-    end
+  def ints!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
 
-    Nx.to_flat_list(t)
+  # Every read of a tensor value on the host goes through here, so a traced value
+  # raises the one error that Transmuter.compile/3 breaks the graph on.
+  @doc false
+  def known!(value, description) do
+    unless known?(value), do: raise(Transmuter.UnknownValueError, value: description)
+    value
   end
 
   # Concrete values can be read on the host: static ones, and every tensor when the

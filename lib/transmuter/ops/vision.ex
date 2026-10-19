@@ -4,7 +4,7 @@ defmodule Transmuter.Ops.Vision do
   # Spatial operators: sampling grids, crops, patch folding, region pooling,
   # deformable convolution and image decoding. Sizes that decide output shapes must be static.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, known?: 1, static_tensor: 2]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, known!: 2, static_tensor: 2]
 
   @compile {:no_warn_undefined, StbImage}
 
@@ -135,10 +135,7 @@ defmodule Transmuter.Ops.Vision do
     max? = attr(node, "mode", "avg") == "max"
 
     # With an adaptive sampling ratio the grid size depends on each ROI, so the ROIs must be known.
-    if ratio == 0 and not Transmuter.Ops.known?(rois) do
-      raise ArgumentError,
-            "RoiAlign with sampling_ratio 0 needs static ROIs, pass them as static_inputs or run eagerly"
-    end
+    if ratio == 0, do: known!(rois, "the RoiAlign ROIs with sampling_ratio 0")
 
     count = Nx.axis_size(rois, 0)
     known = if ratio == 0, do: Nx.to_list(rois)
@@ -296,10 +293,7 @@ defmodule Transmuter.Ops.Vision do
             ~s(ImageDecoder needs the optional stb_image dependency, add {:stb_image, "~> 1.0"} to your deps)
     end
 
-    unless Transmuter.Ops.known?(encoded) do
-      raise ArgumentError,
-            "ImageDecoder decodes on the host, pass the encoded image as a static input or run eagerly"
-    end
+    known!(encoded, "the ImageDecoder input")
 
     # stb_image 1.0 returns the wrong shape when asked to convert channels, so the
     # source channels (gray, gray and alpha, RGB or RGBA) become RGB here.
@@ -328,11 +322,9 @@ defmodule Transmuter.Ops.Vision do
   defp op(node = %{op_type: "NonMaxSuppression"}, [boxes, scores | rest]) do
     [max_boxes, iou, score_threshold] = Enum.take(rest ++ [nil, nil, nil], 3)
 
-    unless Enum.all?([boxes, scores | rest], &(&1 == nil or known?(&1))) do
-      raise ArgumentError,
-            "NonMaxSuppression needs known boxes and scores, pass the graph inputs they " <>
-              "depend on as static_inputs or call Transmuter.run/4 without Nx.Defn.jit"
-    end
+    for value <- [boxes, scores | rest],
+        value != nil,
+        do: known!(value, "the NonMaxSuppression input")
 
     limit = if max_boxes, do: max(hd(ints!(max_boxes)), 0), else: 0
     iou = if iou, do: hd(Nx.to_flat_list(iou)), else: 0.0

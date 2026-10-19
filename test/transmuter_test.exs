@@ -62,7 +62,7 @@ defmodule TransmuterTest do
     %{"logits" => logits} = run(model, inputs, %{"use_cache_branch" => flag})
     assert_all_close(logits[[0, 0, 0..4]], [11.7904, 7.4783, 7.9252, 8.0604, 6.4908])
 
-    assert_raise RuntimeError, ~r/If needs a static condition/, fn ->
+    assert_raise Transmuter.UnknownValueError, ~r/the If condition is only known/, fn ->
       run(model, Map.put(inputs, "use_cache_branch", Nx.backend_copy(flag, @backend)))
     end
   end

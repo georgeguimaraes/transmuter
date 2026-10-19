@@ -11,7 +11,7 @@ defmodule Transmuter.Ops.Shape do
       dtype: 1,
       empty?: 1,
       ints!: 1,
-      known?: 1,
+      known!: 2,
       normalize_axis: 2,
       shape_of: 1,
       static_tensor: 2,
@@ -224,8 +224,7 @@ defmodule Transmuter.Ops.Shape do
           {attr(node, "pads"), attr(node, "value", 0.0), nil}
 
         [pads | more] ->
-          {ints!(pads), (Enum.at(more, 0) && Nx.to_number(Enum.at(more, 0))) || 0,
-           Enum.at(more, 1) && ints!(Enum.at(more, 1))}
+          {ints!(pads), Enum.at(more, 0) || 0, Enum.at(more, 1) && ints!(Enum.at(more, 1))}
       end
 
     rank = Nx.rank(a)
@@ -236,7 +235,7 @@ defmodule Transmuter.Ops.Shape do
     if mode == "constant" do
       Nx.pad(
         a,
-        Nx.tensor(value, type: Nx.type(a)),
+        value |> Nx.as_type(Nx.type(a)) |> Nx.reshape({}),
         Enum.map(0..(rank - 1), &Map.get(by_axis, &1, {0, 0, 0}))
       )
     else
@@ -343,7 +342,7 @@ defmodule Transmuter.Ops.Shape do
   defp op(node = %{op_type: "Trilu"}, [x | k]) do
     k =
       case k do
-        [k] when k != nil -> Nx.to_number(k)
+        [k] when k != nil -> Nx.reshape(k, {})
         _ -> 0
       end
 
@@ -358,7 +357,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "OneHot"}, [indices, depth, values]) do
-    depth = Nx.to_number(depth)
+    [depth] = depth |> known!("the OneHot depth") |> Nx.to_flat_list() |> Enum.map(&trunc/1)
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + Nx.rank(indices) + 1, else: axis
     indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, depth), indices)
@@ -386,11 +385,7 @@ defmodule Transmuter.Ops.Shape do
 
   # The output shape depends on the data, so NonZero only works on values known at trace time.
   defp op(%{op_type: "NonZero"}, [a]) do
-    unless known?(a) do
-      raise ArgumentError,
-            "NonZero needs a static input, pass the graph inputs it depends on as static_inputs"
-    end
-
+    known!(a, "the NonZero input")
     rank = Nx.rank(a)
     a = if rank == 0, do: Nx.reshape(a, {1}), else: a
 
@@ -409,10 +404,7 @@ defmodule Transmuter.Ops.Shape do
   # Slices along the axis (or values of the flattened input) are compared as lists, in
   # the same lexicographic order as ONNX Runtime.
   defp op(node = %{op_type: "Unique"}, [x]) do
-    unless known?(x) do
-      raise ArgumentError,
-            "Unique needs a static input, pass the graph inputs it depends on as static_inputs"
-    end
+    known!(x, "the Unique input")
 
     {x, axis} =
       case attr(node, "axis") do
@@ -450,10 +442,7 @@ defmodule Transmuter.Ops.Shape do
 
   # Only the condition decides the output size, so the data can be traced.
   defp op(node = %{op_type: "Compress"}, [x, condition]) do
-    unless known?(condition) do
-      raise ArgumentError,
-            "Compress needs a static condition, pass the graph inputs it depends on as static_inputs"
-    end
+    known!(condition, "the Compress condition")
 
     {x, axis} =
       case attr(node, "axis") do

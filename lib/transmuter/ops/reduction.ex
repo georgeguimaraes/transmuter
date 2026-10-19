@@ -66,14 +66,14 @@ defmodule Transmuter.Ops.Reduction do
   end
 
   defp op(node = %{op_type: "CumSum"}, [x, axis]) do
-    axis = axis |> Nx.to_number()
+    [axis] = ints!(axis)
     axis = if axis < 0, do: axis + Nx.rank(x), else: axis
     sum = Nx.cumulative_sum(x, axis: axis, reverse: attr(node, "reverse", 0) == 1)
     if attr(node, "exclusive", 0) == 1, do: Nx.subtract(sum, x), else: sum
   end
 
   defp op(node = %{op_type: "TopK"}, [x, k]) do
-    k = k |> Nx.to_flat_list() |> hd()
+    [k] = ints!(k)
     rank = Nx.rank(x)
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + rank, else: axis

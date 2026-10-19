@@ -243,6 +243,10 @@ defmodule Transmuter do
           end
           |> Enum.map(&upcast(&1, ctx.compute_type))
         rescue
+          e in Transmuter.UnknownValueError ->
+            reraise %{e | node: e.node || node.name, op_type: e.op_type || node.op_type},
+                    __STACKTRACE__
+
           e ->
             shapes =
               Enum.map(inputs, fn
@@ -263,13 +267,8 @@ defmodule Transmuter do
   end
 
   defp run_if(node, [condition], env, ctx) do
-    unless Ops.known?(condition) do
-      raise ArgumentError,
-            "If needs a static condition, pass the graph inputs it depends on as static_inputs"
-    end
-
     branch =
-      if Nx.to_number(Nx.any(condition)) == 1,
+      if Nx.to_number(Nx.any(Ops.known!(condition, "the If condition"))) == 1,
         do: Ops.attr(node, "then_branch"),
         else: Ops.attr(node, "else_branch")
 
@@ -282,14 +281,20 @@ defmodule Transmuter do
   defp run_loop(node, [trip_count, condition | initial], env, ctx) do
     body = Ops.attr(node, "body")
     [counter, condition_name | carried_names] = Enum.map(body.input, & &1.name)
-    trips = if trip_count, do: Nx.to_number(trip_count), else: @max_loop_iterations
+
+    trips =
+      if trip_count,
+        do: Nx.to_number(Ops.known!(trip_count, "the Loop trip count")),
+        else: @max_loop_iterations
+
     env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
 
     {carried, scans} =
       Enum.reduce_while(0..(trips - 1)//1, {initial, [], condition}, fn i,
                                                                         {carried, scans,
                                                                          condition} ->
-        if condition != nil and Nx.to_number(Nx.any(static!(condition, "Loop"))) == 0 do
+        if condition != nil and
+             Nx.to_number(Nx.any(Ops.known!(condition, "the Loop condition"))) == 0 do
           {:halt, {carried, scans, condition}}
         else
           step =
@@ -438,15 +443,6 @@ defmodule Transmuter do
 
   defp normalize_axis(axis, rank) when axis < 0, do: axis + rank
   defp normalize_axis(axis, _rank), do: axis
-
-  defp static!(t, op) do
-    unless Ops.known?(t) do
-      raise ArgumentError,
-            "#{op} needs a static condition, pass the graph inputs it depends on as static_inputs"
-    end
-
-    t
-  end
 
   # Some exports list nodes out of order, so sort them by data dependencies.
   defp toposort(nodes, known) do

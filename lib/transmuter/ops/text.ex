@@ -4,7 +4,7 @@ defmodule Transmuter.Ops.Text do
   # String operators and TfIdfVectorizer. They run on the host, so a numeric
   # TfIdfVectorizer input must be known: static, or read while the model runs eagerly.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1, known?: 1, static_tensor: 2]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1, known!: 2, static_tensor: 2]
 
   @op_types ~w(StringNormalizer StringConcat StringSplit RegexFullMatch TfIdfVectorizer)
 
@@ -165,13 +165,7 @@ defmodule Transmuter.Ops.Text do
   defp host_values({:strings, shape, values}), do: {shape, values}
 
   defp host_values(x) do
-    unless known?(x) do
-      raise ArgumentError,
-            "TfIdfVectorizer reads its input on the host. Pass the graph inputs it depends on " <>
-              "as static_inputs, or call Transmuter.run/4 without Nx.Defn.jit"
-    end
-
-    {Nx.shape(x), Nx.to_flat_list(x)}
+    {Nx.shape(x), x |> known!("the TfIdfVectorizer input") |> Nx.to_flat_list()}
   end
 
   # The pool lists the 1-grams, then the 2-grams and so on. ngram_counts gives the start
