@@ -69,6 +69,19 @@ defmodule Transmuter.Ops do
     "RoiAlign" => [0, 1, 2]
   }
 
+  # The f16 value of each FP8 byte, by ONNX type. FLOAT8E5M2 (19) is the high byte of an
+  # f16. Nx decodes FLOAT8E4M3FN (17) correctly, but not the subnormals of E5M2.
+  @fp8_to_f16 %{
+    17 =>
+      Nx.iota({256}, type: :u8, backend: Nx.BinaryBackend)
+      |> Nx.bitcast(:f8_e4m3fn)
+      |> Nx.as_type(:f16)
+      |> Nx.to_binary()
+      |> then(&for(<<value::binary-2 <- &1>>, do: value))
+      |> List.to_tuple(),
+    19 => List.to_tuple(for b <- 0..255, do: <<b * 256::16-native>>)
+  }
+
   defp dispatch(node, inputs, opset) do
     empty_outputs(node, inputs) || dispatch_op(node, inputs, opset)
   end
@@ -437,6 +450,22 @@ defmodule Transmuter.Ops do
     |> Nx.reshape(List.to_tuple(outer ++ [div(last + 1, 2)]))
   end
 
+  # FP8 data loads as f16, which holds every FLOAT8E4M3FN and FLOAT8E5M2 value exactly.
+  # A table maps each byte to its f16 value. Without raw data, int32_data holds one byte
+  # in each element.
+  defp tensor_data(t = %{data_type: dt, dims: dims}, _dir) when is_map_key(@fp8_to_f16, dt) do
+    table = @fp8_to_f16[dt]
+
+    bytes =
+      if t.raw_data in [nil, ""],
+        do: for(b <- t.int32_data, into: <<>>, do: <<b>>),
+        else: t.raw_data
+
+    for(<<b <- bytes>>, into: <<>>, do: elem(table, b))
+    |> Nx.from_binary(:f16, backend: Nx.BinaryBackend)
+    |> Nx.reshape(List.to_tuple(dims))
+  end
+
   defp tensor_data(t = %{raw_data: raw, data_type: dt, dims: dims}, _dir) do
     type = dtype(dt)
 
@@ -466,4 +495,9 @@ defmodule Transmuter.Ops do
   def dtype(10), do: :f16
   def dtype(11), do: :f64
   def dtype(16), do: :bf16
+
+  def dtype(dt) when dt in 17..20 do
+    raise ArgumentError,
+          "Transmuter loads FP8 tensors as f16, but it cannot compute FP8 values (ONNX type #{dt})"
+  end
 end

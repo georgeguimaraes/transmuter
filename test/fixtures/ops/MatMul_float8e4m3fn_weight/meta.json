@@ -1,0 +1,37 @@
+{
+ "repo": "op/MatMul_float8e4m3fn_weight",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Cast": 1,
+  "Mul": 1,
+  "MatMul": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    8
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ]
+  }
+ ],
+ "ort_ok": true
+}

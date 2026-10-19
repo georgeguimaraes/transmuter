@@ -896,3 +896,17 @@ case("Pow_integer_base_float_exponent",
       node("Concat", ["batch", "side", "side", "channels"], ["target"], axis=0), node("Reshape", ["x", "target"], ["y"])],
      {"x": rf32(2, 16, 3)}, {"half": np.array(0.5, np.float32), "batch": np.array([2], np.int64), "channels": np.array([3], np.int64)})
 case("Shape_negative_start_end_past_rank", [node("Shape", ["x"], ["y"], start=-2, end=10)], {"x": rf32(2, 3, 4)})
+
+# ---------- FP8 weights ----------
+
+# Every byte of each FP8 type, with subnormals, NaN and the largest values, cast to f32.
+import ml_dtypes
+r = rng_for("FP8 weights")
+for name, fp8 in [("float8e4m3fn", ml_dtypes.float8_e4m3fn), ("float8e5m2", ml_dtypes.float8_e5m2)]:
+    case(f"Cast_{name}_all_bytes", [node("Cast", ["w"], ["y"], to=TensorProto.FLOAT)], {},
+         {"w": np.arange(256, dtype=np.uint8).view(fp8).reshape(16, 16)}, opset=21)
+# A weight-only FP8 matmul as FP8 checkpoints make it: the weight is dequantized with a scale.
+fp8_weight = (r.standard_normal((8, 6)) * 4).astype(ml_dtypes.float8_e4m3fn)
+case("MatMul_float8e4m3fn_weight",
+     [node("Cast", ["w"], ["w_f"], to=TensorProto.FLOAT), node("Mul", ["w_f", "scale"], ["w_s"]), node("MatMul", ["x", "w_s"], ["y"])],
+     {"x": r.standard_normal((3, 8)).astype(np.float32)}, {"w": fp8_weight, "scale": np.array(0.05, np.float32)}, opset=21)
