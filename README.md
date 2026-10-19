@@ -1,6 +1,6 @@
 # Transmuter ⚗️
 
-Transmuter runs Hugging Face ONNX models on any Nx backend, with no per-architecture code. Use EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
+Transmuter runs Hugging Face [ONNX](https://onnx.ai) models on any Nx backend, with no per-architecture code. Use EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
 
 The goal of Transmuter is to implement the ONNX operators in Nx. Then ONNX models run without model code.
 
