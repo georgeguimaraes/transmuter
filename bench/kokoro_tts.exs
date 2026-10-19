@@ -99,7 +99,9 @@ inputs = fn speed ->
   }
 end
 
-speak = Transmuter.compile(model, inputs.(1.0), compiler: EMLX)
+# Each 200 ms bucket compiles its own decoder. Keep 64 of them, which covers texts of
+# up to about 13 s of audio, so that common lengths do not compile again.
+speak = Transmuter.compile(model, inputs.(1.0), compiler: EMLX, cache_size: 64)
 
 # Other speeds give other lengths. Lengths in one 200 ms bucket reuse one compiled decoder.
 for speed <- [1.0, 1.05, 1.1, 1.0, 1.05, 1.1] do
