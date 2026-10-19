@@ -2,6 +2,8 @@
 
 This guide explains how to run a decoder language model with a static key-value (KV) cache, and how to run quantized ONNX exports.
 
+To generate text without the details of this guide, use `Transmuter.Text.generation/2`. It does the tokenization, the chat template, the KV cache and the sampling. See the [Pipelines guide](pipelines.md). This guide is for the work that the serving does not do, or to control each step.
+
 ## How decoder exports work
 
 Hugging Face exporters produce one or more ONNX files for a decoder model:

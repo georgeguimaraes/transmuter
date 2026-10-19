@@ -103,9 +103,9 @@ run = Transmuter.compile(model, inputs, compiler: EXLA, client: :cuda)
 
 ## What Transmuter does and does not do
 
-Transmuter runs the graph that is in the ONNX file, and nothing more. If the graph stops at the token vectors (as in the MiniLM export above), the pooling step is not in the file and you must do it yourself. Bumblebee servings do the tokenization, pooling, and batching for you. Transmuter has no servings.
+Transmuter runs the graph that is in the ONNX file, and nothing more. If the graph stops at the token vectors (as in the MiniLM export above), the pooling step is not in the file and you must do it yourself.
 
-For tokenization, use [tokenizers](https://hex.pm/packages/tokenizers).
+For text models, the servings of `Transmuter.Text` do the tokenization, the pooling and the batching for you. See the [Pipelines guide](pipelines.md).
 
 If a model has no ONNX file on Hugging Face, export it once with [Optimum](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model):
 

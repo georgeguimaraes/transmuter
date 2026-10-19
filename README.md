@@ -26,6 +26,27 @@ When a model has no ONNX file on Hugging Face, export it one time with [Optimum]
 
 ## Example
 
+`Transmuter.Text` gives servings that take text, as in Bumblebee. A serving loads the ONNX file, the tokenizer and the configuration of a Hugging Face repository, and returns an `Nx.Serving`:
+
+```elixir
+opts = [backend: EMLX.Backend, defn_options: [compiler: EMLX]]
+
+serving = Transmuter.Text.text_embedding({:hf, "Xenova/all-MiniLM-L6-v2"}, opts)
+Nx.Serving.run(serving, "The cat sat on the mat.")
+#=> %{embedding: #Nx.Tensor<f32[384] ...>}
+
+serving = Transmuter.Text.generation({:hf, "onnx-community/Qwen3-0.6B-ONNX"}, opts)
+Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capital of France?"}], seed: 7})
+#=> %{results: [%{text: "<think>\n...</think>\n\nThe capital of France is **Paris, France**.",
+#=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
+```
+
+The text tasks are `text_embedding`, `text_classification`, `token_classification`, `fill_mask` and `generation`. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. See the [Pipelines guide](guides/pipelines.md).
+
+## Tensors
+
+For a model that has no serving, give tensors to the graph:
+
 ```elixir
 model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"}, backend: EMLX.Backend)
 
@@ -46,7 +67,7 @@ embedding = Nx.divide(embedding, Nx.LinAlg.norm(embedding, axes: [1], keep_axes:
 
 The export sets the names of the inputs and outputs. `model.inputs` and `model.outputs` show them. For this export, `model.outputs` is `["last_hidden_state"]`.
 
-Transmuter runs the graph that is in the file, and nothing more. The graph of all-MiniLM-L6-v2 stops at the token vectors, because sentence-transformers adds the pooling outside of the model. Thus the example above does the pooling. Bumblebee servings, such as `Bumblebee.Text.text_embedding/3`, also do the tokenization, pooling and batching for you. Transmuter has no servings yet. For tokenization, use [tokenizers](https://github.com/elixir-nx/tokenizers).
+Transmuter runs the graph that is in the file, and nothing more. The graph of all-MiniLM-L6-v2 stops at the token vectors, because sentence-transformers adds the pooling outside of the model. Thus the example above does the pooling. `Transmuter.Text.text_embedding/2` does the tokenization, the pooling and the batching for you.
 
 `Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. The function that it returns also takes inputs of other shapes: it compiles them on their first call, and keeps the most recently used shapes compiled. The `:cache_size` option sets how many, and the default is 8.
 
@@ -69,12 +90,13 @@ The example also fixes one node of the export. The export computes the STFT phas
 def deps do
   [
     {:transmuter, "~> 0.1"},
-    {:emlx, "~> 0.5"}
+    {:emlx, "~> 0.5"},
+    {:tokenizers, "~> 0.5"}
   ]
 end
 ```
 
-Use EXLA instead of EMLX for CUDA.
+Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. Chat templates need `minijinja_ex` with its Hugging Face compatibility, which is not released yet: add `{:minijinja_ex, github: "georgeguimaraes/minijinja_ex", branch: "feat/chat-template-compat"}` and set `MINIJINJA_EX_BUILD=1` to build it.
 
 ## Compilation and graph breaks
 
