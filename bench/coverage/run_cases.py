@@ -27,7 +27,11 @@ for slug in sorted(os.listdir(cases_dir)):
     if not os.path.exists(meta_path):
         continue
     meta = json.load(open(meta_path))
-    if not meta.get("ort_ok") or missing_ops(meta):
+    if not meta.get("ort_ok"):
+        print("skip", meta["repo"], meta["file"], "(ONNX Runtime failed)", flush=True)
+        continue
+    if missing_ops(meta):
+        print("skip", meta["repo"], meta["file"], "(missing ops: " + ", ".join(missing_ops(meta)) + ")", flush=True)
         continue
     if os.path.exists(result_path) and not rerun:
         continue
