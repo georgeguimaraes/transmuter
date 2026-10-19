@@ -110,7 +110,7 @@ defmodule Transmuter do
   defp read!(path, opts) do
     dir = Path.dirname(path)
     model = ModelProto.decode!(File.read!(path))
-    graph = model.graph
+    graph = inline_external(model.graph, dir)
 
     trainable = Keyword.get(opts, :trainable, false)
 
@@ -135,6 +135,35 @@ defmodule Transmuter do
     }
 
     if backend = opts[:backend], do: %{model | params: move_params(model, backend)}, else: model
+  end
+
+  # Tensors in node attributes, such as the value of a Constant, and the initializers of
+  # subgraphs can also keep their data in the external file. Only the loader knows the
+  # directory of that file, so it reads them here, and every operator gets plain tensors.
+  # The initializers of the main graph stay external, because the loader reads them once.
+  defp inline_external(graph, dir) do
+    node =
+      Enum.map(graph.node, fn node ->
+        attribute =
+          Enum.map(node.attribute, fn a ->
+            %{
+              a
+              | t: a.t && Ops.read_external(a.t, dir),
+                tensors: Enum.map(a.tensors, &Ops.read_external(&1, dir)),
+                g: a.g && inline_subgraph(a.g, dir),
+                graphs: Enum.map(a.graphs, &inline_subgraph(&1, dir))
+            }
+          end)
+
+        %{node | attribute: attribute}
+      end)
+
+    %{graph | node: node}
+  end
+
+  defp inline_subgraph(graph, dir) do
+    graph = inline_external(graph, dir)
+    %{graph | initializer: Enum.map(graph.initializer, &Ops.read_external(&1, dir))}
   end
 
   @doc """

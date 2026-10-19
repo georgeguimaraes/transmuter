@@ -422,15 +422,7 @@ defmodule Transmuter.Ops do
   @doc false
   def tensor(t, dir \\ nil)
 
-  def tensor(t = %{data_location: :EXTERNAL, external_data: entries}, dir) do
-    entries = Map.new(entries, &{&1.key, &1.value})
-    path = Path.join(dir, entries["location"])
-    offset = String.to_integer(entries["offset"] || "0")
-    {:ok, file} = :file.open(path, [:read, :raw, :binary])
-    {:ok, raw} = :file.pread(file, offset, String.to_integer(entries["length"]))
-    :ok = :file.close(file)
-    tensor(%{t | data_location: :DEFAULT, raw_data: raw}, dir)
-  end
+  def tensor(t = %{data_location: :EXTERNAL}, dir), do: t |> read_external(dir) |> tensor(dir)
 
   def tensor(%{dims: dims} = t, dir) when dims != [] do
     if 0 in dims, do: {:empty, List.to_tuple(dims)}, else: tensor_data(t, dir)
@@ -480,6 +472,20 @@ defmodule Transmuter.Ops do
 
     Nx.reshape(flat, List.to_tuple(dims))
   end
+
+  # Reads the data of a tensor that keeps it in a file next to the model.
+  @doc false
+  def read_external(t = %{data_location: :EXTERNAL, external_data: entries}, dir) do
+    entries = Map.new(entries, &{&1.key, &1.value})
+    path = Path.join(dir, entries["location"])
+    offset = String.to_integer(entries["offset"] || "0")
+    {:ok, file} = :file.open(path, [:read, :raw, :binary])
+    {:ok, raw} = :file.pread(file, offset, String.to_integer(entries["length"]))
+    :ok = :file.close(file)
+    %{t | data_location: :DEFAULT, external_data: [], raw_data: raw}
+  end
+
+  def read_external(t, _dir), do: t
 
   @doc false
   def dtype(4), do: :u16

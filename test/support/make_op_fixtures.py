@@ -47,11 +47,12 @@ def value_info(name, v):
 
 
 def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=False, static=(), eager=False, atol=None,
-         output_infos=None, extra=None):
+         output_infos=None, extra=None, external=False):
     """inputs/initializers: dict name -> value. A value is an array (a string array for STRING tensors) or a
     list of arrays (a sequence). outputs: list of names (defaults to last node outputs). output_infos: dict
     name -> ValueInfoProto for outputs that need a type, such as optionals. eager: the test runs the model
-    without compiling. atol: an absolute tolerance instead of the default one. extra: more meta.json keys."""
+    without compiling. atol: an absolute tolerance instead of the default one. extra: more meta.json keys.
+    external: every tensor, also in attributes and subgraphs, keeps its data in model.onnx_data."""
     initializers = initializers or {}
     outputs = outputs or [o for o in nodes[-1].output if o]
     output_infos = output_infos or {}
@@ -67,7 +68,11 @@ def case(name, nodes, inputs, initializers=None, outputs=None, opset=23, ms=Fals
     path = os.path.join(cases_dir, name)
     os.makedirs(path, exist_ok=True)
     onnx_path = os.path.join(path, "model.onnx")
-    onnx.save(model, onnx_path)
+    if external:
+        onnx.save_model(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
+                        location="model.onnx_data", size_threshold=0, convert_attribute=True)
+    else:
+        onnx.save(model, onnx_path)
     meta = {"repo": "op/" + name, "task": "op", "file": "model.onnx", "onnx_path": "model.onnx", "unoptimized_ref": True,
             "ops": dict(Counter((f"{n.domain}:" if n.domain else "") + n.op_type for n in nodes)), "static_inputs": list(static)}
     if eager:
@@ -910,3 +915,18 @@ fp8_weight = (r.standard_normal((8, 6)) * 4).astype(ml_dtypes.float8_e4m3fn)
 case("MatMul_float8e4m3fn_weight",
      [node("Cast", ["w"], ["w_f"], to=TensorProto.FLOAT), node("Mul", ["w_f", "scale"], ["w_s"]), node("MatMul", ["x", "w_s"], ["y"])],
      {"x": r.standard_normal((3, 8)).astype(np.float32)}, {"w": fp8_weight, "scale": np.array(0.05, np.float32)}, opset=21)
+
+# ---------- external data in attributes and subgraphs ----------
+
+# Exporters can put Constant values and subgraph initializers in the external data file too.
+r = rng_for("external data in attributes and subgraphs")
+rf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+case("Constant_external_data",
+     [node("Constant", [], ["c"], value=numpy_helper.from_array(rf32(2, 3), "c_value")), node("Add", ["x", "c"], ["y"])],
+     {"x": rf32(2, 3)}, external=True)
+branch = lambda name: helper.make_graph(
+    [node("Constant", [], ["k"], value=numpy_helper.from_array(rf32(3), name + "_k")), node("Mul", ["k", name + "_w"], ["out"])],
+    name, [], [helper.make_tensor_value_info("out", TensorProto.FLOAT, [3])], [numpy_helper.from_array(rf32(3), name + "_w")])
+case("If_external_data_in_branches",
+     [node("If", ["cond"], ["b"], then_branch=branch("then"), else_branch=branch("else")), node("Add", ["x", "b"], ["y"])],
+     {"x": rf32(3)}, {"cond": np.array(True)}, external=True)
