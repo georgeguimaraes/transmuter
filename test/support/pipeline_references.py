@@ -1,6 +1,6 @@
-"""Prints the reference values of test/transmuter/text_test.exs, from the pipelines of Python transformers and sentence-transformers.
+"""Prints the reference values of test/transmuter/text_test.exs and test/transmuter/vision_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf python -I test/support/pipeline_references.py
 
 Transformers 5 removed the question answering pipeline, so the script uses transformers 4.
 """
@@ -92,3 +92,42 @@ for _ in range(12):
     past = {name.replace("present", "past_key_values"): value for name, value in outputs.items() if name.startswith("present")}
     step = tokens[-1:]
 print("gemma3", repr(tokenizer.decode(tokens, skip_special_tokens=True)))
+
+# Vision, on test/fixtures/cats.png, a 320x240 copy of the COCO image
+# http://images.cocodataset.org/val2017/000000039769.jpg. PNG decoders give the same pixels,
+# so the inputs of Python and Transmuter are equal. The image processors are the slow ones,
+# which use Pillow, as Transmuter does. The fast ones use torchvision and differ by up to one
+# step of 1/255 before normalization.
+from PIL import Image
+from transformers import AutoImageProcessor, CLIPVisionModelWithProjection
+
+image = Image.open("test/fixtures/cats.png")
+processor = lambda repo: AutoImageProcessor.from_pretrained(repo, use_fast=False)  # noqa: E731
+
+# pixel_values[0] at (channel, y, x), and the mean of the absolute values. ViT resizes to
+# 224x224, CLIP resizes the short side to 224 and crops the center.
+positions = [(0, 0, 0), (1, 100, 37), (2, 223, 223), (0, 57, 190), (1, 150, 120)]
+for repo in ["google/vit-base-patch16-224", "openai/clip-vit-base-patch32"]:
+    values = processor(repo)(image, return_tensors="np")["pixel_values"][0]
+    print(repo, "pixel_values", [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+
+for repo in ["google/vit-base-patch16-224", "facebook/convnext-tiny-224"]:
+    classify = pipeline("image-classification", model=repo, image_processor=processor(repo), device="cpu")
+    print(repo, [(p["label"], round(p["score"], 6)) for p in classify(image, top_k=5)])
+
+clip = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+embedding = clip(**processor("openai/clip-vit-base-patch32")(image, return_tensors="pt")).image_embeds[0].detach().numpy()
+print("clip image_embeds", [round(float(x), 4) for x in embedding[:4]], round(float(np.linalg.norm(embedding)), 4))
+
+# The DINOv2 export interpolates the position embeddings in another way than transformers
+# does now, so its reference is ONNX Runtime: the first token of last_hidden_state.
+directory = snapshot_download("Xenova/dinov2-small", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+pixel_values = processor("facebook/dinov2-small")(image, return_tensors="np")["pixel_values"]
+cls = session.run(None, {"pixel_values": pixel_values})[0][0, 0]
+print("dinov2 onnxruntime", [round(float(x), 4) for x in cls[:4]], round(float(np.linalg.norm(cls)), 4))
+
+labels = ["cats", "dogs", "a remote control", "a couch"]
+for repo in ["openai/clip-vit-base-patch32", "google/siglip-base-patch16-224"]:
+    classify = pipeline("zero-shot-image-classification", model=repo, image_processor=processor(repo), device="cpu")
+    print(repo, [(p["label"], round(p["score"], 6)) for p in classify(image, candidate_labels=labels)])

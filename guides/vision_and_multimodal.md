@@ -1,51 +1,45 @@
 # Vision and Multimodal
 
-This guide shows how to run image classification, zero-shot image-text models, and vision-language model pipelines with Transmuter.
+This guide shows how to run image models, zero-shot image-text models, and vision-language model pipelines with Transmuter.
+
+## Servings
+
+For image classification, image embeddings and zero-shot image classification, use the servings of `Transmuter.Vision`. They prepare the images, make the batches and do the steps after the model, such as softmax. Their results match the pipelines of Python transformers. See the [Pipelines guide](pipelines.md).
+
+```elixir
+opts = [backend: EMLX.Backend, defn_options: [compiler: EMLX]]
+image = StbImage.read_file!("cats.jpg")
+
+serving = Transmuter.Vision.image_classification({:hf, "Xenova/vit-base-patch16-224"}, opts)
+Nx.Serving.run(serving, image)
+#=> %{predictions: [%{label: "Egyptian cat", score: 0.94}, ...]}
+
+labels = ["cats", "dogs"]
+serving = Transmuter.Vision.zero_shot_image_classification({:hf, "Xenova/clip-vit-base-patch32"}, labels, opts)
+Nx.Serving.run(serving, image)
+```
+
+The other sections of this guide show how to run models that do not have a serving.
 
 ## Image preprocessing
 
 Most vision models expect a float tensor of shape `{batch, channels, height, width}` with normalized pixel values. The preprocessing steps (resize, crop, rescale, normalize) are not in the ONNX file. You must do them before you give the tensor to the model.
 
-Each model gives its preprocessing in `preprocessor_config.json`. The values differ between models. For example, ViT uses a mean and std of `0.5`, CLIP uses `[0.4815, 0.4578, 0.4082]` and `[0.2686, 0.2613, 0.2758]`, and mobileclip does not normalize. Read the file with `Transmuter.Hub.json/3`:
+Each model gives its preprocessing in `preprocessor_config.json`. The values differ between models. For example, ViT uses a mean and std of `0.5`, CLIP uses `[0.4815, 0.4578, 0.4082]` and `[0.2686, 0.2613, 0.2758]`, and mobileclip does not normalize.
+
+`Transmuter.Featurizer` reads this file and does the steps as the image processors of Python transformers do:
 
 ```elixir
-source = {:hf, "Xenova/vit-base-patch16-224"}
-config = Transmuter.Hub.json(source, "preprocessor_config.json")
-# %{"size" => %{"height" => 224, "width" => 224}, "rescale_factor" => 0.00392156862745098,
-#   "image_mean" => [0.5, 0.5, 0.5], "image_std" => [0.5, 0.5, 0.5], "do_normalize" => true, ...}
+featurizer = Transmuter.Featurizer.load!({:hf, "Xenova/vit-base-patch16-224"})
+pixel_values = Transmuter.Featurizer.process(featurizer, [image], backend: EMLX.Backend)
+# Shape: {1, 3, 224, 224}, type :f32.
 ```
 
-Use [StbImage](https://hex.pm/packages/stb_image) to load the image and resize it to `size`:
-
-```elixir
-%{"height" => height, "width" => width} = config["size"]
-
-pixel_values =
-  "image.jpg"
-  |> StbImage.read_file!(channels: 3)
-  |> StbImage.resize(height, width)
-  |> StbImage.to_nx()
-  # {height, width, 3} -> {1, 3, height, width}
-  |> Nx.transpose(axes: [2, 0, 1])
-  |> Nx.new_axis(0)
-  |> Nx.as_type(:f32)
-  |> Nx.multiply(config["rescale_factor"])
-
-pixel_values =
-  if config["do_normalize"] do
-    mean = config["image_mean"] |> Nx.tensor() |> Nx.reshape({1, 3, 1, 1})
-    std = config["image_std"] |> Nx.tensor() |> Nx.reshape({1, 3, 1, 1})
-    pixel_values |> Nx.subtract(mean) |> Nx.divide(std)
-  else
-    pixel_values
-  end
-```
-
-Some models give `size` as `%{"shortest_edge" => n}` and a `crop_size`. For these models, resize so that the short side is `n` and keep the aspect ratio. Then take the center `crop_size` region.
+The resize of the featurizer gives the same pixels as Pillow. `StbImage.resize/3` uses other filters. On a test image, its pixels differ from Pillow by 0.6 to 1.4 steps of 1/255 on average, and by up to 36 steps. These differences change the scores of the model.
 
 ## Image classification
 
-Run a ViT model on an image:
+Run a ViT model on the pixel values:
 
 ```elixir
 model = Transmuter.load!(
@@ -63,7 +57,7 @@ logits = outputs["logits"]
 
 [CLIP](https://huggingface.co/Xenova/mobileclip_s0) encodes images and text into a shared embedding space. Zero-shot classification compares the image embedding with the text embeddings of candidate labels.
 
-The mobileclip export has two ONNX files: `vision_model.onnx` and `text_model.onnx`. Load them separately:
+`Transmuter.Vision.zero_shot_image_classification/3` needs `model.onnx`, which has both towers and the logit scale of the model. The mobileclip export has only two ONNX files: `vision_model.onnx` and `text_model.onnx`. Load them separately:
 
 ```elixir
 vision_model = Transmuter.load!(

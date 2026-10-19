@@ -1,6 +1,6 @@
 # Pipelines
 
-This guide shows how to run text models with the servings of `Transmuter.Text`. A serving takes text and gives results. It does the tokenization, the batching and the steps after the model, such as pooling and softmax.
+This guide shows how to run text models with the servings of `Transmuter.Text`, and image models with the servings of `Transmuter.Vision`. A serving takes text or images and gives results. It does the tokenization or the image preprocessing, the batching and the steps after the model, such as pooling and softmax.
 
 ## Installation
 
@@ -146,13 +146,69 @@ The prompt runs in parts with a power-of-two length, and each new token is a par
 
 The serving runs one input at a time and does not stream tokens.
 
+## Images
+
+The servings of `Transmuter.Vision` take a `StbImage` struct or a tensor of shape `{height, width, channels}` of type `:u8`. To read image files, add `{:stb_image, "~> 1.0"}` to your deps:
+
+```elixir
+image = StbImage.read_file!("cats.jpg")
+```
+
+| Function | Input | Result |
+|---|---|---|
+| `image_classification/2` | image | `%{predictions: [%{label: label, score: score}]}` |
+| `image_embedding/2` | image | `%{embedding: tensor}` |
+| `zero_shot_image_classification/3` | image | `%{predictions: [%{label: label, score: score}]}` |
+
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4.
+
+### Image preprocessing
+
+`Transmuter.Featurizer` reads `preprocessor_config.json` and prepares the images as the image processors of Python transformers do. It converts the image to RGB, resizes it, crops the center, rescales the values and normalizes them. The result is a tensor of shape `{batch, 3, height, width}` and type `:f32`.
+
+The resize gives the same pixels as Pillow, for all `resample` filters of Pillow. With the hamming filter, a small number of pixels can differ by 1. The scores of a model change when the pixels change, so this match is important. The serving resizes on the `:backend` of the task, because the resize is slow on `Nx.BinaryBackend`.
+
+The serving compiles the model for one image size, which comes from `size` or `crop_size` in `preprocessor_config.json`. The serving raises an error when the size depends on the image, for example with `shortest_edge` and no crop.
+
+### Image classification
+
+```elixir
+serving = Transmuter.Vision.image_classification({:hf, "Xenova/vit-base-patch16-224"})
+Nx.Serving.run(serving, image)
+#=> %{predictions: [%{label: "Egyptian cat", score: 0.94}, ...]}
+```
+
+The labels come from `id2label` in `config.json`.
+
+### Image embeddings
+
+```elixir
+serving = Transmuter.Vision.image_embedding({:hf, "Xenova/clip-vit-base-patch32"})
+%{embedding: embedding} = Nx.Serving.run(serving, image)
+```
+
+For CLIP and SigLIP, the serving uses `vision_model.onnx`, and the embedding is the `image_embeds` output. For other models, the embedding is `pooler_output`, or else the first token of `last_hidden_state`. Set `embedding_processor: :l2_norm` to normalize the embedding.
+
+### Zero-shot image classification
+
+```elixir
+labels = ["cats", "dogs", "a remote control"]
+serving = Transmuter.Vision.zero_shot_image_classification({:hf, "Xenova/clip-vit-base-patch32"}, labels)
+Nx.Serving.run(serving, image)
+#=> %{predictions: [%{label: "cats", score: 0.98}, ...]}
+```
+
+The serving uses `model.onnx`, which has the text tower, the image tower, and the logit scale and bias of the model. `vision_model.onnx` and `text_model.onnx` do not have the logit scale and bias. Each label goes into the template `"This is a photo of {}."`, as in Python transformers. Use `:hypothesis_template` to change it.
+
+The scores are a softmax over the labels for CLIP. For SigLIP, the scores are a sigmoid of each label, so they do not add up to 1. The SigLIP tokenizer also removes the punctuation of the text and makes it lowercase, as in Python transformers.
+
 ## Options of all tasks
 
-- `:compile`: `:batch_size` (the default is 1) and `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the maximum length of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. Generation does not use this option.
+- `:compile`: `:batch_size` (the default is 1) and, for text, `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the maximum length of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. Generation does not use this option.
 - `:backend` and `:compute_type`: options of `Transmuter.load!/2`.
 - `:defn_options`: options of `Transmuter.compile/3`, such as `compiler: EMLX`.
 - `:variant` and `:cache_dir`: see above and `Transmuter.Hub`.
-- `:model` and `:tokenizer`: a model and a tokenizer that you loaded yourself.
+- `:model`, `:tokenizer` and `:featurizer`: a model, a tokenizer and a featurizer that you loaded yourself.
 
 ## Run a serving in your application
 

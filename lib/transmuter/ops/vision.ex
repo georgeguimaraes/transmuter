@@ -297,13 +297,12 @@ defmodule Transmuter.Ops.Vision do
     # stb_image 1.0 returns the wrong shape when asked to convert channels, so the
     # source channels (gray, gray and alpha, RGB or RGBA) become RGB here.
     case StbImage.read_binary(Nx.to_binary(encoded)) do
-      {:ok, %{data: data, shape: shape = {h, w, c}}} ->
-        pixels = data |> Nx.from_binary(:u8, backend: Nx.BinaryBackend) |> Nx.reshape(shape)
-
+      {:ok, %{data: data, shape: shape}} ->
         rgb =
-          if c < 3,
-            do: pixels |> Nx.slice_along_axis(0, 1, axis: 2) |> Nx.broadcast({h, w, 3}),
-            else: Nx.slice_along_axis(pixels, 0, 3, axis: 2)
+          data
+          |> Nx.from_binary(:u8, backend: Nx.BinaryBackend)
+          |> Nx.reshape(shape)
+          |> Transmuter.Featurizer.rgb()
 
         case attr(node, "pixel_format", "RGB") do
           "RGB" -> rgb

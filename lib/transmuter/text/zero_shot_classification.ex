@@ -48,19 +48,11 @@ defmodule Transmuter.Text.ZeroShotClassification do
       opts,
       fn outputs, _inputs -> %{logits: outputs["logits"]} end,
       fn rows, _items ->
-        predictions =
-          rows
-          |> Enum.map(& &1.logits)
-          |> Nx.stack()
-          |> scores.()
-          |> Nx.to_list()
-          |> Enum.zip_with(labels, &%{label: &2, score: &1})
-          |> Enum.sort_by(& &1.score, :desc)
-
-        %{
-          predictions:
-            if(opts[:top_k], do: Enum.take(predictions, opts[:top_k]), else: predictions)
-        }
+        rows
+        |> Enum.map(& &1.logits)
+        |> Nx.stack()
+        |> scores.()
+        |> Serving.predictions(&Enum.at(labels, &1), opts[:top_k])
       end,
       fn
         text when is_binary(text) -> {:ok, Enum.map(hypotheses, &{text, &1})}

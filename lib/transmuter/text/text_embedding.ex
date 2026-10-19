@@ -108,9 +108,5 @@ defmodule Transmuter.Text.TextEmbedding do
   end
 
   defp process(embedding, nil), do: embedding
-
-  defp process(embedding, :l2_norm) do
-    norm = embedding |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
-    Nx.divide(embedding, Nx.max(norm, 1.0e-12))
-  end
+  defp process(embedding, :l2_norm), do: Serving.l2_norm(embedding)
 end

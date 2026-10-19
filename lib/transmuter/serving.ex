@@ -1,31 +1,36 @@
 defmodule Transmuter.Serving do
   @moduledoc """
-  Builds the `Nx.Serving` of a text task from a model, a tokenizer and the functions of the task.
+  Builds the `Nx.Serving` of a task from a model, a tokenizer or a featurizer, and the functions of the task.
 
-  The client side tokenizes the inputs and gives each batch the key of its sequence length. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
+  The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
   """
 
-  alias Transmuter.{Repo, Tokenizer}
+  alias Transmuter.{Featurizer, Repo, Tokenizer}
+
+  @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
 
   @doc """
   The options that all text tasks take. See `Transmuter.Text`.
   """
-  def options,
-    do: [
-      :compile,
-      :variant,
-      :cache_dir,
-      :model,
-      :tokenizer,
-      :backend,
-      :compute_type,
-      defn_options: []
-    ]
+  def options, do: [:tokenizer | @options]
 
   @doc """
-  Loads the repository of `source`, its model and its tokenizer. The model is the first of `components` that the repository has, in the default variant `variant` of the task.
+  The options that all image tasks take. See `Transmuter.Vision`.
+  """
+  def image_options, do: [:featurizer | @options]
+
+  @doc """
+  Loads the repository of `source`, its model and its tokenizer. See `load_model!/4`.
   """
   def load!(source, opts, variant, components \\ ["model"]) do
+    {repo, model} = load_model!(source, opts, variant, components)
+    {repo, model, opts[:tokenizer] || Tokenizer.load!(repo)}
+  end
+
+  @doc """
+  Loads the repository of `source` and its model. The model is the first of `components` that the repository has, in the default variant `variant` of the task.
+  """
+  def load_model!(source, opts, variant, components \\ ["model"]) do
     repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
     component = Enum.find(components, hd(components), &(Repo.variants(repo, &1) != []))
 
@@ -38,7 +43,7 @@ defmodule Transmuter.Serving do
           Keyword.take(opts, [:backend, :compute_type])
         )
 
-    {repo, model, opts[:tokenizer] || Tokenizer.load!(repo)}
+    {repo, model}
   end
 
   @doc """
@@ -61,36 +66,99 @@ defmodule Transmuter.Serving do
     lengths = List.wrap(compile[:sequence_length])
     tokenizer = Tokenizer.configure(tokenizer, length: lengths)
 
-    Nx.Serving.new(
-      fn {:sequence_length, length}, defn_options ->
-        zeros =
-          Nx.broadcast(Nx.tensor(0, type: :s64, backend: Nx.BinaryBackend), {batch_size, length})
+    templates =
+      Map.new(lengths, fn length ->
+        {{:sequence_length, length},
+         Map.new(model.inputs, &{&1, zeros({batch_size, length}, :s64)})}
+      end)
 
-        run = Transmuter.compile(model, Map.new(model.inputs, &{&1, zeros}), defn_options)
+    preprocess = fn sequences ->
+      {tensors, encodings} = Tokenizer.encode(tokenizer, sequences)
+      key = {:sequence_length, Nx.axis_size(tensors["input_ids"], 1)}
+
+      rows =
+        Enum.zip_with(sequences, encodings, fn sequence, windows ->
+          Enum.map(windows, &{sequence, &1})
+        end)
+
+      {tensors, key, rows}
+    end
+
+    shapes = %{batch_size: batch_size, templates: templates, inputs: %{}}
+    new(model, opts, shapes, preprocess, fun, postprocess, validate)
+  end
+
+  @doc """
+  Returns an `Nx.Serving` that runs `model` on images.
+
+  The featurizer turns the images into `"pixel_values"` on the `:backend` of `opts`. The featurizer must give one image size, so the serving compiles one shape. `inputs` are other inputs of the model that are the same for all images, such as the text of the labels in zero-shot classification. Their first axis is not the batch.
+
+  `fun` and `postprocess` are as in `text/7`. An image is one row, so `postprocess` takes a list of one row and a list of one image tensor.
+  """
+  def image(model, featurizer, opts, fun, postprocess, inputs \\ %{}) do
+    compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
+    batch_size = compile[:batch_size]
+
+    {height, width} =
+      Featurizer.size(featurizer) ||
+        raise ArgumentError,
+              "the featurizer gives images of different sizes, so they cannot go in one batch. " <>
+                "Set a size with height and width, or a crop size, in preprocessor_config.json"
+
+    key = {:image_size, {height, width}}
+    templates = %{key => %{"pixel_values" => zeros({batch_size, 3, height, width}, :f32)}}
+    backend = opts[:backend] || Nx.default_backend()
+
+    preprocess = fn images ->
+      pixels =
+        featurizer
+        |> Featurizer.process(images, backend: backend)
+        |> Nx.backend_transfer(Nx.BinaryBackend)
+
+      {%{"pixel_values" => pixels}, key, Enum.map(images, &[&1])}
+    end
+
+    validate = fn input ->
+      with {:ok, image} <- Featurizer.tensor(input), do: {:ok, [image]}
+    end
+
+    shapes = %{batch_size: batch_size, templates: templates, inputs: inputs}
+    new(model, opts, shapes, preprocess, fun, postprocess, validate)
+  end
+
+  # `shapes` has the batch size, the input templates of each batch key, and the inputs
+  # that are the same for all batches. `validate` gives the sequences of each input.
+  # `preprocess` takes the sequences of all inputs and gives the tensors, the batch key, and
+  # for each sequence the list of its rows.
+  defp new(model, opts, shapes, preprocess, fun, postprocess, validate) do
+    %{batch_size: batch_size, templates: templates} = shapes
+    fixed = Map.take(shapes.inputs, model.inputs)
+
+    Nx.Serving.new(
+      fn key, defn_options ->
+        run = Transmuter.compile(model, Map.merge(fixed, templates[key]), defn_options)
 
         fn batch ->
           batch = Nx.Batch.pad(batch, batch_size - batch.size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-          inputs |> run.() |> fun.(inputs) |> Nx.backend_transfer(Nx.BinaryBackend)
+
+          fixed
+          |> Map.merge(inputs)
+          |> run.()
+          |> fun.(inputs)
+          |> Nx.backend_transfer(Nx.BinaryBackend)
         end
       end,
       opts[:defn_options]
     )
     |> Nx.Serving.batch_size(batch_size)
-    |> Nx.Serving.process_options(batch_keys: Enum.map(lengths, &{:sequence_length, &1}))
+    |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
-      sequences = Enum.concat(inputs)
-      {tensors, encodings} = Tokenizer.encode(tokenizer, sequences)
-      key = {:sequence_length, Nx.axis_size(tensors["input_ids"], 1)}
-      batch = [model_inputs!(model, tensors)] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
-
-      items =
-        sequences
-        |> Enum.zip_with(encodings, fn sequence, windows -> Enum.map(windows, &{sequence, &1}) end)
-        |> split_like(inputs)
-        |> Enum.map(&Enum.concat/1)
-
+      {tensors, key, rows} = preprocess.(Enum.concat(inputs))
+      tensors = model_inputs!(model, tensors, fixed)
+      batch = [tensors] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
+      items = rows |> split_like(inputs) |> Enum.map(&Enum.concat/1)
       {batch, {multi?, items}}
     end)
     |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, items} ->
@@ -105,6 +173,9 @@ defmodule Transmuter.Serving do
       if multi?, do: results, else: hd(results)
     end)
   end
+
+  defp zeros(shape, type),
+    do: Nx.broadcast(Nx.tensor(0, type: type, backend: Nx.BinaryBackend), shape)
 
   # Splits list into consecutive parts with the lengths of the lists in groups.
   defp split_like(list, groups) do
@@ -126,13 +197,14 @@ defmodule Transmuter.Serving do
     Enum.uniq(Enum.map([32, 128, 512], &min(&1, max)))
   end
 
-  defp model_inputs!(model, tensors) do
-    case model.inputs -- Map.keys(tensors) do
+  defp model_inputs!(model, tensors, fixed) do
+    case model.inputs -- Map.keys(Map.merge(tensors, fixed)) do
       [] ->
-        Map.take(tensors, model.inputs)
+        Map.take(tensors, model.inputs -- Map.keys(fixed))
 
       missing ->
-        raise ArgumentError, "the tokenizer does not give the model inputs #{inspect(missing)}"
+        raise ArgumentError,
+              "the model needs the inputs #{inspect(missing)}, which the task does not give"
     end
   end
 
@@ -168,10 +240,50 @@ defmodule Transmuter.Serving do
     do: get_in(repo.config, ["id2label", Integer.to_string(index)]) || "LABEL_#{index}"
 
   @doc """
+  Returns `%{predictions: [%{label: label, score: score}]}` from the scores of one input, from the highest score. `label` takes the index of a class and returns its label. `top_k` is the number of predictions, or `nil` for all.
+  """
+  def predictions(scores, label, top_k) do
+    predictions =
+      scores
+      |> Nx.to_list()
+      |> Enum.with_index(&%{label: label.(&2), score: &1})
+      |> Enum.sort_by(& &1.score, :desc)
+
+    %{predictions: if(top_k, do: Enum.take(predictions, top_k), else: predictions)}
+  end
+
+  @doc """
+  Returns the default scores function of a classification model, as the classification pipelines of Python transformers: `:none` for regression, `:sigmoid` for one label or multi-label classification, and else `:softmax`.
+  """
+  def scores_function(repo) do
+    cond do
+      repo.config["problem_type"] == "regression" -> :none
+      map_size(repo.config["id2label"] || %{}) == 1 -> :sigmoid
+      repo.config["problem_type"] == "multi_label_classification" -> :sigmoid
+      true -> :softmax
+    end
+  end
+
+  @doc """
+  Applies a scores function (`:softmax`, `:sigmoid` or `:none`) to logits.
+  """
+  def scores(logits, :softmax), do: softmax(logits)
+  def scores(logits, :sigmoid), do: Nx.sigmoid(logits)
+  def scores(logits, :none), do: logits
+
+  @doc """
   The softmax over the last axis.
   """
   def softmax(logits) do
     exp = Nx.exp(Nx.subtract(logits, Nx.reduce_max(logits, axes: [-1], keep_axes: true)))
     Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+  end
+
+  @doc """
+  Divides each vector on the last axis by its L2 norm.
+  """
+  def l2_norm(tensor) do
+    norm = tensor |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+    Nx.divide(tensor, Nx.max(norm, 1.0e-12))
   end
 end

@@ -80,7 +80,9 @@ defmodule Transmuter.MixProject do
       groups_for_modules: [
         Pipelines: [
           Transmuter.Text,
+          Transmuter.Vision,
           Transmuter.Tokenizer,
+          Transmuter.Featurizer,
           Transmuter.ChatTemplate
         ],
         "Public API": [
@@ -101,6 +103,9 @@ defmodule Transmuter.MixProject do
           Transmuter.Text.TextEmbedding,
           Transmuter.Text.TokenClassification,
           Transmuter.Text.ZeroShotClassification,
+          Transmuter.Vision.ImageClassification,
+          Transmuter.Vision.ImageEmbedding,
+          Transmuter.Vision.ZeroShotImageClassification,
           Transmuter.GraphBreaks,
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,

@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering` and `generation`. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering` and `generation`. `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding` and `zero_shot_image_classification`. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 
@@ -96,7 +96,7 @@ def deps do
 end
 ```
 
-Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. Chat templates need `minijinja_ex` with its Hugging Face compatibility, which is not released yet: add `{:minijinja_ex, github: "georgeguimaraes/minijinja_ex", branch: "feat/chat-template-compat"}` and set `MINIJINJA_EX_BUILD=1` to build it.
+Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. To read image files for the `Transmuter.Vision` servings, add `{:stb_image, "~> 1.0"}`. Chat templates need `minijinja_ex` with its Hugging Face compatibility, which is not released yet: add `{:minijinja_ex, github: "georgeguimaraes/minijinja_ex", branch: "feat/chat-template-compat"}` and set `MINIJINJA_EX_BUILD=1` to build it.
 
 ## Compilation and graph breaks
 

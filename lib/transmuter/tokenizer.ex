@@ -17,6 +17,7 @@ defmodule Transmuter.Tokenizer do
   defstruct [
     :native,
     :special_tokens,
+    :canonicalize,
     length: nil,
     pad_direction: :right,
     truncation: :longest_first,
@@ -52,7 +53,13 @@ defmodule Transmuter.Tokenizer do
     # Exports often save a fixed padding in tokenizer.json, and encode/3 pads on its own.
     native = Tokenizer.disable_padding(native)
 
-    configure(%__MODULE__{native: native, special_tokens: special_tokens(repo)}, opts)
+    tokenizer = %__MODULE__{
+      native: native,
+      special_tokens: special_tokens(repo),
+      canonicalize: canonicalize(repo.tokenizer_config)
+    }
+
+    configure(tokenizer, opts)
   end
 
   def load!(source, opts), do: load!(Repo.load!(source, opts), opts)
@@ -80,6 +87,14 @@ defmodule Transmuter.Tokenizer do
     %{tokenizer | native: native}
   end
 
+  # SiglipTokenizer of Python transformers removes the punctuation of the text, and
+  # lowercases it with do_lower_case, before it tokenizes. tokenizer.json does not have
+  # these steps.
+  defp canonicalize(config = %{"tokenizer_class" => "SiglipTokenizer"}),
+    do: [lowercase: Map.get(config, "do_lower_case", true)]
+
+  defp canonicalize(_config), do: nil
+
   defp special_tokens(repo) do
     for name <- @special_tokens,
         content = Repo.special_token(repo, name),
@@ -97,6 +112,11 @@ defmodule Transmuter.Tokenizer do
     * `:add_special_tokens` - adds the special tokens of the tokenizer, such as `[CLS]` and `[SEP]`. The default is `true`. Use `false` for text that already has them, such as the output of a chat template.
   """
   def encode(tokenizer, inputs, opts \\ []) do
+    inputs =
+      if tokenizer.canonicalize,
+        do: Enum.map(inputs, &canonical(&1, tokenizer.canonicalize)),
+        else: inputs
+
     encodings =
       case Tokenizer.encode_batch(tokenizer.native, inputs,
              add_special_tokens: Keyword.get(opts, :add_special_tokens, true)
@@ -135,6 +155,18 @@ defmodule Transmuter.Tokenizer do
       Enum.map_reduce(windows, rows, &Enum.split(&2, length(&1)))
 
     {tensors, encodings}
+  end
+
+  defp canonical({text, pair}, opts), do: {canonical(text, opts), canonical(pair, opts)}
+
+  # The punctuation is the ASCII punctuation of Python, string.punctuation.
+  defp canonical(text, opts) do
+    text = if opts[:lowercase], do: String.downcase(text), else: text
+
+    text
+    |> String.replace(~r/[!-\/:-@\[-`{-~]/, "")
+    |> String.replace(~r/\s+/u, " ")
+    |> String.trim()
   end
 
   defp pad_length(nil, longest), do: longest
