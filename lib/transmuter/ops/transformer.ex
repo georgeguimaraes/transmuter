@@ -2,13 +2,14 @@ defmodule Transmuter.Ops.Transformer do
   @moduledoc """
   Attention, linear attention, KV cache writes, rotary embedding and normalization. The same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain decides the input layout.
 
-  On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations run as fused kernels of `EMLX.Fast`.
+  On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations and the attention core run as fused kernels of `EMLX.Fast`. Attention with a softcap keeps the Nx operations, because the kernel has no softcap.
   """
 
   import Transmuter.Ops,
     only: [
       attr: 2,
       attr: 3,
+      broadcast_shape: 1,
       emlx?: 1,
       emlx_norm: 4,
       empty?: 1,
@@ -43,26 +44,26 @@ defmodule Transmuter.Ops.Transformer do
     {_b, _heads, s, head_size} = Nx.shape(q)
     t = Nx.axis_size(k, 2)
 
-    scores =
-      q
-      |> grouped_scores(k, attr(node, "scale") || 1 / :math.sqrt(head_size))
-      |> softcap(attr(node, "softcap", 0.0))
-      |> add_mask(mask)
+    scale = attr(node, "scale") || 1 / :math.sqrt(head_size)
+    cap = attr(node, "softcap", 0.0)
 
     # ONNX Runtime aligns the causal mask to the last query, so past keys stay visible.
-    scores =
+    hidden =
       if attr(node, "is_causal", 0) == 1,
         do:
-          mask_where(
-            scores,
-            Nx.greater(
-              Nx.iota({1, 1, 1, t}, axis: 3),
-              Nx.add(Nx.iota({1, 1, s, 1}, axis: 2), t - s)
-            )
-          ),
-        else: scores
+          Nx.greater(
+            Nx.iota({1, 1, 1, t}, axis: 3),
+            Nx.add(Nx.iota({1, 1, s, 1}, axis: 2), t - s)
+          )
 
-    out = scores |> softmax_last() |> grouped_values(v)
+    masks = &(&1 |> add_mask(mask) |> mask_where(hidden))
+    scores = q |> grouped_scores(k, scale) |> softcap(cap) |> masks.()
+
+    out =
+      if emlx?(q) and cap == 0,
+        do: emlx_attention(q, k, v, scale, masks, [hidden, mask]),
+        else: scores |> softmax_last() |> grouped_values(v)
+
     out = if rank == 3, do: from_heads(out), else: out
     [out, k, v, scores]
   end
@@ -120,15 +121,22 @@ defmodule Transmuter.Ops.Transformer do
       )
 
     head_size = Nx.axis_size(q, 3)
+    scale = nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size)
+    cap = attr(node, "softcap", 0.0)
+
+    masks = &(&1 |> add_mask(attention_bias) |> mask_where(hidden))
 
     out =
-      q
-      |> grouped_scores(present_k, nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size))
-      |> softcap(attr(node, "softcap", 0.0))
-      |> add_mask(attention_bias)
-      |> mask_where(hidden)
-      |> softmax_last()
-      |> grouped_values(present_v)
+      if emlx?(q) and cap == 0 do
+        emlx_attention(q, present_k, present_v, scale, masks, [hidden, attention_bias])
+      else
+        q
+        |> grouped_scores(present_k, scale)
+        |> softcap(cap)
+        |> masks.()
+        |> softmax_last()
+        |> grouped_values(present_v)
+      end
       |> from_heads()
 
     [out, present_k, present_v]
@@ -160,13 +168,20 @@ defmodule Transmuter.Ops.Transformer do
           ),
         else: Nx.tensor(0, type: :u8)
 
+    scale = nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size)
+    hidden = Nx.logical_or(padding, causal)
+    masks = &(&1 |> add_mask(attention_bias) |> mask_where(hidden))
+
     out =
-      q
-      |> scores(k, nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size))
-      |> add_mask(attention_bias)
-      |> mask_where(Nx.logical_or(padding, causal))
-      |> softmax_last()
-      |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+      if emlx?(q) do
+        emlx_attention(q, k, v, scale, masks, [hidden, attention_bias])
+      else
+        q
+        |> scores(k, scale)
+        |> masks.()
+        |> softmax_last()
+        |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+      end
       |> from_heads()
 
     [out, k, v]
@@ -322,14 +337,23 @@ defmodule Transmuter.Ops.Transformer do
         else: Nx.tensor(0, type: :u8)
 
     hidden = Nx.logical_or(causal, padding_mask(mask, b, s))
+    scale = nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size)
+
+    masks =
+      &(&1
+        |> add_mask(attention_bias)
+        |> Nx.add(Nx.multiply(Nx.as_type(hidden, Nx.type(&1)), filter)))
 
     out =
-      q
-      |> scores(k, nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size))
-      |> add_mask(attention_bias)
-      |> then(&Nx.add(&1, Nx.multiply(Nx.as_type(hidden, Nx.type(&1)), filter)))
-      |> softmax_last()
-      |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+      if emlx?(q) do
+        emlx_attention(q, k, v, scale, masks, [hidden, attention_bias])
+      else
+        q
+        |> scores(k, scale)
+        |> masks.()
+        |> softmax_last()
+        |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+      end
       |> from_heads()
 
     [out]
@@ -505,6 +529,20 @@ defmodule Transmuter.Ops.Transformer do
       do: mask_where(scores, Nx.equal(mask, 0)),
       else: Nx.add(scores, Nx.as_type(mask, Nx.type(scores)))
   end
+
+  # The fused kernel adds the masks as one additive mask: masks applied to zeros of the
+  # shape that the mask tensors and the key axis broadcast to.
+  defp emlx_attention(q, k, v, scale, masks, mask_tensors) do
+    shape =
+      broadcast_shape([
+        {1, 1, 1, Nx.axis_size(k, 2)} | for(m <- mask_tensors, m, do: Nx.shape(m))
+      ])
+
+    mask = Nx.tensor(0, type: Nx.type(q)) |> Nx.broadcast(shape) |> masks.()
+    EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, mask)
+  end
+
+  defp mask_where(scores, nil), do: scores
 
   defp mask_where(scores, hidden),
     do:

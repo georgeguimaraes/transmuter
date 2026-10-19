@@ -31,6 +31,13 @@ model = Transmuter.load!(source, backend: {EMLX.Backend, device: :gpu})
 run = Transmuter.compile(model, inputs, compiler: EMLX, device: :gpu)
 ```
 
+On EMLX, the normalization and attention operators run as the fused kernels of `EMLX.Fast`. This applies when EMLX compiles the model and when the model runs eagerly on `EMLX.Backend`:
+
+- `RMSNormalization`, `SimplifiedLayerNormalization`, `SkipSimplifiedLayerNormalization`, `LayerNormalization`, `SkipLayerNormalization` and `EmbedLayerNormalization` use one normalization kernel.
+- `Attention`, `GroupQueryAttention`, `MultiHeadAttention` and the `com.microsoft` `Attention` use one attention kernel. Attention with a softcap keeps the Nx operations, because the kernel has no softcap.
+
+The fused kernels change the last bits of the results. On an Apple silicon GPU, the fused normalization makes a decode step of Qwen3-0.6B q4 about 0.6 ms faster, and the fused attention makes it 1.3 ms faster again (12.7 ms to 11.4 ms). The vision encoder of Ministral 3 3B takes 298 ms instead of 364 ms for a 448x448 image. Exports that write the normalization or the attention as separate operators, such as `Pow` and `ReduceMean`, do not change.
+
 ### EXLA
 
 EXLA uses XLA and runs on NVIDIA GPUs (CUDA) or on the CPU. Add it to your dependencies:
