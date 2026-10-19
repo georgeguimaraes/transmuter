@@ -26,7 +26,7 @@ defmodule Transmuter.MixProject do
   defp deps do
     [
       {:nx, "~> 1.0"},
-      {:protox, "~> 1.7"},
+      {:protox, "~> 2.1"},
       {:req, "~> 0.5"},
       {:telemetry, "~> 1.0"},
       {:emlx, "~> 0.5", optional: true},
