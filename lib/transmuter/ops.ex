@@ -3,6 +3,8 @@ defmodule Transmuter.Ops do
   ONNX operators as Nx calls. Values known at trace time live on Nx.BinaryBackend ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no zero-size tensors, so a zero-size value is {:empty, shape}.
   """
 
+  alias Nx.Defn.Compiler
+
   alias Transmuter.Ops.{
     Elementwise,
     LinAlg,
@@ -306,6 +308,32 @@ defmodule Transmuter.Ops do
   def known?({:sequence, elements}), do: Enum.all?(elements, &known?/1)
   def known?(%Nx.Tensor{data: %Nx.Defn.Expr{}}), do: false
   def known?(%Nx.Tensor{}), do: true
+
+  @doc """
+  Returns whether EMLX computes `tensor`: in a function that EMLX compiles, or eagerly on `EMLX.Backend`.
+
+  Operators then use the fused kernels of `EMLX.Fast`. Other compilers, such as `Nx.Defn.Evaluator`, keep the plain Nx operations, also on EMLX tensors.
+  """
+  def emlx?(tensor) do
+    case Compiler.current() do
+      nil -> match?(%Nx.Tensor{data: %{__struct__: EMLX.Backend}}, tensor)
+      compiler -> compiler == EMLX
+    end
+  end
+
+  @doc """
+  Normalizes `x` over `axes` with `fun`, a kernel of `EMLX.Fast` that normalizes the last axis.
+
+  The normalized axes become one axis, and each weight becomes a vector of this axis. `fun` gets this view of x and the weights.
+  """
+  def emlx_norm(fun, x, axes, weights) do
+    shape = Nx.shape(x)
+    {outer, inner} = shape |> Tuple.to_list() |> Enum.split(hd(axes))
+    size = Enum.product(inner)
+    flat = &(&1 |> Nx.broadcast(List.to_tuple(inner)) |> Nx.reshape({size}))
+    view = Nx.reshape(x, List.to_tuple(outer ++ [size]))
+    fun |> apply([view | Enum.map(weights, flat)]) |> Nx.reshape(shape)
+  end
 
   @doc false
   def static_tensor([], _type), do: {:empty, {0}}

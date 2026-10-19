@@ -4,7 +4,16 @@ defmodule Transmuter.Ops.NN do
   """
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize: 3, static_tensor: 2]
+    only: [
+      attr: 2,
+      attr: 3,
+      emlx?: 1,
+      emlx_norm: 4,
+      empty?: 1,
+      ints!: 1,
+      normalize: 3,
+      static_tensor: 2
+    ]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
@@ -90,11 +99,18 @@ defmodule Transmuter.Ops.NN do
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + Nx.rank(x), else: axis
     axes = Enum.to_list(axis..(Nx.rank(x) - 1))
-    out = x |> normalize(axes, attr(node, "epsilon", 1.0e-5)) |> Nx.multiply(scale)
+    eps = attr(node, "epsilon", 1.0e-5)
 
-    case bias do
-      [b | _] when b != nil -> Nx.add(out, b)
-      _ -> out
+    if emlx?(x) do
+      bias = List.first(bias) || Nx.tensor(0, type: Nx.type(x))
+      emlx_norm(&EMLX.Fast.layer_norm(&1, &2, &3, eps), x, axes, [scale, bias])
+    else
+      out = x |> normalize(axes, eps) |> Nx.multiply(scale)
+
+      case bias do
+        [b | _] when b != nil -> Nx.add(out, b)
+        _ -> out
+      end
     end
   end
 

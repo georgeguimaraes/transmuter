@@ -333,6 +333,8 @@ defmodule Transmuter do
   Puts the values of literal tensors in the compile cache key of EMLX.
 
   EMLX 0.5 keys its compile cache by the structure of the graph, and a literal tensor adds only its shape and type to the key. Two graphs that differ only in literal values then share one compiled program. A metadata node with a hash of the value puts the value in the key. EMLX compiles a metadata node as its inner node.
+
+  EMLX compiles a kernel of `EMLX.Fast` from the operands in its metadata, so these operands get the tags too.
   """
   def tag_literals(outputs, EMLX) do
     {outputs, _seen} = Composite.traverse(outputs, %{}, &tag_literal/2)
@@ -352,6 +354,7 @@ defmodule Transmuter do
 
       %{} ->
         {args, seen} = Tree.apply_args(t, :all, seen, &tag_literal/2)
+        {args, seen} = tag_operands(args, seen)
         tagged = put_in(t.data.args, args)
         {tagged, Map.put(seen, id, tagged)}
     end
@@ -359,6 +362,13 @@ defmodule Transmuter do
 
   defp tag_literal(t = %Nx.Tensor{shape: {}}, seen), do: {t, seen}
   defp tag_literal(t = %Nx.Tensor{}, seen), do: tag_literal(Expr.tensor(t), seen)
+
+  defp tag_operands([expr, meta = %{__EMLX__: kernel}], seen) do
+    {operands, seen} = Enum.map_reduce(kernel.operands, seen, &tag_literal/2)
+    {[expr, %{meta | __EMLX__: %{kernel | operands: operands}}], seen}
+  end
+
+  defp tag_operands(args, seen), do: {args, seen}
 
   @doc false
   def run_nodes(nodes, env, ctx) do

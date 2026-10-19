@@ -1,12 +1,16 @@
 defmodule Transmuter.Ops.Transformer do
   @moduledoc """
   Attention, linear attention, KV cache writes, rotary embedding and normalization. The same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain decides the input layout.
+
+  On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations run as fused kernels of `EMLX.Fast`.
   """
 
   import Transmuter.Ops,
     only: [
       attr: 2,
       attr: 3,
+      emlx?: 1,
+      emlx_norm: 4,
       empty?: 1,
       ints!: 1,
       normalize: 3,
@@ -540,16 +544,26 @@ defmodule Transmuter.Ops.Transformer do
 
   defp rms_norm(x, w, eps, axis) do
     axes = norm_axes(x, axis)
-    x32 = Nx.as_type(x, :f32)
-    inv = x32 |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.add(eps) |> Nx.rsqrt()
-    x32 |> Nx.multiply(inv) |> Nx.as_type(Nx.type(x)) |> Nx.multiply(w)
+
+    if emlx?(x) do
+      emlx_norm(&EMLX.Fast.rms_norm(&1, &2, eps), x, axes, [w])
+    else
+      x32 = Nx.as_type(x, :f32)
+      inv = x32 |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.add(eps) |> Nx.rsqrt()
+      x32 |> Nx.multiply(inv) |> Nx.as_type(Nx.type(x)) |> Nx.multiply(w)
+    end
   end
 
   defp layer_norm(x, gamma, beta, eps) do
-    x
-    |> normalize([-1], eps)
-    |> Nx.multiply(gamma)
-    |> add_optional(beta)
+    if emlx?(x) do
+      beta = beta || Nx.tensor(0, type: Nx.type(x))
+      emlx_norm(&EMLX.Fast.layer_norm(&1, &2, &3, eps), x, [Nx.rank(x) - 1], [gamma, beta])
+    else
+      x
+      |> normalize([-1], eps)
+      |> Nx.multiply(gamma)
+      |> add_optional(beta)
+    end
   end
 
   defp norm_axes(x, axis) do
