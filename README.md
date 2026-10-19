@@ -55,6 +55,12 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 - Call it directly. Each operator runs immediately, one after the other. This is eager execution. It is slower, but the model can read values while it runs.
 - Give it to `Nx.Defn.jit/2` or `Nx.Defn.value_and_grad/2`. Nx then records the operators as one graph, and the backend compiles that graph.
 
+## Text to speech with Kokoro
+
+`bench/kokoro_tts.exs` runs [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) from its ONNX export and writes a WAV file. All operators of the export run in Transmuter, and `Transmuter.compile/3` compiles the model with no static inputs. Inputs up to the limit of the model work: 505 phonemes gave 26.6 seconds of audio.
+
+Kokoro reads phonemes, not text. The Python and JavaScript versions of Kokoro make the phonemes with misaki or espeak-ng, outside of the model. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance.
+
 ## Installation
 
 ```elixir
@@ -84,6 +90,7 @@ These results are from an Apple silicon GPU:
 |---|---|---|---|
 | Kokoro, 7.0 seconds of audio | 2.3 s | 2.1 s | 0.34 s |
 | Kokoro, 20.2 seconds of audio | 13.2 s | 8.8 s | 0.87 s |
+| Kokoro, 26.6 seconds of audio | 25.2 s | 13.5 s | 1.16 s |
 | Faster R-CNN 12, the same image | 33.8 s | 6.5 s | 0.35 s |
 
 A new audio length in Kokoro compiles the operators after the break again, and that first call takes about as long as a call without compilation. `bench/kokoro_tts.exs` rounds the total duration up to steps of 200 ms by making the final pause longer, so sentences of a similar length share one compiled decoder.
@@ -154,7 +161,7 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | Models requested in Bumblebee issues | 11 of 12 files match |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 8 of 8 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
-| One graph for each operator variant | 222 of 222 match |
+| One graph for each operator variant | 228 of 228 match |
 
 Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use.
 
