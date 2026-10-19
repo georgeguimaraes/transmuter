@@ -98,12 +98,17 @@ defmodule Transmuter do
 
   Returns a function that takes the inputs and returns the outputs. The params
   are the model's own, so load it with `:backend` first. Inputs of other shapes
-  compile on their first call. The function keeps the 8 most recently used
+  compile on their first call, and the function keeps the most recently used
   shapes compiled.
 
   ## Options
 
     * `:static_inputs` - inputs known when the model compiles, see `run/4`
+
+    * `:cache_size` - how many compiled shapes to keep for each part of the
+      graph. Defaults to 8. Use a larger value when the inputs have many
+      shapes that come back, for example audio lengths. Each compiled shape
+      uses memory.
 
   Other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX`.
 

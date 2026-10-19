@@ -48,7 +48,7 @@ The export sets the names of the inputs and outputs. `model.inputs` and `model.o
 
 Transmuter runs the graph that is in the file, and nothing more. The graph of all-MiniLM-L6-v2 stops at the token vectors, because sentence-transformers adds the pooling outside of the model. Thus the example above does the pooling. Bumblebee servings, such as `Bumblebee.Text.text_embedding/3`, also do the tokenization, pooling and batching for you. Transmuter has no servings yet. For tokenization, use [tokenizers](https://github.com/elixir-nx/tokenizers).
 
-`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. The function that it returns also takes inputs of other shapes: it compiles them on their first call, and keeps the 8 most recently used shapes compiled.
+`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. The function that it returns also takes inputs of other shapes: it compiles them on their first call, and keeps the most recently used shapes compiled. The `:cache_size` option sets how many, and the default is 8.
 
 `Transmuter.run/4` is the function that `Transmuter.compile/3` compiles. It reads the ONNX graph and calls one Nx function for each operator. You can use it in two ways:
 
@@ -82,7 +82,7 @@ Some graphs use a value to set a shape or to select a branch. Examples are the l
 2. It runs the break operator on the values.
 3. It compiles the operators after the break for the shapes that the values decide, and continues.
 
-The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache keeps the 8 most recently used compiled parts for each break. A new shape after that replaces the part that was used least recently. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
+The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache keeps the 8 most recently used compiled parts for each break, or the number in the `:cache_size` option. A new shape after that replaces the part that was used least recently. When the shapes come back often, as with the audio lengths of a speech service, set `:cache_size` to the number of shapes, so that calls do not compile the same shapes again. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
 
 These results are from an Apple silicon GPU:
 

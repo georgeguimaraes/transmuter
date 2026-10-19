@@ -17,14 +17,16 @@ defmodule Transmuter.GraphBreaks do
   alias Nx.Defn.Compiler
   alias Transmuter.{Ops, UnknownValueError}
 
-  # A segment of fewer nodes runs eagerly. The cache keeps this many segments for each
+  # A segment of fewer nodes runs eagerly. The cache keeps :cache_size segments for each
   # position, and a new key at a full position evicts the least recently used one.
   @min_compiled_nodes 20
-  @entries_per_position 8
 
   @doc false
   def compile(model, inputs, static_inputs, opts) do
+    {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
+
     plan = %{
+      cache_size: cache_size,
       model: model,
       nodes: List.to_tuple(model.nodes),
       last_use: last_use(model),
@@ -119,7 +121,7 @@ defmodule Transmuter.GraphBreaks do
     fun = fn args -> trace(plan, statics, args, pos, ref) end
     entry = compile_segment(plan, fun, args, pos, ref)
     Process.delete(ref)
-    store(plan.table, key, entry)
+    store(plan.table, key, entry, plan.cache_size)
     classify(entry)
   end
 
@@ -349,10 +351,10 @@ defmodule Transmuter.GraphBreaks do
     ArgumentError -> :miss
   end
 
-  defp store(table, key = {pos, _templates, _static_key}, entry) do
+  defp store(table, key = {pos, _templates, _static_key}, entry, cache_size) do
     entries = :ets.match_object(table, {{pos, :_, :_}, :_, :_})
 
-    if length(entries) >= @entries_per_position do
+    if length(entries) >= cache_size do
       {oldest, _entry, _used} = Enum.min_by(entries, &elem(&1, 2))
       :ets.delete(table, oldest)
     end

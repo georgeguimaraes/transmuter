@@ -330,6 +330,28 @@ defmodule TransmuterTest do
     assert compiles.([1]) == 1
   end
 
+  test "the cache size sets how many shapes stay compiled" do
+    model = load_fixture("Break_Range_long_tail")
+    input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}
+
+    compiled =
+      Transmuter.compile(model, input.(1),
+        compiler: CountingCompiler,
+        device: @device,
+        cache_size: 2
+      )
+
+    compiles = fn firsts ->
+      Enum.each(firsts, &compiled.(input.(&1)))
+      flush_compiles(0)
+    end
+
+    assert flush_compiles(0) == 1
+    assert compiles.(1..3) == 3
+    assert compiles.(2..3) == 0
+    assert compiles.([1]) == 1
+  end
+
   defp flush_compiles(count) do
     receive do
       :compiled -> flush_compiles(count + 1)
