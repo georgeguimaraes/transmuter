@@ -1,6 +1,6 @@
 defmodule Transmuter.Generation do
   @moduledoc """
-  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2` and `Transmuter.Text.text_to_text/2` use it.
+  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2` and `Transmuter.Audio.speech_to_text/2` use it.
 
   Generation runs the model in steps. A step takes new tokens and the KV cache, and gives the logits and the next cache. The prompt runs in steps of power-of-two lengths (45 tokens run as 32, 8, 4 and 1), and each new token is a step of length 1, so a small number of compiled shapes covers all prompts.
 

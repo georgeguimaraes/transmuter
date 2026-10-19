@@ -97,7 +97,39 @@ waveform = output["waveform"]
 
 ## Whisper speech recognition
 
-[Whisper](https://huggingface.co/onnx-community/whisper-base) is a speech recognition model. Its ONNX export has four files: an encoder and three decoder variants. The merged decoder (`decoder_model_merged.onnx`) uses `use_cache_branch` to select the prefill or decode path.
+[Whisper](https://huggingface.co/onnx-community/whisper-base) is a speech recognition model. `Transmuter.Audio.speech_to_text/2` runs it from PCM samples to text:
+
+```elixir
+# 16 kHz mono f32 samples, for example from ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32
+audio = Nx.from_binary(File.read!("speech.f32"), :f32)
+
+serving =
+  Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"},
+    backend: EMLX.Backend,
+    defn_options: [compiler: EMLX]
+  )
+
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+#=>              start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}
+```
+
+The serving does the steps of Python transformers:
+
+1. The featurizer makes a log-mel spectrogram of 30 s, as `WhisperFeatureExtractor`. It pads the audio with zeros to 30 s, takes an STFT with frames of 400 samples every 160 samples and a Hann window, and applies 80 mel filters (128 for large-v3). The features are within 2e-5 of transformers.
+2. The encoder runs once on the spectrogram.
+3. The decoder starts from the prompt `<|startoftranscript|>`, the language token, the task token and `<|notimestamps|>`. An English-only model, such as `whisper-tiny.en`, has no language and task tokens. The `:language` option (the default is `"en"`) and the `:task` option (`:transcribe` or `:translate`) select the tokens. The serving does not detect the language.
+4. The selection of each token suppresses `suppress_tokens`, and `begin_suppress_tokens` for the first token, from `generation_config.json`.
+
+With `strategy: :greedy`, the text is the same as the `generate` function of transformers for `whisper-tiny.en` and `whisper-base`. The serving does not give timestamps.
+
+The serving takes audio of up to 30 s and raises an error for longer audio. Split long audio into parts of 30 s or less, for example at silences, and run each part.
+
+On an Apple M-series GPU, 5.9 s of speech takes 0.9 s with `whisper-tiny.en` and 1.0 s with `whisper-base`, a real-time factor of 0.15 to 0.17. The featurizer and the encoder take less than 0.12 s, and the decoder gives 25 to 28 tokens per second. The decoder of these exports computes the positions from the length of the cache, so its steps run without compilation (see `Transmuter.Generation`).
+
+### Whisper with tensors
+
+The ONNX export has four files: an encoder and three decoder variants. The merged decoder (`decoder_model_merged.onnx`) uses `use_cache_branch` to select the prefill or decode path.
 
 ```elixir
 encoder = Transmuter.load!(

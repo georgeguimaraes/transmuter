@@ -1,6 +1,6 @@
-"""Prints the reference values of test/transmuter/text_test.exs and test/transmuter/vision_test.exs, from the pipelines of Python transformers and sentence-transformers.
+"""Prints the reference values of test/transmuter/text_test.exs, test/transmuter/vision_test.exs and test/transmuter/audio_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa python -I test/support/pipeline_references.py
 
 Transformers 5 removed the question answering pipeline, so the script uses transformers 4.
 """
@@ -141,3 +141,19 @@ for repo, text in [("google-t5/t5-small", "translate English to German: The hous
     model = AutoModelForSeq2SeqLM.from_pretrained(repo)
     output = model.generate(**tokenizer(text, return_tensors="pt"), do_sample=False, num_beams=1, max_new_tokens=64)
     print(repo, repr(tokenizer.decode(output[0], skip_special_tokens=True)))
+
+# Speech-to-text of test/fixtures/librispeech_0.f32, which this part writes. datasets 4
+# decodes audio with torchcodec, so the script uses datasets 3 with soundfile.
+from datasets import load_dataset
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+audio = np.asarray(load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")[0]["audio"]["array"], dtype=np.float32)
+audio.astype("<f4").tofile("test/fixtures/librispeech_0.f32")
+
+for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"language": "en", "task": "transcribe"}), ("openai/whisper-base", {"language": "fr", "task": "transcribe"})]:
+    processor = WhisperProcessor.from_pretrained(repo)
+    features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+    if repo == "openai/whisper-tiny.en":
+        print("features", features[0, 0, :5].tolist(), features[0, 40, 100:103].tolist(), float(features.mean()))
+    output = WhisperForConditionalGeneration.from_pretrained(repo).generate(features, do_sample=False, num_beams=1, **options)
+    print(repo, options, repr(processor.batch_decode(output, skip_special_tokens=True)[0]))

@@ -1,6 +1,6 @@
 # Pipelines
 
-This guide shows how to run text models with the servings of `Transmuter.Text`, and image models with the servings of `Transmuter.Vision`. A serving takes text or images and gives results. It does the tokenization or the image preprocessing, the batching and the steps after the model, such as pooling and softmax.
+This guide shows how to run text models with the servings of `Transmuter.Text`, image models with the servings of `Transmuter.Vision`, and speech models with the servings of `Transmuter.Audio`. A serving takes text, images or audio and gives results. It does the tokenization or the preprocessing, the batching and the steps after the model, such as pooling and softmax.
 
 ## Installation
 
@@ -56,6 +56,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
+| `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task.
 
@@ -163,6 +164,17 @@ The serving runs an encoder-decoder model, such as T5 or Marian. The repository 
 T5 takes the task in the text, for example `"translate English to German: The house is wonderful."`. A Marian model translates one language pair, and its tokenizer encodes the text with `source.spm`, as `MarianTokenizer` of Python transformers.
 
 The settings of `generation_config.json` apply, as for `generation/2`. The serving does not do beam search, so it ignores `num_beams`. With `strategy: :greedy`, the text is the same as the `generate` function of transformers with `num_beams=1`.
+
+### Speech recognition
+
+```elixir
+audio = Nx.from_binary(File.read!("speech.f32"), :f32)
+serving = Transmuter.Audio.speech_to_text({:hf, "onnx-community/whisper-base"}, language: "en")
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, ...", ...}]}
+```
+
+`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. Convert other audio before you run it, for example with `ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32`. The audio can be up to 30 s long. See [Speech and audio](speech_and_audio.md) for the details.
 
 ## Images
 

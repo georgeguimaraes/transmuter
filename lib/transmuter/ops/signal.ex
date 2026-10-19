@@ -141,12 +141,7 @@ defmodule Transmuter.Ops.Signal do
     size = if window, do: Nx.axis_size(window, 0), else: hd(ints!(frame_length))
     # The spec signal is {B, L, 1 or 2}. ONNX Runtime also takes a real {B, L} signal.
     signal = if Nx.rank(signal) == 2, do: Nx.new_axis(signal, 2), else: signal
-    {_b, l, _} = Nx.shape(signal)
-    frames = div(l - size, step) + 1
-    framed = frame(signal, size, step, frames)
-    framed = if window, do: Nx.multiply(framed, Nx.reshape(window, {1, 1, size, 1})), else: framed
-    bins = if attr(node, "onesided", 1) == 1, do: div(size, 2) + 1, else: size
-    dft(framed, 2, size, bins, false)
+    stft(signal, window, size, step, attr(node, "onesided", 1) == 1)
   end
 
   # DFT along one axis of {..., n, 1 or 2}. Output keeps the layout with 2 components.
@@ -160,6 +155,18 @@ defmodule Transmuter.Ops.Signal do
     inverse? = attr(node, "inverse", 0) == 1
     bins = if attr(node, "onesided", 0) == 1, do: div(n, 2) + 1, else: n
     dft(x, axis, n, bins, inverse?)
+  end
+
+  @doc """
+  The short-time Fourier transform of `signal` {B, L, 1 or 2}, in frames of `size` samples every `step` samples. `window` is a tensor {size} or `nil`. Returns {B, frames, bins, 2}, with the real and the imaginary parts on the last axis. `bins` is `size / 2 + 1` when `onesided?` is `true`, else `size`.
+  """
+  def stft(signal, window, size, step, onesided?) do
+    {_b, l, _} = Nx.shape(signal)
+    frames = div(l - size, step) + 1
+    framed = frame(signal, size, step, frames)
+    framed = if window, do: Nx.multiply(framed, Nx.reshape(window, {1, 1, size, 1})), else: framed
+    bins = if onesided?, do: div(size, 2) + 1, else: size
+    dft(framed, 2, size, bins, false)
   end
 
   # Runs one or two directions and stacks them. step.(x_gates, r, r_bias, state) -> state.

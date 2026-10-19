@@ -81,6 +81,7 @@ defmodule Transmuter.MixProject do
         Pipelines: [
           Transmuter.Text,
           Transmuter.Vision,
+          Transmuter.Audio,
           Transmuter.Tokenizer,
           Transmuter.Featurizer,
           Transmuter.ChatTemplate
@@ -108,6 +109,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.ImageClassification,
           Transmuter.Vision.ImageEmbedding,
           Transmuter.Vision.ZeroShotImageClassification,
+          Transmuter.Audio.SpeechToText,
           Transmuter.GraphBreaks,
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,
