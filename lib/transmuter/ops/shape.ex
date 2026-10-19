@@ -255,8 +255,14 @@ defmodule Transmuter.Ops.Shape do
       Enum.reduce(by_axis, a, fn {ax, {l, h, 0}}, acc ->
         dim = Nx.axis_size(acc, ax)
 
-        indices = Enum.map(-l..(dim - 1 + h)//1, &pad_source(mode, &1, dim))
-        Nx.take(acc, static_tensor(indices, :s64), axis: ax)
+        # Nx has no zero-size tensors yet, so a side with no padding is left out.
+        sides = [
+          {l, pad_side(mode, acc, ax, 0, 1, l)},
+          {1, fn -> acc end},
+          {h, pad_side(mode, acc, ax, dim - 1, dim - 1 - h, h)}
+        ]
+
+        Nx.concatenate(for({n, part} <- sides, n > 0, do: part.()), axis: ax)
       end)
     end
   end
@@ -497,9 +503,18 @@ defmodule Transmuter.Ops.Shape do
   defp optional_ints(nil, default), do: default
   defp optional_ints(t, _default), do: ints!(t)
 
-  defp pad_source("edge", i, dim), do: min(max(i, 0), dim - 1)
-  defp pad_source("reflect", i, dim) when abs(i) > dim - 1, do: 2 * (dim - 1) - abs(i)
-  defp pad_source("reflect", i, _dim), do: abs(i)
+  # The padding of one side: the edge element repeated, or the elements next to the
+  # edge in reverse order.
+  defp pad_side("edge", acc, ax, edge, _start, n) do
+    fn ->
+      acc
+      |> Nx.slice_along_axis(edge, 1, axis: ax)
+      |> Nx.broadcast(put_elem(Nx.shape(acc), ax, n))
+    end
+  end
+
+  defp pad_side("reflect", acc, ax, _edge, start, n),
+    do: fn -> acc |> Nx.slice_along_axis(start, n, axis: ax) |> Nx.reverse(axes: [ax]) end
 
   defp unravel(index, shape) do
     shape

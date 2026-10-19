@@ -146,13 +146,7 @@ defmodule Transmuter.Ops.Signal do
     signal = if Nx.rank(signal) == 2, do: Nx.new_axis(signal, 2), else: signal
     {_b, l, _} = Nx.shape(signal)
     frames = div(l - size, step) + 1
-    index = static_tensor(for(f <- 0..(frames - 1), n <- 0..(size - 1), do: f * step + n), :s64)
-
-    framed =
-      signal
-      |> Nx.take(index, axis: 1)
-      |> Nx.reshape({Nx.axis_size(signal, 0), frames, size, Nx.axis_size(signal, 2)})
-
+    framed = frame(signal, size, step, frames)
     framed = if window, do: Nx.multiply(framed, Nx.reshape(window, {1, 1, size, 1})), else: framed
     bins = if attr(node, "onesided", 1) == 1, do: div(size, 2) + 1, else: size
     dft(framed, 2, size, bins, false)
@@ -302,6 +296,28 @@ defmodule Transmuter.Ops.Signal do
   end
 
   # Real and imaginary parts {..., n} along axis times n x bins DFT matrices.
+  # Frame f holds samples f * step .. f * step + size - 1 of a {B, L, C} signal. The
+  # signal splits into chunks of gcd(size, step) samples, and a frame is size / gcd
+  # consecutive chunks, so strided slices of the chunks build all frames.
+  defp frame(signal, size, step, frames) do
+    {b, _l, c} = Nx.shape(signal)
+    chunk = Integer.gcd(size, step)
+    stride = div(step, chunk)
+    count = (frames - 1) * stride + div(size, chunk)
+
+    chunks =
+      signal
+      |> Nx.slice_along_axis(0, count * chunk, axis: 1)
+      |> Nx.reshape({b, count, chunk, c})
+
+    for j <- 0..(div(size, chunk) - 1)//1 do
+      Nx.slice(chunks, [0, j, 0, 0], [b, (frames - 1) * stride + 1, chunk, c],
+        strides: [1, stride, 1, 1]
+      )
+    end
+    |> Nx.concatenate(axis: 2)
+  end
+
   defp dft(x, axis, n, bins, inverse?) do
     rank = Nx.rank(x)
     {re, im} = components(x)

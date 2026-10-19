@@ -851,3 +851,15 @@ slice_body = helper.make_graph(
     [numpy_helper.from_array(np.array([0], np.int64), "axis0"), numpy_helper.from_array(np.array([1], np.int64), "one_i")])
 case("Loop_long_counter_slice", [node("Loop", ["M", "", "acc0"], ["acc"], body=slice_body)],
      {"xs": rf32(20, 3), "acc0": rf32(1, 3)}, {"M": np.array(20, np.int64)})
+
+# ---------- framing and padding ----------
+
+r = rng_for("framing and padding")
+rf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+case("STFT_step_not_dividing_frame", [node("STFT", ["x", "step", "win"], ["y"])],
+     {"x": rf32(2, 50, 1)}, {"step": np.array(8, np.int64), "win": np.hanning(12).astype(np.float32)}, opset=17)
+for mode in ["reflect", "edge"]:
+    case(f"Pad_{mode}", [node("Pad", ["x", "pads"], ["y"], mode=mode)],
+         {"x": rf32(2, 5, 6)}, {"pads": np.array([0, 3, 0, 1, 0, 2], np.int64)}, opset=18)
+case("Pad_constant_axes", [node("Pad", ["x", "pads", "value", "axes"], ["y"])],
+     {"x": rf32(2, 5, 6)}, {"pads": np.array([1, 0, 2, 3], np.int64), "value": np.array(1.5, np.float32), "axes": np.array([2, 0], np.int64)}, opset=18)
