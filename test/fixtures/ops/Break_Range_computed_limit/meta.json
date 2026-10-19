@@ -1,0 +1,36 @@
+{
+ "repo": "op/Break_Range_computed_limit",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "ReduceSum": 1,
+  "Cast": 2,
+  "Range": 1,
+  "Mul": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

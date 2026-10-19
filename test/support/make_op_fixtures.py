@@ -718,3 +718,56 @@ case("Shape_of_zero_size", [
 ], {"x": r.standard_normal((3, 4, 5)).astype(np.float32)},
      {"starts": np.array([2], np.int64), "ends": np.array([2], np.int64), "axes": np.array([1], np.int64), "last": np.array(2, np.int64)},
      outputs=["shape", "size", "wider_shape"])
+
+# ---------- graph breaks ----------
+
+# These graphs compile with no static inputs. A value computed from the inputs decides a
+# shape or a branch, so Transmuter.compile/3 breaks the graph there.
+r = rng_for("graph breaks")
+pos_f32 = lambda *shape: (r.random(shape) + 0.5).astype(np.float32)
+INT64 = TensorProto.INT64
+case("Break_Range_computed_limit",
+     [node("ReduceSum", ["x"], ["s"], keepdims=0), node("Cast", ["s"], ["n"], to=INT64),
+      node("Range", ["zero", "n", "one"], ["idx"]), node("Cast", ["idx"], ["f"], to=TensorProto.FLOAT), node("Mul", ["f", "s"], ["y"])],
+     {"x": pos_f32(6)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64)})
+case("Break_NonZero_computed", [node("Greater", ["x", "zero"], ["mask"]), node("NonZero", ["mask"], ["y"])],
+     {"x": (r.standard_normal((3, 4))).astype(np.float32)}, {"zero": np.array(0.0, np.float32)})
+case("Break_TopK_computed_k",
+     [node("ReduceMax", ["k_in"], ["k"], keepdims=1), node("TopK", ["x", "k"], ["values", "indices"])],
+     {"x": r.standard_normal((2, 9)).astype(np.float32), "k_in": np.array([2, 4, 3], np.int64)})
+loop_body = helper.make_graph(
+    [node("Add", ["v_in", "one_f"], ["v_out"]), node("Identity", ["cond_in"], ["cond_out"]), node("Mul", ["v_out", "v_out"], ["sq"])],
+    "loop_body",
+    [helper.make_tensor_value_info("i", INT64, []), helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+     helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2])],
+    [helper.make_tensor_value_info("cond_out", TensorProto.BOOL, []), helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2]),
+     helper.make_tensor_value_info("sq", TensorProto.FLOAT, [2])],
+    [numpy_helper.from_array(np.array(1.0, np.float32), "one_f")])
+case("Break_Loop_computed_trip_count",
+     [node("ReduceSum", ["counts"], ["trips"], keepdims=0), node("Loop", ["trips", "", "v0"], ["v", "squares"], body=loop_body)],
+     {"counts": np.array([1, 2, 1], np.int64), "v0": r.standard_normal(2).astype(np.float32)})
+case("Break_two_breaks",
+     [node("ReduceSum", ["x"], ["s"], keepdims=0), node("Cast", ["s"], ["n"], to=INT64),
+      node("Range", ["zero", "n", "one"], ["idx"]), node("Cast", ["idx"], ["f"], to=TensorProto.FLOAT),
+      node("Greater", ["f", "half"], ["mask"]), node("NonZero", ["mask"], ["nz"]), node("Cast", ["nz"], ["y"], to=TensorProto.FLOAT)],
+     {"x": pos_f32(5)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64), "half": np.array(1.5, np.float32)})
+then_branch = helper.make_graph(
+    [node("Cast", ["s"], ["n"], to=INT64), node("Range", ["zero", "n", "one"], ["idx"]), node("Cast", ["idx"], ["out"], to=TensorProto.FLOAT)],
+    "then_branch", [], [helper.make_tensor_value_info("out", TensorProto.FLOAT, None)])
+else_branch = helper.make_graph(
+    [node("Constant", [], ["out"], value=numpy_helper.from_array(np.array([-1.0], np.float32)))],
+    "else_branch", [], [helper.make_tensor_value_info("out", TensorProto.FLOAT, None)])
+case("Break_inside_If",
+     [node("ReduceSum", ["x"], ["s"], keepdims=0), node("Greater", ["s", "zero_f"], ["cond"]),
+      node("If", ["cond"], ["y"], then_branch=then_branch, else_branch=else_branch)],
+     {"x": pos_f32(4)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64), "zero_f": np.array(0.0, np.float32)})
+# 24 nodes after the break that read the traced sum, so the segment after it compiles.
+tail = []
+for i in range(12):
+    tail += [node("Mul", [f"t{i}", "scale" if i else "s"], [f"m{i}"]), node("Add", [f"m{i}", "shift"], [f"t{i + 1}"])]
+case("Break_Range_long_tail",
+     [node("ReduceSum", ["x"], ["s"], keepdims=0), node("Cast", ["s"], ["n"], to=INT64),
+      node("Range", ["zero", "n", "one"], ["idx"]), node("Cast", ["idx"], ["t0"], to=TensorProto.FLOAT)] + tail +
+     [node("Identity", ["t12"], ["y"])],
+     {"x": pos_f32(6)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64),
+                         "scale": np.array(0.9, np.float32), "shift": np.array(0.25, np.float32)})

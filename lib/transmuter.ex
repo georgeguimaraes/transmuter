@@ -108,14 +108,7 @@ defmodule Transmuter do
   """
   def compile(model, inputs, opts \\ []) do
     {static_inputs, opts} = Keyword.pop(opts, :static_inputs, %{})
-
-    with_key =
-      if random?(model.nodes), do: &Map.put(&1, @random_key, random_key()), else: & &1
-
-    fun =
-      Nx.Defn.compile(&run(model, &1, &2, static_inputs), [model.params, with_key.(inputs)], opts)
-
-    fn inputs -> fun.(model.params, with_key.(inputs)) end
+    Transmuter.GraphBreaks.compile(model, inputs, static_inputs, opts)
   end
 
   @doc """
@@ -156,14 +149,15 @@ defmodule Transmuter do
 
   # Strings, sequences and empty optionals cannot leave a compiled function. Without a
   # compiler, a sequence comes back as a list.
-  defp host_outputs(outputs, nil) do
+  @doc false
+  def host_outputs(outputs, nil) do
     Map.new(outputs, fn
       {name, {:sequence, elements}} -> {name, elements}
       other -> other
     end)
   end
 
-  defp host_outputs(outputs, _compiler) do
+  def host_outputs(outputs, _compiler) do
     for {name, value} <- outputs, not is_struct(value, Nx.Tensor) do
       raise ArgumentError,
             "output #{name} is #{describe(value)}, which cannot leave a compiled function. " <>
@@ -181,12 +175,13 @@ defmodule Transmuter do
   # adds only its shape and type to the key. Two graphs that differ only in literal
   # values then share one compiled program. A metadata node with a hash of the value
   # puts the value in the key. EMLX compiles a metadata node as its inner node.
-  defp tag_literals(outputs, EMLX) do
+  @doc false
+  def tag_literals(outputs, EMLX) do
     {outputs, _seen} = Composite.traverse(outputs, %{}, &tag_literal/2)
     outputs
   end
 
-  defp tag_literals(outputs, _compiler), do: outputs
+  def tag_literals(outputs, _compiler), do: outputs
 
   defp tag_literal(t = %Nx.Tensor{data: %Expr{id: id, op: op, args: args}}, seen) do
     case seen do
@@ -207,7 +202,8 @@ defmodule Transmuter do
   defp tag_literal(t = %Nx.Tensor{shape: {}}, seen), do: {t, seen}
   defp tag_literal(t = %Nx.Tensor{}, seen), do: tag_literal(Expr.tensor(t), seen)
 
-  defp run_nodes(nodes, env, ctx) do
+  @doc false
+  def run_nodes(nodes, env, ctx) do
     Enum.reduce(nodes, env, fn node, env ->
       inputs =
         Enum.map(node.input, fn
@@ -300,13 +296,19 @@ defmodule Transmuter do
           step =
             env
             |> Map.merge(Map.new(Enum.zip(carried_names, carried)))
-            |> Map.merge(%{counter => Ops.static_tensor(i, :s64), condition_name => condition})
+            |> Map.merge(%{
+              counter => Ops.static_tensor(i, :s64),
+              condition_name => condition || Ops.static_tensor(1, :u8)
+            })
 
           [next_condition | outputs] =
             body.node
             |> run_nodes(step, ctx)
             |> then(&Enum.map(body.output, fn o -> Map.fetch!(&1, o.name) end))
 
+          # Without a condition input, the loop runs trip_count times and the body's
+          # condition output is ignored.
+          next_condition = if condition == nil, do: nil, else: next_condition
           {next_carried, scan_values} = Enum.split(outputs, length(carried))
           {:cont, {next_carried, [scan_values | scans], next_condition}}
         end
@@ -323,11 +325,16 @@ defmodule Transmuter do
   end
 
   # A key is two u32 words. It is on the default backend, so eager runs draw there.
-  defp random_key do
+  @doc false
+  def random_input, do: @random_key
+
+  @doc false
+  def random_key do
     Nx.tensor([:rand.uniform(2 ** 32) - 1, :rand.uniform(2 ** 32) - 1], type: :u32)
   end
 
-  defp random?(nodes) do
+  @doc false
+  def random?(nodes) do
     Enum.any?(nodes, fn node ->
       node.op_type in Random.op_types() or
         Enum.any?(node.attribute, &(&1.g != nil and random?(&1.g.node)))
@@ -352,11 +359,12 @@ defmodule Transmuter do
       else: not trainable and Nx.size(t) <= @static_max_size
   end
 
-  defp upcast(t = %Nx.Tensor{}, type) when type != nil do
+  @doc false
+  def upcast(t = %Nx.Tensor{}, type) when type != nil do
     if Nx.type(t) in [{:f, 16}, {:bf, 16}], do: Nx.as_type(t, type), else: t
   end
 
-  defp upcast(t, _type), do: t
+  def upcast(t, _type), do: t
 
   # Unrolls Scan over the static length of its scan inputs. Each step takes one slice of
   # every scan input; per-step outputs are stacked along their output axes.
@@ -465,7 +473,8 @@ defmodule Transmuter do
   end
 
   # A node with subgraphs (If branches) also depends on the outer values its branches read.
-  defp dependencies(node) do
+  @doc false
+  def dependencies(node) do
     outer =
       for %{g: graph} when graph != nil <- node.attribute,
           name <- outer_reads(graph),

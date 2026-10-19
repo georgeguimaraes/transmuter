@@ -34,12 +34,18 @@ try do
   {static, inputs} = Enum.split_with(meta["inputs"], static?)
   inputs = Map.new(inputs, &{&1["name"], read.(&1, backend)})
   static = Map.new(static, &{&1["name"], read.(&1, Nx.BinaryBackend)})
-  # EAGER=1 runs without jit, so values that decide shapes are read as the model runs.
+  # EAGER=1 runs without compiling. Otherwise Transmuter.compile/3 compiles the model and
+  # breaks the graph at values that are only known when it runs.
   fun =
     if System.get_env("EAGER") == "1",
-      do: fn p, i -> Transmuter.run(model, p, i, static) end,
-      else: Nx.Defn.jit(fn p, i -> Transmuter.run(model, p, i, static) end, compiler: EMLX)
-  {run_ms, out} = timed.(fn -> fun.(params, inputs) end)
+      do: fn i -> Transmuter.run(model, params, i, static) end,
+      else:
+        Transmuter.compile(%{model | params: params}, inputs,
+          static_inputs: static,
+          compiler: EMLX,
+          device: elem(backend, 1)[:device]
+        )
+  {run_ms, out} = timed.(fn -> fun.(inputs) end)
 
   diffs =
     for spec <- meta["outputs"], not (0 in spec["shape"] and not Map.has_key?(out, spec["name"])) do

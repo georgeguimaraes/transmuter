@@ -62,9 +62,11 @@ defmodule TransmuterTest do
     %{"logits" => logits} = run(model, inputs, %{"use_cache_branch" => flag})
     assert_all_close(logits[[0, 0, 0..4]], [11.7904, 7.4783, 7.9252, 8.0604, 6.4908])
 
-    assert_raise Transmuter.UnknownValueError, ~r/the If condition is only known/, fn ->
+    # As a traced input, the condition breaks the graph and the If runs on its value.
+    %{"logits" => traced} =
       run(model, Map.put(inputs, "use_cache_branch", Nx.backend_copy(flag, @backend)))
-    end
+
+    assert_all_close(traced[[0, 0, 0..4]], [11.7904, 7.4783, 7.9252, 8.0604, 6.4908])
   end
 
   test "generates with a static KV cache like transformers" do
@@ -254,6 +256,32 @@ defmodule TransmuterTest do
   end
 
   defp different?(a, b), do: Nx.to_number(Nx.all(Nx.equal(a, b))) == 0
+
+  test "compiles past a value that is only known at run time" do
+    path = Path.expand("fixtures/ops/Break_Range_long_tail/model.onnx", __DIR__)
+    model = Transmuter.load!(path, backend: @backend)
+    input = &%{"x" => Nx.tensor(&1, backend: @backend)}
+    eager = &(Transmuter.run(model, model.params, input.(&1))["y"] |> Nx.backend_copy())
+
+    # The function compiles in a process that exits, so its cache table is gone.
+    compiled =
+      Task.async(fn -> Transmuter.compile(model, input.([1.0, 1, 1, 1, 1, 1]), @compiler) end)
+      |> Task.await()
+
+    for x <- [[1.0, 1, 1, 1, 1, 1], [2.0, 2, 1, 1, 1, 1], [1.0, 1, 1, 1, 1, 1]] do
+      result = compiled.(input.(x))["y"]
+      assert Nx.shape(result) == {round(Enum.sum(x))}
+      assert_all_close(result, eager.(x))
+    end
+
+    # Calls from the process that compiled it, and from another process, share the cache.
+    compiled = Transmuter.compile(model, input.([1.0, 1, 1, 1, 1, 1]), @compiler)
+
+    for x <- [[2.0, 2, 1, 1, 1, 1], [1.0, 1, 1, 1, 1, 1], [2.0, 2, 1, 1, 1, 1]] do
+      assert_all_close(compiled.(input.(x))["y"], eager.(x))
+      assert_all_close(Task.async(fn -> compiled.(input.(x))["y"] end) |> Task.await(), eager.(x))
+    end
+  end
 
   defp load(repo, file, opts \\ []) do
     Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
