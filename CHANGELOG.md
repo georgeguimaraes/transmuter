@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.2.0](https://github.com/georgeguimaraes/transmuter/compare/v0.1.1...v0.2.0) (2026-10-19)
+
+
+### Features
+
+* Add chat templates and text generation ([089cb95](https://github.com/georgeguimaraes/transmuter/commit/089cb959dee1605f97e4e6aed1a33302da1113ab))
+* Add com.microsoft MoE and QMoE operators ([9b5d562](https://github.com/georgeguimaraes/transmuter/commit/9b5d56299c3c51be1f0b8e0e0a3fcb0177fc0e7a))
+* Add text task servings with a tokenizer ([97e7157](https://github.com/georgeguimaraes/transmuter/commit/97e715730e361fd167bbc4f7dac1f29f5b404404))
+* Choose the compute type in find_divergence.exs ([83ac43c](https://github.com/georgeguimaraes/transmuter/commit/83ac43c1e60c6c44985284f37e5c2ed56a79caa3))
+* Emit telemetry events for load, compile, run and graph breaks ([eb33cce](https://github.com/georgeguimaraes/transmuter/commit/eb33cce3a8d1bdc6e03d5063c0db4a9af33e5966))
+* Load FP8 tensors ([ab71f57](https://github.com/georgeguimaraes/transmuter/commit/ab71f57e175451246c50ed827b68bc6e77faa5f9))
+* Read the files and variants of a model repository ([1a9a042](https://github.com/georgeguimaraes/transmuter/commit/1a9a0424425dd83225025383c8e14584cecfc565))
+* Set the divergence threshold in find_divergence.exs ([a583afa](https://github.com/georgeguimaraes/transmuter/commit/a583afaf3b39aef2f94efe3cf0017a5266f369f2))
+
+
+### Bug Fixes
+
+* Keep Hub errors out of the cache and work offline ([6b649ab](https://github.com/georgeguimaraes/transmuter/commit/6b649ab4b5e8d5bc431bbfccfcd1f5574efd28cc))
+* Read external data in Constant values and subgraphs ([0f907e4](https://github.com/georgeguimaraes/transmuter/commit/0f907e4ff0933e31e81d507d8a7c49650176ac97))
+* Report the cases that run_cases.py skips ([bf00308](https://github.com/georgeguimaraes/transmuter/commit/bf0030870289a137ec1153610fad9ea95214e1d1))
+* Run half-precision exports in f32 by default ([d035284](https://github.com/georgeguimaraes/transmuter/commit/d035284557d68f9c5c1d761ff535f78ee19c51d5))
+* Run If, Loop and Scan nodes in find_divergence.exs ([7f13ded](https://github.com/georgeguimaraes/transmuter/commit/7f13ded94715a314c6a49b219d374cc402053115))
+
+
+### Miscellaneous
+
+* Set the next release to 0.2.0 ([d080a25](https://github.com/georgeguimaraes/transmuter/commit/d080a254d0b7fbb1c2b468ad6882be5487f42166))
+
+
+### Documentation
+
+* Add guides and document the public API ([2a8c14d](https://github.com/georgeguimaraes/transmuter/commit/2a8c14dfdcd06a3c5141cea08ac1217fa5b757f0))
+* Add the models tested today to the README ([fd31449](https://github.com/georgeguimaraes/transmuter/commit/fd31449311149bcbe117bcfc79dd1d71e9f5f502))
+* Document the internal helpers in [@doc](https://github.com/doc) ([c8f1b6d](https://github.com/georgeguimaraes/transmuter/commit/c8f1b6d0b40323da021294c6aa4f929d448ff641))
+* Give the drift of a deep graph in native f16 ([f677d59](https://github.com/georgeguimaraes/transmuter/commit/f677d5951a63ef5fa4ad1aba4553257e26926dff))
+* Link ONNX to its site in the README ([ffa788e](https://github.com/georgeguimaraes/transmuter/commit/ffa788ea9a3cac0555770f13232db9761d1195d4))
+* Read the image preprocessing from preprocessor_config.json ([1b76de4](https://github.com/georgeguimaraes/transmuter/commit/1b76de4d08ec48ee2a03e22d2e39c0ea225bc978))
+* Show the text servings first and add a pipelines guide ([3c1740c](https://github.com/georgeguimaraes/transmuter/commit/3c1740c51513dc7274093be277d488d3477a88ac))
+* Write the module comments as moduledocs ([ed92a1f](https://github.com/georgeguimaraes/transmuter/commit/ed92a1f59afc4b8e9f5d422bf9a7834aaab01c0f))
+
 ## [0.1.1](https://github.com/georgeguimaraes/transmuter/compare/v0.1.0...v0.1.1) (2026-10-19)
 
 
