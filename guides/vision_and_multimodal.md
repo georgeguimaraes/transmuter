@@ -4,35 +4,44 @@ This guide shows how to run image classification, zero-shot image-text models, a
 
 ## Image preprocessing
 
-Most vision models expect a float tensor of shape `{batch, channels, height, width}` with normalized pixel values. The preprocessing steps (resize, crop, normalize) are not in the ONNX file. You must do them before passing the tensor to the model.
+Most vision models expect a float tensor of shape `{batch, channels, height, width}` with normalized pixel values. The preprocessing steps (resize, crop, rescale, normalize) are not in the ONNX file. You must do them before you give the tensor to the model.
 
-Use [StbImage](https://hex.pm/packages/stb_image) to load and resize an image:
+Each model gives its preprocessing in `preprocessor_config.json`. The values differ between models. For example, ViT uses a mean and std of `0.5`, CLIP uses `[0.4815, 0.4578, 0.4082]` and `[0.2686, 0.2613, 0.2758]`, and mobileclip does not normalize. Read the file with `Transmuter.Hub.json/3`:
 
 ```elixir
-{:ok, image} = StbImage.read_file("image.jpg")
-tensor = StbImage.to_nx(image)
-# tensor shape: {height, width, channels}
-
-# Resize to the model's expected size (for example 224x224 for ViT models).
-tensor = Nx.new_axis(tensor, 0)
-# tensor shape: {1, height, width, channels}
-tensor = Nx.transpose(tensor, axes: [0, 3, 1, 2])
-# tensor shape: {1, channels, height, width}
+source = {:hf, "Xenova/vit-base-patch16-224"}
+config = Transmuter.Hub.json(source, "preprocessor_config.json")
+# %{"size" => %{"height" => 224, "width" => 224}, "rescale_factor" => 0.00392156862745098,
+#   "image_mean" => [0.5, 0.5, 0.5], "image_std" => [0.5, 0.5, 0.5], "do_normalize" => true, ...}
 ```
 
-Normalize with the model's mean and standard deviation. For ViT and CLIP models, the common values are mean `[0.485, 0.456, 0.406]` and std `[0.229, 0.224, 0.225]`:
+Use [StbImage](https://hex.pm/packages/stb_image) to load the image and resize it to `size`:
 
 ```elixir
-mean = Nx.tensor([0.485, 0.456, 0.406]) |> Nx.reshape({1, 3, 1, 1})
-std = Nx.tensor([0.229, 0.224, 0.225]) |> Nx.reshape({1, 3, 1, 1})
+%{"height" => height, "width" => width} = config["size"]
 
 pixel_values =
-  tensor
+  "image.jpg"
+  |> StbImage.read_file!(channels: 3)
+  |> StbImage.resize(height, width)
+  |> StbImage.to_nx()
+  # {height, width, 3} -> {1, 3, height, width}
+  |> Nx.transpose(axes: [2, 0, 1])
+  |> Nx.new_axis(0)
   |> Nx.as_type(:f32)
-  |> Nx.divide(255.0)
-  |> Nx.subtract(mean)
-  |> Nx.divide(std)
+  |> Nx.multiply(config["rescale_factor"])
+
+pixel_values =
+  if config["do_normalize"] do
+    mean = config["image_mean"] |> Nx.tensor() |> Nx.reshape({1, 3, 1, 1})
+    std = config["image_std"] |> Nx.tensor() |> Nx.reshape({1, 3, 1, 1})
+    pixel_values |> Nx.subtract(mean) |> Nx.divide(std)
+  else
+    pixel_values
+  end
 ```
+
+Some models give `size` as `%{"shortest_edge" => n}` and a `crop_size`. For these models, resize so that the short side is `n` and keep the aspect ratio. Then take the center `crop_size` region.
 
 ## Image classification
 
@@ -67,7 +76,8 @@ text_model = Transmuter.load!(
   backend: EMLX.Backend
 )
 
-# Vision input: {batch, 3, 256, 256}, pixel values normalized to [0, 1].
+# Vision input: {batch, 3, 256, 256}. The preprocessor config of mobileclip resizes the
+# short side to 256, crops the center 256x256 and rescales to [0, 1] with no normalization.
 vision_inputs = %{"pixel_values" => pixel_values}
 
 # Text input: {num_labels, 77}. CLIP uses a fixed context length of 77 tokens.
@@ -81,7 +91,8 @@ image_embeds = vision_run.(vision_inputs)["image_embeds"]  # {1, 512}
 text_embeds = text_run.(text_inputs)["text_embeds"]        # {num_labels, 512}
 
 # Cosine similarity between image and each text embedding.
-similarity = Nx.dot(image_embeds, Nx.transpose(text_embeds))  # {1, num_labels}
+normalize = &Nx.divide(&1, Nx.LinAlg.norm(&1, axes: [-1], keep_axes: true))
+similarity = Nx.dot(normalize.(image_embeds), Nx.transpose(normalize.(text_embeds)))  # {1, num_labels}
 ```
 
 ## Vision-language model pipeline
