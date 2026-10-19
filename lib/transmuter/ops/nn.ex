@@ -171,26 +171,8 @@ defmodule Transmuter.Ops.NN do
     end
   end
 
-  defp op(node = %{op_type: "ConvTranspose"}, [x, w | b]) do
-    groups = attr(node, "group", 1)
-
-    if groups > 1 do
-      group_in = div(Nx.axis_size(x, 1), groups)
-
-      out =
-        for g <- 0..(groups - 1) do
-          op(%{node | attribute: Enum.reject(node.attribute, &(&1.name == "group"))}, [
-            Nx.slice_along_axis(x, g * group_in, group_in, axis: 1),
-            Nx.slice_along_axis(w, g * group_in, group_in, axis: 0)
-          ])
-        end
-        |> Nx.concatenate(axis: 1)
-
-      add_channel_bias(out, List.first(b))
-    else
-      conv_transpose(node, x, w, List.first(b))
-    end
-  end
+  defp op(node = %{op_type: "ConvTranspose"}, [x, w | b]),
+    do: conv_transpose(node, x, w, List.first(b))
 
   defp op(node = %{op_type: "LpNormalization"}, [x]) do
     axis = attr(node, "axis", -1)
@@ -578,9 +560,17 @@ defmodule Transmuter.Ops.NN do
       ])
       |> Enum.map(fn {k, d, lo, hi, op} -> {d * (k - 1) - lo, d * (k - 1) - hi + op} end)
 
+    # The weight is {in, out / groups, kernel...}. Each group becomes the
+    # {out / groups, in / groups, kernel...} kernel of a grouped conv.
+    groups = attr(node, "group", 1)
+    [c_in, group_out | _] = Tuple.to_list(Nx.shape(w))
+    spatial_axes = Enum.to_list(3..(spatial + 2)//1)
+
     w =
       w
-      |> Nx.transpose(axes: [1, 0 | Enum.to_list(2..(spatial + 1))])
+      |> Nx.reshape(List.to_tuple([groups, div(c_in, groups), group_out | kernel]))
+      |> Nx.transpose(axes: [0, 2, 1 | spatial_axes])
+      |> Nx.reshape(List.to_tuple([groups * group_out, div(c_in, groups) | kernel]))
       |> Nx.reverse(axes: Enum.to_list(2..(spatial + 1)))
 
     x
@@ -588,7 +578,8 @@ defmodule Transmuter.Ops.NN do
       strides: 1,
       padding: padding,
       input_dilation: strides,
-      kernel_dilation: dilations
+      kernel_dilation: dilations,
+      feature_group_size: groups
     )
     |> add_channel_bias(b)
   end
