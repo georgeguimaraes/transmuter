@@ -29,7 +29,8 @@ defmodule Transmuter.Ops.Elementwise do
       else: Nx.divide(a, b)
   end
 
-  defp op(%{op_type: "Pow"}, [a, b]), do: Nx.pow(a, b)
+  # The output has the type of the base, also for an integer base with a float exponent.
+  defp op(%{op_type: "Pow"}, [a, b]), do: a |> Nx.pow(b) |> Nx.as_type(Nx.type(a))
   defp op(%{op_type: "Sqrt"}, [a]), do: Nx.sqrt(a)
   defp op(%{op_type: "Erf"}, [a]), do: Nx.erf(a)
   defp op(%{op_type: "Tanh"}, [a]), do: Nx.tanh(a)

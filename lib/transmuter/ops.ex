@@ -287,6 +287,7 @@ defmodule Transmuter.Ops do
   def known?(%Nx.Tensor{}), do: true
 
   @doc false
+  def static_tensor([], _type), do: {:empty, {0}}
   def static_tensor(list, type), do: Nx.tensor(list, type: type, backend: Nx.BinaryBackend)
 
   @doc false

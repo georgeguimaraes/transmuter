@@ -879,3 +879,20 @@ r = rng_for("one-element control values")
 case("Loop_trip_count_shape_1", [node("Loop", ["M", "cond", "acc0"], ["acc", "scans"], body=body)],
      {"x": r.standard_normal(3).astype(np.float32), "acc0": r.standard_normal(3).astype(np.float32)},
      {"M": np.array([4], np.int64), "cond": np.array([True])})
+
+# ---------- prefill and shape arithmetic from VLM exports ----------
+
+# GQA prefill with an empty past, as SmolVLM's first decoder step runs it.
+r = rng_for("prefill and shape arithmetic")
+rf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+case("GroupQueryAttention_empty_past",
+     [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
+           num_heads=4, kv_num_heads=2)],
+     {"q": rf32(1, 5, 4 * G), "k": rf32(1, 5, 2 * G), "v": rf32(1, 5, 2 * G), "pk": rf32(1, 2, 0, G), "pv": rf32(1, 2, 0, G),
+      "seqlens": np.array([4], dtype=np.int32), "total": np.array(5, dtype=np.int32)}, ms=True, static=("total",))
+# Florence-2's DaViT gets its window count as Pow(int64 length, 0.5) and reshapes with it.
+case("Pow_integer_base_float_exponent",
+     [node("Shape", ["x"], ["shape"], start=1, end=2), node("Pow", ["shape", "half"], ["side"]),
+      node("Concat", ["batch", "side", "side", "channels"], ["target"], axis=0), node("Reshape", ["x", "target"], ["y"])],
+     {"x": rf32(2, 16, 3)}, {"half": np.array(0.5, np.float32), "batch": np.array([2], np.int64), "channels": np.array([3], np.int64)})
+case("Shape_negative_start_end_past_rank", [node("Shape", ["x"], ["y"], start=-2, end=10)], {"x": rf32(2, 3, 4)})

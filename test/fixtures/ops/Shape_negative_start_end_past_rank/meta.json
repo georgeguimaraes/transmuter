@@ -1,0 +1,35 @@
+{
+ "repo": "op/Shape_negative_start_end_past_rank",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Shape": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    4
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "s64",
+   "shape": [
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

@@ -83,11 +83,15 @@ defmodule Transmuter.Ops.Shape do
 
   defp op(%{op_type: "Size"}, [a]), do: static_tensor(Nx.size(a), :s64)
 
-  defp op(%{op_type: "Shape"}, [{:empty, shape}]),
-    do: shape |> Tuple.to_list() |> static_tensor(:s64)
-
-  defp op(%{op_type: "Shape"}, [a]),
-    do: a |> Nx.shape() |> Tuple.to_list() |> static_tensor(:s64)
+  # start and end (opset 15) slice the dims, and are clamped to the rank like Slice.
+  defp op(node = %{op_type: "Shape"}, [a]) do
+    dims = a |> shape_of() |> Tuple.to_list()
+    rank = length(dims)
+    clamp = &(&1 |> normalize_axis(rank) |> max(0) |> min(rank))
+    first = clamp.(attr(node, "start", 0))
+    count = max(clamp.(attr(node, "end", rank)) - first, 0)
+    dims |> Enum.slice(first, count) |> static_tensor(:s64)
+  end
 
   defp op(node = %{op_type: "Gather"}, [data, indices]) do
     axis = attr(node, "axis", 0)

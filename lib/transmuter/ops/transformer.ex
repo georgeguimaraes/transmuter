@@ -6,7 +6,16 @@ defmodule Transmuter.Ops.Transformer do
   # exporters, so the domain decides the input layout.
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, ints!: 1, normalize: 3, normalize_axis: 2, softmax_last: 1]
+    only: [
+      attr: 2,
+      attr: 3,
+      empty?: 1,
+      ints!: 1,
+      normalize: 3,
+      normalize_axis: 2,
+      shape_of: 1,
+      softmax_last: 1
+    ]
 
   @op_types ~w(Attention GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
@@ -95,7 +104,7 @@ defmodule Transmuter.Ops.Transformer do
         {q, k}
       end
 
-    capacity = max(Nx.axis_size(past_k, 2), total_len)
+    capacity = max(elem(shape_of(past_k), 2), total_len)
     present_k = write_cache(past_k, k, offsets, capacity)
     present_v = write_cache(past_v, v, offsets, capacity)
 
@@ -413,20 +422,18 @@ defmodule Transmuter.Ops.Transformer do
 
   # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at a per-sequence offset.
   defp write_cache(past, new, offsets, capacity) do
-    b = Nx.axis_size(new, 0)
-    past_len = Nx.axis_size(past, 2)
+    {b, heads, past_len, head_size} = shape_of(past)
 
     j = Nx.iota({1, 1, capacity, 1}, axis: 2)
     offsets = Nx.reshape(offsets, {b, 1, 1, 1})
-    zero = Nx.tensor(0, type: Nx.type(past))
+    zero = Nx.tensor(0, type: Nx.type(new))
 
     # A separate present buffer gets each sequence's valid past and zeros after it.
     # A shared buffer (past as long as the capacity) is updated in place.
     base =
       if past_len < capacity do
-        padded =
-          Nx.pad(past, zero, [{0, 0, 0}, {0, 0, 0}, {0, capacity - past_len, 0}, {0, 0, 0}])
-
+        zeros = Nx.broadcast(zero, {b, heads, capacity - past_len, head_size})
+        padded = [past, zeros] |> Enum.reject(&empty?/1) |> Nx.concatenate(axis: 2)
         Nx.select(Nx.broadcast(Nx.less(j, offsets), Nx.shape(padded)), padded, zero)
       else
         past
