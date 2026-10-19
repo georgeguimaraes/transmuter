@@ -4,7 +4,8 @@ defmodule Transmuter.Ops.NN do
   # Neural network layers: convolutions, pooling, unpooling, normalizations, Resize,
   # Upsample, GridSample, LRN, Dropout and the classification losses.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, empty?: 1, ints!: 1, static_tensor: 2]
+  import Transmuter.Ops,
+    only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize: 3, static_tensor: 2]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
@@ -67,13 +68,10 @@ defmodule Transmuter.Ops.NN do
 
   defp op(node = %{op_type: "InstanceNormalization"}, [x, scale, bias]) do
     axes = Enum.to_list(2..(Nx.rank(x) - 1))
-    mean = Nx.mean(x, axes: axes, keep_axes: true)
-    var = Nx.variance(x, axes: axes, keep_axes: true)
     shape = List.to_tuple([1, :auto | List.duplicate(1, length(axes))])
 
     x
-    |> Nx.subtract(mean)
-    |> Nx.multiply(Nx.rsqrt(Nx.add(var, attr(node, "epsilon", 1.0e-5))))
+    |> normalize(axes, attr(node, "epsilon", 1.0e-5))
     |> Nx.multiply(Nx.reshape(scale, shape))
     |> Nx.add(Nx.reshape(bias, shape))
   end
@@ -93,14 +91,7 @@ defmodule Transmuter.Ops.NN do
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + Nx.rank(x), else: axis
     axes = Enum.to_list(axis..(Nx.rank(x) - 1))
-    mean = Nx.mean(x, axes: axes, keep_axes: true)
-    var = Nx.variance(x, axes: axes, keep_axes: true)
-
-    out =
-      x
-      |> Nx.subtract(mean)
-      |> Nx.multiply(Nx.rsqrt(Nx.add(var, attr(node, "epsilon", 1.0e-5))))
-      |> Nx.multiply(scale)
+    out = x |> normalize(axes, attr(node, "epsilon", 1.0e-5)) |> Nx.multiply(scale)
 
     case bias do
       [b | _] when b != nil -> Nx.add(out, b)
@@ -192,13 +183,7 @@ defmodule Transmuter.Ops.NN do
     shape = Nx.shape(x)
     {n, c} = {elem(shape, 0), elem(shape, 1)}
     grouped = Nx.reshape(x, {n, groups, :auto})
-    mean = Nx.mean(grouped, axes: [2], keep_axes: true)
-    var = Nx.variance(grouped, axes: [2], keep_axes: true)
-
-    normed =
-      grouped
-      |> Nx.subtract(mean)
-      |> Nx.multiply(Nx.rsqrt(Nx.add(var, attr(node, "epsilon", 1.0e-5))))
+    normed = normalize(grouped, [2], attr(node, "epsilon", 1.0e-5))
 
     {scale, bias} =
       if Nx.size(scale) == c,

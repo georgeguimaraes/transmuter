@@ -367,6 +367,15 @@ defmodule Transmuter.Ops do
     |> List.to_tuple()
   end
 
+  # (x - mean) / sqrt(variance + eps) over axes. It centers x once and reuses it,
+  # where Nx.variance would compute the mean and center x again.
+  @doc false
+  def normalize(x, axes, eps) do
+    centered = Nx.subtract(x, Nx.mean(x, axes: axes, keep_axes: true))
+    var = centered |> Nx.multiply(centered) |> Nx.mean(axes: axes, keep_axes: true)
+    Nx.multiply(centered, Nx.rsqrt(Nx.add(var, eps)))
+  end
+
   @doc false
   def softmax_last(a) do
     max = Nx.reduce_max(a, axes: [-1], keep_axes: true)

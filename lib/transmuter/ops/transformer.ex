@@ -5,7 +5,8 @@ defmodule Transmuter.Ops.Transformer do
   # same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT
   # exporters, so the domain decides the input layout.
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2, softmax_last: 1]
+  import Transmuter.Ops,
+    only: [attr: 2, attr: 3, ints!: 1, normalize: 3, normalize_axis: 2, softmax_last: 1]
 
   @op_types ~w(Attention GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
@@ -540,12 +541,8 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   defp layer_norm(x, gamma, beta, eps) do
-    mean = Nx.mean(x, axes: [-1], keep_axes: true)
-    var = Nx.variance(x, axes: [-1], keep_axes: true)
-
     x
-    |> Nx.subtract(mean)
-    |> Nx.multiply(Nx.rsqrt(Nx.add(var, eps)))
+    |> normalize([-1], eps)
     |> Nx.multiply(gamma)
     |> add_optional(beta)
   end
