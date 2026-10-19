@@ -74,6 +74,8 @@ defmodule Transmuter.MixProject do
         "Public API": [
           Transmuter,
           Transmuter.EMLX,
+          Transmuter.Hub,
+          Transmuter.Repo,
           Transmuter.Telemetry,
           Transmuter.Telemetry.Logger,
           Transmuter.UnknownValueError

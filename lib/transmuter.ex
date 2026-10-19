@@ -104,7 +104,7 @@ defmodule Transmuter do
     end)
   end
 
-  defp path!({:hf, repo, file}, opts), do: download!(repo, file, opts)
+  defp path!({:hf, repo, file}, opts), do: Transmuter.Hub.fetch!({:hf, repo}, file, opts)
   defp path!(path, _opts) when is_binary(path), do: path
 
   defp read!(path, opts) do
@@ -732,44 +732,5 @@ defmodule Transmuter do
     local = Enum.map(graph.initializer, & &1.name) ++ Enum.map(graph.input, & &1.name)
     produced = Enum.flat_map(graph.node, & &1.output)
     Enum.uniq(Enum.flat_map(graph.node, &dependencies/1)) -- (local ++ produced)
-  end
-
-  defp download!(repo, file, opts) do
-    dir =
-      Path.join(
-        opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"]),
-        repo
-      )
-
-    path = Path.join(dir, file)
-
-    unless File.exists?(path) do
-      %{"siblings" => siblings} = hub_get!("https://huggingface.co/api/models/#{repo}").body
-
-      data_files =
-        for %{"rfilename" => f} <- siblings,
-            String.starts_with?(f, file <> "_data") or f == file <> ".data",
-            do: f
-
-      for f <- data_files ++ [file] do
-        target = Path.join(dir, f)
-        File.mkdir_p!(Path.dirname(target))
-
-        hub_get!("https://huggingface.co/#{repo}/resolve/main/#{f}",
-          into: File.stream!(target <> ".part")
-        )
-
-        File.rename!(target <> ".part", target)
-      end
-    end
-
-    path
-  end
-
-  defp hub_get!(url, opts \\ []) do
-    headers =
-      if token = System.get_env("HF_TOKEN"), do: [authorization: "Bearer #{token}"], else: []
-
-    Req.get!(url, [headers: headers, receive_timeout: 600_000, redirect_log_level: false] ++ opts)
   end
 end
