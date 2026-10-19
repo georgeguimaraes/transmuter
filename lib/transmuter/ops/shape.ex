@@ -8,6 +8,7 @@ defmodule Transmuter.Ops.Shape do
     only: [
       attr: 2,
       attr: 3,
+      broadcast_shape: 1,
       dtype: 1,
       empty?: 1,
       ints!: 1,
@@ -57,17 +58,23 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(%{op_type: "Expand"}, [a, shape]) do
-    target = ints!(shape)
-    rank = max(Nx.rank(a), length(target))
-    pad = fn list -> List.duplicate(1, rank - length(list)) ++ list end
-    out = Enum.zip_with(pad.(Tuple.to_list(Nx.shape(a))), pad.(target), &max/2)
+    out = broadcast_shape([Nx.shape(a), List.to_tuple(ints!(shape))])
+    pad = List.duplicate(1, tuple_size(out) - Nx.rank(a)) ++ Tuple.to_list(Nx.shape(a))
 
-    a
-    |> Nx.reshape(List.to_tuple(pad.(Tuple.to_list(Nx.shape(a)))))
-    |> Nx.broadcast(List.to_tuple(out))
+    if 0 in Tuple.to_list(out),
+      do: {:empty, out},
+      else: a |> Nx.reshape(List.to_tuple(pad)) |> Nx.broadcast(out)
   end
 
-  defp op(%{op_type: "Tile"}, [a, repeats]), do: Nx.tile(a, ints!(repeats))
+  defp op(%{op_type: "Tile"}, [a, repeats]) do
+    repeats = ints!(repeats)
+
+    if 0 in repeats,
+      do:
+        {:empty,
+         a |> Nx.shape() |> Tuple.to_list() |> Enum.zip_with(repeats, &*/2) |> List.to_tuple()},
+      else: Nx.tile(a, repeats)
+  end
 
   defp op(node = %{op_type: "Squeeze"}, [a | rest]) do
     axes = if rest == [] or rest == [nil], do: attr(node, "axes"), else: ints!(hd(rest))
@@ -188,7 +195,10 @@ defmodule Transmuter.Ops.Shape do
   defp op(%{op_type: "Range"}, [start_t, limit, delta]) do
     [start, limit, delta] = Enum.map([start_t, limit, delta], &(&1 |> ints!() |> hd()))
     n = max(ceil((limit - start) / delta), 0)
-    static_tensor(Enum.map(0..(n - 1)//1, &(start + &1 * delta)), Nx.type(start_t))
+
+    if n == 0,
+      do: {:empty, {0}},
+      else: static_tensor(Enum.map(0..(n - 1)//1, &(start + &1 * delta)), Nx.type(start_t))
   end
 
   defp op(node = %{op_type: "Split"}, [a | rest]) do
@@ -212,7 +222,10 @@ defmodule Transmuter.Ops.Shape do
 
     sizes
     |> Enum.scan({0, 0}, fn size, {start, prev} -> {start + prev, size} end)
-    |> Enum.map(fn {start, size} -> Nx.slice_along_axis(a, start, size, axis: axis) end)
+    |> Enum.map(fn
+      {_start, 0} -> {:empty, a |> Nx.shape() |> put_elem(axis, 0)}
+      {start, size} -> Nx.slice_along_axis(a, start, size, axis: axis)
+    end)
   end
 
   defp op(node = %{op_type: "Pad"}, [a | rest]) do
@@ -272,7 +285,9 @@ defmodule Transmuter.Ops.Shape do
     |> Nx.reshape({n, c * b * b, div(h, b), div(w, b)})
   end
 
-  defp op(%{op_type: "ScatterElements"}, [data, {:empty, _}, {:empty, _}]), do: data
+  defp op(%{op_type: scatter}, [data, {:empty, _}, {:empty, _}])
+       when scatter in ["ScatterElements", "Scatter", "ScatterND"],
+       do: data
 
   # Each update goes to its own coordinates with the index replacing the axis coordinate.
   # Scatter is the old name of ScatterElements.

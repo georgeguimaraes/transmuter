@@ -61,17 +61,42 @@ defmodule Transmuter.Ops do
     "Reshape" => [0],
     "Expand" => [0],
     "Gather" => [0, 1],
+    "GatherND" => [1],
+    "GatherElements" => [1],
+    "OneHot" => [0],
+    "MatMul" => [0, 1],
     "NonMaxSuppression" => [0, 1],
     "RoiAlign" => [0, 1, 2]
   }
 
   defp dispatch(node, inputs, opset) do
+    empty_outputs(node, inputs) || dispatch_op(node, inputs, opset)
+  end
+
+  # The outputs of an operator with a zero-size input, or nil when the operator computes them.
+  defp empty_outputs(node, inputs) do
     empty_through = Map.get(@empty_through, node.op_type, [])
 
     cond do
       Enum.any?(empty_through, &empty?(Enum.at(inputs, &1))) ->
-        [{:empty, node |> empty_shape(inputs) |> List.to_tuple()}]
+        shape = node |> empty_shape(inputs) |> List.to_tuple()
 
+        # A product over an empty axis is zero, so its output is not empty.
+        if 0 in Tuple.to_list(shape),
+          do: [{:empty, shape}],
+          else: [Nx.broadcast(Nx.tensor(0, type: zero_type(inputs)), shape)]
+
+      node.op_type in Elementwise.op_types() and node.op_type != "SwiGLU" and
+          Enum.any?(inputs, &empty?/1) ->
+        [{:empty, broadcast_shape(for input <- inputs, input != nil, do: shape_of(input))}]
+
+      true ->
+        nil
+    end
+  end
+
+  defp dispatch_op(node, inputs, opset) do
+    cond do
       node.op_type in ["Softmax", "LogSoftmax", "Hardmax"] ->
         [along_axis(node, hd(inputs), opset)]
 
@@ -175,6 +200,29 @@ defmodule Transmuter.Ops do
     before ++ shape_list(indices) ++ after_axis
   end
 
+  defp empty_shape(node = %{op_type: "GatherND"}, [data, indices]) do
+    {outer, [k]} = indices |> shape_list() |> Enum.split(-1)
+    outer ++ Enum.drop(shape_list(data), attr(node, "batch_dims", 0) + k)
+  end
+
+  defp empty_shape(%{op_type: "GatherElements"}, [_data, indices]), do: shape_list(indices)
+
+  defp empty_shape(node = %{op_type: "OneHot"}, [indices, depth, _values]) do
+    dims = shape_list(indices)
+    [depth] = ints!(depth)
+    List.insert_at(dims, normalize_axis(attr(node, "axis", -1), length(dims) + 1), depth)
+  end
+
+  defp empty_shape(%{op_type: "MatMul"}, [a, b]) do
+    {a_dims, b_dims} = {shape_list(a), shape_list(b)}
+    {a_batch, [m, _k]} = Enum.split(if(length(a_dims) == 1, do: [1 | a_dims], else: a_dims), -2)
+    {b_batch, [_k, n]} = Enum.split(if(length(b_dims) == 1, do: b_dims ++ [1], else: b_dims), -2)
+    batch = broadcast_shape([List.to_tuple(a_batch), List.to_tuple(b_batch)])
+
+    Tuple.to_list(batch) ++
+      if(length(a_dims) == 1, do: [], else: [m]) ++ if(length(b_dims) == 1, do: [], else: [n])
+  end
+
   defp empty_shape(%{op_type: "NonMaxSuppression"}, _inputs), do: [0, 3]
 
   defp empty_shape(node = %{op_type: "RoiAlign"}, [x, rois | _]) do
@@ -187,6 +235,13 @@ defmodule Transmuter.Ops do
   end
 
   defp shape_list(t), do: t |> shape_of() |> Tuple.to_list()
+
+  defp zero_type(inputs) do
+    case Enum.find(inputs, &is_struct(&1, Nx.Tensor)) do
+      nil -> :f32
+      t -> Nx.type(t)
+    end
+  end
 
   @doc false
   def empty?({:empty, _shape}), do: true
@@ -301,13 +356,14 @@ defmodule Transmuter.Ops do
     a |> Nx.shape() |> Nx.iota(axis: last) |> Nx.equal(first) |> Nx.as_type(Nx.type(a))
   end
 
+  # ONNX broadcasting. A dimension of 0 takes the place of 1 like any other size.
   @doc false
   def broadcast_shape(shapes) do
     rank = shapes |> Enum.map(&tuple_size/1) |> Enum.max()
 
     shapes
     |> Enum.map(fn s -> List.duplicate(1, rank - tuple_size(s)) ++ Tuple.to_list(s) end)
-    |> Enum.zip_with(&Enum.max/1)
+    |> Enum.zip_with(fn dims -> Enum.find(dims, 1, &(&1 != 1)) end)
     |> List.to_tuple()
   end
 

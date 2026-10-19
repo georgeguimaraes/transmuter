@@ -719,6 +719,47 @@ case("Shape_of_zero_size", [
      {"starts": np.array([2], np.int64), "ends": np.array([2], np.int64), "axes": np.array([1], np.int64), "last": np.array(2, np.int64)},
      outputs=["shape", "size", "wider_shape"])
 
+# Index operators with no indices. In the spline clamp of the VITS duration predictor,
+# NonZero finds no values out of bounds, so the gather is empty and the scatter keeps x.
+r = rng_for("Empty_indices")
+case("Empty_indices_GatherND_ScatterND", [
+    node("Greater", ["x", "bound"], ["outside"]), node("NonZero", ["outside"], ["nz"]), node("Transpose", ["nz"], ["idx"]),
+    node("GatherND", ["x", "idx"], ["picked"]), node("Mul", ["picked", "half"], ["clamped"]),
+    node("ScatterND", ["x", "idx", "clamped"], ["y"]),
+], {"x": r.standard_normal((1, 2, 5)).astype(np.float32)}, {"bound": np.array(10, np.float32), "half": np.array(0.5, np.float32)})
+case("Empty_indices_GatherElements_OneHot", [
+    node("Slice", ["all", "zero", "zero", "one"], ["idx"]), node("GatherElements", ["x", "idx"], ["g"], axis=1),
+    node("Shape", ["g"], ["g_shape"]), node("Slice", ["row", "zero", "zero"], ["hot_idx"]),
+    node("OneHot", ["hot_idx", "depth", "values"], ["hot"]), node("Shape", ["hot"], ["hot_shape"]),
+], {"x": r.standard_normal((2, 3)).astype(np.float32)},
+     {"all": np.zeros((2, 3), np.int64), "row": np.array([1, 2], np.int64), "zero": np.array([0], np.int64), "one": np.array([1], np.int64),
+      "depth": np.array(4, np.int64), "values": np.array([0, 1], np.float32)},
+     outputs=["g_shape", "hot_shape"])
+# SAM 2 adds a bias to the embeddings of an empty box input, then concatenates them with the points.
+# A MatMul over an empty axis gives zeros.
+case("Empty_elementwise_Concat", [
+    node("Slice", ["x", "zero", "zero", "one"], ["no_boxes"]), node("Add", ["no_boxes", "bias"], ["shifted"]),
+    node("Relu", ["shifted"], ["active"]), node("Mul", ["active", "scale"], ["scaled"]), node("Shape", ["scaled"], ["empty_shape"]),
+    node("Concat", ["scaled", "x"], ["y"], axis=1),
+    node("MatMul", ["no_boxes", "w"], ["projected"]), node("Shape", ["projected"], ["matmul_shape"]),
+    node("Slice", ["x", "zero", "zero", "two"], ["no_features"]), node("Slice", ["w", "zero", "zero"], ["no_rows"]),
+    node("MatMul", ["no_features", "no_rows"], ["zeros"]),
+], {"x": r.standard_normal((1, 3, 4)).astype(np.float32)},
+     {"zero": np.array([0], np.int64), "one": np.array([1], np.int64), "two": np.array([2], np.int64), "bias": np.array(0.5, np.float32),
+      "scale": r.standard_normal((1, 1, 4)).astype(np.float32), "w": r.standard_normal((4, 2)).astype(np.float32)},
+     outputs=["empty_shape", "y", "matmul_shape", "zeros"])
+# Operators that make a zero-size output from inputs that are not zero size.
+case("Empty_outputs_from_sizes", [
+    node("Range", ["zero_s", "zero_s", "one_s"], ["no_steps"]), node("Shape", ["no_steps"], ["range_shape"]),
+    node("Expand", ["row", "to_empty"], ["expanded"]), node("Shape", ["expanded"], ["expand_shape"]),
+    node("Tile", ["x", "no_repeats"], ["tiled"]), node("Shape", ["tiled"], ["tile_shape"]),
+    node("Split", ["x", "sizes"], ["none_of_it", "all_of_it"], axis=1), node("Shape", ["none_of_it"], ["split_shape"]),
+    node("TopK", ["x", "zero"], ["top", "top_idx"]), node("Shape", ["top"], ["topk_shape"]),
+], {"x": r.standard_normal((2, 3)).astype(np.float32)},
+     {"zero_s": np.array(0, np.int64), "one_s": np.array(1, np.int64), "to_empty": np.array([0, 3], np.int64), "row": np.ones((1, 3), np.float32),
+      "no_repeats": np.array([1, 0], np.int64), "sizes": np.array([0, 3], np.int64), "zero": np.array([0], np.int64)},
+     outputs=["range_shape", "expand_shape", "tile_shape", "split_shape", "all_of_it", "topk_shape"])
+
 # ---------- graph breaks ----------
 
 # These graphs compile with no static inputs. A value computed from the inputs decides a

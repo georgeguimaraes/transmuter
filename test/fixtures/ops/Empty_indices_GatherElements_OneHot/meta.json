@@ -1,0 +1,45 @@
+{
+ "repo": "op/Empty_indices_GatherElements_OneHot",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Slice": 2,
+  "GatherElements": 1,
+  "Shape": 2,
+  "OneHot": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "g_shape",
+   "file": "out_0.bin",
+   "dtype": "s64",
+   "shape": [
+    2
+   ]
+  },
+  {
+   "name": "hot_shape",
+   "file": "out_1.bin",
+   "dtype": "s64",
+   "shape": [
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

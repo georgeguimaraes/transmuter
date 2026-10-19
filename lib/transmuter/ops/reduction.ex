@@ -78,13 +78,19 @@ defmodule Transmuter.Ops.Reduction do
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + rank, else: axis
     direction = if attr(node, "largest", 1) == 1, do: :desc, else: :asc
-    # A stable sort keeps the lower index first among equal values, as ORT does.
-    idx =
-      x
-      |> Nx.argsort(axis: axis, direction: direction, stable: true)
-      |> Nx.slice_along_axis(0, k, axis: axis)
 
-    [Nx.take_along_axis(x, idx, axis: axis), Nx.as_type(idx, :s64)]
+    if k == 0 do
+      empty = {:empty, x |> Nx.shape() |> put_elem(axis, 0)}
+      [empty, empty]
+    else
+      # A stable sort keeps the lower index first among equal values, as ORT does.
+      idx =
+        x
+        |> Nx.argsort(axis: axis, direction: direction, stable: true)
+        |> Nx.slice_along_axis(0, k, axis: axis)
+
+      [Nx.take_along_axis(x, idx, axis: axis), Nx.as_type(idx, :s64)]
+    end
   end
 
   defp op(node = %{op_type: "CumProd"}, [x, axis]) do
