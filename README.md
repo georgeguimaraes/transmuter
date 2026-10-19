@@ -2,7 +2,11 @@
 
 Transmuter runs ONNX models on Nx. Load a model from Hugging Face and run it on any Nx backend: EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
 
-Transmuter does not port model architectures. An ONNX file contains the forward pass that the exporter traced from the original model. Transmuter changes each ONNX operator into Nx operations. A new architecture needs no new Elixir code. It needs only the operators that its export uses.
+The goal of Transmuter is to implement the ONNX operators in Nx. Then ONNX models run without model code.
+
+An ONNX file contains a graph of operators. An operator is one small, standard computation, such as `MatMul`, `Conv`, `Softmax`, `Add` or `Reshape`. Each operator has inputs, outputs and attributes, for example the kernel size of a `Conv`. The ONNX standard defines about 200 operators, and a model connects a few hundred to a few thousand of them. When a model is exported, the exporter traces its forward pass and writes these operators to the file.
+
+Transmuter implements each operator one time, as Nx operations. It then runs a model by running its graph, operator by operator. So Transmuter does not port model architectures. A new architecture needs no new Elixir code. It needs only operators that Transmuter already has.
 
 ## The gap
 
