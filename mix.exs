@@ -96,6 +96,7 @@ defmodule Transmuter.MixProject do
         ],
         Internals: [
           Transmuter.Serving,
+          Transmuter.Generation,
           Transmuter.Text.FillMask,
           Transmuter.Text.Generation,
           Transmuter.Text.QuestionAnswering,
