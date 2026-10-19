@@ -289,7 +289,7 @@ defmodule Transmuter do
 
     trips =
       if trip_count,
-        do: Nx.to_number(Ops.known!(trip_count, "the Loop trip count")),
+        do: trip_count |> Ops.known!("the Loop trip count") |> Nx.reshape({}) |> Nx.to_number(),
         else: @max_loop_iterations
 
     env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))

@@ -871,3 +871,11 @@ rf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
 for name, a, b in [("matrix_by_batch", (4, 5), (2, 3, 5, 2)), ("batch_broadcast", (3, 1, 4, 5), (2, 5, 6)),
                    ("vector_by_batch", (5,), (2, 3, 5, 4)), ("batch_by_vector", (2, 3, 4, 5), (5,))]:
     case(f"MatMul_{name}", [node("MatMul", ["a", "b"], ["y"])], {"a": rf32(*a), "b": rf32(*b)})
+
+# ---------- one-element control values ----------
+
+# Exporters often give the trip count and the condition shape [1] instead of a scalar.
+r = rng_for("one-element control values")
+case("Loop_trip_count_shape_1", [node("Loop", ["M", "cond", "acc0"], ["acc", "scans"], body=body)],
+     {"x": r.standard_normal(3).astype(np.float32), "acc0": r.standard_normal(3).astype(np.float32)},
+     {"M": np.array([4], np.int64), "cond": np.array([True])})

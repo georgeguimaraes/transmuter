@@ -1,0 +1,50 @@
+{
+ "repo": "op/Loop_trip_count_shape_1",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Loop": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Load model from model.onnx failed:Node () Op (Loop) [TypeInferenceError] Graph attribute",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3
+   ]
+  },
+  {
+   "name": "acc0",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "acc",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3
+   ]
+  },
+  {
+   "name": "scans",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}
