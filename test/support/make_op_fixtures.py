@@ -863,3 +863,11 @@ for mode in ["reflect", "edge"]:
          {"x": rf32(2, 5, 6)}, {"pads": np.array([0, 3, 0, 1, 0, 2], np.int64)}, opset=18)
 case("Pad_constant_axes", [node("Pad", ["x", "pads", "value", "axes"], ["y"])],
      {"x": rf32(2, 5, 6)}, {"pads": np.array([1, 0, 2, 3], np.int64), "value": np.array(1.5, np.float32), "axes": np.array([2, 0], np.int64)}, opset=18)
+
+# ---------- MatMul broadcasting ----------
+
+r = rng_for("MatMul broadcasting")
+rf32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+for name, a, b in [("matrix_by_batch", (4, 5), (2, 3, 5, 2)), ("batch_broadcast", (3, 1, 4, 5), (2, 5, 6)),
+                   ("vector_by_batch", (5,), (2, 3, 5, 4)), ("batch_by_vector", (2, 3, 4, 5), (5,))]:
+    case(f"MatMul_{name}", [node("MatMul", ["a", "b"], ["y"])], {"a": rf32(*a), "b": rf32(*b)})

@@ -1,0 +1,48 @@
+{
+ "repo": "op/MatMul_matrix_by_batch",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "MatMul": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "a",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    5
+   ]
+  },
+  {
+   "name": "b",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    5,
+    2
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    4,
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

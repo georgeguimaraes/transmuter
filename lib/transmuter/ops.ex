@@ -305,6 +305,13 @@ defmodule Transmuter.Ops do
       {ra, 2} ->
         Nx.dot(a, [ra - 1], b, [0])
 
+      # A plain matrix applies to every batch of b without a broadcast. The dot puts its
+      # rows first, and the transpose moves them before the last axis.
+      {2, rb} ->
+        a
+        |> Nx.dot([1], b, [rb - 2])
+        |> Nx.transpose(axes: Enum.to_list(1..(rb - 2)) ++ [0, rb - 1])
+
       {ra, rb} ->
         rank = max(ra, rb)
         batch = Enum.take(Tuple.to_list(broadcast_shape([Nx.shape(a), Nx.shape(b)])), rank - 2)

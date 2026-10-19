@@ -158,10 +158,10 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 |---|---|
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
-| Models requested in Bumblebee issues | 10 of 12 files match. The Stable Diffusion VAE encoder samples noise, and LaMa does not finish in 15 minutes |
+| Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
-| One graph for each operator variant | 232 of 232 match |
+| One graph for each operator variant | 240 of 240 match |
 
 Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use.
 
@@ -229,7 +229,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr](https://huggingface.co/Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr) | image-to-image | 12.1M | model | matches |
 | [onnx-community/manga-ocr-base-ONNX](https://huggingface.co/onnx-community/manga-ocr-base-ONNX) | image-to-text | 115M | decoder_model, encoder_model | matches |
 | [Xenova/trocr-small-handwritten](https://huggingface.co/Xenova/trocr-small-handwritten) | image-to-text | 61.4M | decoder_model, decoder_model_merged, decoder_with_past_model, encoder_model | matches |
-| [Carve/LaMa-ONNX](https://huggingface.co/Carve/LaMa-ONNX) | inpainting | 51M | lama_fp32 | times out |
+| [Carve/LaMa-ONNX](https://huggingface.co/Carve/LaMa-ONNX) | inpainting | 51M | lama_fp32 | matches |
 | [onnx-community/vitpose-base-simple](https://huggingface.co/onnx-community/vitpose-base-simple) | keypoint-detection | 85.9M | model | matches |
 | [onnx-community/sam3-tracker-ONNX](https://huggingface.co/onnx-community/sam3-tracker-ONNX) | mask-generation | 473M | prompt_encoder_mask_decoder, vision_encoder | matches |
 | [Xenova/sam-vit-base](https://huggingface.co/Xenova/sam-vit-base) | mask-generation | 187M | model, prompt_encoder_mask_decoder, vision_encoder | matches |
