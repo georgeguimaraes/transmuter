@@ -133,7 +133,10 @@ defmodule Transmuter.Generation do
       end
 
     settings = Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p])
-    Map.put(ctx, :select, Nx.Defn.jit(&select_token(&1, &2, &3, &4, settings), defn_options))
+
+    ctx
+    |> Map.put(:select, Nx.Defn.jit(&select_token(&1, &2, &3, &4, settings), defn_options))
+    |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
   end
 
   @doc """
@@ -225,27 +228,35 @@ defmodule Transmuter.Generation do
   defp step(ctx, state, tokens) do
     {inputs, static} = step_inputs(ctx, state, tokens)
     outputs = ctx.run.(inputs, static)
-    n = length(tokens)
 
-    cache =
-      Map.new(ctx.cache, fn "past_key_values." <> rest = name ->
-        # Transmuter.run leaves out empty outputs, such as the present of a cache that does
-        # not change.
-        case {ctx.mode, outputs["present." <> rest]} do
-          {_mode, nil} ->
-            {name, state.cache[name]}
+    # Transmuter.run leaves out empty outputs, such as the present of a cache that does not
+    # change, so that cache keeps its value.
+    present =
+      for "past_key_values." <> rest = name <- ctx.cache,
+          Map.has_key?(outputs, "present." <> rest),
+          into: %{},
+          do: {name, outputs["present." <> rest]}
 
-          {:append, present} ->
-            new = Nx.slice_along_axis(present, state.capacity, n, axis: 2)
-            {name, Nx.put_slice(state.cache[name], [0, 0, state.length, 0], new)}
-
-          {_in_place_or_grow, present} ->
-            {name, present}
-        end
-      end)
+    present =
+      if ctx.mode == :append,
+        do: ctx.append.(Map.take(state.cache, Map.keys(present)), present, state.length),
+        else: present
 
     logits = outputs["logits"][[0, -1]]
-    {logits, %{state | cache: cache, length: state.length + n}}
+    cache = Map.merge(state.cache, present)
+    {logits, %{state | cache: cache, length: state.length + length(tokens)}}
+  end
+
+  # The rows of each present cache after the buffer are the new rows, and they go into the
+  # buffer after its valid rows. One compiled function writes all of them, because each
+  # eager slice is a call to the device.
+  defp append_rows(cache, present, offset) do
+    Map.new(cache, fn {name, buffer} ->
+      capacity = Nx.axis_size(buffer, 2)
+      rows = Nx.axis_size(present[name], 2) - capacity
+      new = Nx.slice_along_axis(present[name], capacity, rows, axis: 2)
+      {name, Nx.put_slice(buffer, [0, 0, offset, 0], new)}
+    end)
   end
 
   defp step_inputs(ctx, state, tokens) do
