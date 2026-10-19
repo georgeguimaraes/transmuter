@@ -57,9 +57,9 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 
 ## Text to speech with Kokoro
 
-`bench/kokoro_tts.exs` runs [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) from its ONNX export and writes a WAV file. All operators of the export run in Transmuter, and `Transmuter.compile/3` compiles the model with no static inputs. Inputs up to the limit of the model work: 505 phonemes gave 26.6 seconds of audio.
+`bench/kokoro_tts.exs` runs [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) from its ONNX export and writes a WAV file. All operators of the export run in Transmuter. The example also shows how to round audio lengths to 200 ms buckets to limit recompilation.
 
-Kokoro reads phonemes, not text. The Python and JavaScript versions of Kokoro make the phonemes with misaki or espeak-ng, outside of the model. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance.
+Kokoro reads phonemes, not text. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance. See the [Speech and Audio guide](guides/speech_and_audio.md) for more models and patterns.
 
 The example also fixes one node of the export. The export computes the STFT phase with the `atan2` of `torch.onnx`, which gives -π for `atan2(0, x)` when x is negative. `torch.atan2` gives π, and the model was trained with π. Transmuter computes an exact STFT, so the imaginary part is 0 at DC and Nyquist, and the wrong phase in every frame adds a tone at 4.8 kHz. ONNX Runtime hides the error, because its STFT has small rounding errors at these bins. The example changes the `Greater` test of the `atan2` to `GreaterOrEqual`, as in `torch.atan2`.
 
@@ -76,73 +76,23 @@ end
 
 Use EXLA instead of EMLX for CUDA.
 
-## Values that decide shapes
+## Compilation and graph breaks
 
-Some graphs use a value to set a shape or to select a branch. Examples are the length of the audio in Kokoro text-to-speech, which comes from the predicted duration of each phoneme, and the boxes that `NonMaxSuppression` keeps in Faster R-CNN. A compiled graph must know all its shapes before it runs, so `Transmuter.compile/3` breaks the graph at these operators:
+Some graphs use a tensor value to set a shape or to select a branch. `Transmuter.compile/3` breaks the graph at these operators, runs the break eagerly on the real values, and compiles the next segment for the shapes the values decide. Compiled segments are cached by input shapes.
 
-1. It compiles the operators before the break and runs them.
-2. It runs the break operator on the values.
-3. It compiles the operators after the break for the shapes that the values decide, and continues.
+See the [Compiling and Graph Breaks guide](guides/graph_breaks.md) for a full explanation of graph breaks, static inputs, the `:cache_size` option, EMLX memory management, and how to read error messages.
 
-The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache keeps the 8 most recently used compiled parts for each break, or the number in the `:cache_size` option. A new shape after that replaces the part that was used least recently. When the shapes come back often, as with the audio lengths of a speech service, set `:cache_size` to the number of shapes, so that calls do not compile the same shapes again. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
+## Non-tensor values and random operators
 
-These results are from an Apple silicon GPU:
+Nx tensors hold only numbers. Transmuter keeps string tensors, sequences, and empty optionals as Elixir terms. Give string and sequence inputs as `:static_inputs`. A compiled function returns only tensors. To read string or sequence outputs, call `Transmuter.run/4` without compilation. Random operators draw from `Nx.Random`, and each call of a compiled model draws new values. `ImageDecoder` needs the optional `stb_image` dependency.
 
-| Model | Without compilation | First call | Later calls |
-|---|---|---|---|
-| Kokoro, 7.0 seconds of audio | 2.3 s | 2.3 s | 0.28 s |
-| Kokoro, 20.2 seconds of audio | 13.9 s | 10.6 s | 0.84 s |
-| Kokoro, 26.6 seconds of audio | 25.8 s | 11.4 s | 1.11 s |
-| Faster R-CNN 12, the same image | 33.8 s | 6.5 s | 0.35 s |
-
-A new audio length in Kokoro compiles the operators after the break again, and that first call takes about as long as a call without compilation. `bench/kokoro_tts.exs` rounds the total duration up to steps of 200 ms by making the final pause longer, so sentences of a similar length share one compiled decoder.
-
-EMLX has caches of its own, and each new shape adds to them:
-
-- MLX keeps freed buffers for reuse. Without a limit, this cache grew to 11.7 GB on a 16 GB Mac, and later calls for 20.2 seconds of audio took 22.5 s instead of 0.87 s. Set a limit with `EMLX.set_cache_limit(1_000_000_000)`.
-- `EMLX.CompileCache` keeps each compiled function. Set `max_items` for it in the `:emlx` config. EMLX also keeps each MLX program, with no limit.
-
-If you know such a value before the model runs, give it as an `Nx.BinaryBackend` tensor in the `:static_inputs` option of `Transmuter.compile/3`. Then the graph has no break there. Each new value of a static input compiles the model again. Examples:
-
-- `use_cache_branch` in merged decoder exports selects an `If` branch.
-- `num_logits_to_keep` in some decoder exports sets the length of a slice.
-- `input_ids` in Grounding DINO go into `NonZero`.
-
-`Transmuter.run/4` without compilation reads all values while the model runs.
-
-## Strings, sequences and random values
-
-Nx tensors hold only numbers. Transmuter keeps other ONNX values in the graph as Elixir terms:
-
-- A string tensor is `{:strings, shape, values}`, with the values as a flat list of binaries.
-- A sequence is a list of tensors.
-- An empty optional is `:none`.
-- A tensor with a dimension of 0 is `{:empty, shape}`, because Nx has no zero-size tensors.
-
-Give string and sequence inputs as `:static_inputs`. A compiled function returns only tensors, so call `Transmuter.run/4` without compilation to read string or sequence outputs.
-
-Random operators draw from `Nx.Random`. Each call of a compiled model draws new values. A node with a `seed` attribute draws the same values on each call. The values cannot be the same as in ONNX Runtime, because the random number generators are different.
-
-`ImageDecoder` needs the optional `stb_image` dependency.
+See [Supported Operators and Data Types](guides/supported_operators.md) for details.
 
 ## Precision and quantization
 
-Half-precision exports (`model_fp16.onnx`) run in f16 or bf16. Sums, normalizations, softmax and attention scores use f32 inside the operation. ONNX Runtime on the CPU calculates half-precision graphs in f32. To get the same result, use `Transmuter.load!(source, compute_type: :f32)`.
+Half-precision exports run in f16 or bf16. Use `compute_type: :f32` to match ONNX Runtime on the CPU. With `backend: EMLX.Backend`, 4-bit and 8-bit `MatMulNBits` weights stay packed as MLX quantized tensors for lower peak memory and faster inference.
 
-Quantized exports run with their weights dequantized in the graph:
-
-- `model_q4.onnx` and `model_q4f16.onnx` use 4-bit weights with `MatMulNBits` and `GatherBlockQuantized`.
-- `model_quantized.onnx` and `model_int8.onnx` use dynamic int8 with `DynamicQuantizeLinear`, `MatMulInteger` and `ConvInteger`.
-
-With `backend: EMLX.Backend`, `Transmuter.load!/2` keeps `MatMulNBits` weights packed as MLX quantized tensors. Then `mx::quantized_matmul` reads the 4-bit or 8-bit weights directly. On other backends, each forward pass dequantizes the weights to floats. These results are from an Apple silicon GPU with one forward pass of 8 tokens:
-
-| Model | Weights | Peak memory | Time |
-|---|---|---|---|
-| Qwen3-0.6B fp32 | 2,294 MB | 2,321 MB | 34 ms |
-| Qwen3-0.6B q4, dequantized in the graph | 876 MB | 1,612 MB | 64 ms |
-| Qwen3-0.6B q4, packed on EMLX | 981 MB | 1,005 MB | 28 ms |
-
-Dynamic int8 quantizes each activation again. A change of one f32 rounding step can move a value to the next int8 step, and the next layers make that change larger. For example, when all weights of SmolLM2 int8 change by a factor of 1 + 1e-7, its logits change by 22. Thus, compare an int8 model with its own noise.
+See the [Backends and Performance guide](guides/backends_and_performance.md) and the [Language Models guide](guides/language_models.md) for details and benchmarks.
 
 ## Fine-tuning
 

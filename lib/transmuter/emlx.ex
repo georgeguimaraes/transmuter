@@ -20,11 +20,33 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     @group_sizes [32, 64, 128]
 
     @doc """
-    Returns `model.params` on EMLX, with compatible `MatMulNBits` weights quantized.
+    Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed.
+
+    Compatible `MatMulNBits` weights become MLX quantized tensors, so
+    `mx::quantized_matmul` reads the packed weights directly. This avoids
+    materializing the float weights in memory on each forward pass. Other params
+    are transferred to EMLX with `Nx.backend_transfer/2`.
+
+    A weight is compatible when:
+
+    - The bit width is 4 or 8.
+    - The group (block) size is 32, 64, or 128.
+    - The K dimension is a whole number of groups.
+
+    Weights that do not meet these criteria stay as packed bytes and are
+    dequantized in the graph.
+
+    `Transmuter.load!/2` with `backend: EMLX.Backend` calls this function for
+    you. Call it directly only when you need to transfer params separately.
 
     ## Options
 
-      * `:device` - the EMLX device, `:gpu` (default) or `:cpu`
+      * `:device` (`t:atom/0`) - the EMLX device. The default is `:gpu`.
+
+    ## Examples
+
+        model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"})
+        params = Transmuter.EMLX.params(model, device: :gpu)
     """
     def params(model, opts \\ []) do
       backend = {EMLX.Backend, device: Keyword.get(opts, :device, :gpu)}

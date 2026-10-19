@@ -34,30 +34,67 @@ defmodule Transmuter do
   @doc """
   Loads an ONNX model.
 
-  The source is a local path or `{:hf, repo, file}`. Hub files are downloaded
-  once into `~/.cache/transmuter`, together with their external data files.
+  `source` is a local file path or `{:hf, repo, file}`. Hub files are downloaded
+  once into `~/.cache/transmuter`, together with any external data files.
 
   ## Options
 
-    * `:cache_dir` - the directory for Hub downloads
+    * `:cache_dir` (`t:String.t/0`) - the directory for Hub downloads.
+      The default is `~/.cache/transmuter`.
 
-    * `:backend` - moves the params to this backend, for example `EMLX.Backend`
-      or `{EXLA.Backend, client: :cuda}`. On EMLX, 4-bit and 8-bit `MatMulNBits`
-      weights stay packed, see `Transmuter.EMLX`. By default the params stay on
-      `Nx.BinaryBackend`.
+    * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params
+      to this backend after loading. For example, `EMLX.Backend` or
+      `{EXLA.Backend, client: :cuda}`. On EMLX, 4-bit and 8-bit `MatMulNBits`
+      weights stay packed as MLX quantized tensors (see `Transmuter.EMLX`). The
+      default is `Nx.BinaryBackend`.
 
-    * `:compute_type` - runs f16 and bf16 graphs in this type, for example `:f32`.
-      ONNX Runtime on the CPU computes half-precision graphs in f32, so use `:f32`
-      to match it. By default the graph keeps its own types.
+    * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
+      through every operator. For example, `:f32` matches ONNX Runtime on the
+      CPU, which calculates half-precision graphs in f32. The default is `nil`,
+      which keeps the graph's own types.
 
-    * `:trainable` - when `true`, every float initializer is a param, so small
-      weights such as a 1-element bias get gradients. By default float
-      initializers with up to 16 elements are folded as constants.
+    * `:trainable` (`t:boolean/0`) - when `true`, every float initializer is a
+      param, so small weights such as a 1-element bias get gradients. The
+      default is `false`, which folds float initializers with up to 16 elements
+      as constants.
 
   Returns a map with:
 
     * `:params` - the weights, on the `:backend` when it is given
-    * `:inputs` and `:outputs` - the graph input and output names
+    * `:inputs` - the names of the graph inputs
+    * `:outputs` - the names of the graph outputs
+
+  ## Examples
+
+  Load from the Hugging Face Hub:
+
+      model = Transmuter.load!(
+        {:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"},
+        backend: EMLX.Backend
+      )
+      model.inputs
+      # => ["input_ids", "attention_mask", "token_type_ids"]
+      model.outputs
+      # => ["last_hidden_state"]
+
+  Load a quantized model:
+
+      model = Transmuter.load!(
+        {:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"},
+        backend: EMLX.Backend
+      )
+
+  Load a half-precision model and run it in f32 to match ONNX Runtime:
+
+      model = Transmuter.load!(
+        {:hf, "Xenova/bert-base-uncased", "onnx/model_fp16.onnx"},
+        backend: EMLX.Backend,
+        compute_type: :f32
+      )
+
+  Load a local file:
+
+      model = Transmuter.load!("/path/to/model.onnx")
   """
   def load!(source, opts \\ [])
 
@@ -96,23 +133,54 @@ defmodule Transmuter do
   @doc """
   Compiles the model for the shapes and types of `inputs`.
 
-  Returns a function that takes the inputs and returns the outputs. The params
-  are the model's own, so load it with `:backend` first. Inputs of other shapes
-  compile on their first call, and the function keeps the most recently used
-  shapes compiled.
+  Returns a function that takes inputs and returns outputs. The model params are
+  captured from `model.params`, so load the model with `:backend` first. The
+  returned function compiles inputs of other shapes on their first call and
+  keeps the most recently used shapes compiled.
+
+  When the graph has operators that require a value to decide a shape (such as
+  `Range`, `NonZero`, or `If`), `compile/3` creates graph breaks. Each segment
+  between breaks is compiled separately. See [Compiling and Graph Breaks](guides/graph_breaks.md).
 
   ## Options
 
-    * `:static_inputs` - inputs known when the model compiles, see `run/4`
+    * `:static_inputs` (`t:map/0`) - inputs whose values are known at compile
+      time. Give them as `Nx.BinaryBackend` tensors. Each new value compiles a
+      new version of the model. Use this for flags that select a branch (such as
+      `use_cache_branch`) and for inputs that decide an output shape (such as
+      the `input_ids` that feed `NonZero`). The default is `%{}`.
 
-    * `:cache_size` - how many compiled shapes to keep for each part of the
-      graph. Defaults to 8. Use a larger value when the inputs have many
-      shapes that come back, for example audio lengths. Each compiled shape
-      uses memory.
+    * `:cache_size` (`t:pos_integer/0`) - how many compiled shapes to keep for
+      each graph segment. The default is `8`. Use a larger value when the inputs
+      have many shapes that come back often, such as audio lengths in a speech
+      service. Each cached shape uses memory.
 
-  Other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX`.
+  All other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX` or
+  `compiler: EXLA`.
 
   Each call of a model with random operators draws new values.
+
+  ## Examples
+
+  Compile with EMLX on Apple silicon:
+
+      run = Transmuter.compile(model, inputs, compiler: EMLX)
+      outputs = run.(inputs)
+
+  Compile with a static input to select an `If` branch:
+
+      flag = Nx.tensor([1], type: :u8, backend: Nx.BinaryBackend)
+
+      run = Transmuter.compile(
+        model,
+        inputs,
+        static_inputs: %{"use_cache_branch" => flag},
+        compiler: EMLX
+      )
+
+  Compile with a larger cache for speech models with many audio lengths:
+
+      run = Transmuter.compile(model, inputs, compiler: EMLX, cache_size: 64)
   """
   def compile(model, inputs, opts \\ []) do
     {static_inputs, opts} = Keyword.pop(opts, :static_inputs, %{})
@@ -120,13 +188,20 @@ defmodule Transmuter do
   end
 
   @doc """
-  Runs the model graph. Call it inside `Nx.Defn.jit/2` or `Nx.Defn.compile/3`.
+  Runs the model graph operator by operator.
+
+  Call this function inside `Nx.Defn.jit/2` or `Nx.Defn.compile/3` to compile it
+  with a backend. Call it directly for eager execution, to read intermediate values,
+  or to read non-tensor outputs such as strings or sequences.
+
+  `params` is the weight map from `model.params` (or a map of tensors you have
+  moved to a device). `inputs` is a map of input name to tensor.
 
   `static_inputs` are graph inputs whose values are known when the function is
   traced. Give them as `Nx.BinaryBackend` tensors. Use them for flags that select
-  a branch, such as `use_cache_branch`, and for inputs that decide an output
-  shape, such as the `input_ids` that feed `NonZero` in Grounding DINO. Each new
-  value compiles again.
+  a branch (such as `use_cache_branch`) and for inputs that decide an output shape
+  (such as the `input_ids` that feed `NonZero` in Grounding DINO). Each new value
+  of a static input compiles a new version of the graph. The default is `%{}`.
 
   Outputs with a zero-size dimension are left out of the result.
 
@@ -134,6 +209,28 @@ defmodule Transmuter do
   Without it, each call makes a new key. A function that you compile yourself makes
   the key when it is traced, so it gives the same values on every call unless you
   pass the key.
+
+  ## Examples
+
+  Eager execution (no compilation):
+
+      outputs = Transmuter.run(model, model.params, inputs)
+
+  Compile with `Nx.Defn.jit/2`:
+
+      jit_run = Nx.Defn.jit(&Transmuter.run(model, &1, &2))
+      outputs = jit_run.(model.params, inputs)
+
+  Compile two shapes (prefill and decode) for a decoder with a static KV cache:
+
+      fun = &Transmuter.run(model, &1, &2)
+      prefill = Nx.Defn.compile(fun, [params, prefill_inputs], compiler: EMLX)
+      decode = Nx.Defn.compile(fun, [params, decode_inputs], compiler: EMLX)
+
+  Run with a static branch selector:
+
+      flag = Nx.tensor([1], type: :u8, backend: Nx.BinaryBackend)
+      outputs = Transmuter.run(model, model.params, inputs, %{"use_cache_branch" => flag})
   """
   def run(model, params, inputs, static_inputs \\ %{}) do
     {key, inputs} = Map.pop_lazy(inputs, @random_key, &random_key/0)

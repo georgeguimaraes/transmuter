@@ -46,6 +46,33 @@ defmodule Transmuter.MixProject do
   end
 
   defp docs do
-    [main: "readme", extras: ["README.md"], source_ref: "v#{@version}"]
+    [
+      main: "Transmuter",
+      extras: [
+        "README.md": [title: "Overview"],
+        "guides/getting_started.md": [title: "Getting started"],
+        "guides/graph_breaks.md": [title: "Compiling and graph breaks"],
+        "guides/language_models.md": [title: "Language models with a KV cache"],
+        "guides/speech_and_audio.md": [title: "Speech and audio"],
+        "guides/vision_and_multimodal.md": [title: "Vision and multimodal"],
+        "guides/backends_and_performance.md": [title: "Backends and performance"],
+        "guides/supported_operators.md": [title: "Supported operators and data types"]
+      ],
+      groups_for_extras: [
+        Guides: ~w(
+          guides/getting_started.md
+          guides/graph_breaks.md
+          guides/language_models.md
+          guides/speech_and_audio.md
+          guides/vision_and_multimodal.md
+          guides/backends_and_performance.md
+          guides/supported_operators.md
+        )
+      ],
+      groups_for_modules: [
+        "Public API": [Transmuter, Transmuter.EMLX, Transmuter.UnknownValueError]
+      ],
+      source_ref: "v#{@version}"
+    ]
   end
 end
