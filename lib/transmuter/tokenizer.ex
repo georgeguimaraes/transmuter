@@ -14,7 +14,14 @@ defmodule Transmuter.Tokenizer do
   alias Tokenizers.{Encoding, Tokenizer}
   alias Transmuter.{Hub, Repo}
 
-  defstruct [:native, :special_tokens, length: nil, pad_direction: :right]
+  defstruct [
+    :native,
+    :special_tokens,
+    length: nil,
+    pad_direction: :right,
+    truncation: :longest_first,
+    stride: nil
+  ]
 
   @special_tokens ~w(pad eos bos unk mask cls sep)
 
@@ -26,6 +33,10 @@ defmodule Transmuter.Tokenizer do
     * `:length` - the length of the encoded inputs. `nil` (the default) pads to the longest input. An integer pads to that length. A list of lengths pads to the smallest length that fits the longest input. Inputs longer than the largest length are truncated.
 
     * `:pad_direction` - `:right` (the default) or `:left`.
+
+    * `:truncation` - the text of a pair that truncation shortens: `:longest_first` (the default), `:only_first` or `:only_second`.
+
+    * `:stride` - `nil` (the default) removes the tokens after the largest length. An integer keeps them in more windows of the largest length. Each window repeats the last `stride` tokens of the window before it. The stride is at most half of the largest length, as in the question answering pipeline of Python transformers.
 
   Other options go to `Transmuter.Repo.load!/2` when the first argument is a source.
   """
@@ -47,18 +58,24 @@ defmodule Transmuter.Tokenizer do
   def load!(source, opts), do: load!(Repo.load!(source, opts), opts)
 
   @doc """
-  Sets the `:length` and `:pad_direction` options of `load!/2`.
+  Sets the `:length`, `:pad_direction`, `:truncation` and `:stride` options of `load!/2`.
   """
   def configure(tokenizer, opts) do
-    tokenizer = struct!(tokenizer, Keyword.take(opts, [:length, :pad_direction]))
+    tokenizer =
+      struct!(tokenizer, Keyword.take(opts, [:length, :pad_direction, :truncation, :stride]))
 
     native =
-      if tokenizer.length,
-        do:
-          Tokenizer.set_truncation(tokenizer.native,
-            max_length: Enum.max(List.wrap(tokenizer.length))
-          ),
-        else: Tokenizer.disable_truncation(tokenizer.native)
+      if tokenizer.length do
+        max_length = Enum.max(List.wrap(tokenizer.length))
+
+        Tokenizer.set_truncation(tokenizer.native,
+          max_length: max_length,
+          strategy: tokenizer.truncation,
+          stride: min(tokenizer.stride || 0, div(max_length, 2))
+        )
+      else
+        Tokenizer.disable_truncation(tokenizer.native)
+      end
 
     %{tokenizer | native: native}
   end
@@ -73,35 +90,51 @@ defmodule Transmuter.Tokenizer do
   @doc """
   Encodes `inputs`, a list of strings or `{text, text_pair}` tuples.
 
-  Returns the input tensors and the `Tokenizers.Encoding` of each input, which has the offsets, the word ids and the special tokens mask. The tensors are `"input_ids"`, `"attention_mask"` and `"token_type_ids"`, of type `:s64` on `Nx.BinaryBackend`.
+  Returns the input tensors and, for each input, the list of its `Tokenizers.Encoding`, one for each row of the tensors. An input has one row, or one row for each window with `:stride`. An encoding has the offsets, the word ids and the special tokens mask. The tensors are `"input_ids"`, `"attention_mask"` and `"token_type_ids"`, of type `:s64` on `Nx.BinaryBackend`.
 
   ## Options
 
     * `:add_special_tokens` - adds the special tokens of the tokenizer, such as `[CLS]` and `[SEP]`. The default is `true`. Use `false` for text that already has them, such as the output of a chat template.
   """
   def encode(tokenizer, inputs, opts \\ []) do
-    {:ok, encodings} =
-      Tokenizer.encode_batch(tokenizer.native, inputs,
-        add_special_tokens: Keyword.get(opts, :add_special_tokens, true)
-      )
+    encodings =
+      case Tokenizer.encode_batch(tokenizer.native, inputs,
+             add_special_tokens: Keyword.get(opts, :add_special_tokens, true)
+           ) do
+        {:ok, encodings} ->
+          encodings
 
-    longest = encodings |> Enum.map(&Encoding.n_tokens/1) |> Enum.max()
+        # For example, a first text that leaves no tokens for the second text with :only_second.
+        {:error, reason} ->
+          raise ArgumentError, "the tokenizer cannot encode the inputs: #{reason}"
+      end
+
+    windows =
+      if tokenizer.stride,
+        do: Enum.map(encodings, &[&1 | Encoding.get_overflowing(&1)]),
+        else: Enum.map(encodings, &[&1])
+
+    rows = Enum.concat(windows)
+    longest = rows |> Enum.map(&Encoding.n_tokens/1) |> Enum.max()
     length = pad_length(tokenizer.length, longest)
 
-    encodings =
-      if Enum.all?(encodings, &(Encoding.n_tokens(&1) == length)),
-        do: encodings,
-        else: pad(tokenizer, encodings, length)
+    rows =
+      if Enum.all?(rows, &(Encoding.n_tokens(&1) == length)),
+        do: rows,
+        else: pad(tokenizer, rows, length)
 
-    tensor = &Nx.tensor(Enum.map(encodings, &1), type: :s64, backend: Nx.BinaryBackend)
+    tensor = &Nx.tensor(Enum.map(rows, &1), type: :s64, backend: Nx.BinaryBackend)
 
-    inputs = %{
+    tensors = %{
       "input_ids" => tensor.(&Encoding.get_ids/1),
       "attention_mask" => tensor.(&Encoding.get_attention_mask/1),
       "token_type_ids" => tensor.(&Encoding.get_type_ids/1)
     }
 
-    {inputs, encodings}
+    {encodings, []} =
+      Enum.map_reduce(windows, rows, &Enum.split(&2, length(&1)))
+
+    {tensors, encodings}
   end
 
   defp pad_length(nil, longest), do: longest

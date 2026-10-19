@@ -31,7 +31,7 @@ defmodule Transmuter.Text.FillMask do
         {scores, ids} = logits |> Serving.softmax() |> Nx.top_k(k: opts[:top_k])
         %{scores: scores, ids: ids}
       end,
-      fn %{scores: scores, ids: ids}, {text, encoding} ->
+      fn [%{scores: scores, ids: ids}], [{text, encoding}] ->
         masks = Enum.count(Tokenizers.Encoding.get_ids(encoding), &(&1 == mask_id))
 
         unless masks == 1 do
@@ -51,6 +51,6 @@ defmodule Transmuter.Text.FillMask do
     )
   end
 
-  defp masked(text, mask) when is_binary(text), do: {:ok, String.replace(text, "[MASK]", mask)}
+  defp masked(text, mask) when is_binary(text), do: {:ok, [String.replace(text, "[MASK]", mask)]}
   defp masked(input, _mask), do: Serving.string(input)
 end

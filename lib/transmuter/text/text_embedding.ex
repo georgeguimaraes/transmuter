@@ -28,7 +28,7 @@ defmodule Transmuter.Text.TextEmbedding do
         hidden = outputs["last_hidden_state"]
         %{embedding: hidden |> pool(pool, inputs["attention_mask"]) |> process(processor)}
       end,
-      fn %{embedding: embedding}, _item -> %{embedding: embedding} end
+      fn [%{embedding: embedding}], _items -> %{embedding: embedding} end
     )
   end
 

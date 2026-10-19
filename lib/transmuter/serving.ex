@@ -44,9 +44,11 @@ defmodule Transmuter.Serving do
   @doc """
   Returns an `Nx.Serving` that runs `model` on text.
 
-  `fun` takes the outputs of the model and the inputs of a batch, and returns a map of tensors with the batch on the first axis. `postprocess` takes the row of one input from that map and `{input, encoding}`, and returns the result for that input. `validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
+  `validate` takes one input and returns `{:ok, sequences}` or `{:error, message}`. The sequences are the strings or `{text, text_pair}` tuples to encode for the input. Each sequence gives one row of the batch, or one row for each window when the tokenizer has a `:stride` (see `Transmuter.Tokenizer.load!/2`).
 
-  The `:max_length` option of a task limits the default sequence lengths, before the limits in `tokenizer_config.json` and `config.json`.
+  `fun` takes the outputs of the model and the inputs of a batch, and returns a map of tensors with the rows on the first axis. `postprocess` takes the rows of one input and returns the result for that input. Its arguments are the list of rows of the map from `fun`, and a list of `{sequence, encoding}` for these rows.
+
+  The `:max_length` option of a task limits the default sequence lengths, as do the limits in `tokenizer_config.json` and `config.json`.
   """
   def text(repo, model, tokenizer, opts, fun, postprocess, validate \\ &string/1) do
     compile =
@@ -78,33 +80,48 @@ defmodule Transmuter.Serving do
     |> Nx.Serving.process_options(batch_keys: Enum.map(lengths, &{:sequence_length, &1}))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
-      {tensors, encodings} = Tokenizer.encode(tokenizer, inputs)
+      sequences = Enum.concat(inputs)
+      {tensors, encodings} = Tokenizer.encode(tokenizer, sequences)
       key = {:sequence_length, Nx.axis_size(tensors["input_ids"], 1)}
       batch = [model_inputs!(model, tensors)] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
-      {batch, {multi?, Enum.zip(inputs, encodings)}}
+
+      items =
+        sequences
+        |> Enum.zip_with(encodings, fn sequence, windows -> Enum.map(windows, &{sequence, &1}) end)
+        |> split_like(inputs)
+        |> Enum.map(&Enum.concat/1)
+
+      {batch, {multi?, items}}
     end)
     |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, items} ->
       results =
-        for {item, i} <- Enum.with_index(items) do
-          postprocess.(Map.new(outputs, fn {name, t} -> {name, t[i]} end), item)
-        end
+        for(
+          i <- 0..(Enum.sum_by(items, &length/1) - 1)//1,
+          do: Map.new(outputs, fn {name, t} -> {name, t[i]} end)
+        )
+        |> split_like(items)
+        |> Enum.zip_with(items, postprocess)
 
       if multi?, do: results, else: hd(results)
     end)
   end
 
+  # Splits list into consecutive parts with the lengths of the lists in groups.
+  defp split_like(list, groups) do
+    {parts, []} = Enum.map_reduce(groups, list, &Enum.split(&2, length(&1)))
+    parts
+  end
+
   # Powers of 4 from 32, up to the longest input of the model.
   defp lengths(repo, max_length) do
     max =
-      Enum.find(
-        [
-          max_length,
-          repo.tokenizer_config["model_max_length"],
-          repo.config["max_position_embeddings"]
-        ],
-        512,
-        &(is_integer(&1) and &1 <= 1_000_000)
-      )
+      [
+        max_length,
+        repo.tokenizer_config["model_max_length"],
+        repo.config["max_position_embeddings"]
+      ]
+      |> Enum.filter(&(is_integer(&1) and &1 <= 1_000_000))
+      |> Enum.min(fn -> 512 end)
 
     Enum.uniq(Enum.map([32, 128, 512], &min(&1, max)))
   end
@@ -139,9 +156,9 @@ defmodule Transmuter.Serving do
   end
 
   @doc """
-  Accepts a string.
+  Accepts a string as one sequence.
   """
-  def string(input) when is_binary(input), do: {:ok, input}
+  def string(input) when is_binary(input), do: {:ok, [input]}
   def string(input), do: {:error, "expected a string, got: #{inspect(input)}"}
 
   @doc """

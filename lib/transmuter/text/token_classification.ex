@@ -49,7 +49,7 @@ defmodule Transmuter.Text.TokenClassification do
       tokenizer,
       opts,
       fn outputs, _inputs -> %{scores: Serving.softmax(outputs["logits"])} end,
-      fn %{scores: scores}, {text, encoding} ->
+      fn [%{scores: scores}], [{text, encoding}] ->
         tokens =
           for {scores, id, token, {start, stop}, 0} <-
                 Enum.zip([

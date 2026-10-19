@@ -17,7 +17,7 @@ defmodule Transmuter.Text.TextClassification do
       tokenizer,
       opts,
       fn outputs, _inputs -> %{scores: scores(outputs["logits"], scores_function)} end,
-      fn %{scores: scores}, _item ->
+      fn [%{scores: scores}], _items ->
         predictions =
           scores
           |> Nx.to_list()
@@ -47,10 +47,10 @@ defmodule Transmuter.Text.TextClassification do
   defp scores(logits, :sigmoid), do: Nx.sigmoid(logits)
   defp scores(logits, :none), do: logits
 
-  defp text_or_pair(text) when is_binary(text), do: {:ok, text}
+  defp text_or_pair(text) when is_binary(text), do: {:ok, [text]}
 
   defp text_or_pair(input = {text, pair}) when is_binary(text) and is_binary(pair),
-    do: {:ok, input}
+    do: {:ok, [input]}
 
   defp text_or_pair(input),
     do: {:error, "expected a string or a pair of strings, got: #{inspect(input)}"}
