@@ -50,8 +50,10 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 |---|---|---|
 | `text_embedding/2` | text | `%{embedding: tensor}` |
 | `text_classification/2` | text, or a `{text, text_pair}` tuple | `%{predictions: [%{label: label, score: score}]}` |
+| `zero_shot_classification/3` | text | `%{predictions: [%{label: label, score: score}]}` |
 | `token_classification/2` | text | `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}` |
 | `fill_mask/2` | text with `[MASK]` | `%{predictions: [%{score: score, token: token}]}` |
+| `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task.
@@ -79,6 +81,36 @@ Nx.Serving.run(serving, [
 ```
 
 The labels come from `id2label` in `config.json`. The scores are a softmax, a sigmoid for a model with one label or with multi-label classification, and the logits for regression.
+
+### Zero-shot classification
+
+```elixir
+serving =
+  Transmuter.Text.zero_shot_classification(
+    {:hf, "Xenova/distilbert-base-uncased-mnli"},
+    ["urgent", "phone", "tablet"]
+  )
+
+Nx.Serving.run(serving, "My iphone is broken and I need it fixed today!")
+```
+
+You give the labels when you build the serving. A natural language inference (NLI) model compares the text with the hypothesis of each label, such as "This example is phone.". Set `:hypothesis_template` to change the hypothesis. The scores add up to 1. With `multi_label: true`, the model scores each label alone, so more than one label can have a high score.
+
+Each label is one row of the batch. A text with 5 labels uses 5 rows of `:batch_size`.
+
+### Question answering
+
+```elixir
+serving = Transmuter.Text.question_answering({:hf, "Xenova/distilbert-base-cased-distilled-squad"})
+
+Nx.Serving.run(serving, %{
+  question: "Where is the Eiffel Tower?",
+  context: "The Eiffel Tower is a wrought-iron lattice tower in Paris."
+})
+#=> %{results: [%{text: "Paris", start: 52, end: 57, score: ...}]}
+```
+
+The answer is a part of the context, and `start` and `end` are byte offsets in the context. A long context becomes windows of 384 tokens that overlap by 128 tokens, as in Python transformers. A different `:sequence_length` in `:compile` changes the length of the windows. Each window is one row of the batch. Spans with the same text add their scores, also from different windows, and the text with the highest score is the answer.
 
 ### Named entities
 

@@ -1,6 +1,8 @@
 """Prints the reference values of test/transmuter/text_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with transformers --with sentence-transformers --with torch python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch python -I test/support/pipeline_references.py
+
+Transformers 5 removed the question answering pipeline, so the script uses transformers 4.
 """
 
 from sentence_transformers import SentenceTransformer
@@ -30,6 +32,20 @@ print("unknown token", [(e["entity_group"], e["word"]) for e in ner("My friend A
 
 fill = pipeline("fill-mask", model="distilbert/distilroberta-base", device="cpu")
 print("fill", [(r["token_str"], round(r["score"], 5)) for r in fill("Paris is the <mask> of France.")[:2]])
+
+zero_shot = pipeline("zero-shot-classification", model="typeform/distilbert-base-uncased-mnli", device="cpu")
+text = "I have a problem with my iphone that needs to be resolved asap!!"
+for labels, multi_label in [(["urgent", "not urgent", "phone", "tablet", "computer"], False), (["urgent", "not urgent", "phone", "tablet", "computer"], True), (["urgent"], False)]:
+    r = zero_shot(text, candidate_labels=labels, multi_label=multi_label)
+    print("zero-shot", multi_label, [(label, round(score, 5)) for label, score in zip(r["labels"], r["scores"])])
+
+# The answer of the long context is in the third of five windows. The text has "é", so the byte
+# offsets are not the character offsets.
+qa = pipeline("question-answering", model="distilbert/distilbert-base-cased-distilled-squad", device="cpu")
+filler = "The café on the corner sells bread, coffee and small cakes to the people of the town every morning. " * 30
+for question, context in [("Where is the Eiffel Tower?", "The Eiffel Tower is a wrought-iron lattice tower in Paris"), ("What is the code word?", filler + "The code word for the meeting is Zanzibar. " + filler)]:
+    a = qa(question=question, context=context)
+    print("qa", (a["answer"], len(context[: a["start"]].encode()), len(context[: a["end"]].encode()), round(a["score"], 6)))
 
 # Generation: greedy, 12 new tokens.
 from transformers import AutoModelForCausalLM, AutoTokenizer

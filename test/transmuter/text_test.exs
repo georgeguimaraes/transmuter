@@ -112,6 +112,81 @@ defmodule Transmuter.TextTest do
     assert {person.label, person.phrase} == {"PER", "Angela☃Merkel"}
   end
 
+  test "zero-shot classification scores the labels together, or each label alone" do
+    text = "I have a problem with my iphone that needs to be resolved asap!!"
+    labels = ["urgent", "not urgent", "phone", "tablet", "computer"]
+
+    run = fn labels, opts ->
+      {:hf, "Xenova/distilbert-base-uncased-mnli"}
+      |> Transmuter.Text.zero_shot_classification(labels, opts ++ @opts)
+      |> Nx.Serving.run(text)
+      |> Map.fetch!(:predictions)
+      |> Enum.map(&{&1.label, &1.score})
+    end
+
+    # One label gets the score of :multi_label, because a softmax over one label is always 1.
+    for {labels, opts, expected} <- [
+          {labels, [multi_label: false],
+           [
+             {"phone", 0.80463},
+             {"computer", 0.13484},
+             {"not urgent", 0.02647},
+             {"urgent", 0.02374},
+             {"tablet", 0.01033}
+           ]},
+          {labels, [multi_label: true],
+           [
+             {"phone", 0.80205},
+             {"urgent", 0.39549},
+             {"computer", 0.20127},
+             {"not urgent", 0.06874},
+             {"tablet", 0.00023}
+           ]},
+          {["urgent"], [], [{"urgent", 0.39549}]}
+        ] do
+      predictions = run.(labels, opts)
+      assert Enum.map(predictions, &elem(&1, 0)) == Enum.map(expected, &elem(&1, 0))
+
+      for {{_, score}, {_, expected}} <- Enum.zip(predictions, expected),
+          do: assert_in_delta(score, expected, 1.0e-4)
+    end
+  end
+
+  test "question answering finds the answer at the end of the context and in a long context" do
+    serving =
+      Transmuter.Text.question_answering(
+        {:hf, "Xenova/distilbert-base-cased-distilled-squad"},
+        @opts
+      )
+
+    # The long context has 1281 tokens. The answer is in the third of five windows, and
+    # candidates in the subwords of "Zanzibar" add their scores. The byte offsets count the
+    # 2 bytes of each "é" before the answer.
+    filler =
+      String.duplicate(
+        "The café on the corner sells bread, coffee and small cakes to the people of the town every morning. ",
+        30
+      )
+
+    results =
+      Nx.Serving.run(serving, [
+        %{
+          question: "Where is the Eiffel Tower?",
+          context: "The Eiffel Tower is a wrought-iron lattice tower in Paris"
+        },
+        %{
+          question: "What is the code word?",
+          context: filler <> "The code word for the meeting is Zanzibar. " <> filler
+        }
+      ])
+
+    for {%{results: [answer]}, {text, start, stop, score}} <-
+          Enum.zip(results, [{"Paris", 52, 57, 0.966489}, {"Zanzibar", 3063, 3071, 0.967573}]) do
+      assert {answer.text, answer.start, answer.end} == {text, start, stop}
+      assert_in_delta answer.score, score, 1.0e-4
+    end
+  end
+
   test "fill-mask raises when truncation removes the mask" do
     serving =
       Transmuter.Text.fill_mask(

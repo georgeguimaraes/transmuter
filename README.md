@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `token_classification`, `fill_mask` and `generation`. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering` and `generation`. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 

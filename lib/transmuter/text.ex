@@ -75,6 +75,26 @@ defmodule Transmuter.Text do
   defdelegate text_classification(source, opts \\ []), to: Transmuter.Text.TextClassification
 
   @doc """
+  Builds a serving that classifies text with labels that you give, with a natural language inference (NLI) model.
+
+  The model compares the text with one hypothesis for each label, such as "This example is sports.". The score of a label comes from the entailment class of the model. The input is a string or a list of strings. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
+
+  The entailment class is the class in `id2label` of `config.json` that starts with "entail". As in Python transformers, the contradiction class is the last class when the entailment class is the first, else the first class. Each label adds one sequence to the batch, so a text with 5 labels uses 5 rows of `:batch_size`.
+
+  ## Options
+
+    * `:hypothesis_template` - a function that takes a label and returns its hypothesis. The default is `&"This example is \#{&1}."`.
+
+    * `:multi_label` - `false` (the default) gives scores that add up to 1: a softmax of the entailment logits over the labels. `true` scores each label alone: a softmax over the contradiction and entailment logits of the label. A single label always gets the score of `true`, as in Python transformers.
+
+    * `:top_k` - the number of predictions, or `nil` for all. The default is `5`.
+
+  See the module documentation for the other options.
+  """
+  defdelegate zero_shot_classification(source, labels, opts \\ []),
+    to: Transmuter.Text.ZeroShotClassification
+
+  @doc """
   Builds a serving that labels the tokens of a text, such as named entity recognition.
 
   The input is a string or a list of strings. The result is `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}`. `start` and `end` are byte offsets in the text.
@@ -104,6 +124,21 @@ defmodule Transmuter.Text do
   See the module documentation for the other options.
   """
   defdelegate fill_mask(source, opts \\ []), to: Transmuter.Text.FillMask
+
+  @doc """
+  Builds a serving that finds the answer to a question in a context, with an extractive question answering model.
+
+  The input is `%{question: question, context: context}` or a list of them. The result is `%{results: [%{text: text, start: start, end: end, score: score}]}`. The text is a part of the context, and `start` and `end` are byte offsets in the context. The results are empty when no window has an answer in the context.
+
+  The search follows the question answering pipeline of Python transformers. The score of a span of context tokens is the start probability of its first token times the end probability of its last token. A long context becomes windows of the largest sequence length, which is 384 tokens by default. The windows overlap by 128 tokens. Each window is one row of `:batch_size`. Spans with the same text add their scores, also from different windows, and the text with the highest score is the answer. `Transmuter.Text.QuestionAnswering` gives all the steps.
+
+  ## Options
+
+    * `:max_answer_length` - the maximum number of tokens in the answer. The default is `15`.
+
+  See the module documentation for the other options.
+  """
+  defdelegate question_answering(source, opts \\ []), to: Transmuter.Text.QuestionAnswering
 
   @doc """
   Builds a serving that generates text with a decoder, such as a chat model.
