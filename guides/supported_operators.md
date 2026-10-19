@@ -18,6 +18,8 @@ Transmuter supports all 203 operators in the ONNX standard domain (`ai.onnx`). I
 - `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`: fused residual add and layer norm
 - `EmbedLayerNormalization`: fused embedding and layer norm
 - `RMSNormalization`, `SimplifiedLayerNormalization`: RMS normalization variants
+- `MoE`: mixture-of-experts with SiLU and SwiGLU activation, top-k routing, optional normalize
+- `QMoE`: quantized mixture-of-experts with 4-bit and 8-bit block-wise weights and top-k routing
 
 The full list of operators tested is in the [coverage section of the README](../README.md).
 

@@ -83,6 +83,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,
           Transmuter.Ops.LinAlg,
+          Transmuter.Ops.MoE,
           Transmuter.Ops.NN,
           Transmuter.Ops.Quantized,
           Transmuter.Ops.Random,

@@ -6,6 +6,7 @@ defmodule Transmuter.Ops do
   alias Transmuter.Ops.{
     Elementwise,
     LinAlg,
+    MoE,
     NN,
     Quantized,
     Reduction,
@@ -23,7 +24,7 @@ defmodule Transmuter.Ops do
               LayerNormalization InstanceNormalization GroupNormalization BatchNormalization
               RMSNormalization SimplifiedLayerNormalization SkipLayerNormalization
               SkipSimplifiedLayerNormalization EmbedLayerNormalization Attention
-              GroupQueryAttention MultiHeadAttention)
+              GroupQueryAttention MultiHeadAttention MoE QMoE)
 
   @doc false
   def apply(node, inputs, opset) do
@@ -113,6 +114,9 @@ defmodule Transmuter.Ops do
 
       node.op_type in Transformer.op_types() ->
         Transformer.apply(node, inputs)
+
+      node.op_type in MoE.op_types() ->
+        MoE.apply(node, inputs)
 
       node.op_type in Quantized.op_types() ->
         Quantized.apply(node, inputs)

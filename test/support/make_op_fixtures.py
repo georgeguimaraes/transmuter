@@ -930,3 +930,85 @@ branch = lambda name: helper.make_graph(
 case("If_external_data_in_branches",
      [node("If", ["cond"], ["b"], then_branch=branch("then"), else_branch=branch("else")), node("Add", ["x", "b"], ["y"])],
      {"x": rf32(3)}, {"cond": np.array(True)}, external=True)
+||||||| parent of 9022190 (feat: Add com.microsoft MoE and QMoE operators)
+
+
+# ---------- MoE and QMoE ----------
+
+# Helper: pack unsigned ints along the last axis, 2 per byte for 4-bit (lowest bits first).
+def pack_weights(q, bits):
+    per = 8 // bits
+    q = q.reshape(*q.shape[:-1], -1, per).astype(np.uint8)
+    return sum((q[..., i] << (bits * i)) for i in range(per)).astype(np.uint8)
+
+r = rng_for("MoE and QMoE")
+rf32 = lambda *shape, scale=1.0: (r.standard_normal(shape) * scale).astype(np.float32)
+
+# Float MoE: silu, k=1.
+E, H, I = 4, 8, 6
+case("MoE_silu_k1",
+     [node("MoE", ["input", "router", "fc1", "", "fc2", ""], ["output"], domain=MS,
+           k=1, activation_type="silu", normalize_routing_weights=0, swiglu_fusion=0)],
+     {"input": rf32(2, 3, H), "router": rf32(6, E)},
+     {"fc1": rf32(E, I, H), "fc2": rf32(E, H, I)}, ms=True)
+
+# Float MoE: silu, k=2, normalize_routing_weights.
+case("MoE_silu_k2_normalize",
+     [node("MoE", ["input", "router", "fc1", "", "fc2", ""], ["output"], domain=MS,
+           k=2, activation_type="silu", normalize_routing_weights=1, swiglu_fusion=0)],
+     {"input": rf32(2, 3, H), "router": rf32(6, E)},
+     {"fc1": rf32(E, I, H), "fc2": rf32(E, H, I)}, ms=True)
+
+# Float MoE: swiglu interleaved (fusion=1), k=2. FC1 produces 2*I activations.
+case("MoE_swiglu_k2",
+     [node("MoE", ["input", "router", "fc1", "", "fc2", ""], ["output"], domain=MS,
+           k=2, activation_type="swiglu", normalize_routing_weights=1, swiglu_fusion=1)],
+     {"input": rf32(2, 3, H), "router": rf32(6, E)},
+     {"fc1": rf32(E, 2 * I, H), "fc2": rf32(E, H, I)}, ms=True)
+
+# QMoE: 4-bit, block_size=16, silu, k=2.
+E2, H2, I2, BS, BITS = 4, 32, 16, 16, 4
+fc1_q = r.integers(0, 16, (E2, I2, H2)).astype(np.uint8)
+fc1_packed = pack_weights(fc1_q, BITS).reshape(E2, I2, H2 // 2)
+fc1_scales = rf32(E2, I2, H2 // BS, scale=0.05) + 0.01
+fc2_q = r.integers(0, 16, (E2, H2, I2)).astype(np.uint8)
+fc2_packed = pack_weights(fc2_q, BITS).reshape(E2, H2, I2 // 2)
+fc2_scales = rf32(E2, H2, I2 // BS, scale=0.05) + 0.01
+case("QMoE_4bit_silu_k2",
+     [node("QMoE", ["input", "router", "fc1", "fc1s", "", "fc2", "fc2s"], ["output"], domain=MS,
+           k=2, activation_type="silu", normalize_routing_weights=0, swiglu_fusion=0,
+           expert_weight_bits=BITS, block_size=BS, weights_prepacked=0)],
+     {"input": rf32(2, 3, H2), "router": rf32(6, E2)},
+     {"fc1": fc1_packed, "fc1s": fc1_scales, "fc2": fc2_packed, "fc2s": fc2_scales}, ms=True)
+
+# QMoE: 4-bit, block_size=32 (matching LFM2), swiglu interleaved, k=2, normalize.
+E3, H3, I3, BS3 = 4, 32, 32, 32
+fc1b_q = r.integers(0, 16, (E3, 2 * I3, H3)).astype(np.uint8)
+fc1b_packed = pack_weights(fc1b_q, BITS).reshape(E3, 2 * I3, H3 // 2)
+fc1b_scales = rf32(E3, 2 * I3, H3 // BS3, scale=0.05) + 0.01
+fc2b_q = r.integers(0, 16, (E3, H3, I3)).astype(np.uint8)
+fc2b_packed = pack_weights(fc2b_q, BITS).reshape(E3, H3, I3 // 2)
+fc2b_scales = rf32(E3, H3, I3 // BS3, scale=0.05) + 0.01
+case("QMoE_4bit_swiglu_k2_normalize",
+     [node("QMoE", ["input", "router", "fc1", "fc1s", "", "fc2", "fc2s"], ["output"], domain=MS,
+           k=2, activation_type="swiglu", normalize_routing_weights=1, swiglu_fusion=1,
+           expert_weight_bits=BITS, block_size=BS3, weights_prepacked=0)],
+     {"input": rf32(2, 3, H3), "router": rf32(6, E3)},
+     {"fc1": fc1b_packed, "fc1s": fc1b_scales, "fc2": fc2b_packed, "fc2s": fc2b_scales}, ms=True)
+
+# QMoE: 8-bit, block_size=16, silu, k=1.
+BITS8 = 8
+fc1c_q = r.integers(0, 256, (E2, I2, H2)).astype(np.uint8)
+fc2c_q = r.integers(0, 256, (E2, H2, I2)).astype(np.uint8)
+# Offset must exceed ~4 std deviations to keep all scales positive (quantization requires s > 0).
+fc1c_scales = np.abs(rf32(E2, I2, H2 // BS, scale=0.005)) + 0.001
+fc2c_scales = np.abs(rf32(E2, H2, I2 // BS, scale=0.005)) + 0.001
+case("QMoE_8bit_silu_k1",
+     [node("QMoE", ["input", "router", "fc1", "fc1s", "", "fc2", "fc2s"], ["output"], domain=MS,
+           k=1, activation_type="silu", normalize_routing_weights=0, swiglu_fusion=0,
+           expert_weight_bits=BITS8, block_size=BS, weights_prepacked=0)],
+     {"input": rf32(2, 3, H2), "router": rf32(6, E2)},
+     {"fc1": fc1c_q, "fc1s": fc1c_scales, "fc2": fc2c_q, "fc2s": fc2c_scales}, ms=True,
+     # ONNX Runtime's 8-bit QMoE kernel is an approximation: it differs from the exact
+     # dequantized result by 0.11 (1.3% of the largest output), which Transmuter matches.
+     atol=0.15)
