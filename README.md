@@ -1,4 +1,4 @@
-# ⚗️ Transmuter
+# ⚗️🪙 Transmuter
 
 Transmuter runs ONNX models on Nx. Load a model from Hugging Face and run it on any Nx backend: EMLX on Apple silicon, or EXLA on CUDA or on the CPU.
 
