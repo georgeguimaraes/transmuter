@@ -76,6 +76,8 @@ model = Transmuter.load!(source, compute_type: :f32)
 
 `compute_type: :f32` upcasts every f16 and bf16 tensor before each operator. This gives the same numerical result as ONNX Runtime on the CPU but uses more memory and is slower on a GPU.
 
+In native f16, each intermediate value is stored in f16, and a deep graph can drift far. The fp16 vision encoder of Qwen2-VL 2B has 32 blocks. In native f16, its output differs from the f32 result by 60%. With `compute_type: :f32`, it matches ONNX Runtime within 2e-5. Compare a half-precision model with an f32 run before you use native f16.
+
 ## Memory management with EMLX
 
 EMLX maintains two caches of its own that grow with new shapes.
