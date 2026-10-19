@@ -20,7 +20,7 @@ static? = fn spec ->
     (Map.has_key?(meta["ops"], "NonZero") and spec["dtype"] in ["s64", "s32"])
 end
 
-model = Transmuter.load!(meta["onnx_path"], compute_type: :f32)
+model = Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32)
 params = Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)
 
 inputs =
@@ -56,27 +56,18 @@ end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
+ctx = %{opset: model.opset, compute_type: nil, key: key}
 
-Enum.reduce_while(model.nodes, env, fn node, env ->
+model.nodes
+|> Enum.reduce_while(env, fn node, env ->
   ins =
     Enum.map(node.input, fn
       "" -> nil
       name -> Map.fetch!(env, name)
     end)
 
-  outs =
-    cond do
-      node.op_type in Transmuter.Ops.Random.op_types() ->
-        Transmuter.Ops.Random.apply(node, ins, key)
-
-      Enum.all?(ins, &(&1 == nil or Transmuter.Ops.static?(&1))) ->
-        Nx.with_default_backend(Nx.BinaryBackend, fn ->
-          Transmuter.Ops.apply(node, ins, model.opset)
-        end)
-
-      true ->
-        Transmuter.Ops.apply(node, ins, model.opset)
-    end
+  # One step of the interpreter, so that If, Loop and Scan nodes run as in Transmuter.run/4.
+  outs = Enum.map(node.output, &Map.get(Transmuter.run_nodes([node], env, ctx), &1))
 
   bad =
     for {name, t} <- Enum.zip(node.output, outs),
@@ -126,6 +117,7 @@ Enum.reduce_while(model.nodes, env, fn node, env ->
         "  inputs: #{inspect(Enum.map(ins, &(&1 && ((is_struct(&1) && Nx.shape(&1)) || &1))))}"
       )
 
-      {:halt, env}
+      {:halt, :diverged}
   end
 end)
+|> then(&if(&1 != :diverged, do: IO.puts("No divergence in #{length(model.nodes)} nodes")))
