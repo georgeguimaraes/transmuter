@@ -123,13 +123,17 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
-| One graph for each operator variant | 240 of 240 match |
+| Models that Bumblebee pull requests add: GLiNER, Nomic BERT, ColBERT, MPNet, Jina BERT v2, Swin, M2M100, NLLB, Llama 3.2, Phi-3.5, SmolLM3, Qwen3-VL, Gemma 4 and Ministral 3 | 18 of 21 files match. The Phi-3.5 q4f16 file is within noise. The Gemma 4 decoder differs, see below. The Ministral 3 vision encoder times out at its 1540x1540 input |
+| Small language models: Granite 4.0-H (hybrid with Mamba-2 layers), LFM2-8B-A1B (mixture of experts), Gemma 3, Phi-4-mini, Qwen3, DeepSeek-R1-Distill, Falcon3, TinyLlama, MobileLLM-R1 and Baguettotron | 11 of 11 q4 files match |
+| SigLIP and SigLIP2: the full model, the vision model and the text model | 6 of 6 match |
+| One graph for each operator variant | 255 of 255 match |
 
-Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use.
+Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use, including the mixture-of-experts operators `MoE` and `QMoE`.
 
-Two models do not match value by value, because they make small rounding differences large:
+Three models do not match value by value, because they make small rounding differences large:
 
 - **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
+- **The Gemma 4 E2B decoder** has activations up to about 1300 and final norm weights up to about 700. When the test changes the float inputs of ONNX Runtime by 1e-7 of their values, about one f32 rounding step, the logits of ONNX Runtime change by up to 5.5. The logits of Transmuter differ from ONNX Runtime by 5.3 on the CPU and by 13.6 on the GPU, which is the same noise. The two give the same token for 7 of 8 positions of the random test input.
 - **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently. Also, the `atan2` of the export gives a different phase for an exact STFT than for the STFT of ONNX Runtime (see [Text to speech with Kokoro](#text-to-speech-with-kokoro)). When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. With the `atan2` fix of the example, the spectrum of the speech matches PyTorch, with no tone at 4.8 kHz.
 
 These models also ran from input to final result, and the result agrees with ONNX Runtime:
@@ -141,6 +145,21 @@ These models also ran from input to final result, and the result agrees with ONN
 | [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |
 | [Moonshine base](https://huggingface.co/onnx-community/moonshine-base-ONNX) | The same tokens for 2 s, 6 s and 15 s of speech |
+| [Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export) | The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter |
+| [wav2vec2 base 960h](https://huggingface.co/Xenova/wav2vec2-base-960h) | The same CTC transcripts for 2 s, 6 s and 15 s of speech |
+| [Piper en_US lessac medium](https://huggingface.co/rhasspy/piper-voices) | The same audio length and a waveform within 1.3e-5, with the noise scales at 0 |
+| [Florence-2 base](https://huggingface.co/onnx-community/Florence-2-base-ft) | The same tokens for the caption, detailed caption and object detection tasks |
+| [SmolVLM 256M](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | The same 100 tokens for an image with 13 tiles |
+| [Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct) | With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes. The fp32 vision encoder is within 2e-5 |
+| [InsightFace buffalo_l](https://huggingface.co/WePrompt/buffalo_l) | SCRFD detection within 2.7e-5, and ArcFace embeddings with a cosine similarity of 1.0 to ONNX Runtime |
+| [RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR v4) | The same text for three lines of rendered text, after detection, cropping and recognition |
+| [Real-ESRGAN x4](https://huggingface.co/imgdesignart/realesrgan-x4-onnx) | The upscaled image within 1.3e-5 |
+| [SD-Turbo](https://huggingface.co/Heliosoph/sd-turbo-onnx) | The UNet within 2e-6 and the text encoder within 7.6e-5, then 4-step images |
+| [Chronos-Bolt tiny](https://huggingface.co/bakshinghampalace/chronos-bolt-tiny-onnx) | The quantile forecasts within 1.2e-6 |
+| Qwen3-0.6B FP8, exported with FLOAT8E4M3FN weights | The same 30 tokens, with logits within 4.5e-5 |
+| Qwen3-0.6B with YaRN rope scaling, exported | The same 30 tokens, compiled and without compilation |
+| FaceNet (InceptionResnetV1), exported | Embeddings within 1e-7 |
+| ControlNet scribble and the SD 1.5 UNet with ControlNet inputs, exported | ControlNet residuals within 3.8e-5, then a scribble-to-image run |
 
 <details>
 <summary>All tested models</summary>
@@ -163,6 +182,10 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Xenova/all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2) | feature-extraction | 22.6M | model, model_fp16, model_int8, model_q4, model_quantized | matches |
 | [Xenova/bge-base-en-v1.5](https://huggingface.co/Xenova/bge-base-en-v1.5) | feature-extraction | 109M | model | matches |
 | [Xenova/bge-small-en-v1.5](https://huggingface.co/Xenova/bge-small-en-v1.5) | feature-extraction | 33.2M | model | matches |
+| [jinaai/jina-embeddings-v2-small-en](https://huggingface.co/jinaai/jina-embeddings-v2-small-en) | feature-extraction | 32.4M | model | matches |
+| [Xenova/all-mpnet-base-v2](https://huggingface.co/Xenova/all-mpnet-base-v2) | feature-extraction | 109M | model | matches |
+| [answerdotai/answerai-colbert-small-v1](https://huggingface.co/answerdotai/answerai-colbert-small-v1) | feature-extraction | 33.2M | model | matches |
+| [nomic-ai/nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | feature-extraction | 137M | model | matches |
 | [google/bigbird-roberta-base](https://huggingface.co/google/bigbird-roberta-base) (exported with Optimum) | fill-mask | 166M | model | matches |
 | [microsoft/mdeberta-v3-base](https://huggingface.co/microsoft/mdeberta-v3-base) (exported with Optimum) | fill-mask | 472M | model | matches |
 | [Xenova/bert-base-multilingual-cased](https://huggingface.co/Xenova/bert-base-multilingual-cased) | fill-mask | 178M | model | matches |
@@ -178,6 +201,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | inception-v1-12 (ONNX Model Zoo) | image-classification | 7M | inception-v1-12 | matches |
 | vgg16-12-int8 (ONNX Model Zoo) | image-classification | 138M | vgg16-12-int8 | matches |
 | zfnet512-12-int8 (ONNX Model Zoo) | image-classification | 87.3M | zfnet512-12-int8 | matches |
+| [Xenova/swin-tiny-patch4-window7-224](https://huggingface.co/Xenova/swin-tiny-patch4-window7-224) | image-classification | 28.6M | model | matches |
 | [Xenova/dino-vits16](https://huggingface.co/Xenova/dino-vits16) | image-feature-extraction | 21.7M | model | matches |
 | [Xenova/dinov2-small](https://huggingface.co/Xenova/dinov2-small) | image-feature-extraction | 22.1M | model | matches |
 | [onnx-community/ormbg-ONNX](https://huggingface.co/onnx-community/ormbg-ONNX) | image-segmentation | 44M | model | matches |
@@ -186,6 +210,9 @@ These models also ran from input to final result, and the result agrees with ONN
 | MaskRCNN-12 (ONNX Model Zoo) | image-segmentation | 44.4M | MaskRCNN-12 | matches |
 | [Xenova/tiny-random-Florence2ForConditionalGeneration](https://huggingface.co/Xenova/tiny-random-Florence2ForConditionalGeneration) | image-text-to-text | 5.16M | decoder_model, decoder_model_merged, decoder_with_past_model, embed_tokens, encoder_model, vision_encoder | matches |
 | [Xenova/tiny-random-LlavaForConditionalGeneration](https://huggingface.co/Xenova/tiny-random-LlavaForConditionalGeneration) | image-text-to-text | 9.44M | decoder_model, decoder_model_merged, decoder_with_past_model, embed_tokens, vision_encoder | matches |
+| [mistralai/Ministral-3-3B-Instruct-2512-ONNX](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-ONNX) | image-text-to-text | 4.29B | decoder_model_merged_q4, embed_tokens_q4, vision_encoder_q4 | decoder_model_merged_q4, embed_tokens_q4 match; vision_encoder_q4 times out |
+| [onnx-community/Qwen3-VL-2B-Instruct-ONNX](https://huggingface.co/onnx-community/Qwen3-VL-2B-Instruct-ONNX) | image-text-to-text | 2.37B | decoder_model_merged_q4, embed_tokens_q4, vision_encoder | matches |
+| [onnx-community/gemma-4-E2B-it-ONNX](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX) | image-text-to-text | 5.64B | audio_encoder_q4, decoder_model_merged_q4, embed_tokens_q4, vision_encoder | audio_encoder_q4, embed_tokens_q4, vision_encoder match; decoder_model_merged_q4 differ, see below |
 | [Xenova/swin2SR-classical-sr-x2-64](https://huggingface.co/Xenova/swin2SR-classical-sr-x2-64) | image-to-image | 12.1M | model | matches |
 | [Xenova/swin2SR-lightweight-x2-64](https://huggingface.co/Xenova/swin2SR-lightweight-x2-64) | image-to-image | 1.03M | model | matches |
 | [Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr](https://huggingface.co/Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr) | image-to-image | 12.1M | model | matches |
@@ -227,6 +254,20 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Xenova/llama2.c-stories15M](https://huggingface.co/Xenova/llama2.c-stories15M) | text-generation | 30.4M | decoder_model, decoder_model_merged, decoder_with_past_model, model | matches |
 | [Xenova/tiny-random-GemmaForCausalLM](https://huggingface.co/Xenova/tiny-random-GemmaForCausalLM) | text-generation | 2.05M | model | matches |
 | [Xenova/tiny-random-Phi3ForCausalLM](https://huggingface.co/Xenova/tiny-random-Phi3ForCausalLM) | text-generation | 2.07M | model | matches |
+| [onnx-community/Baguettotron-ONNX](https://huggingface.co/onnx-community/Baguettotron-ONNX) | text-generation | 321M | model_q4 | matches |
+| [onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX](https://huggingface.co/onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX) | text-generation | 1.79B | model_q4 | matches |
+| [onnx-community/Falcon3-1B-Instruct](https://huggingface.co/onnx-community/Falcon3-1B-Instruct) | text-generation | 1.67B | model_q4 | matches |
+| [onnx-community/gemma-3-1b-it-ONNX](https://huggingface.co/onnx-community/gemma-3-1b-it-ONNX) | text-generation | 1.32B | model_q4 | matches |
+| [onnx-community/granite-4.0-h-1b-ONNX](https://huggingface.co/onnx-community/granite-4.0-h-1b-ONNX) | text-generation | 1.97B | model_q4 | matches |
+| [onnx-community/granite-4.0-h-350m-ONNX](https://huggingface.co/onnx-community/granite-4.0-h-350m-ONNX) | text-generation | 490M | model_q4 | matches |
+| [onnx-community/LFM2-8B-A1B-ONNX](https://huggingface.co/onnx-community/LFM2-8B-A1B-ONNX) | text-generation | 4.85B | model_q4 | matches |
+| [onnx-community/MobileLLM-R1-950M-ONNX](https://huggingface.co/onnx-community/MobileLLM-R1-950M-ONNX) | text-generation | 952M | model_q4 | matches |
+| [onnx-community/Phi-4-mini-instruct-ONNX](https://huggingface.co/onnx-community/Phi-4-mini-instruct-ONNX) | text-generation | 4.46B | model_q4 | matches |
+| [onnx-community/Qwen3-1.7B-ONNX](https://huggingface.co/onnx-community/Qwen3-1.7B-ONNX) | text-generation | 1.73B | model_q4 | matches |
+| [Xenova/TinyLlama-1.1B-Chat-v1.0](https://huggingface.co/Xenova/TinyLlama-1.1B-Chat-v1.0) | text-generation | 1.1B | model_q4 | matches |
+| [onnx-community/Phi-3.5-mini-instruct-onnx-web](https://huggingface.co/onnx-community/Phi-3.5-mini-instruct-onnx-web) | text-generation | 3.83B | model_q4f16 | within noise |
+| [onnx-community/Llama-3.2-1B-Instruct-ONNX](https://huggingface.co/onnx-community/Llama-3.2-1B-Instruct-ONNX) | text-generation | 1.24B | model_q4 | matches |
+| [HuggingFaceTB/SmolLM3-3B-ONNX](https://huggingface.co/HuggingFaceTB/SmolLM3-3B-ONNX) | text-generation | 3.08B | model_q4 | matches |
 | [onnx-community/stable-diffusion-v1-5-ONNX](https://huggingface.co/onnx-community/stable-diffusion-v1-5-ONNX) | text-to-image | 1.07B | text_encoder/model, unet/model, vae_decoder/model, vae_encoder/model | text_encoder/model, unet/model, vae_decoder/model match; vae_encoder/model random |
 | [onnx-community/Kokoro-82M-v1.0-ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) | text-to-speech | 81.2M | model | differs, see below |
 | [onnx-community/granite-timeseries-patchtsmixer](https://huggingface.co/onnx-community/granite-timeseries-patchtsmixer) | time-series-forecasting | 196K | model | matches |
@@ -234,7 +275,10 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Xenova/bert-base-multilingual-cased-ner-hrl](https://huggingface.co/Xenova/bert-base-multilingual-cased-ner-hrl) | token-classification | 177M | model | matches |
 | [Xenova/bert-base-NER](https://huggingface.co/Xenova/bert-base-NER) | token-classification | 108M | model | matches |
 | [Xenova/distilbert-base-multilingual-cased-ner-hrl](https://huggingface.co/Xenova/distilbert-base-multilingual-cased-ner-hrl) | token-classification | 135M | model | matches |
+| [onnx-community/gliner_small-v2.1](https://huggingface.co/onnx-community/gliner_small-v2.1) | token-classification | 153M | model | matches |
 | [Xenova/opus-mt-en-ROMANCE](https://huggingface.co/Xenova/opus-mt-en-ROMANCE) | translation | 111M | decoder_model, decoder_model_merged, decoder_with_past_model, encoder_model | matches |
+| [Xenova/m2m100_418M](https://huggingface.co/Xenova/m2m100_418M) | translation | 617M | decoder_model_merged, encoder_model | matches |
+| [Xenova/nllb-200-distilled-600M](https://huggingface.co/Xenova/nllb-200-distilled-600M) | translation | 1.06B | decoder_model_merged_q4, encoder_model_q4 | matches |
 | [onnx-community/timesformer-base-finetuned-k400](https://huggingface.co/onnx-community/timesformer-base-finetuned-k400) | video-classification | 122M | model | matches |
 | [onnx-community/silero-vad](https://huggingface.co/onnx-community/silero-vad) | voice-activity-detection | 545K | model | matches |
 | [onnx-community/smart-turn-v3-ONNX](https://huggingface.co/onnx-community/smart-turn-v3-ONNX) | voice-activity-detection | 8M | model | matches |
@@ -244,6 +288,8 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Xenova/chinese-clip-vit-base-patch16](https://huggingface.co/Xenova/chinese-clip-vit-base-patch16) | zero-shot-image-classification | 188M | model | matches |
 | [Xenova/mobileclip_s0](https://huggingface.co/Xenova/mobileclip_s0) | zero-shot-image-classification | 53.8M | text_model, vision_model | matches |
 | [Xenova/mobileclip_s2](https://huggingface.co/Xenova/mobileclip_s2) | zero-shot-image-classification | 99.1M | text_model, vision_model | matches |
+| [Xenova/siglip-base-patch16-224](https://huggingface.co/Xenova/siglip-base-patch16-224) | zero-shot-image-classification | 203M | model, text_model, vision_model | matches |
+| [onnx-community/siglip2-base-patch16-224-ONNX](https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX) | zero-shot-image-classification | 375M | model, text_model, vision_model | matches |
 | [onnx-community/grounding-dino-tiny-ONNX](https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX) | zero-shot-object-detection | 179M | model | differs, see below |
 | [Xenova/owlv2-base-patch16-ensemble](https://huggingface.co/Xenova/owlv2-base-patch16-ensemble) | zero-shot-object-detection | 153M | model | matches |
 | [Xenova/owlvit-base-patch32](https://huggingface.co/Xenova/owlvit-base-patch32) | zero-shot-object-detection | 153M | model | matches |
