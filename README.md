@@ -88,9 +88,9 @@ These results are from an Apple silicon GPU:
 
 | Model | Without compilation | First call | Later calls |
 |---|---|---|---|
-| Kokoro, 7.0 seconds of audio | 2.3 s | 2.1 s | 0.34 s |
-| Kokoro, 20.2 seconds of audio | 13.2 s | 8.8 s | 0.87 s |
-| Kokoro, 26.6 seconds of audio | 25.2 s | 13.5 s | 1.16 s |
+| Kokoro, 7.0 seconds of audio | 2.3 s | 2.3 s | 0.28 s |
+| Kokoro, 20.2 seconds of audio | 13.9 s | 10.6 s | 0.84 s |
+| Kokoro, 26.6 seconds of audio | 25.8 s | 11.4 s | 1.11 s |
 | Faster R-CNN 12, the same image | 33.8 s | 6.5 s | 0.35 s |
 
 A new audio length in Kokoro compiles the operators after the break again, and that first call takes about as long as a call without compilation. `bench/kokoro_tts.exs` rounds the total duration up to steps of 200 ms by making the final pause longer, so sentences of a similar length share one compiled decoder.
