@@ -301,9 +301,12 @@ defmodule Transmuter do
     |> tag_literals(Compiler.current())
   end
 
-  # Strings, sequences and empty optionals cannot leave a compiled function. Without a
-  # compiler, a sequence comes back as a list.
-  @doc false
+  @doc group: "Internals"
+  @doc """
+  Prepares the outputs of a graph to leave the function that runs it.
+
+  Strings, sequences and empty optionals cannot leave a compiled function. Without a compiler, a sequence comes back as a list.
+  """
   def host_outputs(outputs, nil) do
     Map.new(outputs, fn
       {name, {:sequence, elements}} -> {name, elements}
@@ -325,11 +328,12 @@ defmodule Transmuter do
   defp describe({:sequence, _elements}), do: "a sequence"
   defp describe(:none), do: "an empty optional"
 
-  # EMLX 0.5 keys its compile cache by the structure of the graph, and a literal tensor
-  # adds only its shape and type to the key. Two graphs that differ only in literal
-  # values then share one compiled program. A metadata node with a hash of the value
-  # puts the value in the key. EMLX compiles a metadata node as its inner node.
-  @doc false
+  @doc group: "Internals"
+  @doc """
+  Puts the values of literal tensors in the compile cache key of EMLX.
+
+  EMLX 0.5 keys its compile cache by the structure of the graph, and a literal tensor adds only its shape and type to the key. Two graphs that differ only in literal values then share one compiled program. A metadata node with a hash of the value puts the value in the key. EMLX compiles a metadata node as its inner node.
+  """
   def tag_literals(outputs, EMLX) do
     {outputs, _seen} = Composite.traverse(outputs, %{}, &tag_literal/2)
     outputs
@@ -555,8 +559,12 @@ defmodule Transmuter do
     :unroll -> nil
   end
 
-  # A key is two u32 words. It is on the default backend, so eager runs draw there.
-  @doc false
+  @doc group: "Internals"
+  @doc """
+  The name of the graph input that holds the `Nx.Random` key of random operators.
+
+  A key is two u32 words. It is on the default backend, so eager runs draw there.
+  """
   def random_input, do: @random_key
 
   @doc false
@@ -737,8 +745,12 @@ defmodule Transmuter do
     sorted
   end
 
-  # A node with subgraphs (If branches) also depends on the outer values its branches read.
-  @doc false
+  @doc group: "Internals"
+  @doc """
+  Returns the names of the values that `node` reads.
+
+  A node with subgraphs (If branches) also depends on the outer values its branches read.
+  """
   def dependencies(node) do
     outer =
       for %{g: graph} when graph != nil <- node.attribute,

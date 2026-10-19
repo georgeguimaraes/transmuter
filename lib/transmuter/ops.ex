@@ -262,15 +262,17 @@ defmodule Transmuter.Ops do
   def empty?({:empty, _shape}), do: true
   def empty?(_), do: false
 
-  # The shape of a tensor or of a zero-size value.
-  @doc false
+  @doc """
+  Returns the shape of a tensor or of a zero-size value.
+  """
   def shape_of({:empty, shape}), do: shape
   def shape_of(t), do: Nx.shape(t)
 
-  # Values that Nx cannot hold live in the graph environment as host terms: a string
-  # tensor is {:strings, shape, values}, a sequence is {:sequence, elements}, an empty
-  # optional is :none and a zero-size tensor is {:empty, shape}.
-  @doc false
+  @doc """
+  Returns whether a value is known before the graph runs.
+
+  Values that Nx cannot hold live in the graph environment as host terms: a string tensor is `{:strings, shape, values}`, a sequence is `{:sequence, elements}`, an empty optional is `:none` and a zero-size tensor is `{:empty, shape}`.
+  """
   def static?({:empty, _shape}), do: true
   def static?(:none), do: true
   def static?({:strings, _shape, _values}), do: true
@@ -283,17 +285,21 @@ defmodule Transmuter.Ops do
 
   def ints!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
 
-  # Every read of a tensor value on the host goes through here, so a traced value
-  # raises the one error that Transmuter.compile/3 breaks the graph on.
-  @doc false
+  @doc """
+  Returns `value`, or raises `Transmuter.UnknownValueError` when the value is not known on the host.
+
+  Every read of a tensor value on the host goes through here, so a traced value raises the one error that `Transmuter.compile/3` breaks the graph on.
+  """
   def known!(value, description) do
     unless known?(value), do: raise(Transmuter.UnknownValueError, value: description)
     value
   end
 
-  # Concrete values can be read on the host: static ones, and every tensor when the
-  # model runs eagerly. Only values inside a traced function are unknown.
-  @doc false
+  @doc """
+  Returns whether the host can read a value.
+
+  Concrete values can be read on the host: static ones, and every tensor when the model runs eagerly. Only values inside a traced function are unknown.
+  """
   def known?({:empty, _shape}), do: true
   def known?(:none), do: true
   def known?({:strings, _shape, _values}), do: true
@@ -379,8 +385,11 @@ defmodule Transmuter.Ops do
     a |> Nx.shape() |> Nx.iota(axis: last) |> Nx.equal(first) |> Nx.as_type(Nx.type(a))
   end
 
-  # ONNX broadcasting. A dimension of 0 takes the place of 1 like any other size.
-  @doc false
+  @doc """
+  Returns the shape that ONNX broadcasting gives for `shapes`.
+
+  A dimension of 0 takes the place of 1 like any other size.
+  """
   def broadcast_shape(shapes) do
     rank = shapes |> Enum.map(&tuple_size/1) |> Enum.max()
 
@@ -390,9 +399,11 @@ defmodule Transmuter.Ops do
     |> List.to_tuple()
   end
 
-  # (x - mean) / sqrt(variance + eps) over axes. It centers x once and reuses it,
-  # where Nx.variance would compute the mean and center x again.
-  @doc false
+  @doc """
+  Computes `(x - mean) / sqrt(variance + eps)` over `axes`.
+
+  It centers x once and reuses it, where `Nx.variance` would compute the mean and center x again.
+  """
   def normalize(x, axes, eps) do
     centered = Nx.subtract(x, Nx.mean(x, axes: axes, keep_axes: true))
     var = centered |> Nx.multiply(centered) |> Nx.mean(axes: axes, keep_axes: true)
@@ -475,8 +486,9 @@ defmodule Transmuter.Ops do
     Nx.reshape(flat, List.to_tuple(dims))
   end
 
-  # Reads the data of a tensor that keeps it in a file next to the model.
-  @doc false
+  @doc """
+  Reads the data of a tensor that keeps it in a file next to the model.
+  """
   def read_external(t = %{data_location: :EXTERNAL, external_data: entries}, dir) do
     entries = Map.new(entries, &{&1.key, &1.value})
     path = Path.join(dir, entries["location"])

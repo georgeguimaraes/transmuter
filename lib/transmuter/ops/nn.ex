@@ -432,11 +432,11 @@ defmodule Transmuter.Ops.NN do
     end
   end
 
-  # A convolution of zero-shifted integers, with x and w as f32, to s32. It is one matrix
-  # product per kernel tap, and f32 matrix products of integers are exact below 2^24.
-  # A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels,
-  # and is off by up to 15 on sums of about 1.6e6.
-  @doc false
+  @doc """
+  Computes a convolution of zero-shifted integers, with x and w as f32, to s32.
+
+  It is one matrix product per kernel tap, and f32 matrix products of integers are exact below 2^24. A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels, and is off by up to 15 on sums of about 1.6e6.
+  """
   def integer_conv(node, x, w) do
     [n, c | _] = Tuple.to_list(Nx.shape(x))
     [o, group_c | kernel] = Tuple.to_list(Nx.shape(w))
