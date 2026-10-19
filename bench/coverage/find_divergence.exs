@@ -20,7 +20,10 @@ static? = fn spec ->
     (Map.has_key?(meta["ops"], "NonZero") and spec["dtype"] in ["s64", "s32"])
 end
 
-model = Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32)
+# COMPUTE_TYPE=none keeps the types of the graph, to test half-precision graphs as they are.
+compute_type = System.get_env("COMPUTE_TYPE", "f32")
+compute_type = if compute_type == "none", do: nil, else: String.to_atom(compute_type)
+model = Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: compute_type)
 params = Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)
 
 inputs =
@@ -56,7 +59,7 @@ end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
-ctx = %{opset: model.opset, compute_type: nil, key: key}
+ctx = %{opset: model.opset, compute_type: compute_type, key: key}
 
 model.nodes
 |> Enum.reduce_while(env, fn node, env ->
