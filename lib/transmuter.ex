@@ -1,6 +1,6 @@
 defmodule Transmuter do
   @moduledoc """
-  Runs ONNX models on any Nx backend.
+  Runs Hugging Face ONNX models on any Nx backend, with no per-architecture code.
 
   Transmuter reads an ONNX file, such as an export from the Hugging Face Hub, and
   turns its graph into Nx operations. It does not port model architectures. The
