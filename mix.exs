@@ -11,7 +11,8 @@ defmodule Transmuter.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Runs Hugging Face ONNX models on any Nx backend, with no per-architecture code.",
+      description:
+        "Runs Hugging Face ONNX models on any Nx backend, with no per-architecture code.",
       package: package(),
       docs: docs(),
       source_url: @source_url
