@@ -34,16 +34,36 @@ defmodule Transmuter.GraphBreaks do
       random?: Transmuter.random?(model.nodes)
     }
 
+    general = fn inputs ->
+      plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
+    end
+
+    # A graph without breaks keeps its compiled function here for the shapes of these
+    # inputs, because a read from the cache table copies the function. Inputs of other
+    # shapes compile on their first call and are cached.
     case segment(plan, initial(plan, inputs, static_inputs), 0) do
       {:end, entry} ->
+        shapes = input_shapes(inputs)
+
         fn inputs ->
-          state = initial(plan, inputs, static_inputs)
-          state |> merge(run_compiled(entry, arguments(plan, state, 0))) |> outputs(plan)
+          if input_shapes(inputs) == shapes do
+            state = initial(plan, inputs, static_inputs)
+            state |> merge(run_compiled(entry, arguments(plan, state, 0))) |> outputs(plan)
+          else
+            general.(inputs)
+          end
         end
 
       _break ->
-        fn inputs -> plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan) end
+        general
     end
+  end
+
+  defp input_shapes(inputs) do
+    Map.new(inputs, fn
+      {name, t = %Nx.Tensor{}} -> {name, {Nx.shape(t), Nx.type(t)}}
+      other -> other
+    end)
   end
 
   # The values of one call: names, the set of static names and the random key.

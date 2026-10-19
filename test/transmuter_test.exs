@@ -297,6 +297,23 @@ defmodule TransmuterTest do
     end
   end
 
+  test "a compiled function takes inputs of other shapes" do
+    model = load_fixture("Cosh")
+    input = &%{"x" => Nx.iota(&1, type: :f32, backend: @backend) |> Nx.divide(10)}
+
+    compiled =
+      Transmuter.compile(model, input.({3, 5}), compiler: CountingCompiler, device: @device)
+
+    assert flush_compiles(0) == 1
+
+    for shape <- [{2, 7}, {2, 7}, {3, 5}] do
+      expected = Transmuter.run(model, model.params, input.(shape))["y"]
+      assert_all_close(compiled.(input.(shape))["y"], expected)
+    end
+
+    assert flush_compiles(0) == 1
+  end
+
   test "keeps the most recently used segments after a break" do
     model = load_fixture("Break_Range_long_tail")
     input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}

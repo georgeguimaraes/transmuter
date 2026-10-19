@@ -48,7 +48,7 @@ The export sets the names of the inputs and outputs. `model.inputs` and `model.o
 
 Transmuter runs the graph that is in the file, and nothing more. The graph of all-MiniLM-L6-v2 stops at the token vectors, because sentence-transformers adds the pooling outside of the model. Thus the example above does the pooling. Bumblebee servings, such as `Bumblebee.Text.text_embedding/3`, also do the tokenization, pooling and batching for you. Transmuter has no servings yet. For tokenization, use [tokenizers](https://github.com/elixir-nx/tokenizers).
 
-`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. For other shapes, compile again.
+`Transmuter.compile/3` compiles the model for the shapes of the inputs that you give. The function that it returns also takes inputs of other shapes: it compiles them on their first call, and keeps the 8 most recently used shapes compiled.
 
 `Transmuter.run/4` is the function that `Transmuter.compile/3` compiles. It reads the ONNX graph and calls one Nx function for each operator. You can use it in two ways:
 

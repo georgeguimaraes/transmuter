@@ -10,10 +10,10 @@ defmodule Transmuter do
       run = Transmuter.compile(model, inputs, compiler: EMLX)
       %{"last_hidden_state" => hidden} = run.(inputs)
 
-  Shapes are resolved when the function is compiled, so `compile/3` returns a
-  function for the shapes of the inputs it was given. Compile again for other
-  shapes. `run/4` is the uncompiled function, for `Nx.Defn.jit/2`, gradients or
-  eager execution.
+  Shapes are resolved when the function is compiled. `compile/3` compiles for
+  the shapes of the inputs it was given, and the function compiles inputs of
+  other shapes on their first call. `run/4` is the uncompiled function, for
+  `Nx.Defn.jit/2`, gradients or eager execution.
   """
 
   alias Nx.Defn.{Compiler, Composite, Expr, Tree}
@@ -97,7 +97,9 @@ defmodule Transmuter do
   Compiles the model for the shapes and types of `inputs`.
 
   Returns a function that takes the inputs and returns the outputs. The params
-  are the model's own, so load it with `:backend` first.
+  are the model's own, so load it with `:backend` first. Inputs of other shapes
+  compile on their first call. The function keeps the 8 most recently used
+  shapes compiled.
 
   ## Options
 
