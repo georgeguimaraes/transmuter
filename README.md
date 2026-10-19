@@ -64,19 +64,32 @@ end
 
 Use EXLA instead of EMLX for CUDA.
 
-## Static inputs and eager execution
+## Values that decide shapes
 
-Some graphs use the value of an input to set a shape or to select a branch. Give these inputs as `Nx.BinaryBackend` tensors in the `:static_inputs` option of `Transmuter.compile/3`:
+Some graphs use a value to set a shape or to select a branch. Examples are the length of the audio in Kokoro text-to-speech, which comes from the predicted duration of each phoneme, and the boxes that `NonMaxSuppression` keeps in Faster R-CNN. A compiled graph must know all its shapes before it runs, so `Transmuter.compile/3` breaks the graph at these operators:
+
+1. It compiles the operators before the break and runs them.
+2. It runs the break operator on the values.
+3. It compiles the operators after the break for the shapes that the values decide, and continues.
+
+The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
+
+These results are from an Apple silicon GPU:
+
+| Model | Without compilation | First call | Later calls |
+|---|---|---|---|
+| Kokoro, 4.45 seconds of audio | 1.6 s | 3.2 s | 0.28 s |
+| Faster R-CNN 12, the same image | 33.8 s | 6.5 s | 0.35 s |
+
+A new audio length in Kokoro compiles the operators after the break again, and that first call takes about as long as a call without compilation.
+
+If you know such a value before the model runs, give it as an `Nx.BinaryBackend` tensor in the `:static_inputs` option of `Transmuter.compile/3`. Then the graph has no break there. Each new value of a static input compiles the model again. Examples:
 
 - `use_cache_branch` in merged decoder exports selects an `If` branch.
 - `num_logits_to_keep` in some decoder exports sets the length of a slice.
 - `input_ids` in Grounding DINO go into `NonZero`.
 
-Each new value of a static input compiles the model again.
-
-Some graphs calculate a shape inside the graph. For these graphs, call `Transmuter.run/4` without compilation. Then Transmuter reads the values while the model runs. Kokoro text-to-speech needs this, because the length of its audio comes from the predicted duration of each phoneme. On an Apple silicon GPU, Kokoro makes 4.45 seconds of audio in 1.4 seconds.
-
-`NonMaxSuppression`, `Unique`, `Compress`, `NonZero` and `TfIdfVectorizer` also read their input values, so they need static inputs or a run without compilation. Faster R-CNN and Mask R-CNN from the ONNX Model Zoo run this way.
+`Transmuter.run/4` without compilation reads all values while the model runs.
 
 ## Strings, sequences and random values
 
@@ -130,15 +143,15 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
 | Models requested in Bumblebee issues | 11 of 12 files match |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 8 of 8 match |
-| Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo, without compilation | 3 of 3 match |
-| One graph for each operator variant | 215 of 215 match |
+| Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
+| One graph for each operator variant | 222 of 222 match |
 
 Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use.
 
-These models do not match by position, or do not run with compilation:
+Two models do not match value by value, because they make small rounding differences large:
 
-- **Grounding DINO** runs. But with random inputs, its `TopK` selection changes when the input has noise of 1e-6. ONNX Runtime has the same difference when it compares with itself.
-- **Kokoro** runs only in eager mode, because its audio length is calculated in the graph.
+- **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
+- **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently, and phases near zero amplitude change by up to π. When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
 
 To run the matrix:
 
