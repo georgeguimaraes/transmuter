@@ -2,6 +2,8 @@
 
 This guide shows how to install Transmuter, load an ONNX model from the Hugging Face Hub, and run it with EMLX or EXLA.
 
+For text, image and speech models, the servings of `Transmuter.Text`, `Transmuter.Vision` and `Transmuter.Audio` take text, images and audio, and give results. Start with the [Pipelines guide](pipelines.md) for these tasks. This guide shows the lower level: tensors in, tensors out.
+
 ## Installation
 
 Add Transmuter and a backend to your dependencies in `mix.exs`.
@@ -26,6 +28,13 @@ def deps do
     {:exla, "~> 1.0"}
   ]
 end
+```
+
+The servings need the optional `tokenizers` package for text, and `stb_image` to read image files:
+
+```elixir
+{:tokenizers, "~> 0.5"},
+{:stb_image, "~> 1.0"}
 ```
 
 Run `mix deps.get` to install.
