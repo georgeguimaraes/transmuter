@@ -1,0 +1,213 @@
+defmodule Transmuter.TextTest do
+  use ExUnit.Case, async: true
+
+  # Reference values come from the pipelines of Python transformers and sentence-transformers,
+  # see test/support/pipeline_references.py. The first run downloads the models.
+  @moduletag timeout: 900_000
+
+  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
+             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
+          |> String.to_existing_atom()
+  @opts [
+    backend: {EMLX.Backend, device: @device},
+    defn_options: [compiler: EMLX, device: @device]
+  ]
+
+  alias Transmuter.Tokenizer
+
+  test "the tokenizer pads to the smallest length that fits and truncates to the largest" do
+    tokenizer = Tokenizer.load!({:hf, "Xenova/all-MiniLM-L6-v2"}, length: [8, 16])
+    long = String.duplicate("word ", 40)
+
+    {inputs, _} = Tokenizer.encode(tokenizer, ["hello world"])
+    assert Nx.to_flat_list(inputs["input_ids"]) == [101, 7592, 2088, 102, 0, 0, 0, 0]
+    assert Nx.to_flat_list(inputs["attention_mask"]) == [1, 1, 1, 1, 0, 0, 0, 0]
+
+    {inputs, _} =
+      Tokenizer.encode(tokenizer, ["hello world", "one two three four five six seven"])
+
+    assert Nx.shape(inputs["input_ids"]) == {2, 16}
+
+    {inputs, _} = Tokenizer.encode(tokenizer, [long])
+    assert Nx.shape(inputs["input_ids"]) == {1, 16}
+    assert inputs["input_ids"][[0, -1]] |> Nx.to_number() == 102
+  end
+
+  test "an embedding takes the pooling and normalization of the base model" do
+    # Neither repository has 1_Pooling/config.json: MiniLM uses mean pooling and bge the
+    # CLS token, both normalized.
+    for {repo, expected} <- [
+          {"Xenova/all-MiniLM-L6-v2", [0.1302, -0.0158, -0.0367, 0.058]},
+          {"Xenova/bge-small-en-v1.5", [0.0313, -0.0109, 0.0031, 0.0661]}
+        ] do
+      serving = Transmuter.Text.text_embedding({:hf, repo}, @opts)
+      %{embedding: embedding} = Nx.Serving.run(serving, "The cat sat on the mat.")
+      assert_all_close(embedding[0..3], expected)
+    end
+  end
+
+  test "an embedding truncates at max_seq_length of sentence_bert_config.json" do
+    # 541 tokens. all-MiniLM-L6-v2 truncates at 256, not at 512 as its tokenizer.
+    text = String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
+    serving = Transmuter.Text.text_embedding({:hf, "Xenova/all-MiniLM-L6-v2"}, @opts)
+    %{embedding: embedding} = Nx.Serving.run(serving, text)
+    assert_all_close(embedding[0..3], [0.0529, -0.0371, 0.0714, 0.0049])
+  end
+
+  test "a cross-encoder scores text pairs with a sigmoid" do
+    serving = Transmuter.Text.text_classification({:hf, "Xenova/ms-marco-MiniLM-L-6-v2"}, @opts)
+    query = "How many people live in Berlin?"
+
+    [relevant, other] =
+      Nx.Serving.run(serving, [
+        {query, "Berlin has a population of 3,520,031 registered inhabitants."},
+        {query, "New York City is famous for the Metropolitan Museum of Art."}
+      ])
+
+    assert [%{label: "LABEL_0", score: score}] = relevant.predictions
+    assert_in_delta score, 0.99984, 1.0e-4
+    assert_in_delta hd(other.predictions).score, 1.3065e-5, 1.0e-6
+  end
+
+  test "word aggregation gives each word one label before grouping" do
+    text =
+      "Hugging Face Inc. is a company based in New York City. Its headquarters are in DUMBO, São Paulo."
+
+    run = fn aggregation ->
+      {:hf, "Xenova/bert-base-NER"}
+      |> Transmuter.Text.token_classification([aggregation: aggregation] ++ @opts)
+      |> Nx.Serving.run(text)
+      |> Map.fetch!(:entities)
+    end
+
+    spans = [
+      {0, 16, "ORG", "Hugging Face Inc"},
+      {40, 53, "LOC", "New York City"},
+      {79, 84, "LOC", "DUMBO"},
+      {86, 96, "LOC", "São Paulo"}
+    ]
+
+    for {aggregation, scores} <- [
+          same: [0.99161, 0.99944, 0.96740, 0.99926],
+          word_first: [0.99722, 0.99944, 0.98146, 0.99926]
+        ] do
+      entities = run.(aggregation)
+      assert Enum.map(entities, &{&1.start, &1.end, &1.label, &1.phrase}) == spans
+
+      for {entity, score} <- Enum.zip(entities, scores),
+          do: assert_in_delta(entity.score, score, 1.0e-4)
+    end
+  end
+
+  test "an unknown token keeps its text in the entity" do
+    serving =
+      Transmuter.Text.token_classification(
+        {:hf, "Xenova/bert-base-NER"},
+        [aggregation: :same] ++ @opts
+      )
+
+    %{entities: [person | _]} =
+      Nx.Serving.run(serving, "My friend Angela☃Merkel lives in Berlin.")
+
+    assert {person.label, person.phrase} == {"PER", "Angela☃Merkel"}
+  end
+
+  test "fill-mask raises when truncation removes the mask" do
+    serving =
+      Transmuter.Text.fill_mask(
+        {:hf, "Xenova/distilroberta-base"},
+        [compile: [sequence_length: 32]] ++ @opts
+      )
+
+    assert_raise ArgumentError, ~r/one mask token in the encoded text, got 0/, fn ->
+      Nx.Serving.run(serving, String.duplicate("word ", 60) <> "Paris is the [MASK] of France.")
+    end
+  end
+
+  test "fill-mask uses the mask token of the tokenizer" do
+    serving = Transmuter.Text.fill_mask({:hf, "Xenova/distilroberta-base"}, @opts)
+
+    %{predictions: [first, second | _]} =
+      Nx.Serving.run(serving, "Paris is the [MASK] of France.")
+
+    assert first.token == " capital"
+    assert second.token == " birthplace"
+    assert_in_delta first.score, 0.67902, 1.0e-4
+  end
+
+  defp assert_all_close(tensor, expected) do
+    expected = Nx.tensor(expected)
+
+    assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
+             Nx.tensor(1, type: :u8),
+           "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end
+
+# The compile count comes from a global telemetry event, so these tests do not run with
+# other tests.
+defmodule Transmuter.TextServingTest do
+  use ExUnit.Case, async: false
+
+  @moduletag timeout: 900_000
+
+  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
+             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
+          |> String.to_existing_atom()
+  @opts [
+    backend: {EMLX.Backend, device: @device},
+    defn_options: [compiler: EMLX, device: @device]
+  ]
+
+  test "a started serving compiles each length once and batches inputs of any length" do
+    test_pid = self()
+    handler = "compile-#{inspect(test_pid)}"
+
+    :telemetry.attach(
+      handler,
+      [:transmuter, :compile, :stop],
+      fn _, _, _, pid -> send(pid, :compiled) end,
+      test_pid
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    serving =
+      Transmuter.Text.text_embedding(
+        {:hf, "Xenova/all-MiniLM-L6-v2"},
+        [compile: [batch_size: 4, sequence_length: [16, 64]]] ++ @opts
+      )
+
+    name = :"embedding_#{System.unique_integer([:positive])}"
+    start_supervised!({Nx.Serving, serving: serving, name: name, batch_timeout: 20})
+
+    texts = for i <- 1..8, do: String.duplicate("word #{i} ", i * 4)
+
+    batched =
+      texts
+      |> Task.async_stream(&Nx.Serving.batched_run(name, &1))
+      |> Enum.map(fn {:ok, %{embedding: embedding}} -> embedding end)
+
+    assert compiles() == 2
+
+    for {text, embedding} <- Enum.zip(texts, batched) do
+      assert_all_close(embedding, Nx.Serving.run(serving, text).embedding)
+    end
+  end
+
+  defp compiles(count \\ 0) do
+    receive do
+      :compiled -> compiles(count + 1)
+    after
+      0 -> count
+    end
+  end
+
+  defp assert_all_close(tensor, expected) do
+    expected = Nx.tensor(expected)
+
+    assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
+             Nx.tensor(1, type: :u8),
+           "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end

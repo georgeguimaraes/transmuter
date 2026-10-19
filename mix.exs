@@ -31,7 +31,7 @@ defmodule Transmuter.MixProject do
       {:telemetry, "~> 1.0"},
       {:emlx, "~> 0.5", optional: true},
       {:stb_image, "~> 1.0", optional: true},
-      {:tokenizers, "~> 0.5", only: [:dev, :test]},
+      {:tokenizers, "~> 0.5", optional: true},
       {:polaris, "~> 0.1", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
@@ -71,6 +71,10 @@ defmodule Transmuter.MixProject do
         )
       ],
       groups_for_modules: [
+        Pipelines: [
+          Transmuter.Text,
+          Transmuter.Tokenizer
+        ],
         "Public API": [
           Transmuter,
           Transmuter.EMLX,
@@ -81,6 +85,11 @@ defmodule Transmuter.MixProject do
           Transmuter.UnknownValueError
         ],
         Internals: [
+          Transmuter.Serving,
+          Transmuter.Text.FillMask,
+          Transmuter.Text.TextClassification,
+          Transmuter.Text.TextEmbedding,
+          Transmuter.Text.TokenClassification,
           Transmuter.GraphBreaks,
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,
