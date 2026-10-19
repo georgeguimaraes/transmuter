@@ -122,7 +122,7 @@ Transmuter.Telemetry.Logger.attach()
 
 ## Precision and quantization
 
-Half-precision exports run in f16 or bf16. Use `compute_type: :f32` to match ONNX Runtime on the CPU. With `backend: EMLX.Backend`, 4-bit and 8-bit `MatMulNBits` weights stay packed as MLX quantized tensors for lower peak memory and faster inference.
+Half-precision exports run in f32 by default, as in ONNX Runtime on the CPU. `compute_type: nil` runs them in native f16 or bf16 with half the memory, but some exports overflow in native f16. With `backend: EMLX.Backend`, 4-bit and 8-bit `MatMulNBits` weights stay packed as MLX quantized tensors for lower peak memory and faster inference.
 
 See the [Backends and Performance guide](guides/backends_and_performance.md) and the [Language Models guide](guides/language_models.md) for details and benchmarks.
 

@@ -64,19 +64,19 @@ outputs = Transmuter.run(model, model.params, inputs)
 
 ## Compute types
 
-By default, Transmuter keeps the types in the ONNX file. A half-precision export (`model_fp16.onnx` or `model_bf16.onnx`) runs in f16 or bf16.
+By default, Transmuter runs half-precision exports (`model_fp16.onnx` or `model_bf16.onnx`) in f32. It converts the f16 and bf16 weights to f32 when the model loads. ONNX Runtime on the CPU also computes half-precision graphs in f32, so the results match.
 
-Precision-sensitive operators (sums, normalizations, softmax, attention scores) automatically run in f32 and cast their output back to f16 or bf16. This matches the behavior of standard transformer implementations.
-
-ONNX Runtime on the CPU computes all operations in f32, even for half-precision exports. To match ONNX Runtime results, load with `compute_type: :f32`:
+The f32 weights use as much memory as an fp32 export. With `compute_type: nil`, the model runs in native f16 or bf16 with half the memory:
 
 ```elixir
-model = Transmuter.load!(source, compute_type: :f32)
+model = Transmuter.load!(source, compute_type: nil)
 ```
 
-`compute_type: :f32` upcasts every f16 and bf16 tensor before each operator. This gives the same numerical result as ONNX Runtime on the CPU but uses more memory and is slower on a GPU.
+In native f16, precision-sensitive operators (sums, normalizations, softmax, attention scores) run in f32 and cast their output back to f16 or bf16. This does not protect a normalization that the export writes as separate operators. Many fp16 decoder exports compute RMSNorm as `Pow`, `ReduceMean`, `Add`, `Sqrt`, `Div` and `Mul`. `Pow` overflows to infinity in f16 for values above 256, and the normalized values become 0. The fp16 export of SmolLM2 135M then gives logits of 0.
 
-In native f16, each intermediate value is stored in f16, and a deep graph can drift far. The fp16 vision encoder of Qwen2-VL 2B has 32 blocks. In native f16, its output differs from the f32 result by 60%. With `compute_type: :f32`, it matches ONNX Runtime within 2e-5. Compare a half-precision model with an f32 run before you use native f16.
+Native f16 can also drift in a deep graph, because each intermediate value is stored in f16. The fp16 vision encoder of Qwen2-VL 2B has 32 blocks. In native f16, its output differs from the f32 result by 60%. In f32, it matches ONNX Runtime within 2e-5.
+
+Use native f16 only after you compare its output with the default f32 run. On an Apple silicon GPU, the fp16 export of SmolLM2 135M generates 60.5 tokens per second in f32 and 66.2 in native f16.
 
 ## Memory management with EMLX
 

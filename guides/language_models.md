@@ -111,7 +111,7 @@ Hugging Face provides quantized exports for most decoder models. Use the filenam
 | `model_q4f16.onnx` | 4-bit weights, activations in f16 | |
 | `model_quantized.onnx` | Dynamic int8 with `MatMulInteger` | Close to f32 quality |
 | `model_int8.onnx` | Same as `model_quantized.onnx` | |
-| `model_fp16.onnx` | Half-precision weights | Use `:compute_type` to match ONNX Runtime |
+| `model_fp16.onnx` | Half-precision weights | Runs in f32 by default, see `:compute_type` |
 
 Load a quantized model the same way as a full-precision model:
 
@@ -134,10 +134,10 @@ Performance comparison on Apple silicon GPU, one forward pass of 8 tokens:
 
 ## Half-precision exports
 
-Half-precision exports (`model_fp16.onnx`) run in f16 or bf16. To match the results of ONNX Runtime on the CPU (which computes half-precision graphs in f32), load with `compute_type: :f32`:
+Half-precision exports (`model_fp16.onnx`) run in f32 by default, as in ONNX Runtime on the CPU. Many fp16 decoder exports write RMSNorm as separate operators (`Pow`, `ReduceMean`, `Add`, `Sqrt`). In native f16, `Pow` overflows for values above 256, and the model gives logits of 0. Use `compute_type: nil` for native f16 only after you compare its output with an f32 run:
 
 ```elixir
-model = Transmuter.load!({:hf, repo, "onnx/model_fp16.onnx"}, compute_type: :f32)
+model = Transmuter.load!({:hf, repo, "onnx/model_fp16.onnx"}, compute_type: nil)
 ```
 
 See [Backends and Performance](backends_and_performance.md) for more on compute types.

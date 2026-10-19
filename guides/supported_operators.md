@@ -41,7 +41,7 @@ Compiled functions can only return `Nx.Tensor` values. To read a string or seque
 
 ## Precision notes
 
-Sums, normalizations, softmax, and attention scores run in f32 when the input is f16 or bf16. The output is cast back to f16 or bf16. This matches the precision behavior of standard transformer libraries. Use `compute_type: :f32` when loading to match ONNX Runtime on the CPU.
+With `compute_type: nil`, sums, normalizations, softmax, and attention scores run in f32 when the input is f16 or bf16. The output is cast back to f16 or bf16. This matches the precision behavior of standard transformer libraries. Use `compute_type: :f32` when loading to match ONNX Runtime on the CPU.
 
 ## Known numeric differences
 

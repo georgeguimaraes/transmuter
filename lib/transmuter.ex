@@ -49,9 +49,12 @@ defmodule Transmuter do
       default is `Nx.BinaryBackend`.
 
     * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
-      through every operator. For example, `:f32` matches ONNX Runtime on the
-      CPU, which calculates half-precision graphs in f32. The default is `nil`,
-      which keeps the graph's own types.
+      through every operator. The default is `:f32`, as ONNX Runtime on the CPU,
+      which calculates half-precision graphs in f32. Half-precision weights are
+      converted when the model loads, so they use as much memory as f32 weights.
+      `nil` keeps the types of the graph. In native f16, an export that writes a
+      normalization as separate operators can overflow and give zeros. See
+      [Backends and performance](guides/backends_and_performance.md).
 
     * `:trainable` (`t:boolean/0`) - when `true`, every float initializer is a
       param, so small weights such as a 1-element bias get gradients. The
@@ -85,12 +88,12 @@ defmodule Transmuter do
         backend: EMLX.Backend
       )
 
-  Load a half-precision model and run it in f32 to match ONNX Runtime:
+  Load a half-precision model and run it in native f16, with half the memory:
 
       model = Transmuter.load!(
         {:hf, "Xenova/bert-base-uncased", "onnx/model_fp16.onnx"},
         backend: EMLX.Backend,
-        compute_type: :f32
+        compute_type: nil
       )
 
   Load a local file:
@@ -122,7 +125,7 @@ defmodule Transmuter do
     initializers = Enum.map(graph.initializer, & &1.name)
     graph_inputs = for i <- graph.input, i.name not in initializers, do: i
     inputs = Enum.map(graph_inputs, & &1.name)
-    compute_type = opts[:compute_type]
+    compute_type = Keyword.get(opts, :compute_type, :f32)
 
     model = %{
       nodes: toposort(graph.node, inputs ++ initializers),

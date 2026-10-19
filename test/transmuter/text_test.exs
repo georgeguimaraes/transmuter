@@ -205,6 +205,21 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  test "a half-precision export runs in f32 by default" do
+    # The fp16 export writes RMSNorm as Pow, ReduceMean, Add and Sqrt. In native f16, Pow
+    # overflows and all logits are 0.
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"},
+        [variant: :fp16, strategy: :greedy, max_new_tokens: 12] ++ @opts
+      )
+
+    chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
+
+    assert %{results: [%{text: "The capital of France is Paris."}]} =
+             Nx.Serving.run(serving, chat)
+  end
+
   test "sampling with the same seed gives the same text" do
     serving =
       Transmuter.Text.generation(

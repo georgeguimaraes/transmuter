@@ -25,8 +25,9 @@ defmodule Transmuter.Repo do
     opts: []
   ]
 
-  # File suffix of each variant, as in transformers.js (utils/dtypes.js). Variants that
-  # Transmuter runs in f32 come first, so that a fallback avoids native f16.
+  # File suffix of each variant, as in transformers.js (utils/dtypes.js). fp16 and q4f16
+  # come last: Transmuter converts their f16 values to f32 by default, so fp16 saves no
+  # memory over fp32.
   @variants [
     fp32: "",
     q4: "_q4",
