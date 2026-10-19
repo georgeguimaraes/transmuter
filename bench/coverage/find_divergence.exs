@@ -33,6 +33,10 @@ inputs =
 
 # The sample can miss a few changed values, so integer outputs must also match the
 # whole-tensor sum of absolute values exactly.
+# THRESHOLD sets the relative difference that counts as a divergence. A small value finds
+# where a deterministic difference starts, before the graph makes it large.
+threshold = "THRESHOLD" |> System.get_env("1.0e-3") |> String.to_float()
+
 diverged? = fn name, t ->
   r = ref[name]
   integer? = Nx.Type.integer?(Nx.type(t))
@@ -54,7 +58,9 @@ diverged? = fn name, t ->
   shape = Tuple.to_list(Nx.shape(t))
   sum_diff? = integer? and r["abssum"] != nil and abssum != r["abssum"]
   diff = if sum_diff?, do: max(diff, abs(abssum - r["abssum"])), else: diff
-  {shape != r["shape"] or sum_diff? or diff > 1.0e-3 * max(r["absmax"], 1.0), shape, sample, diff}
+
+  {shape != r["shape"] or sum_diff? or diff > threshold * max(r["absmax"], 1.0), shape, sample,
+   diff}
 end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
