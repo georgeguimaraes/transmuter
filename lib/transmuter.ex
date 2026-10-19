@@ -63,6 +63,7 @@ defmodule Transmuter do
     * `:params` - the weights, on the `:backend` when it is given
     * `:inputs` - the names of the graph inputs
     * `:outputs` - the names of the graph outputs
+    * `:source` - the source, which `Transmuter.Telemetry` events give as metadata
 
   ## Examples
 
@@ -96,11 +97,17 @@ defmodule Transmuter do
 
       model = Transmuter.load!("/path/to/model.onnx")
   """
-  def load!(source, opts \\ [])
+  def load!(source, opts \\ []) do
+    :telemetry.span([:transmuter, :load], %{source: source}, fn ->
+      model = source |> path!(opts) |> read!(opts) |> Map.put(:source, source)
+      {model, %{source: source, node_count: length(model.nodes), opset: model.opset}}
+    end)
+  end
 
-  def load!({:hf, repo, file}, opts), do: repo |> download!(file, opts) |> load!(opts)
+  defp path!({:hf, repo, file}, opts), do: download!(repo, file, opts)
+  defp path!(path, _opts) when is_binary(path), do: path
 
-  def load!(path, opts) when is_binary(path) do
+  defp read!(path, opts) do
     dir = Path.dirname(path)
     model = ModelProto.decode!(File.read!(path))
     graph = model.graph
@@ -233,6 +240,14 @@ defmodule Transmuter do
       outputs = Transmuter.run(model, model.params, inputs, %{"use_cache_branch" => flag})
   """
   def run(model, params, inputs, static_inputs \\ %{}) do
+    metadata = %{source: model[:source]}
+
+    :telemetry.span([:transmuter, :run], metadata, fn ->
+      {run_graph(model, params, inputs, static_inputs), metadata}
+    end)
+  end
+
+  defp run_graph(model, params, inputs, static_inputs) do
     {key, inputs} = Map.pop_lazy(inputs, @random_key, &random_key/0)
     ctx = %{opset: model.opset, compute_type: model[:compute_type], key: key}
     cast = &Map.new(&1, fn {k, t} -> {k, upcast(t, ctx.compute_type)} end)

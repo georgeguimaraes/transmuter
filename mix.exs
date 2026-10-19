@@ -28,6 +28,7 @@ defmodule Transmuter.MixProject do
       {:nx, "~> 1.0"},
       {:protox, "~> 1.7"},
       {:req, "~> 0.5"},
+      {:telemetry, "~> 1.0"},
       {:emlx, "~> 0.5", optional: true},
       {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", only: [:dev, :test]},
@@ -70,7 +71,13 @@ defmodule Transmuter.MixProject do
         )
       ],
       groups_for_modules: [
-        "Public API": [Transmuter, Transmuter.EMLX, Transmuter.UnknownValueError]
+        "Public API": [
+          Transmuter,
+          Transmuter.EMLX,
+          Transmuter.Telemetry,
+          Transmuter.Telemetry.Logger,
+          Transmuter.UnknownValueError
+        ]
       ],
       source_ref: "v#{@version}"
     ]

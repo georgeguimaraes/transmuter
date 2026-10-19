@@ -24,18 +24,36 @@ defmodule Transmuter.GraphBreaks do
   @doc false
   def compile(model, inputs, static_inputs, opts) do
     {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
+    compiler = opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
+    metadata = %{source: model[:source], compiler: compiler}
 
-    plan = %{
-      cache_size: cache_size,
-      model: model,
-      nodes: List.to_tuple(model.nodes),
-      last_use: last_use(model),
-      opts: opts,
-      backend: Nx.Defn.to_backend(opts),
-      table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
-      random?: Transmuter.random?(model.nodes)
-    }
+    :telemetry.span([:transmuter, :compile], metadata, fn ->
+      plan = %{
+        cache_size: cache_size,
+        model: model,
+        source: model[:source],
+        nodes: List.to_tuple(model.nodes),
+        last_use: last_use(model),
+        opts: opts,
+        backend: Nx.Defn.to_backend(opts),
+        table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
+        random?: Transmuter.random?(model.nodes)
+      }
 
+      {call, graph_break} = call(plan, inputs, static_inputs)
+      {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
+    end)
+  end
+
+  defp instrument(call, source) do
+    metadata = %{source: source}
+
+    fn inputs ->
+      :telemetry.span([:transmuter, :call], metadata, fn -> {call.(inputs), metadata} end)
+    end
+  end
+
+  defp call(plan, inputs, static_inputs) do
     general = fn inputs ->
       plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
     end
@@ -47,7 +65,7 @@ defmodule Transmuter.GraphBreaks do
       {:end, entry} ->
         shapes = input_shapes(inputs)
 
-        fn inputs ->
+        fast = fn inputs ->
           if input_shapes(inputs) == shapes do
             state = initial(plan, inputs, static_inputs)
             state |> merge(run_compiled(entry, arguments(plan, state, 0))) |> outputs(plan)
@@ -56,8 +74,10 @@ defmodule Transmuter.GraphBreaks do
           end
         end
 
+        {fast, false}
+
       _break ->
-        general
+        {general, true}
     end
   end
 
@@ -108,20 +128,32 @@ defmodule Transmuter.GraphBreaks do
   defp segment(plan, state, pos) do
     args = arguments(plan, state, pos)
     statics = live(plan, state, pos, &(not argument?(state, &1, &2)))
-    key = {pos, templates(args), static_key(plan, statics)}
+    shapes = templates(args)
+    key = {pos, shapes, static_key(plan, statics)}
+    metadata = %{source: plan.source, position: pos, shapes: shapes}
 
     case lookup(plan.table, key) do
-      {:ok, entry} -> classify(entry)
-      :miss -> build(plan, pos, key, statics, args)
+      {:ok, entry} ->
+        :telemetry.execute([:transmuter, :cache, :hit], %{count: 1}, metadata)
+        classify(entry)
+
+      :miss ->
+        :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
+        build(plan, key, statics, args, metadata)
     end
   end
 
-  defp build(plan, pos, key, statics, args) do
-    ref = make_ref()
-    fun = fn args -> trace(plan, statics, args, pos, ref) end
-    entry = compile_segment(plan, fun, args, pos, ref)
-    Process.delete(ref)
-    store(plan.table, key, entry, plan.cache_size)
+  defp build(plan, key = {pos, _shapes, _static_key}, statics, args, metadata) do
+    entry =
+      :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
+        ref = make_ref()
+        fun = fn args -> trace(plan, statics, args, pos, ref) end
+        entry = compile_segment(plan, fun, args, pos, ref)
+        Process.delete(ref)
+        {entry, Map.merge(metadata, %{stop: entry.stop, compiled: entry.compiled != nil})}
+      end)
+
+    store(plan, key, entry)
     classify(entry)
   end
 
@@ -197,7 +229,14 @@ defmodule Transmuter.GraphBreaks do
   # segments can fold the shapes they decide.
   defp run_break(plan, state, index) do
     node = elem(plan.nodes, index)
+    metadata = %{source: plan.source, position: index, node: node.name, op_type: node.op_type}
 
+    :telemetry.span([:transmuter, :break], metadata, fn ->
+      {run_break_node(plan, state, node), metadata}
+    end)
+  end
+
+  defp run_break_node(plan, state, node) do
     state =
       Enum.reduce(node.input, state, fn name, state ->
         value = Map.get(state.env, name)
@@ -351,15 +390,22 @@ defmodule Transmuter.GraphBreaks do
     ArgumentError -> :miss
   end
 
-  defp store(table, key = {pos, _templates, _static_key}, entry, cache_size) do
-    entries = :ets.match_object(table, {{pos, :_, :_}, :_, :_})
+  defp store(plan, key = {pos, _templates, _static_key}, entry) do
+    entries = :ets.match_object(plan.table, {{pos, :_, :_}, :_, :_})
 
-    if length(entries) >= cache_size do
-      {oldest, _entry, _used} = Enum.min_by(entries, &elem(&1, 2))
-      :ets.delete(table, oldest)
+    if length(entries) >= plan.cache_size do
+      {oldest = {_pos, shapes, _static_key}, _entry, _used} = Enum.min_by(entries, &elem(&1, 2))
+      :ets.delete(plan.table, oldest)
+
+      :telemetry.execute([:transmuter, :cache, :evict], %{count: 1}, %{
+        source: plan.source,
+        position: pos,
+        shapes: shapes,
+        cache_size: plan.cache_size
+      })
     end
 
-    :ets.insert(table, {key, entry, :erlang.unique_integer([:monotonic])})
+    :ets.insert(plan.table, {key, entry, :erlang.unique_integer([:monotonic])})
   rescue
     ArgumentError -> :ok
   end

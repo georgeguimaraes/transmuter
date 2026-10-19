@@ -88,6 +88,16 @@ Nx tensors hold only numbers. Transmuter keeps string tensors, sequences, and em
 
 See [Supported Operators and Data Types](guides/supported_operators.md) for details.
 
+## Telemetry
+
+Transmuter emits `:telemetry` events when it loads, compiles and runs a model. The graph break events show which segment compiles again and for which shapes, which segment the cache evicts, and how long each break operator runs. `Transmuter.Telemetry` lists each event with its measurements and metadata.
+
+To log the compile work, attach the logger when your application starts:
+
+```elixir
+Transmuter.Telemetry.Logger.attach()
+```
+
 ## Precision and quantization
 
 Half-precision exports run in f16 or bf16. Use `compute_type: :f32` to match ONNX Runtime on the CPU. With `backend: EMLX.Backend`, 4-bit and 8-bit `MatMulNBits` weights stay packed as MLX quantized tensors for lower peak memory and faster inference.
