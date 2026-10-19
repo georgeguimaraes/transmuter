@@ -32,6 +32,11 @@ defmodule Transmuter.MixProject do
       {:emlx, "~> 0.5", optional: true},
       {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", optional: true},
+      {:minijinja_ex,
+       github: "georgeguimaraes/minijinja_ex",
+       branch: "feat/chat-template-compat",
+       only: [:dev, :test]},
+      {:rustler, "~> 0.36", only: [:dev, :test], runtime: false},
       {:polaris, "~> 0.1", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
@@ -52,6 +57,7 @@ defmodule Transmuter.MixProject do
       extras: [
         "README.md": [title: "Overview"],
         "guides/getting_started.md": [title: "Getting started"],
+        "guides/pipelines.md": [title: "Pipelines"],
         "guides/graph_breaks.md": [title: "Compiling and graph breaks"],
         "guides/language_models.md": [title: "Language models with a KV cache"],
         "guides/speech_and_audio.md": [title: "Speech and audio"],
@@ -62,6 +68,7 @@ defmodule Transmuter.MixProject do
       groups_for_extras: [
         Guides: ~w(
           guides/getting_started.md
+          guides/pipelines.md
           guides/graph_breaks.md
           guides/language_models.md
           guides/speech_and_audio.md
@@ -73,7 +80,8 @@ defmodule Transmuter.MixProject do
       groups_for_modules: [
         Pipelines: [
           Transmuter.Text,
-          Transmuter.Tokenizer
+          Transmuter.Tokenizer,
+          Transmuter.ChatTemplate
         ],
         "Public API": [
           Transmuter,
@@ -87,6 +95,7 @@ defmodule Transmuter.MixProject do
         Internals: [
           Transmuter.Serving,
           Transmuter.Text.FillMask,
+          Transmuter.Text.Generation,
           Transmuter.Text.TextClassification,
           Transmuter.Text.TextEmbedding,
           Transmuter.Text.TokenClassification,

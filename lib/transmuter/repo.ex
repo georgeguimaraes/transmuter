@@ -96,6 +96,19 @@ defmodule Transmuter.Repo do
   end
 
   @doc """
+  Returns the special token `name` (such as `"pad"` or `"eos"`) as a string, or `nil`.
+
+  The token comes from `special_tokens_map.json`, then `tokenizer_config.json`, as in Python transformers. A token in these files is a string or a map with `"content"`.
+  """
+  def special_token(repo, name) do
+    case repo.special_tokens[name <> "_token"] || repo.tokenizer_config[name <> "_token"] do
+      %{"content" => content} when is_binary(content) -> content
+      content when is_binary(content) -> content
+      _none -> nil
+    end
+  end
+
+  @doc """
   Returns the variants that the repository has for `component`.
   """
   def variants(repo, component) do

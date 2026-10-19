@@ -120,7 +120,8 @@ defmodule Transmuter do
       |> Enum.split_with(fn {_, t} -> static_initializer?(t, trainable) end)
 
     initializers = Enum.map(graph.initializer, & &1.name)
-    inputs = for i <- graph.input, i.name not in initializers, do: i.name
+    graph_inputs = for i <- graph.input, i.name not in initializers, do: i
+    inputs = Enum.map(graph_inputs, & &1.name)
     compute_type = opts[:compute_type]
 
     model = %{
@@ -129,6 +130,7 @@ defmodule Transmuter do
       params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end),
       compute_type: compute_type,
       inputs: inputs,
+      input_types: Map.new(graph_inputs, &{&1.name, value_type(&1)}),
       outputs: Enum.map(graph.output, & &1.name),
       opset:
         Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
@@ -575,6 +577,21 @@ defmodule Transmuter do
       do: Transmuter.EMLX.params(model, backend_opts),
       else: Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, backend)} end)
   end
+
+  # The type and the dimensions of a tensor input. A symbolic dimension is nil.
+  defp value_type(%{type: %{value: {:tensor_type, %{elem_type: elem_type, shape: shape}}}}) do
+    dims =
+      for d <- (shape && shape.dim) || [] do
+        case d.value do
+          {:dim_value, size} -> size
+          _symbolic -> nil
+        end
+      end
+
+    {if(elem_type == 8, do: :string, else: Ops.dtype(elem_type)), dims}
+  end
+
+  defp value_type(_input), do: nil
 
   defp static_initializer?({:empty, _shape}, _trainable), do: true
   defp static_initializer?({:strings, _shape, _values}, _trainable), do: true

@@ -23,16 +23,17 @@ defmodule Transmuter.Serving do
     ]
 
   @doc """
-  Loads the repository of `source`, its `"model"` component and its tokenizer. `variant` is the default variant of the task.
+  Loads the repository of `source`, its model and its tokenizer. The model is the first of `components` that the repository has, in the default variant `variant` of the task.
   """
-  def load!(source, opts, variant) do
+  def load!(source, opts, variant, components \\ ["model"]) do
     repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    component = Enum.find(components, hd(components), &(Repo.variants(repo, &1) != []))
 
     model =
       opts[:model] ||
         Repo.load_component!(
           repo,
-          "model",
+          component,
           variant,
           Keyword.take(opts, [:backend, :compute_type])
         )

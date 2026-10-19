@@ -63,13 +63,9 @@ defmodule Transmuter.Tokenizer do
     %{tokenizer | native: native}
   end
 
-  # special_tokens_map.json overrides tokenizer_config.json, as in Python transformers. A token
-  # is a string or a map with "content".
   defp special_tokens(repo) do
     for name <- @special_tokens,
-        token = repo.special_tokens[name <> "_token"] || repo.tokenizer_config[name <> "_token"],
-        content = if(is_map(token), do: token["content"], else: token),
-        is_binary(content),
+        content = Repo.special_token(repo, name),
         into: %{},
         do: {String.to_atom(name), content}
   end

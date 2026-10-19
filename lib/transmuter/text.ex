@@ -104,4 +104,29 @@ defmodule Transmuter.Text do
   See the module documentation for the other options.
   """
   defdelegate fill_mask(source, opts \\ []), to: Transmuter.Text.FillMask
+
+  @doc """
+  Builds a serving that generates text with a decoder, such as a chat model.
+
+  The input is a string, `%{text: string}`, `%{messages: messages}` or a list of them. Messages are maps with `:role` and `:content`, and they go through the chat template of the model (see `Transmuter.ChatTemplate`). A map input can also have `:seed`, and a chat can have `:tools`. The result is `%{results: [%{text: text, token_summary: %{input: count, output: count, padding: 0}}]}`. The text has only the new tokens.
+
+  The settings come from `generation_config.json`, and the options below override them. Generation stops at an `eos_token_id` of the configuration or after `:max_new_tokens`.
+
+  The default variant is `:q4` when the repository has it, because the 4-bit weights of a decoder are smaller and faster.
+
+  ## Options
+
+    * `:max_new_tokens` - the maximum number of new tokens. The default is `256`.
+
+    * `:strategy` - `:greedy` or `:sampling`. The default is `:sampling` when `do_sample` in the configuration is `true`, else `:greedy`.
+
+    * `:temperature`, `:top_k`, `:top_p` and `:repetition_penalty` - as in Python transformers. The defaults are `1.0`, `50`, `1.0` and `1.0`.
+
+    * `:seed` - the seed of sampling for inputs without their own seed. The default is a new seed for each input.
+
+    * `:template_options` - other variables of the chat template, such as `enable_thinking: false` for Qwen3.
+
+  `:compile` does not apply to generation, which runs one input at a time. The other options are those of the module documentation.
+  """
+  defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
 end

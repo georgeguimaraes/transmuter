@@ -135,6 +135,94 @@ defmodule Transmuter.TextTest do
     assert_in_delta first.score, 0.67902, 1.0e-4
   end
 
+  test "the chat template renders like apply_chat_template" do
+    repo = Transmuter.Repo.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX"})
+    messages = [%{role: "system", content: "Be brief."}, %{role: "user", content: "Hi"}]
+
+    assert Transmuter.ChatTemplate.render(repo, messages,
+             template_options: [enable_thinking: false]
+           ) ==
+             "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n" <>
+               "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  end
+
+  test "the chat template continues a final assistant message and runs generation blocks" do
+    repo = Transmuter.Repo.load!({:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"})
+
+    messages = [
+      %{role: "user", content: "Write a haiku"},
+      %{role: "assistant", content: "Soft rain on the"}
+    ]
+
+    assert Transmuter.ChatTemplate.render(repo, messages, continue_final_message: true) =~
+             ~r/<\|im_start\|>assistant\nSoft rain on the$/
+
+    # SmolLM3 marks assistant messages with {% generation %}, a tag of transformers.
+    repo = Transmuter.Repo.load!({:hf, "HuggingFaceTB/SmolLM3-3B"})
+    messages = [%{role: "user", content: "Hi"}, %{role: "assistant", content: "Hello!"}]
+
+    assert String.ends_with?(
+             Transmuter.ChatTemplate.render(repo, messages, add_generation_prompt: false),
+             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n"
+           )
+  end
+
+  test "Gemma 3 generates with a cache of exact length" do
+    # Its GroupQueryAttention counts the cache rows from the length of the attention mask.
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "onnx-community/gemma-3-270m-it-ONNX"},
+        [strategy: :greedy, max_new_tokens: 12] ++ @opts
+      )
+
+    chat = %{
+      messages: [
+        %{role: "user", content: "Write a long story about a fox who lives near a river."}
+      ]
+    }
+
+    assert %{results: [%{text: "**The Whispering of the Willow**\n\nThe biting wind"}]} =
+             Nx.Serving.run(serving, chat)
+  end
+
+  test "greedy generation matches transformers in each mode of the KV cache" do
+    chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
+
+    # GroupQueryAttention, a cache with position_ids, and gpt2 without position_ids.
+    for {repo, input, expected} <- [
+          {"HuggingFaceTB/SmolLM2-135M-Instruct", chat, "The capital of France is Paris."},
+          {"onnx-community/SmolLM2-135M-Instruct-ONNX", chat, "The capital of France is Paris."},
+          {"Xenova/gpt2", "The history of the printing press begins",
+           " with the printing press. The first printing press was the first"}
+        ] do
+      serving =
+        Transmuter.Text.generation(
+          {:hf, repo},
+          [variant: :fp32, strategy: :greedy, max_new_tokens: 12] ++ @opts
+        )
+
+      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, input)
+    end
+  end
+
+  test "sampling with the same seed gives the same text" do
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+        [variant: :fp32, strategy: :sampling, max_new_tokens: 12] ++ @opts
+      )
+
+    text = fn seed ->
+      %{results: [%{text: text}]} =
+        Nx.Serving.run(serving, %{text: "Once upon a time", seed: seed})
+
+      text
+    end
+
+    assert text.(1) == text.(1)
+    assert text.(1) != text.(2)
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 
