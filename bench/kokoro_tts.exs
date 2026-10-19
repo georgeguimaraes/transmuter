@@ -61,6 +61,25 @@ defmodule KokoroBuckets do
   end
 end
 
+defmodule KokoroPhase do
+  # The export computes the STFT phase with the atan2 of torch.onnx, which tests im > 0.
+  # For im = 0 and re < 0 it gives -π, but torch.atan2 gives π. An exact STFT has im = 0
+  # at DC and Nyquist, so these bins got the wrong phase in every frame, and the audio
+  # had a tone at 4.8 kHz. ONNX Runtime hides this, because its STFT has small rounding
+  # errors there. The fixed test is im >= 0, as in torch.atan2.
+  @quadrant_test "/decoder/decoder/generator/Greater"
+
+  def fix_atan2(model) do
+    nodes =
+      Enum.map(model.nodes, fn
+        %{name: @quadrant_test} = node -> %{node | op_type: "GreaterOrEqual"}
+        node -> node
+      end)
+
+    %{model | nodes: nodes}
+  end
+end
+
 repo = "onnx-community/Kokoro-82M-v1.0-ONNX"
 backend = {EMLX.Backend, device: :gpu}
 output = List.first(System.argv(), "kokoro.wav")
@@ -89,6 +108,7 @@ style =
 model =
   {:hf, repo, "onnx/model.onnx"}
   |> Transmuter.load!(backend: backend)
+  |> KokoroPhase.fix_atan2()
   |> KokoroBuckets.round_durations(8)
 
 inputs = fn speed ->

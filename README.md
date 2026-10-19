@@ -61,6 +61,8 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 
 Kokoro reads phonemes, not text. The Python and JavaScript versions of Kokoro make the phonemes with misaki or espeak-ng, outside of the model. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance.
 
+The example also fixes one node of the export. The export computes the STFT phase with the `atan2` of `torch.onnx`, which gives -π for `atan2(0, x)` when x is negative. `torch.atan2` gives π, and the model was trained with π. Transmuter computes an exact STFT, so the imaginary part is 0 at DC and Nyquist, and the wrong phase in every frame adds a tone at 4.8 kHz. ONNX Runtime hides the error, because its STFT has small rounding errors at these bins. The example changes the `Greater` test of the `atan2` to `GreaterOrEqual`, as in `torch.atan2`.
+
 ## Installation
 
 ```elixir
@@ -168,13 +170,13 @@ Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX 
 Two models do not match value by value, because they make small rounding differences large:
 
 - **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
-- **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently, and phases near zero amplitude change by up to π. When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
+- **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently. Also, the `atan2` of the export gives a different phase for an exact STFT than for the STFT of ONNX Runtime (see [Text to speech with Kokoro](#text-to-speech-with-kokoro)). When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. With the `atan2` fix of the example, the spectrum of the speech matches PyTorch, with no tone at 4.8 kHz.
 
 These models also ran from input to final result, and the result agrees with ONNX Runtime:
 
 | Model | Check |
 |---|---|
-| [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) | Speech for inputs of up to 505 phonemes, as close to ONNX Runtime as PyTorch is |
+| [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) | Speech for inputs of up to 505 phonemes. With the `atan2` fix of the example, the spectrum matches PyTorch |
 | [Grounding DINO tiny](https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX) | The same detections on a COCO image, with scores within 0.0001 |
 | [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |
