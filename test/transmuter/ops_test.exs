@@ -76,8 +76,8 @@ defmodule Transmuter.OpsTest do
         assert_in_delta stat.(&Nx.standard_deviation/1), std, 0.05 * std, "#{name} std"
 
         if low = distribution["low"] do
-          assert stat.(&Nx.reduce_min/1) >= low and stat.(&Nx.reduce_max/1) < distribution["high"],
-                 "#{name} range"
+          {min, max} = {stat.(&Nx.reduce_min/1), stat.(&Nx.reduce_max/1)}
+          assert min >= low and max < distribution["high"], "#{name} range"
         end
     end
   end
