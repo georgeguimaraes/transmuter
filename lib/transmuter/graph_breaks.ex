@@ -9,7 +9,7 @@ defmodule Transmuter.GraphBreaks do
   # the segment, and the next segment starts after it. Small inputs of the break node
   # (integer shapes, float scales) become static, so later segments fold the shapes
   # they decide. Compiled segments are cached by the shapes of their arguments and
-  # the values of their static inputs.
+  # the values of their static inputs, with least recently used eviction.
   #
   # Static values are those of the model, the static inputs, promoted values and values
   # folded from them. Everything else enters a segment as an argument.
@@ -17,10 +17,10 @@ defmodule Transmuter.GraphBreaks do
   alias Nx.Defn.Compiler
   alias Transmuter.{Ops, UnknownValueError}
 
-  # A segment of fewer nodes runs eagerly, and so does every segment at a position
-  # after this many different cache keys, for example per-image box counts.
+  # A segment of fewer nodes runs eagerly. The cache keeps this many segments for each
+  # position, and a new key at a full position evicts the least recently used one.
   @min_compiled_nodes 20
-  @max_keys_per_position 8
+  @entries_per_position 8
 
   @doc false
   def compile(model, inputs, static_inputs, opts) do
@@ -95,16 +95,12 @@ defmodule Transmuter.GraphBreaks do
   end
 
   defp build(plan, pos, key, statics, args) do
-    if count(plan.table, pos) >= @max_keys_per_position do
-      {:eager, :end}
-    else
-      ref = make_ref()
-      fun = fn args -> trace(plan, statics, args, pos, ref) end
-      entry = compile_segment(plan, fun, args, pos, ref)
-      Process.delete(ref)
-      store(plan.table, key, pos, entry)
-      classify(entry)
-    end
+    ref = make_ref()
+    fun = fn args -> trace(plan, statics, args, pos, ref) end
+    entry = compile_segment(plan, fun, args, pos, ref)
+    Process.delete(ref)
+    store(plan.table, key, entry)
+    classify(entry)
   end
 
   # The first segment compiles at once, as a model without breaks always did. A later
@@ -322,22 +318,26 @@ defmodule Transmuter.GraphBreaks do
   # process is gone, segments compile again on each call.
   defp lookup(table, key) do
     case :ets.lookup(table, key) do
-      [{^key, entry}] -> {:ok, entry}
-      [] -> :miss
+      [{^key, entry, _used}] ->
+        :ets.update_element(table, key, {3, :erlang.unique_integer([:monotonic])})
+        {:ok, entry}
+
+      [] ->
+        :miss
     end
   rescue
     ArgumentError -> :miss
   end
 
-  defp count(table, pos) do
-    :ets.lookup_element(table, {:count, pos}, 2, 0)
-  rescue
-    ArgumentError -> 0
-  end
+  defp store(table, key = {pos, _templates, _static_key}, entry) do
+    entries = :ets.match_object(table, {{pos, :_, :_}, :_, :_})
 
-  defp store(table, key, pos, entry) do
-    if :ets.insert_new(table, {key, entry}),
-      do: :ets.update_counter(table, {:count, pos}, 1, {{:count, pos}, 0})
+    if length(entries) >= @entries_per_position do
+      {oldest, _entry, _used} = Enum.min_by(entries, &elem(&1, 2))
+      :ets.delete(table, oldest)
+    end
+
+    :ets.insert(table, {key, entry, :erlang.unique_integer([:monotonic])})
   rescue
     ArgumentError -> :ok
   end

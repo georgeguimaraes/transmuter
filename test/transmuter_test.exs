@@ -283,6 +283,44 @@ defmodule TransmuterTest do
     end
   end
 
+  defmodule CountingCompiler do
+    @moduledoc false
+    @behaviour Nx.Defn.Compiler
+
+    defdelegate __jit__(key, vars, fun, args, opts), to: EMLX
+    defdelegate __partitions_options__(opts), to: EMLX
+    defdelegate __to_backend__(opts), to: EMLX
+
+    def __compile__(key, vars, fun, opts) do
+      send(self(), :compiled)
+      EMLX.__compile__(key, vars, fun, opts)
+    end
+  end
+
+  test "keeps the most recently used segments after a break" do
+    model = load_fixture("Break_Range_long_tail")
+    input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}
+    compiled = Transmuter.compile(model, input.(1), compiler: CountingCompiler, device: @device)
+
+    compiles = fn firsts ->
+      Enum.each(firsts, &compiled.(input.(&1)))
+      flush_compiles(0)
+    end
+
+    assert flush_compiles(0) == 1
+    assert compiles.(1..10) == 10
+    assert compiles.(3..10) == 0
+    assert compiles.([1]) == 1
+  end
+
+  defp flush_compiles(count) do
+    receive do
+      :compiled -> flush_compiles(count + 1)
+    after
+      0 -> count
+    end
+  end
+
   defp load(repo, file, opts \\ []) do
     Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
   end
