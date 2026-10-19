@@ -76,16 +76,22 @@ Some graphs use a value to set a shape or to select a branch. Examples are the l
 2. It runs the break operator on the values.
 3. It compiles the operators after the break for the shapes that the values decide, and continues.
 
-The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
+The compiled parts are cached, so a later call with the same shapes runs only compiled code. The cache keeps the 8 most recently used compiled parts for each break. A new shape after that replaces the part that was used least recently. The cache belongs to the process that calls `Transmuter.compile/3`, for example the `Nx.Serving` process.
 
 These results are from an Apple silicon GPU:
 
 | Model | Without compilation | First call | Later calls |
 |---|---|---|---|
-| Kokoro, 4.45 seconds of audio | 1.6 s | 3.2 s | 0.28 s |
+| Kokoro, 7.0 seconds of audio | 2.3 s | 2.1 s | 0.34 s |
+| Kokoro, 20.2 seconds of audio | 13.2 s | 8.8 s | 0.87 s |
 | Faster R-CNN 12, the same image | 33.8 s | 6.5 s | 0.35 s |
 
 A new audio length in Kokoro compiles the operators after the break again, and that first call takes about as long as a call without compilation. `bench/kokoro_tts.exs` rounds the total duration up to steps of 200 ms by making the final pause longer, so sentences of a similar length share one compiled decoder.
+
+EMLX has caches of its own, and each new shape adds to them:
+
+- MLX keeps freed buffers for reuse. Without a limit, this cache grew to 11.7 GB on a 16 GB Mac, and later calls for 20.2 seconds of audio took 22.5 s instead of 0.87 s. Set a limit with `EMLX.set_cache_limit(1_000_000_000)`.
+- `EMLX.CompileCache` keeps each compiled function. Set `max_items` for it in the `:emlx` config. EMLX also keeps each MLX program, with no limit.
 
 If you know such a value before the model runs, give it as an `Nx.BinaryBackend` tensor in the `:static_inputs` option of `Transmuter.compile/3`. Then the graph has no break there. Each new value of a static input compiles the model again. Examples:
 

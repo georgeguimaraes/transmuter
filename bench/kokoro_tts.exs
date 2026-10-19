@@ -65,6 +65,10 @@ repo = "onnx-community/Kokoro-82M-v1.0-ONNX"
 backend = {EMLX.Backend, device: :gpu}
 output = List.first(System.argv(), "kokoro.wav")
 
+# MLX keeps freed buffers in a cache. Each audio length frees buffers of new sizes,
+# and without a limit this cache grew to 11.7 GB on a 16 GB Mac and made calls slow.
+EMLX.set_cache_limit(1_000_000_000)
+
 download = fn file ->
   Req.get!("https://huggingface.co/#{repo}/resolve/main/#{file}", decode_body: false).body
 end
