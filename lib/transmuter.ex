@@ -22,6 +22,7 @@ defmodule Transmuter do
   alias Transmuter.Ops.Random
 
   @max_loop_iterations 100_000
+  @max_unrolled_steps 16
 
   # Small initializers and integer initializers are shape data, so they stay static.
   # Large integer initializers are packed quantized weights, so they are params.
@@ -273,7 +274,8 @@ defmodule Transmuter do
     Enum.map(branch.output, &Map.fetch!(env, &1.name))
   end
 
-  # Unrolls the loop while tracing, so the trip count and the condition must be static.
+  # A long traced loop with a condition that stays true runs as an Nx while loop. Other
+  # loops unroll while tracing, so the trip count and the condition must be static.
   defp run_loop(node, [trip_count, condition | initial], env, ctx) do
     body = Ops.attr(node, "body")
     [counter, condition_name | carried_names] = Enum.map(body.input, & &1.name)
@@ -285,7 +287,41 @@ defmodule Transmuter do
 
     env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
 
-    {carried, scans} =
+    step = fn i, carried, env ->
+      step_env =
+        env
+        |> Map.merge(Map.new(Enum.zip(carried_names, carried)))
+        |> Map.merge(%{counter => i, condition_name => condition || Ops.static_tensor(1, :u8)})
+
+      [next_condition | outputs] =
+        body.node
+        |> run_nodes(step_env, ctx)
+        |> then(&Enum.map(body.output, fn o -> Map.fetch!(&1, o.name) end))
+
+      # Without a condition input, the loop runs trip_count times and the body's
+      # condition output is ignored.
+      next_condition = if condition == nil, do: nil, else: next_condition
+      {next_condition, Enum.split(outputs, length(carried))}
+    end
+
+    while_step = fn i, carried, env ->
+      {next_condition, outputs} = step.(i, carried, env)
+      unless always_true?(next_condition), do: throw(:unroll)
+      outputs
+    end
+
+    looped =
+      if trip_count != nil and always_true?(condition),
+        do: while_loop(body, trips, initial, env, while_step)
+
+    case looped do
+      {carried, stacked} -> carried ++ stacked
+      nil -> unroll_loop(trips, initial, condition, &step.(&1, &2, env))
+    end
+  end
+
+  defp unroll_loop(trips, initial, condition, step) do
+    {carried, scans, _condition} =
       Enum.reduce_while(0..(trips - 1)//1, {initial, [], condition}, fn i,
                                                                         {carried, scans,
                                                                          condition} ->
@@ -293,27 +329,12 @@ defmodule Transmuter do
              Nx.to_number(Nx.any(Ops.known!(condition, "the Loop condition"))) == 0 do
           {:halt, {carried, scans, condition}}
         else
-          step =
-            env
-            |> Map.merge(Map.new(Enum.zip(carried_names, carried)))
-            |> Map.merge(%{
-              counter => Ops.static_tensor(i, :s64),
-              condition_name => condition || Ops.static_tensor(1, :u8)
-            })
+          {next_condition, {next_carried, scan_values}} =
+            step.(Ops.static_tensor(i, :s64), carried)
 
-          [next_condition | outputs] =
-            body.node
-            |> run_nodes(step, ctx)
-            |> then(&Enum.map(body.output, fn o -> Map.fetch!(&1, o.name) end))
-
-          # Without a condition input, the loop runs trip_count times and the body's
-          # condition output is ignored.
-          next_condition = if condition == nil, do: nil, else: next_condition
-          {next_carried, scan_values} = Enum.split(outputs, length(carried))
           {:cont, {next_carried, [scan_values | scans], next_condition}}
         end
       end)
-      |> then(fn {carried, scans, _} -> {carried, scans} end)
 
     stacked =
       case scans do
@@ -322,6 +343,63 @@ defmodule Transmuter do
       end
 
     carried ++ stacked
+  end
+
+  defp always_true?(nil), do: true
+  defp always_true?(condition), do: Ops.known?(condition) and Nx.to_number(Nx.all(condition)) == 1
+
+  # Runs step.(i, carried, env) for i in 0..(count - 1) as an Nx while loop, because an
+  # unrolled graph can get too deep to compile. The step returns the next carried
+  # values and its outputs, and the outputs of all steps are stacked on a new first
+  # axis. Returns nil when the loop is short, is not traced, or needs a static i, for
+  # example to decide a shape. Then the caller unrolls. A while body cannot read outer
+  # values, so the traced values that the step reads from env go in the loop state:
+  # the outer reads of the body and the names in inputs.
+  defp while_loop(body, count, carried, env, step, inputs \\ []) do
+    captured =
+      env
+      |> Map.take(outer_reads(body) ++ inputs)
+      |> Map.reject(fn {_k, v} -> Ops.static?(v) end)
+
+    values = carried ++ Map.values(captured)
+
+    if count > @max_unrolled_steps and Enum.all?(values, &is_struct(&1, Nx.Tensor)) and
+         not Enum.all?(values, &Ops.known?/1) and not random?(body.node) do
+      {probe, outputs} = step.(Ops.static_tensor(0, :s64), carried, env)
+
+      if Enum.map(probe, &Nx.to_template/1) != Enum.map(carried, &Nx.to_template/1),
+        do: throw(:unroll)
+
+      buffers =
+        Enum.map(outputs, fn o ->
+          Nx.broadcast(Nx.tensor(0, type: Nx.type(o)), Tuple.insert_at(Nx.shape(o), 0, count))
+        end)
+
+      initial = {List.to_tuple(carried), List.to_tuple(buffers), captured}
+
+      loop = fn :body, {i, {carried, buffers, captured}} ->
+        i = Nx.as_type(i, :s64)
+        {next, outputs} = step.(i, Tuple.to_list(carried), Map.merge(env, captured))
+
+        buffers =
+          Enum.zip_with(Tuple.to_list(buffers), outputs, fn buffer, o ->
+            Nx.put_slice(buffer, [i | List.duplicate(0, Nx.rank(o))], Nx.new_axis(o, 0))
+          end)
+
+        {List.to_tuple(next), List.to_tuple(buffers), captured}
+      end
+
+      {carried, buffers, _captured} =
+        Expr.defn_while(__ENV__.file, __ENV__.line, initial, {:while, 0..(count - 1)}, loop,
+          unroll: @max_unrolled_steps
+        )
+
+      {Tuple.to_list(carried), Tuple.to_list(buffers)}
+    end
+  rescue
+    _error in [Transmuter.UnknownValueError, ArgumentError, RuntimeError] -> nil
+  catch
+    :unroll -> nil
   end
 
   # A key is two u32 words. It is on the default backend, so eager runs draw there.
@@ -366,8 +444,9 @@ defmodule Transmuter do
 
   def upcast(t, _type), do: t
 
-  # Unrolls Scan over the static length of its scan inputs. Each step takes one slice of
-  # every scan input; per-step outputs are stacked along their output axes.
+  # Runs Scan over the static length of its scan inputs, as a while loop when it is long
+  # and traced, or else unrolled. Each step takes one slice of every scan input, and
+  # the per-step outputs are stacked along their output axes.
   defp run_scan(node, inputs, env, ctx) do
     body = Ops.attr(node, "body")
     scan_count = Ops.attr(node, "num_scan_inputs")
@@ -385,29 +464,39 @@ defmodule Transmuter do
       |> Enum.map(&(&1 == 1))
 
     length = Nx.axis_size(hd(scans), hd(in_axes))
-    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+    scan_inputs = scans |> Enum.with_index(&{{:scan, &2}, &1}) |> Map.new()
 
-    {steps, final_states} =
-      Enum.map_reduce(0..(length - 1), states, fn t, states ->
-        slices =
-          for {x, axis, reversed} <- Enum.zip([scans, in_axes, in_reversed]) do
-            x
-            |> Nx.slice_along_axis(if(reversed, do: length - 1 - t, else: t), 1, axis: axis)
-            |> Nx.squeeze(axes: [axis])
-          end
+    env =
+      body.initializer
+      |> Enum.reduce(env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+      |> Map.merge(scan_inputs)
 
-        step =
-          env
-          |> Map.merge(Map.new(Enum.zip(state_names, states)))
-          |> Map.merge(Map.new(Enum.zip(scan_names, slices)))
+    step = fn t, states, env ->
+      slices =
+        for {j, axis, reversed} <- Enum.zip([0..(scan_count - 1), in_axes, in_reversed]),
+            do:
+              scan_slice(
+                env[{:scan, j}],
+                if(reversed, do: Nx.subtract(length - 1, t), else: t),
+                axis
+              )
 
-        result = run_nodes(body.node, step, ctx)
+      step_env =
+        env
+        |> Map.merge(Map.new(Enum.zip(state_names, states)))
+        |> Map.merge(Map.new(Enum.zip(scan_names, slices)))
 
-        {new_states, outputs} =
-          body.output |> Enum.map(&Map.fetch!(result, &1.name)) |> Enum.split(length(states))
+      result = run_nodes(body.node, step_env, ctx)
+      body.output |> Enum.map(&Map.fetch!(result, &1.name)) |> Enum.split(length(states))
+    end
 
-        {outputs, new_states}
-      end)
+    {final_states, stacked} =
+      while_loop(body, length, states, env, step, Map.keys(scan_inputs)) ||
+        Enum.map_reduce(0..(length - 1), states, fn t, states ->
+          {new_states, outputs} = step.(Ops.static_tensor(t, :s64), states, env)
+          {outputs, new_states}
+        end)
+        |> then(fn {steps, final_states} -> {final_states, Enum.zip_with(steps, &Nx.stack/1)} end)
 
     output_count = length(body.output) - length(states)
     out_axes = Ops.attr(node, "scan_output_axes", List.duplicate(0, output_count))
@@ -417,15 +506,23 @@ defmodule Transmuter do
       |> Ops.attr("scan_output_directions", List.duplicate(0, output_count))
       |> Enum.map(&(&1 == 1))
 
-    stacked =
-      for {j, axis, reversed} <- Enum.zip([0..(output_count - 1)//1, out_axes, out_reversed]) do
-        values = Enum.map(steps, &Enum.at(&1, j))
-        values = if reversed, do: Enum.reverse(values), else: values
-        Nx.stack(values, axis: normalize_axis(axis, Nx.rank(hd(values)) + 1))
+    outputs =
+      for {values, axis, reversed} <- Enum.zip([stacked, out_axes, out_reversed]) do
+        values = if reversed, do: Nx.reverse(values, axes: [0]), else: values
+        rank = Nx.rank(values)
+        axes = Enum.to_list(1..(rank - 1)//1) |> List.insert_at(normalize_axis(axis, rank), 0)
+        Nx.transpose(values, axes: axes)
       end
 
-    final_states ++ stacked
+    final_states ++ outputs
   end
+
+  # A static index slices, so the unrolled graph has no gather.
+  defp scan_slice(x, t = %Nx.Tensor{data: %Nx.BinaryBackend{}}, axis) do
+    x |> Nx.slice_along_axis(Nx.to_number(t), 1, axis: axis) |> Nx.squeeze(axes: [axis])
+  end
+
+  defp scan_slice(x, t, axis), do: Nx.take(x, t, axis: axis)
 
   # Runs the body once per element. Sequence inputs give one element to each run, and
   # tensor inputs go to every run. Each body output becomes a sequence.

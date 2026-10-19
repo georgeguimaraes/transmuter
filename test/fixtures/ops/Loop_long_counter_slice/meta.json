@@ -1,0 +1,44 @@
+{
+ "repo": "op/Loop_long_counter_slice",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Loop": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "xs",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    20,
+    3
+   ]
+  },
+  {
+   "name": "acc0",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "acc",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

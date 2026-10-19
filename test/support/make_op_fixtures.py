@@ -772,7 +772,7 @@ case("Break_Range_long_tail",
      {"x": pos_f32(6)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64),
                          "scale": np.array(0.9, np.float32), "shift": np.array(0.25, np.float32)})
 
-# ---------- long recurrences ----------
+# ---------- long recurrences and loops ----------
 
 # More than 16 steps, so a compiled model runs these as a while loop.
 r = rng_for("long recurrences")
@@ -786,3 +786,27 @@ case("GRU_long_reverse", [node("GRU", ["x", "w", "r", "b"], ["y", "yh"], hidden_
      {"x": rf32(T, 2, In, scale=1.0)}, {"w": rf32(1, 3 * Hs, In), "r": rf32(1, 3 * Hs, Hs), "b": rf32(1, 6 * Hs)})
 case("RNN_long_forward", [node("RNN", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=Hs)],
      {"x": rf32(T, 2, In, scale=1.0)}, {"w": rf32(1, Hs, In), "r": rf32(1, Hs, Hs), "b": rf32(1, 2 * Hs)})
+
+# Long Loop and Scan bodies that read an outer value. A slice by the Loop counter needs
+# a static counter, so that loop unrolls.
+case("Loop_long_outer_read", [node("Loop", ["M", "cond", "acc0"], ["acc", "scans"], body=body)],
+     {"x": rf32(3), "acc0": rf32(3)}, {"M": np.array(40, np.int64), "cond": np.array(True)})
+long_scan_body = helper.make_graph(
+    [node("Mul", ["sum_in", "decay"], ["kept"]), node("Add", ["kept", "x_t"], ["sum_out"]), node("Mul", ["sum_out", "x_t"], ["scan_t"])],
+    "long_scan_body",
+    [helper.make_tensor_value_info("sum_in", TensorProto.FLOAT, [3]), helper.make_tensor_value_info("x_t", TensorProto.FLOAT, [3])],
+    [helper.make_tensor_value_info("sum_out", TensorProto.FLOAT, [3]), helper.make_tensor_value_info("scan_t", TensorProto.FLOAT, [3])])
+case("Scan_long_outer_read",
+     [node("Scan", ["init", "xs"], ["final", "ys"], body=long_scan_body, num_scan_inputs=1, scan_input_directions=[1],
+           scan_output_axes=[1], scan_output_directions=[1])],
+     {"init": rf32(3), "xs": rf32(T, 3, scale=1.0), "decay": rf32(3)})
+slice_body = helper.make_graph(
+    [node("Unsqueeze", ["i", "axis0"], ["start"]), node("Add", ["start", "one_i"], ["end"]),
+     node("Slice", ["xs", "start", "end"], ["row"]), node("Add", ["acc_in", "row"], ["acc_out"]), node("Identity", ["cond_in"], ["cond_out"])],
+    "slice_body",
+    [helper.make_tensor_value_info("i", INT64, []), helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+     helper.make_tensor_value_info("acc_in", TensorProto.FLOAT, [1, 3])],
+    [helper.make_tensor_value_info("cond_out", TensorProto.BOOL, []), helper.make_tensor_value_info("acc_out", TensorProto.FLOAT, [1, 3])],
+    [numpy_helper.from_array(np.array([0], np.int64), "axis0"), numpy_helper.from_array(np.array([1], np.int64), "one_i")])
+case("Loop_long_counter_slice", [node("Loop", ["M", "", "acc0"], ["acc"], body=slice_body)],
+     {"xs": rf32(20, 3), "acc0": rf32(1, 3)}, {"M": np.array(20, np.int64)})
