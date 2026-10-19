@@ -28,12 +28,12 @@ defmodule Transmuter.Ops.Transformer do
     v = to_heads(v, attr(node, "kv_num_heads"))
     k = if past_k, do: Nx.concatenate([past_k, k], axis: 2), else: k
     v = if past_v, do: Nx.concatenate([past_v, v], axis: 2), else: v
-    {_b, heads, s, head_size} = Nx.shape(q)
+    {_b, _heads, s, head_size} = Nx.shape(q)
     t = Nx.axis_size(k, 2)
 
     scores =
       q
-      |> scores(repeat_kv(k, heads), attr(node, "scale") || 1 / :math.sqrt(head_size))
+      |> grouped_scores(k, attr(node, "scale") || 1 / :math.sqrt(head_size))
       |> softcap(attr(node, "softcap", 0.0))
       |> add_mask(mask)
 
@@ -50,7 +50,7 @@ defmodule Transmuter.Ops.Transformer do
           ),
         else: scores
 
-    out = scores |> softmax_last() |> Nx.dot([3], [0, 1], repeat_kv(v, heads), [2], [0, 1])
+    out = scores |> softmax_last() |> grouped_values(v)
     out = if rank == 3, do: from_heads(out), else: out
     [out, k, v, scores]
   end
@@ -111,15 +111,12 @@ defmodule Transmuter.Ops.Transformer do
 
     out =
       q
-      |> scores(
-        repeat_kv(present_k, heads),
-        nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size)
-      )
+      |> grouped_scores(present_k, nonzero(attr(node, "scale", 0.0)) || 1 / :math.sqrt(head_size))
       |> softcap(attr(node, "softcap", 0.0))
       |> add_mask(attention_bias)
       |> mask_where(hidden)
       |> softmax_last()
-      |> Nx.dot([3], [0, 1], repeat_kv(present_v, heads), [2], [0, 1])
+      |> grouped_values(present_v)
       |> from_heads()
 
     [out, present_k, present_v]
@@ -415,7 +412,7 @@ defmodule Transmuter.Ops.Transformer do
 
   # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at a per-sequence offset.
   defp write_cache(past, new, offsets, capacity) do
-    {b, heads, s, head_size} = Nx.shape(new)
+    b = Nx.axis_size(new, 0)
     past_len = Nx.axis_size(past, 2)
 
     j = Nx.iota({1, 1, capacity, 1}, axis: 2)
@@ -434,15 +431,11 @@ defmodule Transmuter.Ops.Transformer do
         past
       end
 
-    write? = Nx.logical_and(Nx.greater_equal(j, offsets), Nx.less(j, Nx.add(offsets, s)))
-
-    index =
-      j
-      |> Nx.subtract(offsets)
-      |> Nx.clip(0, s - 1)
-      |> Nx.broadcast({b, heads, capacity, head_size})
-
-    Nx.select(Nx.broadcast(write?, Nx.shape(base)), Nx.take_along_axis(new, index, axis: 2), base)
+    # Each sequence writes its new rows at its own offset.
+    Enum.reduce(0..(b - 1)//1, base, fn i, acc ->
+      row = Nx.slice_along_axis(new, i, 1, axis: 0)
+      Nx.put_slice(acc, [i, 0, Nx.reshape(offsets[i], {}), 0], row)
+    end)
   end
 
   defp outside_window(_key_pos, _query_pos, window) when window <= 0, do: Nx.tensor(0, type: :u8)
@@ -466,6 +459,28 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   defp scores(q, k, scale), do: q |> Nx.dot([3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+
+  # Query head h uses key and value head div(h, group). Folding each group of query heads
+  # into the rows of one batched dot avoids copying the keys and values for every head.
+  defp grouped_scores(q, k, scale) do
+    {b, heads, s, head_size} = Nx.shape(q)
+    {_b, kv_heads, t, _head_size} = Nx.shape(k)
+
+    q
+    |> Nx.reshape({b, kv_heads, div(heads, kv_heads) * s, head_size})
+    |> scores(k, scale)
+    |> Nx.reshape({b, heads, s, t})
+  end
+
+  defp grouped_values(probs, v) do
+    {b, heads, s, t} = Nx.shape(probs)
+    {_b, kv_heads, _t, head_size} = Nx.shape(v)
+
+    probs
+    |> Nx.reshape({b, kv_heads, div(heads, kv_heads) * s, t})
+    |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+    |> Nx.reshape({b, heads, s, head_size})
+  end
 
   defp softcap(scores, cap) when cap > 0,
     do: scores |> Nx.divide(cap) |> Nx.tanh() |> Nx.multiply(cap)
