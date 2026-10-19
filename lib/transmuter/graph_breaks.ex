@@ -1,18 +1,11 @@
 defmodule Transmuter.GraphBreaks do
-  @moduledoc false
+  @moduledoc """
+  Compiles a model whose graph needs values that are only known when it runs, such as the limit of a Range or the boxes of a NonMaxSuppression.
 
-  # Compiles a model whose graph needs values that are only known when it runs, such
-  # as the limit of a Range or the boxes of a NonMaxSuppression.
-  #
-  # The graph runs as segments. A segment traces top-level nodes from a position until
-  # a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of
-  # the segment, and the next segment starts after it. Small inputs of the break node
-  # (integer shapes, float scales) become static, so later segments fold the shapes
-  # they decide. Compiled segments are cached by the shapes of their arguments and
-  # the values of their static inputs, with least recently used eviction.
-  #
-  # Static values are those of the model, the static inputs, promoted values and values
-  # folded from them. Everything else enters a segment as an argument.
+  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. Small inputs of the break node (integer shapes, float scales) become static, so later segments fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
+
+  Static values are those of the model, the static inputs, promoted values and values folded from them. Everything else enters a segment as an argument.
+  """
 
   alias Nx.Defn.Compiler
   alias Transmuter.{Ops, UnknownValueError}

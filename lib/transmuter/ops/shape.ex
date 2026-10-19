@@ -1,8 +1,7 @@
 defmodule Transmuter.Ops.Shape do
-  @moduledoc false
-
-  # Operators that build, cast, reshape, index, scatter or reorder tensors. Values
-  # that decide output shapes must be static.
+  @moduledoc """
+  Operators that build, cast, reshape, index, scatter or reorder tensors. Values that decide output shapes must be static.
+  """
 
   import Transmuter.Ops,
     only: [

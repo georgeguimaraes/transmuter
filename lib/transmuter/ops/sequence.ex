@@ -1,9 +1,7 @@
 defmodule Transmuter.Ops.Sequence do
-  @moduledoc false
-
-  # Sequence and optional operators. A sequence is {:sequence, elements} and an empty
-  # optional is :none. The list work happens while tracing, so positions and split
-  # sizes must be static, but the elements can be traced tensors.
+  @moduledoc """
+  Sequence and optional operators. A sequence is {:sequence, elements} and an empty optional is :none. The list work happens while tracing, so positions and split sizes must be static, but the elements can be traced tensors.
+  """
 
   import Transmuter.Ops,
     only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize_axis: 2, static_tensor: 2]

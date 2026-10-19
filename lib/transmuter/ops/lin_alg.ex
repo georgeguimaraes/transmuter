@@ -1,7 +1,7 @@
 defmodule Transmuter.Ops.LinAlg do
-  @moduledoc false
-
-  # Matrix products, Einsum and determinants.
+  @moduledoc """
+  Matrix products, Einsum and determinants.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]
 

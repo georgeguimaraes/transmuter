@@ -1,9 +1,7 @@
 defmodule Transmuter.Ops do
-  @moduledoc false
-
-  # ONNX operators as Nx calls. Values known at trace time live on Nx.BinaryBackend
-  # ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no
-  # zero-size tensors, so a zero-size value is {:empty, shape}.
+  @moduledoc """
+  ONNX operators as Nx calls. Values known at trace time live on Nx.BinaryBackend ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no zero-size tensors, so a zero-size value is {:empty, shape}.
+  """
 
   alias Transmuter.Ops.{
     Elementwise,

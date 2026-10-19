@@ -1,8 +1,7 @@
 defmodule Transmuter.Ops.Text do
-  @moduledoc false
-
-  # String operators and TfIdfVectorizer. They run on the host, so a numeric
-  # TfIdfVectorizer input must be known: static, or read while the model runs eagerly.
+  @moduledoc """
+  String operators and TfIdfVectorizer. They run on the host, so a numeric TfIdfVectorizer input must be known: static, or read while the model runs eagerly.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1, known!: 2, static_tensor: 2]
 

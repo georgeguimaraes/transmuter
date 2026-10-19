@@ -1,8 +1,7 @@
 defmodule Transmuter.Ops.Elementwise do
-  @moduledoc false
-
-  # Elementwise operators: arithmetic, comparisons, logic, bitwise, trigonometry and
-  # activations.
+  @moduledoc """
+  Elementwise operators: arithmetic, comparisons, logic, bitwise, trigonometry and activations.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1]
 

@@ -1,8 +1,7 @@
 defmodule Transmuter.Ops.Vision do
-  @moduledoc false
-
-  # Spatial operators: sampling grids, crops, patch folding, region pooling,
-  # deformable convolution and image decoding. Sizes that decide output shapes must be static.
+  @moduledoc """
+  Spatial operators: sampling grids, crops, patch folding, region pooling, deformable convolution and image decoding. Sizes that decide output shapes must be static.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, known!: 2, static_tensor: 2]
 

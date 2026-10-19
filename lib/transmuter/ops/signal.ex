@@ -1,10 +1,7 @@
 defmodule Transmuter.Ops.Signal do
-  @moduledoc false
-
-  # Recurrent layers and Fourier transforms. Short recurrences unroll over the sequence,
-  # which has a static length. Long traced recurrences run as an Nx while loop, because
-  # an unrolled graph gets too deep to compile. Fourier transforms multiply by static
-  # DFT matrices, so they need no complex numbers on the backend.
+  @moduledoc """
+  Recurrent layers and Fourier transforms. Short recurrences unroll over the sequence, which has a static length. Long traced recurrences run as an Nx while loop, because an unrolled graph gets too deep to compile. Fourier transforms multiply by static DFT matrices, so they need no complex numbers on the backend.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
 

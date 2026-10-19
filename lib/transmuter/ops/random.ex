@@ -1,10 +1,7 @@
 defmodule Transmuter.Ops.Random do
-  @moduledoc false
-
-  # Random operators on Nx.Random. Each run has one key, and each node folds a hash of
-  # its first output name into it, so nodes draw independent streams. A node with a
-  # seed draws the same values on every run. Values cannot match ONNX Runtime, whose
-  # generator differs.
+  @moduledoc """
+  Random operators on Nx.Random. Each run has one key, and each node folds a hash of its first output name into it, so nodes draw independent streams. A node with a seed draws the same values on every run. Values cannot match ONNX Runtime, whose generator differs.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, dtype: 1]
 

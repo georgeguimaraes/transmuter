@@ -1,7 +1,7 @@
 defmodule Transmuter.Ops.Reduction do
-  @moduledoc false
-
-  # Reductions along axes, arg reductions, cumulative sums and products, and TopK.
+  @moduledoc """
+  Reductions along axes, arg reductions, cumulative sums and products, and TopK.
+  """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2]
 

@@ -77,6 +77,22 @@ defmodule Transmuter.MixProject do
           Transmuter.Telemetry,
           Transmuter.Telemetry.Logger,
           Transmuter.UnknownValueError
+        ],
+        Internals: [
+          Transmuter.GraphBreaks,
+          Transmuter.Ops,
+          Transmuter.Ops.Elementwise,
+          Transmuter.Ops.LinAlg,
+          Transmuter.Ops.NN,
+          Transmuter.Ops.Quantized,
+          Transmuter.Ops.Random,
+          Transmuter.Ops.Reduction,
+          Transmuter.Ops.Sequence,
+          Transmuter.Ops.Shape,
+          Transmuter.Ops.Signal,
+          Transmuter.Ops.Text,
+          Transmuter.Ops.Transformer,
+          Transmuter.Ops.Vision
         ]
       ],
       source_ref: "v#{@version}"

@@ -1,8 +1,7 @@
 defmodule Transmuter.Ops.NN do
-  @moduledoc false
-
-  # Neural network layers: convolutions, pooling, unpooling, normalizations, Resize,
-  # Upsample, GridSample, LRN, Dropout and the classification losses.
+  @moduledoc """
+  Neural network layers: convolutions, pooling, unpooling, normalizations, Resize, Upsample, GridSample, LRN, Dropout and the classification losses.
+  """
 
   import Transmuter.Ops,
     only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize: 3, static_tensor: 2]

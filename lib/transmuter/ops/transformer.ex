@@ -1,9 +1,7 @@
 defmodule Transmuter.Ops.Transformer do
-  @moduledoc false
-
-  # Attention, linear attention, KV cache writes, rotary embedding and normalization. The
-  # same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT
-  # exporters, so the domain decides the input layout.
+  @moduledoc """
+  Attention, linear attention, KV cache writes, rotary embedding and normalization. The same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain decides the input layout.
+  """
 
   import Transmuter.Ops,
     only: [
