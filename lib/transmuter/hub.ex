@@ -22,19 +22,16 @@ defmodule Transmuter.Hub do
   """
   def fetch(source, file, opts \\ [])
 
-  def fetch({:hf, repo}, file, opts) do
-    path = Path.join(cache_dir(repo, opts), file)
+  def fetch(source = {:hf, repo}, file, opts) do
+    dir = cache_dir(repo, opts)
+    path = Path.join(dir, file)
+    files = if File.exists?(path), do: [file], else: files(source, opts)
 
-    with false <- File.exists?(path),
-         {:ok, files} <- listed({:hf, repo}, file, opts) do
-      for f <- data_files(file, files) ++ [file] do
-        download!(repo, f, Path.join(cache_dir(repo, opts), f))
-      end
-
+    if file in files do
+      for f <- data_files(file, files) ++ [file], do: download!(repo, f, Path.join(dir, f))
       {:ok, path}
     else
-      true -> {:ok, path}
-      :error -> :error
+      :error
     end
   end
 
@@ -55,24 +52,11 @@ defmodule Transmuter.Hub do
 
   @doc """
   Returns the names of all files in `source`, with paths relative to the repository root.
-
-  The list of a Hub repository is saved in the cache directory, so a repository that was downloaded once also works offline. The `refresh: true` option reads the list from the Hub again.
   """
   def files(source, opts \\ [])
 
-  def files({:hf, repo}, opts) do
-    listing = Path.join(cache_dir(repo, opts), ".files.json")
-
-    if File.exists?(listing) and not Keyword.get(opts, :refresh, false) do
-      listing |> File.read!() |> JSON.decode!()
-    else
-      %{"siblings" => siblings} = get!("https://huggingface.co/api/models/#{repo}").body
-      files = Enum.map(siblings, & &1["rfilename"])
-      File.mkdir_p!(Path.dirname(listing))
-      File.write!(listing, JSON.encode!(files))
-      files
-    end
-  end
+  def files(source = {:hf, _repo}, opts),
+    do: Enum.map(info(source, opts)["siblings"], & &1["rfilename"])
 
   def files(dir, _opts) when is_binary(dir) do
     dir
@@ -83,18 +67,41 @@ defmodule Transmuter.Hub do
   end
 
   @doc """
-  Returns the metadata of a Hub repository from the Hub API, such as `"pipeline_tag"` and `"cardData"`, or `nil` for a local directory.
-  """
-  def info({:hf, repo}), do: get!("https://huggingface.co/api/models/#{repo}").body
-  def info(dir) when is_binary(dir), do: nil
+  Returns the metadata of a Hub repository from the Hub API, such as `"siblings"` (the files), `"pipeline_tag"` and `"cardData"`, or `nil` for a local directory.
 
-  # A saved list can be older than the repository, so a missing file reads the list again.
-  defp listed(source, file, opts) do
-    Enum.find_value([opts, [refresh: true] ++ opts], :error, fn opts ->
-      files = files(source, opts)
-      if file in files, do: {:ok, files}
-    end)
+  The metadata is saved in the cache directory and comes from there later. The `refresh: true` option reads it from the Hub again, and uses the saved metadata when the Hub cannot be reached, so a repository that was downloaded once also works offline.
+  """
+  def info(source, opts \\ [])
+
+  def info({:hf, repo}, opts) do
+    path = Path.join(cache_dir(repo, opts), ".info.json")
+    saved? = File.exists?(path)
+
+    if saved? and not Keyword.get(opts, :refresh, false) do
+      path |> File.read!() |> JSON.decode!()
+    else
+      case get("https://huggingface.co/api/models/#{repo}") do
+        {:ok, %{status: 200, body: info}} ->
+          File.mkdir_p!(Path.dirname(path))
+          File.write!(path, JSON.encode!(info))
+          info
+
+        _error when saved? ->
+          path |> File.read!() |> JSON.decode!()
+
+        {:ok, %{status: status, body: body}} ->
+          raise ArgumentError,
+                "the Hugging Face Hub gave status #{status} for #{repo}: #{inspect(body)}. " <>
+                  "Set HF_TOKEN for a private or gated repository"
+
+        {:error, error} ->
+          raise ArgumentError,
+                "could not reach the Hugging Face Hub for #{repo}: #{Exception.message(error)}"
+      end
+    end
   end
+
+  def info(dir, _opts) when is_binary(dir), do: nil
 
   # External data files of an ONNX file are named <file>_data, <file>_data_1, ... or <file>.data.
   defp data_files(file, files) do
@@ -108,8 +115,9 @@ defmodule Transmuter.Hub do
     unless File.exists?(target) do
       File.mkdir_p!(Path.dirname(target))
 
-      get!("https://huggingface.co/#{repo}/resolve/main/#{file}",
-        into: File.stream!(target <> ".part")
+      Req.get!(
+        "https://huggingface.co/#{repo}/resolve/main/#{file}",
+        req_options(into: File.stream!(target <> ".part"), http_errors: :raise)
       )
 
       File.rename!(target <> ".part", target)
@@ -120,10 +128,12 @@ defmodule Transmuter.Hub do
     Path.join(opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"]), repo)
   end
 
-  defp get!(url, opts \\ []) do
+  defp get(url), do: Req.get(url, req_options(retry: false))
+
+  defp req_options(opts) do
     headers =
       if token = System.get_env("HF_TOKEN"), do: [authorization: "Bearer #{token}"], else: []
 
-    Req.get!(url, [headers: headers, receive_timeout: 600_000, redirect_log_level: false] ++ opts)
+    [headers: headers, receive_timeout: 600_000, redirect_log_level: false] ++ opts
   end
 end

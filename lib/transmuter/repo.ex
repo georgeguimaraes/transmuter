@@ -41,9 +41,13 @@ defmodule Transmuter.Repo do
   @doc """
   Reads the configuration files of `source` (`{:hf, repo}` or a local directory).
 
+  A Hub source reads its file list from the Hub again, or from the cache when the Hub cannot be reached.
+
   Options: `:cache_dir` (see `Transmuter.Hub`) and `:variant`.
   """
   def load!(source, opts \\ []) do
+    # One read of the file list per load, so files added to the repository are found.
+    Hub.info(source, [refresh: true] ++ opts)
     json = &Hub.json(source, &1, opts)
     tokenizer_config = json.("tokenizer_config.json") || %{}
 
