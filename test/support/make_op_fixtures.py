@@ -771,3 +771,18 @@ case("Break_Range_long_tail",
      [node("Identity", ["t12"], ["y"])],
      {"x": pos_f32(6)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64),
                          "scale": np.array(0.9, np.float32), "shift": np.array(0.25, np.float32)})
+
+# ---------- long recurrences ----------
+
+# More than 16 steps, so a compiled model runs these as a while loop.
+r = rng_for("long recurrences")
+rf32 = lambda *shape, scale=0.5: (r.standard_normal(shape) * scale).astype(np.float32)
+T, In, Hs = 40, 5, 4
+case("LSTM_long_bidirectional_lengths",
+     [node("LSTM", ["x", "w", "r", "b", "lengths", "h0", "c0"], ["y", "yh", "yc"], hidden_size=Hs, direction="bidirectional")],
+     {"x": rf32(T, 3, In, scale=1.0), "h0": rf32(2, 3, Hs), "c0": rf32(2, 3, Hs)},
+     {"w": rf32(2, 4 * Hs, In), "r": rf32(2, 4 * Hs, Hs), "b": rf32(2, 8 * Hs), "lengths": np.array([40, 23, 1], np.int32)})
+case("GRU_long_reverse", [node("GRU", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=Hs, direction="reverse")],
+     {"x": rf32(T, 2, In, scale=1.0)}, {"w": rf32(1, 3 * Hs, In), "r": rf32(1, 3 * Hs, Hs), "b": rf32(1, 6 * Hs)})
+case("RNN_long_forward", [node("RNN", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=Hs)],
+     {"x": rf32(T, 2, In, scale=1.0)}, {"w": rf32(1, Hs, In), "r": rf32(1, Hs, Hs), "b": rf32(1, 2 * Hs)})

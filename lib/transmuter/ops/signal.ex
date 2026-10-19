@@ -1,11 +1,14 @@
 defmodule Transmuter.Ops.Signal do
   @moduledoc false
 
-  # Recurrent layers and Fourier transforms. Recurrences unroll over the sequence,
-  # which has a static length. Fourier transforms multiply by static DFT matrices,
-  # so they need no complex numbers on the backend.
+  # Recurrent layers and Fourier transforms. Short recurrences unroll over the sequence,
+  # which has a static length. Long traced recurrences run as an Nx while loop, because
+  # an unrolled graph gets too deep to compile. Fourier transforms multiply by static
+  # DFT matrices, so they need no complex numbers on the backend.
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
+
+  alias Nx.Defn.Expr
 
   @op_types ~w(LSTM GRU RNN STFT DFT HannWindow HammingWindow BlackmanWindow MelWeightMatrix)
 
@@ -170,7 +173,7 @@ defmodule Transmuter.Ops.Signal do
 
   # Runs one or two directions and stacks them. step.(x_gates, r, r_bias, state) -> state.
   defp recur(node, x, {w, r, bias}, lengths, initial, step) do
-    {seq, batch, _} = Nx.shape(x)
+    {_seq, batch, _} = Nx.shape(x)
     hidden = attr(node, "hidden_size")
     gates = div(Nx.axis_size(w, 1), hidden)
     directions = Nx.axis_size(w, 0)
@@ -186,16 +189,8 @@ defmodule Transmuter.Ops.Signal do
         state =
           initial |> Enum.map(&initial_state(&1, d, batch, hidden, Nx.type(x))) |> List.to_tuple()
 
-        order = if reverse or d == 1, do: (seq - 1)..0//-1, else: 0..(seq - 1)
-
-        {outputs, state} =
-          Enum.map_reduce(order, state, fn t, state ->
-            next = step.(x_gates[t], rd, rb, state)
-            next = keep_finished(next, state, lengths, t)
-            {{t, mask_output(elem(next, 0), lengths, t)}, next}
-          end)
-
-        y = outputs |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(&elem(&1, 1)) |> Nx.stack()
+        backward? = reverse or d == 1
+        {y, state} = steps(x_gates, {rd, rb}, state, lengths, backward?, step)
         {y, Tuple.to_list(state)}
       end
 
@@ -205,6 +200,63 @@ defmodule Transmuter.Ops.Signal do
   end
 
   # Sequences shorter than sequence_lens keep their state and output zeros.
+  # A traced sequence longer than this runs as an Nx while loop. An unrolled loop makes
+  # a graph that grows with the sequence, which compiles slowly and, on EMLX, can
+  # overflow the stack of the compiler.
+  @max_unrolled_steps 16
+
+  defp steps(x_gates, weights, state, lengths, backward?, step) do
+    seq = Nx.axis_size(x_gates, 0)
+
+    if traced?(x_gates) and seq > @max_unrolled_steps,
+      do: while_steps(x_gates, weights, state, lengths, backward?, step),
+      else: unrolled_steps(x_gates, weights, state, lengths, backward?, step)
+  end
+
+  defp unrolled_steps(x_gates, {r, rb}, state, lengths, backward?, step) do
+    seq = Nx.axis_size(x_gates, 0)
+    order = if backward?, do: (seq - 1)..0//-1, else: 0..(seq - 1)
+
+    {outputs, state} =
+      Enum.map_reduce(order, state, fn t, state ->
+        next = step.(x_gates[t], r, rb, state)
+        next = keep_finished(next, state, lengths, t)
+        {{t, mask_output(elem(next, 0), lengths, t)}, next}
+      end)
+
+    y = outputs |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(&elem(&1, 1)) |> Nx.stack()
+    {y, state}
+  end
+
+  # The loop state carries every tensor that the steps read, because a while body
+  # cannot read tensors from outside the loop. Each iteration unrolls a block of
+  # steps, so the loop runs fewer times and the graph stays small.
+  defp while_steps(x_gates, {r, rb}, state, lengths, backward?, step) do
+    seq = Nx.axis_size(x_gates, 0)
+    h_shape = state |> elem(0) |> Nx.shape()
+    y = Nx.broadcast(Nx.tensor(0, type: Nx.type(x_gates)), Tuple.insert_at(h_shape, 0, seq))
+
+    initial = %{state: state, y: y, x: x_gates, r: r, rb: rb}
+    initial = if lengths, do: Map.put(initial, :lengths, lengths), else: initial
+
+    body = fn :body, {i, acc = %{state: state}} ->
+      t = if backward?, do: Nx.subtract(seq - 1, i), else: i
+      lengths = acc[:lengths]
+      next = step.(Nx.take(acc.x, t), acc.r, acc.rb, state)
+      next = keep_finished(next, state, lengths, t)
+      h = mask_output(elem(next, 0), lengths, t)
+      %{acc | state: next, y: Nx.put_slice(acc.y, [t, 0, 0], Nx.new_axis(h, 0))}
+    end
+
+    range = {:while, 0..(seq - 1)}
+    opts = [unroll: @max_unrolled_steps]
+    result = Expr.defn_while(__ENV__.file, __ENV__.line, initial, range, body, opts)
+    {result.y, result.state}
+  end
+
+  defp traced?(%Nx.Tensor{data: %Nx.Defn.Expr{}}), do: true
+  defp traced?(_tensor), do: false
+
   defp keep_finished(next, _state, nil, _t), do: next
 
   defp keep_finished(next, state, lengths, t) do
