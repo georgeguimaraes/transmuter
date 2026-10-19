@@ -119,6 +119,8 @@ defmodule Transmuter.Generation do
   Compiles the model and the token selection of `ctx`. Buffer modes compile here, so call this function in the serving process, which owns the cache of compiled shapes.
   """
   def compile(ctx, defn_options) do
+    ctx = Map.put(ctx, :backend, Nx.Defn.to_backend(defn_options))
+
     ctx =
       if ctx.mode == :grow do
         Map.put(ctx, :run, fn inputs, static ->
@@ -209,17 +211,14 @@ defmodule Transmuter.Generation do
 
   defp initial_state(ctx, capacity) do
     # :grow starts with a placeholder row that the branch without cache does not read.
+    # The zeros are made on the backend of the compiler, so they do not cross from the host.
     rows = if ctx.mode == :grow, do: 1, else: capacity
 
     cache =
       Map.new(ctx.cache, fn name ->
         {type, [_batch, heads, _length, head_dim]} = ctx.model.input_types[name]
-
-        {name,
-         Nx.broadcast(
-           Nx.tensor(0, type: type, backend: Nx.BinaryBackend),
-           {1, heads, rows, head_dim}
-         )}
+        zero = Nx.tensor(0, type: type, backend: ctx.backend)
+        {name, Nx.broadcast(zero, {1, heads, rows, head_dim})}
       end)
 
     %{cache: cache, inputs: %{}, length: 0, capacity: capacity}
