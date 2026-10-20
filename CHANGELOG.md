@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.1](https://github.com/georgeguimaraes/transmuter/compare/v1.0.0...v1.0.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* Let concurrent downloads of one Hub file succeed ([8900c12](https://github.com/georgeguimaraes/transmuter/commit/8900c1247df60378e968f2e334159eabe58c6590))
+
+
+### Continuous Integration
+
+* Save the model cache only when the cached models change ([24462a1](https://github.com/georgeguimaraes/transmuter/commit/24462a183fcb903daa299c8f89eed77b8f7b2e85))
+
 ## [1.0.0](https://github.com/georgeguimaraes/transmuter/compare/v0.2.0...v1.0.0) (2026-10-20)
 
 
