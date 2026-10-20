@@ -24,9 +24,12 @@ defmodule Transmuter.GraphBreaks do
       nodes = List.to_tuple(model.nodes)
       last_use = last_use(model)
 
+      # The plan keeps the nodes once, as a tuple. A copy of a closure, such as in a new
+      # process or in :persistent_term, copies each reference to a term again. So the
+      # closure of a call holds the plan once.
       plan = %{
         cache_size: cache_size,
-        model: model,
+        model: Map.delete(model, :nodes),
         source: model[:source],
         nodes: nodes,
         last_use: last_use,
@@ -52,10 +55,6 @@ defmodule Transmuter.GraphBreaks do
   end
 
   defp call(plan, inputs, static_inputs) do
-    general = fn inputs ->
-      plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
-    end
-
     # A graph without breaks keeps its compiled function here for the shapes of these
     # inputs, so a call with these shapes does not search the cache. Inputs of other shapes
     # compile on their first call and are cached.
@@ -68,16 +67,19 @@ defmodule Transmuter.GraphBreaks do
             state = initial(plan, inputs, static_inputs)
             state |> merge(run_compiled(entry, arguments(plan, state, 0))) |> outputs(plan)
           else
-            general.(inputs)
+            general(plan, inputs, static_inputs)
           end
         end
 
         {fast, false}
 
       _break ->
-        {general, true}
+        {&general(plan, &1, static_inputs), true}
     end
   end
+
+  defp general(plan, inputs, static_inputs),
+    do: plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
 
   defp input_shapes(inputs) do
     Map.new(inputs, fn

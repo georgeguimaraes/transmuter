@@ -7,7 +7,9 @@ defmodule Transmuter.Serving do
   `generation/4` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop. With `stream: true`, the loop sends each new token to the client through the `:token` hook of `Nx.Serving.streaming/2`, and the client decodes the text.
   """
 
-  alias Transmuter.{Featurizer, Generation, Repo, Tokenizer}
+  @behaviour Nx.Serving
+
+  alias Transmuter.{Featurizer, Generation, Repo, Shared, Tokenizer}
 
   @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
 
@@ -148,10 +150,17 @@ defmodule Transmuter.Serving do
     fixed = Map.take(shapes.inputs, model.inputs)
 
     Nx.Serving.new(
-      fn key, defn_options ->
-        run = Transmuter.compile(model, Map.merge(fixed, templates[key]), defn_options)
+      __MODULE__,
+      fn defn_options ->
+        {keys, defn_options} = Keyword.pop!(defn_options, :batch_keys)
+
+        runs =
+          Map.new(keys, fn key ->
+            {key, Transmuter.compile(model, Map.merge(fixed, templates[key]), defn_options)}
+          end)
 
         fn batch ->
+          run = runs[batch.key]
           batch = Nx.Batch.pad(batch, batch_size - batch.size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
 
@@ -185,6 +194,33 @@ defmodule Transmuter.Serving do
 
       if multi?, do: results, else: hd(results)
     end)
+  end
+
+  # Nx.Serving runs each batch of a serving process in a new process, which copies the
+  # function of the batch and all that it holds, such as the compiled models. So a serving
+  # process keeps the functions in a scope of Transmuter.Shared, and each batch reads them
+  # without a copy. Nx.Serving.run/2 runs init in the caller, which keeps the functions only
+  # as long as it needs them.
+  @doc false
+  @impl Nx.Serving
+  def init(type, init, partitions) do
+    funs = Enum.map(partitions, init)
+
+    case type do
+      :inline ->
+        {:ok, fn -> funs end}
+
+      :process ->
+        scope = Shared.scope()
+        Shared.put(scope, :batch, funs)
+        {:ok, fn -> Shared.get(scope, :batch) end}
+    end
+  end
+
+  @doc false
+  @impl Nx.Serving
+  def handle_batch(batch, partition, funs) do
+    {:execute, fn -> {Enum.at(funs.(), partition).(batch), :server_info} end, funs}
   end
 
   defp zeros(shape, type),
@@ -238,6 +274,7 @@ defmodule Transmuter.Serving do
 
     # One function runs the batches of all keys.
     Nx.Serving.new(
+      __MODULE__,
       fn defn_options ->
         {hooks, defn_options} =
           defn_options |> Keyword.delete(:batch_keys) |> Keyword.pop(:hooks, %{})

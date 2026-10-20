@@ -159,7 +159,13 @@ defmodule Transmuter.Generation do
         {static, compiled}
       end)
 
-    ctx = Map.put(ctx, :run, fn inputs, static -> runs[static].(inputs) end)
+    # A copy of the context, such as the one that a serving keeps in :persistent_term, copies
+    # each reference to a term again. The compiled functions hold the nodes of the model, so
+    # the context keeps only its inputs.
+    ctx =
+      ctx
+      |> Map.put(:run, fn inputs, static -> runs[static].(inputs) end)
+      |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
     settings =
       Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p, :processor])
