@@ -1,0 +1,39 @@
+{
+ "repo": "op/Resize_linear_pytorch_half_pixel_to_one",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Resize": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2,
+    4,
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2,
+    1,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

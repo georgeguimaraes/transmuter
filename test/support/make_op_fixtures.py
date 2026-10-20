@@ -1165,3 +1165,48 @@ wt = r.standard_normal((2, 3, 3, 3)).astype(np.float32)
 for name, attrs in [("auto_pad_same_upper", dict(auto_pad="SAME_UPPER")), ("auto_pad_same_lower", dict(auto_pad="SAME_LOWER")),
                     ("output_shape", dict(output_shape=[6, 9])), ("output_shape_same_upper", dict(output_shape=[6, 8], auto_pad="SAME_UPPER"))]:
     case(f"ConvTranspose_{name}", [node("ConvTranspose", ["x", "w"], ["y"], strides=[2, 2], **attrs)], {"x": xt}, {"w": wt})
+
+# ---------- Resize and GridSample ----------
+
+r = rng_for("Resize")
+x46 = r.standard_normal((1, 2, 4, 6)).astype(np.float32)
+f32s = lambda *v: np.array(v, np.float32)
+resizes = [
+    ("axes_sizes", dict(mode="linear", axes=[3, 2]), {"sizes": i64(7, 5)}, 18),
+    ("axes_scales", dict(mode="nearest", axes=[-1]), {"scales": f32s(1.5)}, 18),
+    ("keep_aspect_ratio_not_larger", dict(mode="linear", keep_aspect_ratio_policy="not_larger"), {"sizes": i64(1, 2, 8, 8)}, 18),
+    ("keep_aspect_ratio_not_smaller_axes", dict(mode="nearest", axes=[2, 3], keep_aspect_ratio_policy="not_smaller"), {"sizes": i64(6, 7)}, 18),
+    ("tf_crop_and_resize", dict(mode="linear", coordinate_transformation_mode="tf_crop_and_resize", extrapolation_value=-3.0),
+     {"roi": f32s(0, 0, -0.2, 0.1, 1, 1, 0.8, 1.3), "sizes": i64(1, 2, 5, 5)}, 13),
+    ("half_pixel_symmetric", dict(mode="linear", coordinate_transformation_mode="half_pixel_symmetric"), {"scales": f32s(1, 1, 1.7, 0.6)}, 19),
+    ("nearest_asymmetric_round_prefer_ceil", dict(mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="round_prefer_ceil"),
+     {"scales": f32s(1, 1, 2.5, 1.5)}, 13),
+    ("nearest_tf_half_pixel_for_nn_ceil", dict(mode="nearest", coordinate_transformation_mode="tf_half_pixel_for_nn", nearest_mode="ceil"),
+     {"sizes": i64(1, 2, 7, 4)}, 13),
+    ("cubic_align_corners_exclude_outside", dict(mode="cubic", coordinate_transformation_mode="align_corners", exclude_outside=1),
+     {"sizes": i64(1, 2, 7, 9)}, 13),
+    ("linear_pytorch_half_pixel_to_one", dict(mode="linear", coordinate_transformation_mode="pytorch_half_pixel"), {"sizes": i64(1, 2, 1, 3)}, 13),
+]
+for name, attrs, extra_inputs, opset in resizes:
+    names = ["x", "roi" if "roi" in extra_inputs else "", "scales" if "scales" in extra_inputs else "", "sizes" if "sizes" in extra_inputs else ""]
+    while names[-1] == "":
+        names.pop()
+    case(f"Resize_{name}", [node("Resize", names, ["y"], **attrs)], {"x": x46}, extra_inputs, opset=opset)
+case("Resize_linear_uint8", [node("Resize", ["x", "", "scales"], ["y"], mode="linear")],
+     {"x": r.integers(0, 256, (1, 1, 4, 5)).astype(np.uint8)}, {"scales": f32s(1, 1, 1.75, 2.5)})
+
+r = rng_for("GridSample")
+x45 = r.standard_normal((2, 3, 4, 5)).astype(np.float32)
+grid = (r.random((2, 3, 4, 2)) * 3.2 - 1.6).astype(np.float32)
+for mode in ["linear", "nearest"]:
+    for padding in ["zeros", "border", "reflection"]:
+        for align in [0, 1]:
+            case(f"GridSample_{mode}_{padding}_align_{align}", [node("GridSample", ["x", "g"], ["y"], mode=mode, padding_mode=padding, align_corners=align)],
+                 {"x": x45, "g": grid}, opset=20)
+# With align_corners, x = (g + 1) * 2 on 5 columns, so -0.75 and 0.25 land on 0.5 and 2.5.
+ties = np.array([[[[-0.75, -1.0], [0.25, 0.5], [0.75, -0.5]]]], np.float32)
+case("GridSample_nearest_ties", [node("GridSample", ["x", "g"], ["y"], mode="nearest", align_corners=1)], {"x": x45[:1], "g": ties}, opset=20)
+case("GridSample_nearest_ties_static", [node("GridSample", ["x", "g"], ["y"], mode="nearest", align_corners=1)], {"x": x45[:1], "g": ties},
+     opset=20, static=("x", "g"))
+case("GridSample_linear_5d", [node("GridSample", ["x", "g"], ["y"], mode="linear", padding_mode="border")],
+     {"x": r.standard_normal((1, 2, 3, 4, 5)).astype(np.float32), "g": (r.random((1, 2, 3, 2, 3)) * 2.4 - 1.2).astype(np.float32)}, opset=20)

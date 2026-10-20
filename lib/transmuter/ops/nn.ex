@@ -12,6 +12,8 @@ defmodule Transmuter.Ops.NN do
       empty?: 1,
       ints!: 1,
       normalize: 3,
+      normalize_axis: 2,
+      round_half_even: 1,
       static_tensor: 2
     ]
 
@@ -217,38 +219,65 @@ defmodule Transmuter.Ops.NN do
 
   # Resize one axis at a time. Each output element reads a few input elements, so the
   # taps become static index and weight tensors, and the result is a weighted sum of gathers.
+  # Scales, sizes and the roi list the axes of the axes attribute (opset 18), all by
+  # default. Integers resize in f32 and truncate back, as in ONNX Runtime.
   defp op(node = %{op_type: "Resize"}, [x | rest]) do
-    {scales, sizes} =
+    {roi, scales, sizes} =
       case rest do
-        [scales] -> {scales, nil}
-        [_roi, scales] -> {scales, nil}
-        [_roi, scales, sizes] -> {scales, sizes}
+        [scales] -> {nil, scales, nil}
+        [roi, scales] -> {roi, scales, nil}
+        [roi, scales, sizes] -> {roi, scales, sizes}
       end
 
     in_shape = Tuple.to_list(Nx.shape(x))
+    rank = length(in_shape)
 
-    scales =
-      if scales != nil and not empty?(scales) and Nx.size(scales) > 0,
-        do: ints!(scales),
-        else: nil
+    axes =
+      node |> attr("axes", Enum.to_list(0..(rank - 1))) |> Enum.map(&normalize_axis(&1, rank))
 
-    sizes =
-      if sizes != nil and not empty?(sizes),
-        do: ints!(sizes),
-        else: Enum.zip_with(in_shape, scales, &floor(&1 * &2))
+    in_sizes = Enum.map(axes, &Enum.at(in_shape, &1))
+    given = &(&1 != nil and not empty?(&1) and Nx.size(&1) > 0)
 
-    scales = scales || Enum.zip_with(sizes, in_shape, &(&1 / &2))
+    {scales, sizes} =
+      if given.(sizes) do
+        sizes = ints!(sizes)
 
-    [in_shape, sizes, scales]
-    |> Enum.zip()
-    |> Enum.with_index()
-    |> Enum.reduce(x, fn
-      {{same, same, _}, _}, acc ->
-        acc
+        case attr(node, "keep_aspect_ratio_policy", "stretch") do
+          "stretch" ->
+            {Enum.zip_with(sizes, in_sizes, &(&1 / &2)), sizes}
 
-      {{in_size, out_size, scale}, axis}, acc ->
-        resize_axis(acc, node, axis, in_size, out_size, scale)
-    end)
+          policy ->
+            ratios = Enum.zip_with(sizes, in_sizes, &(&1 / &2))
+            scale = if policy == "not_larger", do: Enum.min(ratios), else: Enum.max(ratios)
+            {Enum.map(in_sizes, fn _ -> scale end), Enum.map(in_sizes, &round(&1 * scale))}
+        end
+      else
+        scales = ints!(scales)
+        {scales, Enum.zip_with(in_sizes, scales, &floor(&1 * &2))}
+      end
+
+    count = length(axes)
+
+    roi =
+      if given.(roi), do: ints!(roi), else: List.duplicate(0, count) ++ List.duplicate(1, count)
+
+    regions = Enum.zip(Enum.take(roi, count), Enum.drop(roi, count))
+    type = Nx.type(x)
+    x = if Nx.Type.integer?(type), do: Nx.as_type(x, :f32), else: x
+
+    out =
+      [axes, in_sizes, sizes, scales, regions]
+      |> Enum.zip()
+      |> Enum.reduce(x, fn {axis, in_size, out_size, scale, region}, acc ->
+        resize_axis(acc, node, axis, {in_size, out_size, scale, region})
+      end)
+
+    if Nx.Type.integer?(type),
+      do:
+        out
+        |> Nx.clip(Nx.Constants.min_finite(type), Nx.Constants.max_finite(type))
+        |> Nx.as_type(type),
+      else: out
   end
 
   # Upsample maps coordinates like Resize before opset 11: asymmetric, and nearest rounds
@@ -314,70 +343,38 @@ defmodule Transmuter.Ops.NN do
     [out, Nx.slice_along_axis(padded, Nx.axis_size(padded, 2) - (k - 1), k - 1, axis: 2)]
   end
 
-  # 2-D GridSample: bilinear or nearest, zeros or border padding.
+  # GridSample over any number of spatial axes, linear or nearest, as ONNX Runtime does it.
+  # The last axis of the grid lists the coordinates from the last spatial axis (x) to the
+  # first. A coordinate out of bounds moves to the border or reflects into the bounds, and
+  # each corner of the linear interpolation reads zeros, the border or its reflection.
   defp op(node = %{op_type: "GridSample"}, [x, grid]) do
-    {n, c, h, w} = Nx.shape(x)
-    {_, ho, wo, 2} = Nx.shape(grid)
-    align = attr(node, "align_corners", 0) == 1
-    mode = attr(node, "mode", "linear")
     padding = attr(node, "padding_mode", "zeros")
+    axes = grid_coordinates(node, grid, x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2))
+    out = grid |> Nx.shape() |> Tuple.to_list() |> Enum.slice(1, length(axes))
 
-    unnormalize = fn g, size ->
-      if align,
-        do: Nx.multiply(Nx.add(g, 1), (size - 1) / 2),
-        else: Nx.divide(Nx.subtract(Nx.multiply(Nx.add(g, 1), size), 1), 2)
-    end
-
-    gx = unnormalize.(grid[[.., .., .., 0]], w)
-    gy = unnormalize.(grid[[.., .., .., 1]], h)
-
-    {gx, gy} =
-      if padding == "border", do: {Nx.clip(gx, 0, w - 1), Nx.clip(gy, 0, h - 1)}, else: {gx, gy}
-
-    flat = Nx.reshape(x, {n, c, h * w})
-
-    sample = fn xi, yi ->
-      valid =
-        Nx.logical_and(
-          Nx.logical_and(Nx.greater_equal(xi, 0), Nx.less(xi, w)),
-          Nx.logical_and(Nx.greater_equal(yi, 0), Nx.less(yi, h))
-        )
-
-      idx =
-        Nx.add(Nx.multiply(Nx.clip(yi, 0, h - 1), w), Nx.clip(xi, 0, w - 1))
-        |> Nx.as_type(:s32)
-        |> Nx.reshape({n, 1, ho * wo})
-        |> Nx.broadcast({n, c, ho * wo})
-
-      vals = Nx.take_along_axis(flat, idx, axis: 2) |> Nx.reshape({n, c, ho, wo})
-      Nx.multiply(vals, valid |> Nx.new_axis(1) |> Nx.as_type(Nx.type(x)))
-    end
-
-    case mode do
-      m when m in ["linear", "bilinear"] ->
-        x0 = Nx.floor(gx)
-        y0 = Nx.floor(gy)
-        wx = Nx.subtract(gx, x0) |> Nx.new_axis(1)
-        wy = Nx.subtract(gy, y0) |> Nx.new_axis(1)
-        x1 = Nx.add(x0, 1)
-        y1 = Nx.add(y0, 1)
-
-        top =
-          Nx.add(
-            Nx.multiply(sample.(x0, y0), Nx.subtract(1, wx)),
-            Nx.multiply(sample.(x1, y0), wx)
-          )
-
-        bottom =
-          Nx.add(
-            Nx.multiply(sample.(x0, y1), Nx.subtract(1, wx)),
-            Nx.multiply(sample.(x1, y1), wx)
-          )
-
-        Nx.add(Nx.multiply(top, Nx.subtract(1, wy)), Nx.multiply(bottom, wy))
-
+    case attr(node, "mode", "linear") do
       "nearest" ->
-        sample.(Nx.round(gx), Nx.round(gy))
+        grid_pixels(x, axes, padding, out)
+
+      mode when mode in ["linear", "bilinear"] ->
+        corners =
+          Enum.reduce(Enum.reverse(axes), [{[], 1}], fn {coord, size, bounds}, corners ->
+            low = Nx.floor(coord)
+            weight = Nx.subtract(coord, low)
+
+            for {rest, w} <- corners,
+                {i, wi} <- [{low, Nx.subtract(1, weight)}, {Nx.add(low, 1), weight}],
+                do: {[{i, size, bounds} | rest], Nx.multiply(w, wi)}
+          end)
+
+        corners
+        |> Enum.map(fn {corner, w} ->
+          x |> grid_pixels(corner, padding, out) |> Nx.multiply(Nx.new_axis(w, 1))
+        end)
+        |> Enum.reduce(&Nx.add/2)
+
+      mode ->
+        raise ArgumentError, "GridSample mode #{inspect(mode)} is not supported"
     end
   end
 
@@ -684,57 +681,172 @@ defmodule Transmuter.Ops.NN do
     do:
       Nx.add(out, Nx.reshape(b, List.to_tuple([1, :auto] ++ List.duplicate(1, Nx.rank(out) - 2))))
 
+  # {coordinate, size, bounds} for each spatial axis, in input pixels. Nearest rounds the
+  # coordinates. A coordinate out of bounds moves to the border or reflects into the bounds.
+  defp grid_coordinates(node, grid, sizes) do
+    spatial = length(sizes)
+    align = attr(node, "align_corners", 0) == 1
+
+    for {size, i} <- Enum.with_index(sizes) do
+      g = grid |> Nx.slice_along_axis(spatial - 1 - i, 1, axis: -1) |> Nx.squeeze(axes: [-1])
+
+      coord =
+        if align,
+          do: Nx.multiply(Nx.add(g, 1), (size - 1) / 2),
+          else: Nx.divide(Nx.subtract(Nx.multiply(Nx.add(g, 1), size), 1), 2)
+
+      coord =
+        if attr(node, "mode", "linear") == "nearest", do: round_half_even(coord), else: coord
+
+      bounds = {low, high} = if align, do: {0, size - 1}, else: {-0.5, size - 0.5}
+      outside = Nx.logical_or(Nx.less(coord, low), Nx.greater(coord, high))
+
+      coord =
+        case attr(node, "padding_mode", "zeros") do
+          "zeros" -> coord
+          "border" -> Nx.select(outside, Nx.clip(coord, 0, size - 1), coord)
+          "reflection" -> Nx.select(outside, grid_reflect(coord, bounds), coord)
+        end
+
+      {coord, size, bounds}
+    end
+  end
+
+  # The pixels of x at integer coordinates, one per spatial axis. A pixel outside x is
+  # zero, the border pixel, or the reflected pixel.
+  defp grid_pixels(x, corner, padding, out) do
+    [n, c | sizes] = Tuple.to_list(Nx.shape(x))
+
+    {index, valid} =
+      Enum.reduce(corner, {0, 1}, fn {i, size, bounds}, {index, valid} ->
+        i =
+          case padding do
+            "zeros" -> i
+            "border" -> Nx.clip(i, 0, size - 1)
+            "reflection" -> i |> grid_reflect(bounds) |> Nx.as_type(:s32) |> Nx.clip(0, size - 1)
+          end
+
+        inside = Nx.logical_and(Nx.greater_equal(i, 0), Nx.less(i, size))
+        i = i |> Nx.clip(0, size - 1) |> Nx.as_type(:s32)
+        {Nx.add(Nx.multiply(index, size), i), Nx.logical_and(valid, inside)}
+      end)
+
+    index = index |> Nx.reshape({n, 1, :auto}) |> Nx.broadcast({n, c, Enum.product(out)})
+
+    x
+    |> Nx.reshape({n, c, Enum.product(sizes)})
+    |> Nx.take_along_axis(index, axis: 2)
+    |> Nx.reshape(List.to_tuple([n, c | out]))
+    |> Nx.multiply(valid |> Nx.new_axis(1) |> Nx.as_type(Nx.type(x)))
+  end
+
+  # Reflects a coordinate into [low, high], back and forth, as GsReflect of ONNX Runtime.
+  defp grid_reflect(coord, {low, high}) do
+    range = high - low
+    below = Nx.subtract(low, coord)
+    above = Nx.subtract(coord, high)
+    distance = Nx.select(Nx.less(coord, low), below, above)
+    turns = distance |> Nx.divide(range) |> Nx.floor()
+    rest = Nx.subtract(distance, Nx.multiply(turns, range))
+    even = turns |> Nx.remainder(2) |> Nx.equal(0)
+    from_low = Nx.add(low, rest)
+    from_high = Nx.subtract(high, rest)
+
+    reflected =
+      Nx.select(
+        Nx.less(coord, low),
+        Nx.select(even, from_low, from_high),
+        Nx.select(even, from_high, from_low)
+      )
+
+    Nx.select(Nx.logical_or(Nx.less(coord, low), Nx.greater(coord, high)), reflected, coord)
+  end
+
   defp repeat_groups(t, channels) do
     groups = Nx.size(t)
     t |> Nx.new_axis(1) |> Nx.broadcast({groups, div(channels, groups)}) |> Nx.reshape({channels})
   end
 
-  defp resize_axis(x, node, axis, in_size, out_size, scale) do
+  # An output position outside the input with tf_crop_and_resize has no taps and gets the
+  # extrapolation value. As in ONNX Runtime, an axis with scale 1 stays as it is, unless
+  # its roi crops it.
+  defp resize_axis(x, node, axis, {in_size, out_size, scale, region}) do
     ctm = attr(node, "coordinate_transformation_mode", "half_pixel")
 
-    taps =
-      for i <- 0..(out_size - 1),
-          do: resize_taps(node, resize_source(ctm, i, in_size, out_size, scale), in_size, scale)
+    if scale == 1 and ctm != "tf_crop_and_resize" do
+      x
+    else
+      taps =
+        for i <- 0..(out_size - 1) do
+          xo = resize_source(ctm, i, {in_size, out_size, scale, region})
 
+          if ctm == "tf_crop_and_resize" and (xo < 0 or xo > in_size - 1),
+            do: [],
+            else: resize_taps(node, xo, in_size, scale)
+        end
+
+      weighted_taps(x, axis, taps, attr(node, "extrapolation_value", 0.0))
+    end
+  end
+
+  defp weighted_taps(x, axis, taps, outside_value) do
+    out_size = length(taps)
     width = taps |> Enum.map(&length/1) |> Enum.max()
+    outside = Enum.map(taps, &if(&1 == [], do: 1, else: 0))
     taps = Enum.map(taps, &(&1 ++ List.duplicate({0, 0.0}, width - length(&1))))
     indices = taps |> Enum.map(fn row -> Enum.map(row, &elem(&1, 0)) end) |> static_tensor(:s64)
     weights = taps |> Enum.map(fn row -> Enum.map(row, &elem(&1, 1)) end) |> static_tensor(:f32)
+    ones = x |> Nx.shape() |> Tuple.to_list() |> Enum.map(fn _ -> 1 end)
 
-    weight_shape =
-      x
-      |> Nx.shape()
-      |> Tuple.to_list()
-      |> Enum.map(fn _ -> 1 end)
-      |> List.replace_at(axis, out_size)
-      |> List.to_tuple()
+    along_axis =
+      &(&1
+        |> Nx.reshape(List.to_tuple(List.replace_at(ones, axis, out_size)))
+        |> Nx.as_type(Nx.type(x)))
 
-    for k <- 0..(width - 1) do
-      w =
-        weights
-        |> Nx.slice_along_axis(k, 1, axis: 1)
-        |> Nx.reshape(weight_shape)
-        |> Nx.as_type(Nx.type(x))
+    sum =
+      for k <- 0..(width - 1) do
+        x
+        |> Nx.take(indices |> Nx.slice_along_axis(k, 1, axis: 1) |> Nx.reshape({out_size}),
+          axis: axis
+        )
+        |> Nx.multiply(weights |> Nx.slice_along_axis(k, 1, axis: 1) |> along_axis.())
+      end
+      |> Enum.reduce(&Nx.add/2)
 
-      x
-      |> Nx.take(indices |> Nx.slice_along_axis(k, 1, axis: 1) |> Nx.reshape({out_size}),
-        axis: axis
-      )
-      |> Nx.multiply(w)
-    end
-    |> Enum.reduce(&Nx.add/2)
+    if Enum.any?(outside, &(&1 == 1)),
+      do: Nx.add(sum, Nx.multiply(along_axis.(static_tensor(outside, :f32)), outside_value)),
+      else: sum
   end
 
-  defp resize_source("half_pixel", i, _in, _out, scale), do: (i + 0.5) / scale - 0.5
-  defp resize_source("pytorch_half_pixel", _i, _in, 1, _scale), do: 0.0
-  defp resize_source("pytorch_half_pixel", i, _in, _out, scale), do: (i + 0.5) / scale - 0.5
-  defp resize_source("align_corners", _i, _in, 1, _scale), do: 0.0
+  defp resize_source("half_pixel", i, {_in, _out, scale, _region}), do: (i + 0.5) / scale - 0.5
+  defp resize_source("pytorch_half_pixel", _i, {_in, 1, _scale, _region}), do: 0.0
 
-  defp resize_source("align_corners", i, in_size, out_size, _scale),
+  defp resize_source("pytorch_half_pixel", i, {_in, _out, scale, _region}),
+    do: (i + 0.5) / scale - 0.5
+
+  defp resize_source("align_corners", _i, {_in, 1, _scale, _region}), do: 0.0
+
+  defp resize_source("align_corners", i, {in_size, out_size, _scale, _region}),
     do: i * (in_size - 1) / (out_size - 1)
 
-  defp resize_source("asymmetric", i, _in, _out, scale), do: i / scale
-  defp resize_source("tf_half_pixel_for_nn", i, _in, _out, scale), do: (i + 0.5) / scale
+  defp resize_source("asymmetric", i, {_in, _out, scale, _region}), do: i / scale
+
+  defp resize_source("tf_half_pixel_for_nn", i, {_in, _out, scale, _region}),
+    do: (i + 0.5) / scale
+
+  defp resize_source("half_pixel_symmetric", i, {in_size, out_size, scale, _region}) do
+    adjustment = out_size / (in_size * scale)
+    in_size / 2 * (1 - adjustment) + (i + 0.5) / scale - 0.5
+  end
+
+  defp resize_source("tf_crop_and_resize", _i, {in_size, 1, _scale, {start, stop}}),
+    do: 0.5 * (start + stop) * (in_size - 1)
+
+  defp resize_source("tf_crop_and_resize", i, {in_size, out_size, _scale, {start, stop}}),
+    do: start * (in_size - 1) + i * (stop - start) * (in_size - 1) / (out_size - 1)
+
+  defp resize_source(mode, _i, _sizes),
+    do: raise(ArgumentError, "Resize coordinate_transformation_mode #{inspect(mode)} is unknown")
 
   # {input index, weight} pairs that make one output element.
   defp resize_taps(node, xo, in_size, scale) do
