@@ -1,6 +1,6 @@
 defmodule Transmuter.Generation do
   @moduledoc """
-  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2`, `Transmuter.Vision.image_to_text/2` and `Transmuter.Audio.speech_to_text/2` use it.
+  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2`, `Transmuter.Vision.image_to_text/2`, `Transmuter.Vision.image_text_to_text/2` and `Transmuter.Audio.speech_to_text/2` use it.
 
   Generation runs the model in steps. A step takes new tokens and the KV cache, and gives the logits and the next cache. The prompt runs in steps of power-of-two lengths (45 tokens run as 32, 8, 4 and 1), and each new token is a step of length 1, so a small number of compiled shapes covers all prompts.
 
@@ -15,6 +15,12 @@ defmodule Transmuter.Generation do
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
   The token selection applies the logits processors of Python transformers that `generation_config.json` sets: `repetition_penalty`, `suppress_tokens`, `begin_suppress_tokens` (on the first new token), the bad words of one token in `bad_words_ids`, `temperature`, `top_k` and `top_p`.
+
+  ## Embeddings and image features
+
+  The decoder of a vision language model, such as SmolVLM, declares `inputs_embeds` in place of `input_ids`. Its context has the model of the embeddings in `:embed` (`embed_tokens.onnx`) and the id of the image token in `:image_token`. Each step turns its tokens into embeddings with that model, so the steps are the same as for `input_ids`.
+
+  The task gives the features of the images to `generate/5` in `:image_features`. They are the features of the image tokens of all rows, in order, as `masked_scatter` in Python transformers uses them. A row starts at the features after those of the rows before it. In the steps of the prompt, the features replace the embeddings of the image tokens, and a cursor of each row counts the image tokens that the row used. Parts of the prompt without image tokens and the steps of new tokens only embed their tokens.
 
   A task can add one more processor in the `:processor` key of the context, as `{state, process}`. Before each step, `state` takes the new tokens of a row (the last token first) and gives a tensor. `process` takes the logits and that tensor of one row in the compiled selection, after the suppressed tokens and before the temperature, and gives the new logits.
 
@@ -33,7 +39,9 @@ defmodule Transmuter.Generation do
   @min_capacity 256
 
   @doc """
-  Returns the context of generation for `model`: the cache mode and the settings from `generation_config.json` and `opts`. `given` are the names of other inputs that the caller gives to `generate/4`, such as the outputs of an encoder.
+  Returns the context of generation for `model`: the cache mode and the settings from `generation_config.json` and `opts`. `given` are the names of other inputs that the caller gives to `generate/5`, such as the outputs of an encoder.
+
+  A decoder that declares `inputs_embeds` needs two more options. `:embed` is the model that turns token ids into embeddings, such as `embed_tokens.onnx`. `:image_token` is the id of the image token, whose embeddings the image features replace. See the module documentation.
   """
   def context(repo, model, opts, given \\ []) do
     gen = repo.generation_config
@@ -45,7 +53,9 @@ defmodule Transmuter.Generation do
 
     %{
       model: model,
-      mode: mode(model, given),
+      mode: mode(model, given, opts[:embed]),
+      embed: opts[:embed],
+      image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
       max_new_tokens: opts[:max_new_tokens] || gen["max_new_tokens"] || 256,
       sampling?: Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling,
@@ -75,9 +85,14 @@ defmodule Transmuter.Generation do
   defp suppress_tokens(gen),
     do: List.wrap(gen["suppress_tokens"]) ++ for([id] <- List.wrap(gen["bad_words_ids"]), do: id)
 
-  @inputs ~w(input_ids attention_mask position_ids num_logits_to_keep use_cache_branch)
+  @inputs ~w(input_ids inputs_embeds attention_mask position_ids num_logits_to_keep use_cache_branch)
 
-  defp mode(model, given) do
+  defp mode(model, given, embed) do
+    if "inputs_embeds" in model.inputs and embed == nil do
+      raise ArgumentError,
+            "the decoder takes inputs_embeds, so generation needs the model of the embeddings in :embed"
+    end
+
     case model.inputs --
            (@inputs ++
               given ++
@@ -173,6 +188,7 @@ defmodule Transmuter.Generation do
     ctx =
       ctx
       |> Map.put(:run, fn inputs, static -> runs[static].(inputs) end)
+      |> compile_embed(batch_size, defn_options)
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
     settings =
@@ -184,6 +200,40 @@ defmodule Transmuter.Generation do
       Nx.Defn.jit(&select_tokens(&1, &2, &3, &4, &5, &6, &7, settings), defn_options)
     )
     |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
+  end
+
+  # A prompt runs in chunks of each power of two up to 2^30, see chunks/1.
+  @chunk_sizes 31
+
+  defp compile_embed(ctx = %{embed: nil}, _batch_size, _defn_options), do: ctx
+
+  # The embedding model compiles for the shape of each chunk size, and its output gets the
+  # type of inputs_embeds of the decoder. The merge puts the image features in the place of
+  # the image tokens.
+  defp compile_embed(ctx, batch_size, defn_options) do
+    %{embed: model = %{inputs: [input], outputs: [output]}} = ctx
+    {id_type, _dims} = model.input_types[input]
+    {type, _dims} = ctx.model.input_types["inputs_embeds"]
+
+    template =
+      Nx.broadcast(Nx.tensor(0, type: id_type, backend: Nx.BinaryBackend), {batch_size, 1})
+
+    opts = [cache_size: @chunk_sizes + 1] ++ defn_options
+    run = Transmuter.compile(model, %{input => template}, opts)
+
+    embed = fn tokens ->
+      ids = Nx.tensor(tokens, type: id_type, backend: Nx.BinaryBackend)
+      run.(%{input => ids}) |> Map.fetch!(output) |> Nx.as_type(type)
+    end
+
+    %{ctx | embed: embed}
+    |> Map.put(:merge, Nx.Defn.jit(&merge_features/4, defn_options))
+  end
+
+  defp merge_features(embeds, features, index, mask) do
+    picked = features |> Nx.take(index) |> Nx.as_type(Nx.type(embeds))
+    mask = Nx.broadcast(mask, Nx.shape(embeds), axes: [0, 1])
+    Nx.select(mask, picked, embeds)
   end
 
   defp templates(model, names, batch_size) do
@@ -198,15 +248,28 @@ defmodule Transmuter.Generation do
   @doc """
   Generates tokens after each prompt of `prompts` with a context from `compile/3`. A prompt is a list of token ids, and an empty prompt is a padding row. `seeds` has the seed of sampling of each row. `inputs` are the inputs of each step that `context/4` names in `given`, with one row for each prompt.
 
+  `inputs` can also have the key `:image_features`, a tensor of shape `{count, hidden}` with the features of the image tokens of all prompts: the features of the first prompt, in the order of its image tokens, then those of the next prompt. It can have more rows than the prompts have image tokens. It is not an input of the decoder. See the module documentation.
+
   `on_token` is `nil` or a function that receives `%{token: tensor, finished?: tensor}` after each step of a group, with one row for each prompt. `:token` is the new token of the row, or -1 when the row has no new token. `:finished?` is 1 when the row has no more tokens.
 
   Returns the new token ids of each row, without the eos token.
   """
   def generate(ctx, prompts, seeds, inputs \\ %{}, on_token \\ nil) do
+    {features, inputs} = Map.pop(inputs, :image_features)
+
+    # The features of each row start after those of the rows before it.
+    {cursors, _count} =
+      Enum.map_reduce(prompts, 0, &{&2, &2 + Enum.count(&1, fn id -> id == ctx.image_token end)})
+
+    extras = %{features: features, cursors: cursors}
+
     ids =
       for prompts <- groups(ctx, prompts) do
         notify = &notify(on_token, prompts, &1)
-        group = decode(ctx, start(ctx, prompts, seeds, inputs), ctx.max_new_tokens, notify)
+
+        group =
+          decode(ctx, start(ctx, prompts, seeds, inputs, extras), ctx.max_new_tokens, notify)
+
         Enum.map(group.ids, &Enum.reverse/1)
       end
 
@@ -224,8 +287,9 @@ defmodule Transmuter.Generation do
   end
 
   # Runs the prompts in parts of power-of-two lengths. Each prompt fills the parts from the
-  # last one, so the last token of each row is in the last part.
-  defp start(ctx, prompts, seeds, inputs) do
+  # last one, so the last token of each row is in the last part. Only the prompt takes image
+  # features, and the cursors start again for each group.
+  defp start(ctx, prompts, seeds, inputs, extras) do
     longest = prompts |> Enum.map(&length/1) |> Enum.max()
     state = initial_state(ctx, length(prompts), capacity(longest + ctx.max_new_tokens))
     sizes = chunks(longest)
@@ -234,7 +298,9 @@ defmodule Transmuter.Generation do
       prompts
       |> Enum.map(&split_from_end(&1, sizes))
       |> Enum.zip_with(& &1)
-      |> Enum.reduce(%{state | inputs: inputs}, &step(ctx, &2, &1))
+      |> Enum.reduce(Map.merge(state, Map.put(extras, :inputs, inputs)), &step(ctx, &2, &1))
+
+    state = %{state | features: nil}
 
     {rows, _n, vocab} = Nx.shape(state.logits)
     suppressed = mark(none({vocab}), Enum.map(ctx.suppress, &[&1]))
@@ -357,8 +423,16 @@ defmodule Transmuter.Generation do
         {name, Nx.broadcast(zero, {batch_size, heads, rows, head_dim})}
       end)
 
-    lengths = List.duplicate(0, batch_size)
-    %{cache: cache, inputs: %{}, lengths: lengths, capacity: capacity, logits: nil, index: nil}
+    %{
+      cache: cache,
+      inputs: %{},
+      features: nil,
+      cursors: List.duplicate(0, batch_size),
+      lengths: List.duplicate(0, batch_size),
+      capacity: capacity,
+      logits: nil,
+      index: nil
+    }
   end
 
   # Gives each row its tokens of `parts` and padding tokens after them, so that all rows
@@ -370,6 +444,7 @@ defmodule Transmuter.Generation do
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
     keep = n - (counts |> Enum.reject(&(&1 == 0)) |> Enum.min()) + 1
     {inputs, static} = step_inputs(ctx, state, tokens, keep)
+    {inputs, state} = embed(ctx, state, inputs, tokens)
     outputs = ctx.run.(inputs, static)
 
     # Transmuter.run leaves out empty outputs, such as the present of a cache that does not
@@ -405,6 +480,37 @@ defmodule Transmuter.Generation do
         logits: logits,
         index: index
     }
+  end
+
+  # A decoder with inputs_embeds gets the embeddings of the tokens. In a part of the prompt
+  # with image tokens, the features of the images replace their embeddings. The cursor of
+  # a row is the index of the features of its next image token.
+  defp embed(%{embed: nil}, state, inputs, _tokens), do: {inputs, state}
+
+  defp embed(ctx, state, inputs, tokens) do
+    embeds = ctx.embed.(tokens)
+
+    {rows, cursors} =
+      Enum.zip_with(tokens, state.cursors, fn row, cursor ->
+        Enum.map_reduce(row, cursor, fn
+          id, cursor when id == ctx.image_token -> {{cursor, 1}, cursor + 1}
+          _id, cursor -> {{0, 0}, cursor}
+        end)
+      end)
+      |> Enum.unzip()
+
+    embeds =
+      if state.features == nil or cursors == state.cursors do
+        embeds
+      else
+        index = for row <- rows, do: Enum.map(row, &elem(&1, 0))
+        mask = for row <- rows, do: Enum.map(row, &elem(&1, 1))
+        index = Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend)
+        mask = Nx.tensor(mask, type: :u8, backend: Nx.BinaryBackend)
+        ctx.merge.(embeds, state.features, index, mask)
+      end
+
+    {Map.put(inputs, "inputs_embeds", embeds), %{state | cursors: cursors}}
   end
 
   # The rows of each present cache after the buffer are the new rows, and they go into the
