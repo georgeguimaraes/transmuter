@@ -49,13 +49,12 @@ defmodule Transmuter do
       default is `Nx.BinaryBackend`.
 
     * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
-      through every operator. The default is `:f32`, as ONNX Runtime on the CPU,
-      which calculates half-precision graphs in f32. Half-precision weights are
-      converted when the model loads, so they use as much memory as f32 weights.
-      `nil` keeps the types of the graph. In native f16, an export that writes a
-      normalization as separate operators can overflow and give zeros, when
-      `Transmuter.Fusion` does not recognize the normalization. See
-      [Backends and performance](guides/backends_and_performance.md).
+      through every operator. The default is `nil`, which keeps the types of the
+      graph. In native f16 and bf16, sums, normalizations, softmax and attention
+      scores run in f32. `:f32` converts half-precision weights to f32 when the
+      model loads, as ONNX Runtime on the CPU does, and uses as much memory as
+      f32 weights. Use `:f32` when a deep half-precision graph drifts from the
+      f32 result. See [Backends and performance](guides/backends_and_performance.md).
 
     * `:fuse` (`t:boolean/0`) - replaces normalizations and attention cores that
       the graph writes as separate operators with one operator, which runs as a
@@ -93,12 +92,12 @@ defmodule Transmuter do
         backend: EMLX.Backend
       )
 
-  Load a half-precision model and run it in native f16, with half the memory:
+  Load a half-precision model and run it in f32, as ONNX Runtime on the CPU:
 
       model = Transmuter.load!(
         {:hf, "Xenova/bert-base-uncased", "onnx/model_fp16.onnx"},
         backend: EMLX.Backend,
-        compute_type: nil
+        compute_type: :f32
       )
 
   Load a local file:
@@ -137,7 +136,7 @@ defmodule Transmuter do
     initializers = Enum.map(graph.initializer, & &1.name)
     graph_inputs = for i <- graph.input, i.name not in initializers, do: i
     inputs = Enum.map(graph_inputs, & &1.name)
-    compute_type = Keyword.get(opts, :compute_type, :f32)
+    compute_type = Keyword.get(opts, :compute_type)
 
     model = %{
       nodes: toposort(graph.node, inputs ++ initializers),
