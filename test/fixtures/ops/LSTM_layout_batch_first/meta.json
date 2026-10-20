@@ -1,0 +1,58 @@
+{
+ "repo": "op/LSTM_layout_batch_first",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "LSTM": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 1 : FAIL : Exception during initialization: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/provide",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    3
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    1,
+    4
+   ]
+  },
+  {
+   "name": "yh",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    4
+   ]
+  },
+  {
+   "name": "yc",
+   "file": "out_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

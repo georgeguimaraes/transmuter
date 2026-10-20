@@ -16,61 +16,75 @@ defmodule Transmuter.Ops.Signal do
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
   # ONNX LSTM, gates in i, o, f, c order. Outputs Y {S, D, B, H}, Y_h and Y_c {D, B, H}.
+  # The peepholes add P * c to the i, o and f gates, zeros without the P input. With
+  # input_forget, the forget gate is 1 - i.
   defp op(node = %{op_type: "LSTM"}, [x, w, r | rest]) do
     [bias, lengths, h0, c0, peepholes] = Enum.take(rest ++ List.duplicate(nil, 5), 5)
-    nil = peepholes
-    0 = attr(node, "layout", 0)
-    [f, g, h] = activations(node, ["Sigmoid", "Tanh", "Tanh"])
+    hidden = attr(node, "hidden_size")
+    coupled? = attr(node, "input_forget", 0) == 1
 
-    step = fn x_gates, r, rb, {h_prev, c_prev} ->
-      gates = x_gates |> Nx.add(Nx.dot(h_prev, [1], r, [1])) |> Nx.add(rb)
-      [i, o, fg, c] = chunks(gates, 4)
-      c_new = Nx.add(Nx.multiply(f.(fg), c_prev), Nx.multiply(f.(i), g.(c)))
-      {Nx.multiply(f.(o), h.(c_new)), c_new}
+    peepholes =
+      peepholes || Nx.broadcast(Nx.tensor(0, type: Nx.type(x)), {Nx.axis_size(w, 0), 3 * hidden})
+
+    step = fn [f, g, h] ->
+      fn x_gates, {r, rb, p}, {h_prev, c_prev} ->
+        gates = x_gates |> Nx.add(Nx.dot(h_prev, [1], r, [1])) |> Nx.add(rb)
+        [i, o, fg, c] = chunks(gates, 4)
+        [pi, po, pf] = chunks(p, 3)
+        i = f.(Nx.add(i, Nx.multiply(pi, c_prev)))
+        fg = if coupled?, do: Nx.subtract(1, i), else: f.(Nx.add(fg, Nx.multiply(pf, c_prev)))
+        c_new = Nx.add(Nx.multiply(fg, c_prev), Nx.multiply(i, g.(c)))
+        o = f.(Nx.add(o, Nx.multiply(po, c_new)))
+        {Nx.multiply(o, h.(c_new)), c_new}
+      end
     end
 
-    {y, finals} = recur(node, x, {w, r, bias}, lengths, [h0, c0], step)
-    [y | finals]
+    recur(
+      node,
+      x,
+      {w, r, bias, peepholes},
+      lengths,
+      [h0, c0],
+      {["Sigmoid", "Tanh", "Tanh"], step}
+    )
   end
 
   # ONNX GRU, gates in z, r, h order.
   defp op(node = %{op_type: "GRU"}, [x, w, r | rest]) do
     [bias, lengths, h0] = Enum.take(rest ++ List.duplicate(nil, 3), 3)
-    0 = attr(node, "layout", 0)
-    [f, g] = activations(node, ["Sigmoid", "Tanh"])
     before_reset? = attr(node, "linear_before_reset", 0) == 1
 
-    step = fn x_gates, r, rb, {h_prev} ->
-      [xz, xr, xh] = chunks(x_gates, 3)
-      [rz, rr, rh] = chunks(r, 3, 0)
-      [bz, br, bh] = chunks(rb, 3)
-      z = f.(xz |> Nx.add(Nx.dot(h_prev, [1], rz, [1])) |> Nx.add(bz))
-      reset = f.(xr |> Nx.add(Nx.dot(h_prev, [1], rr, [1])) |> Nx.add(br))
+    step = fn [f, g] ->
+      fn x_gates, {r, rb, _}, {h_prev} ->
+        [xz, xr, xh] = chunks(x_gates, 3)
+        [rz, rr, rh] = chunks(r, 3, 0)
+        [bz, br, bh] = chunks(rb, 3)
+        z = f.(xz |> Nx.add(Nx.dot(h_prev, [1], rz, [1])) |> Nx.add(bz))
+        reset = f.(xr |> Nx.add(Nx.dot(h_prev, [1], rr, [1])) |> Nx.add(br))
 
-      candidate =
-        if before_reset?,
-          do: g.(Nx.add(xh, Nx.multiply(reset, Nx.add(Nx.dot(h_prev, [1], rh, [1]), bh)))),
-          else: g.(xh |> Nx.add(Nx.dot(Nx.multiply(reset, h_prev), [1], rh, [1])) |> Nx.add(bh))
+        candidate =
+          if before_reset?,
+            do: g.(Nx.add(xh, Nx.multiply(reset, Nx.add(Nx.dot(h_prev, [1], rh, [1]), bh)))),
+            else: g.(xh |> Nx.add(Nx.dot(Nx.multiply(reset, h_prev), [1], rh, [1])) |> Nx.add(bh))
 
-      {Nx.add(Nx.multiply(Nx.subtract(1, z), candidate), Nx.multiply(z, h_prev))}
+        {Nx.add(Nx.multiply(Nx.subtract(1, z), candidate), Nx.multiply(z, h_prev))}
+      end
     end
 
-    {y, finals} = recur(node, x, {w, r, bias}, lengths, [h0], step)
-    [y | finals]
+    recur(node, x, {w, r, bias, nil}, lengths, [h0], {["Sigmoid", "Tanh"], step})
   end
 
   # ONNX RNN: one gate, h = f(x W + h R + Wb + Rb).
   defp op(node = %{op_type: "RNN"}, [x, w, r | rest]) do
     [bias, lengths, h0] = Enum.take(rest ++ List.duplicate(nil, 3), 3)
-    0 = attr(node, "layout", 0)
-    [f] = activations(node, ["Tanh"])
 
-    step = fn x_gates, r, rb, {h_prev} ->
-      {f.(x_gates |> Nx.add(Nx.dot(h_prev, [1], r, [1])) |> Nx.add(rb))}
+    step = fn [f] ->
+      fn x_gates, {r, rb, _}, {h_prev} ->
+        {f.(x_gates |> Nx.add(Nx.dot(h_prev, [1], r, [1])) |> Nx.add(rb))}
+      end
     end
 
-    {y, finals} = recur(node, x, {w, r, bias}, lengths, [h0], step)
-    [y | finals]
+    recur(node, x, {w, r, bias, nil}, lengths, [h0], {["Tanh"], step})
   end
 
   defp op(node = %{op_type: window}, [size])
@@ -169,33 +183,48 @@ defmodule Transmuter.Ops.Signal do
     dft(framed, 2, size, bins, false)
   end
 
-  # Runs one or two directions and stacks them. step.(x_gates, r, r_bias, state) -> state.
-  defp recur(node, x, {w, r, bias}, lengths, initial, step) do
+  # Runs one or two directions and stacks them. step.(activations) gives the step of a
+  # direction, step.(x_gates, {r, r_bias, extra}, state) -> state, where extra is the
+  # direction's row of the extra weights (the LSTM peepholes). With layout 1, the batch
+  # axis comes first in x, the initial states and the outputs.
+  defp recur(node, x, {w, r, bias, extra}, lengths, initial, {defaults, step}) do
+    batch_first? = attr(node, "layout", 0) == 1
+    x = if batch_first?, do: Nx.transpose(x, axes: [1, 0, 2]), else: x
+    initial = if batch_first?, do: Enum.map(initial, &swap_leading/1), else: initial
     {_seq, batch, _} = Nx.shape(x)
     hidden = attr(node, "hidden_size")
     gates = div(Nx.axis_size(w, 1), hidden)
     directions = Nx.axis_size(w, 0)
     reverse = attr(node, "direction", "forward") == "reverse"
+    activations = activations(node, defaults, directions)
 
     results =
       for d <- 0..(directions - 1) do
         wd = w[d]
         rd = r[d]
         {wb, rb} = split_bias(bias, d, gates * hidden, Nx.type(x))
+        extra_d = if extra, do: extra[d], else: Nx.tensor(0, type: Nx.type(x))
         x_gates = x |> Nx.dot([2], wd, [1]) |> Nx.add(wb)
 
         state =
           initial |> Enum.map(&initial_state(&1, d, batch, hidden, Nx.type(x))) |> List.to_tuple()
 
         backward? = reverse or d == 1
-        {y, state} = steps(x_gates, {rd, rb}, state, lengths, backward?, step)
+        step_d = step.(Enum.at(activations, d))
+        {y, state} = steps(x_gates, {rd, rb, extra_d}, state, lengths, backward?, step_d)
         {y, Tuple.to_list(state)}
       end
 
     y = results |> Enum.map(&elem(&1, 0)) |> Nx.stack(axis: 1)
     finals = results |> Enum.map(&elem(&1, 1)) |> Enum.zip_with(&Nx.stack/1)
-    {y, finals}
+
+    if batch_first?,
+      do: [Nx.transpose(y, axes: [2, 0, 1, 3]) | Enum.map(finals, &swap_leading/1)],
+      else: [y | finals]
   end
+
+  defp swap_leading(nil), do: nil
+  defp swap_leading(t), do: Nx.transpose(t, axes: [1, 0, 2])
 
   # Sequences shorter than sequence_lens keep their state and output zeros.
   # A traced sequence longer than this runs as an Nx while loop. An unrolled loop makes
@@ -211,13 +240,13 @@ defmodule Transmuter.Ops.Signal do
       else: unrolled_steps(x_gates, weights, state, lengths, backward?, step)
   end
 
-  defp unrolled_steps(x_gates, {r, rb}, state, lengths, backward?, step) do
+  defp unrolled_steps(x_gates, weights, state, lengths, backward?, step) do
     seq = Nx.axis_size(x_gates, 0)
     order = if backward?, do: (seq - 1)..0//-1, else: 0..(seq - 1)
 
     {outputs, state} =
       Enum.map_reduce(order, state, fn t, state ->
-        next = step.(x_gates[t], r, rb, state)
+        next = step.(x_gates[t], weights, state)
         next = keep_finished(next, state, lengths, t)
         {{t, mask_output(elem(next, 0), lengths, t)}, next}
       end)
@@ -229,18 +258,18 @@ defmodule Transmuter.Ops.Signal do
   # The loop state carries every tensor that the steps read, because a while body
   # cannot read tensors from outside the loop. Each iteration unrolls a block of
   # steps, so the loop runs fewer times and the graph stays small.
-  defp while_steps(x_gates, {r, rb}, state, lengths, backward?, step) do
+  defp while_steps(x_gates, weights, state, lengths, backward?, step) do
     seq = Nx.axis_size(x_gates, 0)
     h_shape = state |> elem(0) |> Nx.shape()
     y = Nx.broadcast(Nx.tensor(0, type: Nx.type(x_gates)), Tuple.insert_at(h_shape, 0, seq))
 
-    initial = %{state: state, y: y, x: x_gates, r: r, rb: rb}
+    initial = %{state: state, y: y, x: x_gates, weights: weights}
     initial = if lengths, do: Map.put(initial, :lengths, lengths), else: initial
 
     body = fn :body, {i, acc = %{state: state}} ->
       t = if backward?, do: Nx.subtract(seq - 1, i), else: i
       lengths = acc[:lengths]
-      next = step.(Nx.take(acc.x, t), acc.r, acc.rb, state)
+      next = step.(Nx.take(acc.x, t), acc.weights, state)
       next = keep_finished(next, state, lengths, t)
       h = mask_output(elem(next, 0), lengths, t)
       %{acc | state: next, y: Nx.put_slice(acc.y, [t, 0, 0], Nx.new_axis(h, 0))}
@@ -289,15 +318,77 @@ defmodule Transmuter.Ops.Signal do
     for i <- 0..(n - 1), do: Nx.slice_along_axis(t, i * size, size, axis: axis)
   end
 
-  defp activations(node, defaults) do
-    names = node |> attr("activations", defaults) |> Enum.take(length(defaults))
+  # The activations of each direction. The activations that have an alpha or a beta take
+  # the next value of activation_alpha or activation_beta, in order, as in ONNX Runtime.
+  # clip bounds the input of every activation.
+  defp activations(node, defaults, directions) do
+    names = attr(node, "activations", List.flatten(List.duplicate(defaults, directions)))
+    clip = attr(node, "clip")
 
-    Enum.map(names, fn
-      "Sigmoid" -> &Nx.sigmoid/1
-      "Tanh" -> &Nx.tanh/1
-      "Relu" -> &Nx.max(&1, 0)
-    end)
+    {funs, _rest} =
+      Enum.map_reduce(
+        names,
+        {attr(node, "activation_alpha", []), attr(node, "activation_beta", [])},
+        &activation/2
+      )
+
+    funs = if clip, do: Enum.map(funs, fn f -> &f.(Nx.clip(&1, -clip, clip)) end), else: funs
+    Enum.chunk_every(funs, length(defaults))
   end
+
+  @activations %{
+    "Relu" => {nil, nil},
+    "Tanh" => {nil, nil},
+    "Sigmoid" => {nil, nil},
+    "Softsign" => {nil, nil},
+    "Softplus" => {nil, nil},
+    "Affine" => {1.0, 0.0},
+    "LeakyRelu" => {0.01, nil},
+    "ThresholdedRelu" => {1.0, nil},
+    "ScaledTanh" => {1.0, 1.0},
+    "HardSigmoid" => {0.2, 0.5},
+    "Elu" => {1.0, nil}
+  }
+
+  defp activation(name, {alphas, betas}) do
+    {alpha_default, beta_default} =
+      Map.get_lazy(@activations, name, fn ->
+        raise ArgumentError, "recurrent activation #{inspect(name)} is not supported"
+      end)
+
+    {alpha, alphas} = take_param(alpha_default, alphas)
+    {beta, betas} = take_param(beta_default, betas)
+    {activation(name, alpha, beta), {alphas, betas}}
+  end
+
+  defp take_param(nil, values), do: {nil, values}
+  defp take_param(default, []), do: {default, []}
+  defp take_param(_default, [value | rest]), do: {value, rest}
+
+  defp activation("Relu", _, _), do: &Nx.max(&1, 0)
+  defp activation("Tanh", _, _), do: &Nx.tanh/1
+  defp activation("Sigmoid", _, _), do: &Nx.sigmoid/1
+  defp activation("Softsign", _, _), do: &Nx.divide(&1, Nx.add(1, Nx.abs(&1)))
+
+  defp activation("Softplus", _, _),
+    do: &Nx.add(Nx.max(&1, 0), Nx.log1p(Nx.exp(Nx.negate(Nx.abs(&1)))))
+
+  defp activation("Affine", alpha, beta), do: &Nx.add(Nx.multiply(&1, alpha), beta)
+
+  defp activation("LeakyRelu", alpha, _),
+    do: &Nx.select(Nx.less(&1, 0), Nx.multiply(&1, alpha), &1)
+
+  defp activation("ThresholdedRelu", alpha, _),
+    do: &Nx.select(Nx.greater(&1, alpha), &1, Nx.tensor(0, type: Nx.type(&1)))
+
+  defp activation("ScaledTanh", alpha, beta),
+    do: &Nx.multiply(alpha, Nx.tanh(Nx.multiply(&1, beta)))
+
+  defp activation("HardSigmoid", alpha, beta),
+    do: &(&1 |> Nx.multiply(alpha) |> Nx.add(beta) |> Nx.clip(0, 1))
+
+  defp activation("Elu", alpha, _),
+    do: &Nx.select(Nx.less(&1, 0), Nx.multiply(alpha, Nx.subtract(Nx.exp(&1), 1)), &1)
 
   # Real and imaginary parts {..., n} along axis times n x bins DFT matrices.
   # Frame f holds samples f * step .. f * step + size - 1 of a {B, L, C} signal. The

@@ -1233,3 +1233,28 @@ case("BatchNormalization", [node("BatchNormalization", ["x", "s", "b", "m", "v"]
      {"x": r.standard_normal((2, 3, 5)).astype(np.float32)},
      {"s": r.standard_normal(3).astype(np.float32), "b": r.standard_normal(3).astype(np.float32),
       "m": r.standard_normal(3).astype(np.float32), "v": r.random(3).astype(np.float32) + 0.5})
+
+# ---------- recurrent attributes ----------
+
+r = rng_for("recurrent attributes")
+rf = lambda *shape, scale=0.5: (r.standard_normal(shape) * scale).astype(np.float32)
+T, B, In, Hs = 5, 2, 3, 4
+case("LSTM_clip_input_forget_peepholes",
+     [node("LSTM", ["x", "w", "r", "b", "", "", "", "p"], ["y", "yh", "yc"], hidden_size=Hs, clip=0.8, input_forget=1)],
+     {"x": rf(T, B, In, scale=2.0)}, {"w": rf(1, 4 * Hs, In), "r": rf(1, 4 * Hs, Hs), "b": rf(1, 8 * Hs), "p": rf(1, 3 * Hs)})
+case("LSTM_activations_alpha_beta",
+     [node("LSTM", ["x", "w", "r"], ["y", "yh", "yc"], hidden_size=Hs, activations=["Sigmoid", "LeakyRelu", "ScaledTanh"],
+           activation_alpha=[0.2, 0.9], activation_beta=[1.1])],
+     {"x": rf(T, B, In, scale=2.0)}, {"w": rf(1, 4 * Hs, In), "r": rf(1, 4 * Hs, Hs)})
+case("GRU_bidirectional_activations_clip",
+     [node("GRU", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=Hs, direction="bidirectional", clip=1.5,
+           activations=["HardSigmoid", "Softsign", "Sigmoid", "Tanh"], activation_alpha=[0.3], activation_beta=[0.6])],
+     {"x": rf(T, B, In, scale=2.0)}, {"w": rf(2, 3 * Hs, In), "r": rf(2, 3 * Hs, Hs), "b": rf(2, 6 * Hs)})
+case("RNN_bidirectional_affine_elu",
+     [node("RNN", ["x", "w", "r"], ["y", "yh"], hidden_size=Hs, direction="bidirectional", activations=["Affine", "Elu"],
+           activation_alpha=[0.5, 0.7], activation_beta=[0.1])],
+     {"x": rf(T, B, In, scale=2.0)}, {"w": rf(2, Hs, In), "r": rf(2, Hs, Hs)})
+case("RNN_layout_batch_first", [node("RNN", ["x", "w", "r", "", "", "h0"], ["y", "yh"], hidden_size=Hs, layout=1)],
+     {"x": rf(B, T, In), "h0": rf(B, 1, Hs)}, {"w": rf(1, Hs, In), "r": rf(1, Hs, Hs)})
+case("LSTM_layout_batch_first", [node("LSTM", ["x", "w", "r"], ["y", "yh", "yc"], hidden_size=Hs, layout=1, direction="reverse")],
+     {"x": rf(B, T, In)}, {"w": rf(1, 4 * Hs, In), "r": rf(1, 4 * Hs, Hs)})
