@@ -32,11 +32,7 @@ defmodule Transmuter.MixProject do
       {:emlx, "~> 0.5", optional: true},
       {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", optional: true},
-      {:minijinja_ex,
-       github: "georgeguimaraes/minijinja_ex",
-       branch: "feat/chat-template-compat",
-       only: [:dev, :test]},
-      {:rustler, "~> 0.36", only: [:dev, :test], runtime: false},
+      {:otera, "~> 0.1", optional: true},
       {:polaris, "~> 0.1", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}

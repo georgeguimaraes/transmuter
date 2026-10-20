@@ -96,7 +96,7 @@ def deps do
 end
 ```
 
-Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. To read image files for the `Transmuter.Vision` servings, add `{:stb_image, "~> 1.0"}`. Chat templates need `minijinja_ex` with its Hugging Face compatibility, which is not released yet: add `{:minijinja_ex, github: "georgeguimaraes/minijinja_ex", branch: "feat/chat-template-compat"}` and set `MINIJINJA_EX_BUILD=1` to build it.
+Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. To read image files for the `Transmuter.Vision` servings, add `{:stb_image, "~> 1.0"}`. Chat templates need `{:otera, "~> 0.1"}`, which renders Jinja templates in pure Elixir.
 
 ## Compilation and graph breaks
 

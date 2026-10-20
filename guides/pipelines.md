@@ -16,10 +16,7 @@ def deps do
 end
 ```
 
-Chat templates need `minijinja_ex` with its Hugging Face compatibility. This version is not released yet. To use it, do these steps:
-
-1. Add `{:minijinja_ex, github: "georgeguimaraes/minijinja_ex", branch: "feat/chat-template-compat"}` to your deps.
-2. Set `MINIJINJA_EX_BUILD=1` when you compile the dependencies. This builds the NIF from source, so you need a Rust compiler.
+Chat templates need `{:otera, "~> 0.1"}`. [Otera](https://hex.pm/packages/otera) renders Jinja templates in pure Elixir, with the same output as `apply_chat_template` of Python transformers.
 
 The examples in this guide do not show the backend options. Without them, the model runs on `Nx.BinaryBackend`, which is very slow. Add `backend: EMLX.Backend, defn_options: [compiler: EMLX]` on Apple silicon, or the EXLA options on other machines. See [Backends and performance](backends_and_performance.md).
 
