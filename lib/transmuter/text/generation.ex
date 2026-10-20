@@ -25,26 +25,36 @@ defmodule Transmuter.Text.Generation do
         :repetition_penalty,
         :seed,
         :template_options,
+        compile: [],
         defn_options: []
       ])
 
+    Keyword.validate!(opts[:compile], [:batch_size])
     {repo, model, tokenizer} = Serving.load!(source, opts, :q4, ["model", "decoder_model_merged"])
     ctx = Generation.context(repo, model, opts)
+    bos = ctx.bos
 
     preprocess = fn input ->
       {text, special?} = prompt(repo, input, opts)
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
-      ids = token_ids(tokenizer, text, special?, ctx.bos)
-      [%{"prompt" => Nx.tensor(ids, type: :s64), "seed" => Nx.tensor(seed, type: :s64)}]
+      ids = token_ids(tokenizer, text, special?, bos)
+      summary = %{input: length(ids), padding: 0}
+      [%{prompt: ids, seed: seed, tensors: %{}, summary: summary}]
     end
 
-    postprocess = fn [ids], [%{"prompt" => prompt}] ->
-      summary = %{input: Nx.size(prompt), output: length(ids), padding: 0}
+    postprocess = fn [ids], [run] ->
+      summary = Map.put(run.summary, :output, length(ids))
       %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
     end
 
-    no_inputs = fn _defn_options -> fn _inputs, generate -> generate.(%{}) end end
-    Serving.generation(ctx, no_inputs, &validate/1, preprocess, postprocess, opts[:defn_options])
+    task = %{
+      validate: &validate/1,
+      preprocess: preprocess,
+      init: fn _defn_options -> fn _tensors, prompts, generate -> generate.(%{}, prompts) end end,
+      postprocess: postprocess
+    }
+
+    Serving.generation(ctx, task, opts)
   end
 
   # A chat goes through the chat template, which adds the special tokens itself.

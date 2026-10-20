@@ -4,7 +4,7 @@ defmodule Transmuter.Serving do
 
   `text/7` and `image/6` build the servings that run the model once. The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
 
-  `generation/6` builds the servings that generate tokens with `Transmuter.Generation`, one input at a time.
+  `generation/3` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop.
   """
 
   alias Transmuter.{Featurizer, Generation, Repo, Tokenizer}
@@ -15,6 +15,14 @@ defmodule Transmuter.Serving do
   # generation allocates more than that, so the heap grows through many collections. A
   # heap of 2 MB (in 8-byte words) from the start removes them.
   @generation_heap_size 262_144
+
+  # A step reads its compiled segments from the cache table of Transmuter.GraphBreaks, and
+  # each read references the binary of the graph again. The references count in the binary
+  # heap of the process, but they use no new memory. With a small binary heap, the collector
+  # moves these references between the young and the old heap, and it sweeps the whole heap
+  # again and again. A binary heap of 256 MB (in 8-byte words) from the start removes these
+  # sweeps.
+  @generation_bin_vheap_size 33_554_432
 
   @doc """
   The options that all text tasks take. See `Transmuter.Text`.
@@ -201,57 +209,131 @@ defmodule Transmuter.Serving do
     {repo, encoder, decoder}
   end
 
+  # The prompts of a batch have one width, so prompts of up to 4096 tokens go into one
+  # batch. Longer prompts go into batches with prompts of the same power-of-two width.
+  @prompt_widths for exponent <- 12..20, do: 2 ** exponent
+
   @doc """
-  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`.
+  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`. The rows of a batch generate together.
 
-  `validate` takes one input and returns `{:ok, input}` or `{:error, message}`. `preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map of `Nx.BinaryBackend` tensors without a batch axis: the prompt of the decoder in `"prompt"`, the seed of sampling in `"seed"`, and other tensors for `init`. Each run is one batch.
+  `task` is a map:
 
-  `init` takes the defn options and returns a function. The serving calls `init` in its process, so it can compile models there. The function takes the map of a run with a batch axis, without the prompt and the seed, and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, one or more times, and returns the token ids of the run.
+    * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
-  `postprocess` takes the list of the token ids of each run and the list of runs from `preprocess`, and returns the result.
+    * `:preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, and a batch key in `:key`. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
-  The serving streams the batches, so the token ids of each run can have any length.
+    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. The function returns the token ids of each row.
+
+    * `:postprocess` takes the list of the token ids of each run and the list of runs from `:preprocess`, and returns the result.
+
+    * `:keys` lists the keys of the runs. The default is `[nil]`.
+
+  `opts` are the options of the task. The serving reads `:batch_size` of `:compile` and `:defn_options`.
   """
-  def generation(ctx, init, validate, preprocess, postprocess, defn_options) do
+  def generation(ctx, task, opts) do
+    batch_size = Keyword.get(opts[:compile] || [], :batch_size, 1)
+    keys = for key <- Map.get(task, :keys, [nil]), width <- @prompt_widths, do: {key, width}
+    # The closures of the serving copy what they reference, so each one takes only its
+    # function of the task.
+    %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess} = task
+
+    # One function runs the batches of all keys.
     Nx.Serving.new(
-      fn _key, defn_options ->
+      fn defn_options ->
+        defn_options = Keyword.delete(defn_options, :batch_keys)
         run = init.(defn_options)
-        ctx = Generation.compile(ctx, defn_options)
+        backend = Nx.Defn.to_backend(defn_options)
+        ctx = Generation.compile(ctx, batch_size, defn_options)
 
         fn batch ->
           Process.flag(:min_heap_size, @generation_heap_size)
+          Process.flag(:min_bin_vheap_size, @generation_bin_vheap_size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-          {%{"prompt" => prompt, "seed" => seed}, rest} = Map.split(inputs, ["prompt", "seed"])
-          ids = Nx.to_flat_list(prompt)
-          generated = run.(rest, &Generation.generate(ctx, ids, Nx.to_number(seed[0]), &1))
+          {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed"])
+
+          # Padding rows have no prompt. Nx.Batch.pad pads on the host, which is slow for
+          # large rows such as audio, so the tensors of the task get their padding rows on
+          # the device.
+          padding = batch_size - batch.size
+
+          prompts =
+            Enum.zip_with(Nx.to_list(rows["prompt"]), Nx.to_list(rows["length"]), &Enum.take/2)
+
+          prompts = prompts ++ List.duplicate([], padding)
+          seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
+
+          tensors =
+            Map.new(tensors, fn {name, tensor} -> {name, pad_rows(tensor, padding, backend)} end)
+
+          generated = run.(tensors, prompts, &Generation.generate(ctx, &2, seeds, &1))
+          lengths = Enum.map(generated, &length/1)
 
           # A trailing zero, because Nx has no tensors of length 0.
+          width = Enum.max(lengths) + 1
+          ids = for ids <- generated, do: ids ++ List.duplicate(0, width - length(ids))
+
           %{
-            ids: Nx.tensor([generated ++ [0]], type: :s64, backend: Nx.BinaryBackend),
-            length: Nx.tensor([length(generated)], backend: Nx.BinaryBackend)
+            ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
+            length: Nx.tensor(lengths, backend: Nx.BinaryBackend)
           }
         end
       end,
-      defn_options
+      opts[:defn_options]
     )
-    |> Nx.Serving.batch_size(1)
+    |> Nx.Serving.batch_size(batch_size)
+    |> Nx.Serving.process_options(batch_keys: keys)
     |> Nx.Serving.streaming()
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
-      prepared = Enum.map(inputs, preprocess)
-      {prepared |> Enum.concat() |> Enum.map(&Nx.Batch.stack([&1])), {multi?, prepared}}
+
+      runs = Enum.map(inputs, preprocess)
+
+      batches =
+        runs
+        |> Enum.concat()
+        |> Enum.map(&generation_row/1)
+        |> Enum.chunk_by(&elem(&1, 0))
+        |> Enum.flat_map(&Enum.chunk_every(&1, batch_size))
+        |> Enum.map(fn rows = [{key, _row} | _] ->
+          rows |> Enum.map(&elem(&1, 1)) |> Nx.Batch.stack() |> Nx.Batch.key(key)
+        end)
+
+      {batches, {multi?, runs}}
     end)
-    |> Nx.Serving.client_postprocessing(fn stream, {multi?, prepared} ->
+    |> Nx.Serving.client_postprocessing(fn stream, {multi?, runs} ->
       results =
         stream
-        |> Enum.map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
-          ids |> Nx.to_flat_list() |> Enum.take(Nx.to_number(length[0]))
+        |> Enum.flat_map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
+          Enum.zip_with(Nx.to_list(ids), Nx.to_list(length), &Enum.take/2)
         end)
-        |> split_like(prepared)
-        |> Enum.zip_with(prepared, postprocess)
+        |> split_like(runs)
+        |> Enum.zip_with(runs, postprocess)
 
       if multi?, do: results, else: hd(results)
     end)
+  end
+
+  defp pad_rows(tensor, padding, backend) do
+    [_batch | axes] = List.duplicate({0, 0, 0}, Nx.rank(tensor))
+    tensor |> Nx.backend_transfer(backend) |> Nx.pad(0, [{0, padding, 0} | axes])
+  end
+
+  defp generation_row(run) do
+    width =
+      Enum.find(@prompt_widths, &(&1 >= length(run.prompt))) ||
+        raise ArgumentError,
+              "the prompt has #{length(run.prompt)} tokens, and generation takes up to #{List.last(@prompt_widths)}"
+
+    prompt = run.prompt ++ List.duplicate(0, width - length(run.prompt))
+
+    row =
+      Map.merge(run.tensors, %{
+        "prompt" => Nx.tensor(prompt, type: :s64, backend: Nx.BinaryBackend),
+        "length" => Nx.tensor(length(run.prompt), type: :s64, backend: Nx.BinaryBackend),
+        "seed" => Nx.tensor(run.seed, type: :s64, backend: Nx.BinaryBackend)
+      })
+
+    {{Map.get(run, :key), width}, row}
   end
 
   @doc """

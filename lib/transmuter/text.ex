@@ -12,7 +12,7 @@ defmodule Transmuter.Text do
 
   All tasks take these options:
 
-    * `:compile` - `:batch_size` (the default is `1`) and `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the longest input of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated.
+    * `:compile` - `:batch_size` (the default is `1`) and `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the longest input of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. `generation/2` uses only `:batch_size`.
 
     * `:defn_options` - options of `Transmuter.compile/3`, such as `compiler: EMLX`.
 
@@ -161,7 +161,19 @@ defmodule Transmuter.Text do
 
     * `:template_options` - other variables of the chat template, such as `enable_thinking: false` for Qwen3.
 
-  `:compile` does not apply to generation, which runs one input at a time. The other options are those of the module documentation.
+    * `:compile` - `:batch_size`, the number of inputs that generate together. The default is `1`. The serving does not use `:sequence_length`, because it does not pad or truncate the prompt.
+
+  The other options are those of the module documentation.
+
+  ## Batches
+
+  With `compile: [batch_size: 4]`, the serving runs up to 4 inputs in one loop. The inputs come from a list, or from concurrent calls to `Nx.Serving.batched_run/2`. The prompts can have different lengths. Each row stops at its own eos token. When a batch has fewer inputs, padding rows fill it. A larger batch gives more tokens per second in total, but each input gets its tokens more slowly.
+
+  Each row samples with its own key from its seed, so the random numbers of a row do not depend on the batch. With greedy selection, and with sampling from a seed, an input gives the same text in a batch as alone. A batch can change the rounding of the logits, so in rare cases a token can be different.
+
+  `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A merged decoder without `position_ids`, such as `Xenova/gpt2` or Gemma 3, runs the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length.
+
+  Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
   """
   defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
 
@@ -178,9 +190,9 @@ defmodule Transmuter.Text do
 
   ## Options
 
-    * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits.
+    * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits. `:batch_size` is the number of inputs that generate together, as in `generation/2`. Inputs of the same sequence length go into one batch.
 
-    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty` and `:seed` - as in `generation/2`.
+    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, and `:seed` - as in `generation/2`.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

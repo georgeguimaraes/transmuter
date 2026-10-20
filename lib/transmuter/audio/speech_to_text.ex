@@ -46,8 +46,11 @@ defmodule Transmuter.Audio.SpeechToText do
         :context_num_seconds,
         :timestamps,
         task: :transcribe,
+        compile: [],
         defn_options: []
       ])
+
+    compile = Keyword.validate!(opts[:compile], batch_size: 1)
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
     gen = repo.generation_config
@@ -73,7 +76,7 @@ defmodule Transmuter.Audio.SpeechToText do
 
     init = fn defn_options ->
       features = Nx.Defn.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
-      shape = {1, featurizer.feature_size, settings.frames}
+      shape = {compile[:batch_size], featurizer.feature_size, settings.frames}
       template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
       encode = Transmuter.compile(encoder, %{input => template}, defn_options)
 
@@ -82,9 +85,10 @@ defmodule Transmuter.Audio.SpeechToText do
         %{"encoder_hidden_states" => hidden}
       end
 
-      fn %{"audio" => audio}, generate ->
+      fn %{"audio" => audio}, prompts, generate ->
         features = features.(audio, featurizer.filters, featurizer.window)
-        transcribe(features, 0, settings, &generate.(encode.(&1)))
+        seeks = Enum.map(prompts, fn _ -> 0 end)
+        transcribe(features, prompts, seeks, settings, &generate.(encode.(&1), &2))
       end
     end
 
@@ -94,19 +98,15 @@ defmodule Transmuter.Audio.SpeechToText do
       for {start, stride = {size, _left, _right}} <- windows(Nx.size(audio), settings) do
         padding = featurizer.n_samples - size
 
-        %{
-          "audio" => audio |> Nx.slice([start], [size]) |> Nx.pad(0.0, [{0, padding, 0}]),
-          "stride" => Nx.tensor(Tuple.to_list(stride), type: :s64),
-          "prompt" => Nx.tensor(prompt, type: :s64),
-          "seed" => Nx.tensor(seed, type: :s64)
-        }
+        audio = audio |> Nx.slice([start], [size]) |> Nx.pad(0.0, [{0, padding, 0}])
+        %{prompt: prompt, seed: seed, tensors: %{"audio" => audio}, stride: stride}
       end
     end
 
     postprocess = fn windows, runs ->
       strides =
-        Enum.map(runs, fn %{"stride" => stride} ->
-          stride |> Nx.to_flat_list() |> Enum.map(&(&1 / featurizer.sampling_rate))
+        Enum.map(runs, fn %{stride: stride} ->
+          stride |> Tuple.to_list() |> Enum.map(&(&1 / featurizer.sampling_rate))
         end)
 
       chunks =
@@ -131,7 +131,8 @@ defmodule Transmuter.Audio.SpeechToText do
       input -> {:error, "expected a tensor of PCM samples {samples}, got: #{inspect(input)}"}
     end
 
-    Serving.generation(ctx, init, validate, preprocess, postprocess, opts[:defn_options])
+    task = %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess}
+    Serving.generation(ctx, task, opts)
   end
 
   defp timestamps?(nil), do: false
@@ -189,29 +190,48 @@ defmodule Transmuter.Audio.SpeechToText do
 
   defp windows(_samples, _start, _settings), do: []
 
-  # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of a window.
-  # Tokens that end with two timestamps leave the last segment incomplete, so the next pass
-  # starts at the last timestamp. The features after the frames are zeros.
-  defp transcribe(_features, seek, %{frames: frames}, _generate) when seek >= frames, do: []
+  # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of the window
+  # of each row. Tokens that end with two timestamps leave the last segment incomplete, so
+  # the next pass of that row starts at the last timestamp, and the features after the frames
+  # are zeros. A row without a prompt is done.
+  defp transcribe(features, prompts, seeks, settings, generate) do
+    if Enum.all?(prompts, &(&1 == [])) do
+      Enum.map(prompts, fn _ -> [] end)
+    else
+      frames = settings.frames
 
-  defp transcribe(features, seek, settings, generate) do
-    %{frames: frames, timestamp_begin: begin} = settings
+      input =
+        features
+        |> Nx.to_batched(1)
+        |> Enum.zip_with(seeks, fn row, seek ->
+          row
+          |> Nx.slice_along_axis(seek, frames - seek, axis: 2)
+          |> Nx.pad(0.0, [{0, 0, 0}, {0, 0, 0}, {0, seek, 0}])
+        end)
+        |> Nx.concatenate()
 
-    input =
-      features
-      |> Nx.slice_along_axis(seek, frames - seek, axis: 2)
-      |> Nx.pad(0.0, [{0, 0, 0}, {0, 0, 0}, {0, seek, 0}])
+      {kept, seeks} =
+        generate.(input, prompts)
+        |> Enum.zip_with(seeks, &next_pass(&1, &2, settings))
+        |> Enum.unzip()
 
-    tokens = generate.(input)
+      prompts = Enum.zip_with(prompts, seeks, &if(&2 < frames, do: &1, else: []))
+      seeks = Enum.map(seeks, &if(&1 < frames, do: &1, else: 0))
+      Enum.zip_with(kept, transcribe(features, prompts, seeks, settings, generate), &++/2)
+    end
+  end
+
+  # The tokens to keep from a pass and the seek of the next pass. The seek is the number of
+  # frames when the row is done.
+  defp next_pass(tokens, seek, settings = %{frames: frames, timestamp_begin: begin}) do
     timestamps = Enum.map(tokens, &(&1 >= begin))
     pairs = for {[true, true], i} <- Enum.with_index(Enum.chunk_every(timestamps, 2, 1), 1), do: i
 
     if pairs == [] or Enum.take(timestamps, -2) == [false, true] do
-      tokens
+      {tokens, frames}
     else
       kept = Enum.take(tokens, List.last(pairs) + 1)
-      offset = (Enum.at(kept, -2) - begin) * settings.frames_per_timestamp
-      kept ++ transcribe(features, seek + offset, settings, generate)
+      {kept, seek + (Enum.at(kept, -2) - begin) * settings.frames_per_timestamp}
     end
   end
 

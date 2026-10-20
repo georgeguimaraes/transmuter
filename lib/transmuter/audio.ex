@@ -36,6 +36,8 @@ defmodule Transmuter.Audio do
 
     * `:timestamps` - `:segments` gives a chunk for each segment of speech, with timestamps, as `return_timestamps=True` in transformers. The decoder then predicts timestamp tokens with the rules of `WhisperTimeStampLogitsProcessor`. The default is `nil`, with no timestamps.
 
+    * `:compile` - `:batch_size`, the number of windows that the decoder transcribes together. The windows come from one long audio, from a list of audio, or from concurrent calls to `Nx.Serving.batched_run/2`. The default is `1`.
+
     * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty` and `:seed` - as in `Transmuter.Text.generation/2`. `:max_new_tokens` applies to each pass of the decoder over a window. Its default is `max_length` of `generation_config.json` (448 for Whisper) minus the length of the prompt, as in the pipeline of transformers.
 
   An English-only model, such as `whisper-tiny.en`, raises an error for a `:language` or `:task` other than English transcription.

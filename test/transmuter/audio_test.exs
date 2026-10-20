@@ -131,6 +131,25 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  # The 3 windows of the long audio and the short audio are 4 rows: 2 batches of 2, or a
+  # batch of 3 and a batch with 2 padding rows. With timestamps, the windows of the long
+  # audio have different numbers of passes.
+  test "a batch of windows gives the result of each audio alone" do
+    for {batch_size, timestamps} <- [{2, nil}, {3, :segments}] do
+      opts = [timestamps: timestamps] ++ @opts
+      single = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
+
+      batched =
+        Transmuter.Audio.speech_to_text(
+          {:hf, "Xenova/whisper-tiny.en"},
+          [compile: [batch_size: batch_size]] ++ opts
+        )
+
+      alone = for audio <- [@long, @audio], do: Nx.Serving.run(single, audio)
+      assert Nx.Serving.run(batched, [@long, @audio]) == alone
+    end
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 

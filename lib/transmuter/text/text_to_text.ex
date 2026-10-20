@@ -33,6 +33,7 @@ defmodule Transmuter.Text.TextToText do
 
     compile =
       Keyword.validate!(opts[:compile] || [],
+        batch_size: 1,
         sequence_length: Serving.sequence_lengths(repo, nil)
       )
 
@@ -43,44 +44,47 @@ defmodule Transmuter.Text.TextToText do
       repo.generation_config["decoder_start_token_id"] || repo.config["decoder_start_token_id"]
 
     init = fn defn_options ->
-      template =
-        Nx.broadcast(Nx.tensor(0, type: :s64, backend: Nx.BinaryBackend), {1, hd(lengths)})
-
+      shape = {compile[:batch_size], hd(lengths)}
+      template = Nx.broadcast(Nx.tensor(0, type: :s64, backend: Nx.BinaryBackend), shape)
       opts = [cache_size: length(lengths)] ++ defn_options
       encode = Transmuter.compile(encoder, Map.new(encoder.inputs, &{&1, template}), opts)
 
-      fn inputs, generate ->
+      fn inputs, prompts, generate ->
         %{"last_hidden_state" => hidden} = encode.(Map.take(inputs, encoder.inputs))
 
-        generate.(%{
+        given = %{
           "encoder_hidden_states" => hidden,
           "encoder_attention_mask" => inputs["attention_mask"]
-        })
+        }
+
+        generate.(given, prompts)
       end
     end
 
     preprocess = fn input ->
       {tensors, _encodings} = Tokenizer.encode(tokenizer, [input.text])
+      tensors = Map.new(tensors, fn {name, tensor} -> {name, tensor[0]} end)
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
-
-      run =
-        tensors
-        |> Map.new(fn {name, tensor} -> {name, tensor[0]} end)
-        |> Map.merge(%{
-          "prompt" => Nx.tensor([start], type: :s64),
-          "seed" => Nx.tensor(seed, type: :s64)
-        })
-
-      [run]
+      length = Nx.size(tensors["input_ids"])
+      count = Nx.to_number(Nx.sum(tensors["attention_mask"]))
+      summary = %{input: count, padding: length - count}
+      [%{prompt: [start], seed: seed, tensors: tensors, key: length, summary: summary}]
     end
 
-    postprocess = fn [ids], [%{"attention_mask" => mask}] ->
-      count = Nx.to_number(Nx.sum(mask))
-      summary = %{input: count, output: length(ids), padding: Nx.size(mask) - count}
+    postprocess = fn [ids], [run] ->
+      summary = Map.put(run.summary, :output, length(ids))
       %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
     end
 
-    Serving.generation(ctx, init, &validate/1, preprocess, postprocess, opts[:defn_options])
+    task = %{
+      validate: &validate/1,
+      preprocess: preprocess,
+      init: init,
+      postprocess: postprocess,
+      keys: lengths
+    }
+
+    Serving.generation(ctx, task, Keyword.put(opts, :compile, compile))
   end
 
   defp validate(text) when is_binary(text), do: {:ok, %{text: text}}

@@ -313,27 +313,61 @@ defmodule Transmuter.TextTest do
     assert text.(1) != text.(2)
   end
 
+  test "a batch gives the text of each prompt alone in each mode of the KV cache" do
+    questions = [
+      "What is the capital of France?",
+      "Hi",
+      "What is the capital of Spain?",
+      "Write a long poem about the sea and the wind, in three verses."
+    ]
+
+    chats = for q <- questions, do: %{messages: [%{role: "user", content: q}]}
+
+    # The fourth input runs in a partial batch with two padding rows. gpt2 runs a group for
+    # each prompt length, and the questions about France and Spain have the same length.
+    for {repo, inputs} <- [
+          {"HuggingFaceTB/SmolLM2-135M-Instruct", chats},
+          {"onnx-community/SmolLM2-135M-Instruct-ONNX", chats},
+          {"Xenova/gpt2", questions}
+        ] do
+      opts = [variant: :fp32, strategy: :greedy, max_new_tokens: 12] ++ @opts
+      single = Transmuter.Text.generation({:hf, repo}, opts)
+      batched = Transmuter.Text.generation({:hf, repo}, [compile: [batch_size: 3]] ++ opts)
+      alone = for input <- inputs, do: Nx.Serving.run(single, input)
+      assert Nx.Serving.run(batched, inputs) == alone
+    end
+  end
+
   test "greedy text-to-text matches transformers for T5 and Marian" do
     sentence =
       "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
 
     # Marian encodes with source.spm. The vocabulary of tokenizer.json gives "▁Trans", "mut",
-    # "er" for "Transmuter", and then the translation starts with "Transmuter läuft".
-    for {repo, input, expected} <- [
-          {"Xenova/t5-small", "translate English to German: The house is wonderful.",
-           "Das Haus ist wunderbar."},
-          {"Xenova/t5-small", "translate English to German: " <> sentence,
-           "Transmuter läuft ONNX-Modelle auf jedem Nx-Backend, ohne Code für jede Architektur."},
-          {"Xenova/opus-mt-en-de", sentence,
-           "Transmuter führt ONNX-Modelle auf jedem Nx-Backend aus, ohne Code für jede Architektur."}
+    # "er" for "Transmuter", and then the translation starts with "Transmuter läuft". The T5
+    # inputs run as one batch.
+    for {repo, inputs, expected} <- [
+          {"Xenova/t5-small",
+           [
+             "translate English to German: The house is wonderful.",
+             "translate English to German: " <> sentence
+           ],
+           [
+             "Das Haus ist wunderbar.",
+             "Transmuter läuft ONNX-Modelle auf jedem Nx-Backend, ohne Code für jede Architektur."
+           ]},
+          {"Xenova/opus-mt-en-de", [sentence],
+           [
+             "Transmuter führt ONNX-Modelle auf jedem Nx-Backend aus, ohne Code für jede Architektur."
+           ]}
         ] do
       serving =
         Transmuter.Text.text_to_text(
           {:hf, repo},
-          [strategy: :greedy, max_new_tokens: 64] ++ @opts
+          [strategy: :greedy, max_new_tokens: 64, compile: [batch_size: 2]] ++ @opts
         )
 
-      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, input)
+      results = Nx.Serving.run(serving, inputs)
+      assert Enum.map(results, &hd(&1.results).text) == expected
     end
   end
 
