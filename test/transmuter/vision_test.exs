@@ -13,7 +13,8 @@ defmodule Transmuter.VisionTest do
     defn_options: [compiler: EMLX, device: @device]
   ]
 
-  alias Transmuter.{Featurizer, Vision}
+  alias Transmuter.{ChatTemplate, Featurizer, Tokenizer, Vision}
+  alias Transmuter.Vision.Idefics3Processor
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @labels ["cats", "dogs", "a remote control", "a couch"]
@@ -136,6 +137,46 @@ defmodule Transmuter.VisionTest do
     [%{results: [%{text: text}]} | _] = alone
     stream = Vision.image_to_text(@trocr, [stream: true] ++ opts)
     assert Enum.join(Nx.Serving.run(stream, @handwriting)) == text
+  end
+
+  @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
+
+  test "the Idefics3 processor gives the tiles and the prompt of Python transformers" do
+    repo = Transmuter.Repo.load!(@smolvlm)
+    processor = Idefics3Processor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+    prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+    # A wide image, a tall image, and an image that gets larger again to a multiple of 512
+    # before it splits. The prompt is checked by its length and a SHA-256 of its ids.
+    for {image, tiles, expected, mean, count, sha} <- [
+          {image, 13, [0.1059, -0.7725, -0.7333, -0.9765], 0.4757, 876, "176c4ea8b7b148c7"},
+          {Nx.transpose(image, axes: [1, 0, 2]), 13, [0.1059, -0.1608, -0.7333, 0.349], 0.4757,
+           877, "a493c96a7687a9a8"},
+          {image[0..99], 9, [0.1059, -0.7098, 0.2549, -0.4588], 0.4885, 611, "89410d97ee15e8d2"}
+        ] do
+      {pixels, text} = Idefics3Processor.process(processor, image, @opts[:backend])
+      pixels = Nx.backend_transfer(pixels, Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {tiles, 3, 512, 512}
+
+      got =
+        for index <- [[0, 0, 0, 0], [1, 1, 100, 37], [-1, 2, 511, 511], [2, 0, 257, 190]],
+            do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(tokenizer.native, String.replace(prompt, "<image>", text))
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {count, sha}
+    end
   end
 
   defp assert_predictions(%{predictions: predictions}, expected) do
