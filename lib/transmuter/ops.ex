@@ -22,7 +22,8 @@ defmodule Transmuter.Ops do
 
   # Sums, norms and softmax lose too much precision in f16 and bf16, so these ops
   # run in f32 and cast their outputs back.
-  @f32_ops ~w(ReduceSum ReduceMean ReduceSumSquare ReduceL2 ReduceProd Softmax LpNormalization
+  @f32_ops ~w(ReduceSum ReduceMean ReduceSumSquare ReduceL1 ReduceL2 ReduceLogSum ReduceLogSumExp
+              ReduceProd CumSum CumProd Softmax LogSoftmax LpNormalization
               LayerNormalization InstanceNormalization GroupNormalization BatchNormalization
               RMSNormalization SimplifiedLayerNormalization SkipLayerNormalization
               SkipSimplifiedLayerNormalization EmbedLayerNormalization Attention

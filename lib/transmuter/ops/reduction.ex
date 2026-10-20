@@ -3,7 +3,7 @@ defmodule Transmuter.Ops.Reduction do
   Reductions along axes, arg reductions, cumulative sums and products, and TopK.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2]
+  import Transmuter.Ops, only: [attr: 3, ints!: 1, normalize_axis: 2]
 
   @op_types ~w(ReduceSum ReduceMean CumSum TopK CumProd ReduceMax ReduceMin ReduceProd ReduceL2
                ReduceSumSquare ReduceL1 ReduceLogSum ReduceLogSumExp ArgMax ArgMin)
@@ -14,62 +14,54 @@ defmodule Transmuter.Ops.Reduction do
   @doc false
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
-  defp op(node = %{op_type: "ReduceSum"}, [a | rest]) do
-    axes = if rest == [] or rest == [nil], do: attr(node, "axes"), else: ints!(hd(rest))
-    keep = attr(node, "keepdims", 1) == 1
+  # The axes come from the second input (opset 18) or the axes attribute. No axes reduce
+  # every axis, or none with noop_with_empty_axes.
+  defp op(node = %{op_type: "Reduce" <> _}, [a | rest]) do
+    axes =
+      case rest do
+        [axes | _] when axes != nil -> ints!(axes)
+        _ -> attr(node, "axes", [])
+      end
+
+    opts = [keep_axes: attr(node, "keepdims", 1) == 1]
 
     cond do
-      axes in [nil, []] and attr(node, "noop_with_empty_axes", 0) == 1 -> a
-      axes in [nil, []] -> Nx.sum(a, keep_axes: keep)
-      true -> Nx.sum(a, axes: axes, keep_axes: keep)
+      axes == [] and attr(node, "noop_with_empty_axes", 0) == 1 -> a
+      axes == [] -> reduce(node.op_type, a, opts)
+      true -> reduce(node.op_type, a, [axes: axes] ++ opts)
     end
   end
 
-  defp op(node = %{op_type: "ReduceMean"}, [a | rest]) do
-    axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
-    Nx.mean(a, axes: axes, keep_axes: attr(node, "keepdims", 1) == 1)
-  end
-
-  defp op(node = %{op_type: reduce}, [a | rest])
-       when reduce in [
-              "ReduceMax",
-              "ReduceMin",
-              "ReduceProd",
-              "ReduceL2",
-              "ReduceSumSquare",
-              "ReduceL1",
-              "ReduceLogSum",
-              "ReduceLogSumExp"
-            ] do
-    axes = if rest == [] or rest == [nil], do: attr(node, "axes"), else: ints!(hd(rest))
-
-    opts =
-      [keep_axes: attr(node, "keepdims", 1) == 1] ++
-        if(axes in [nil, []], do: [], else: [axes: axes])
-
-    case reduce do
-      "ReduceMax" -> Nx.reduce_max(a, opts)
-      "ReduceMin" -> Nx.reduce_min(a, opts)
-      "ReduceProd" -> Nx.product(a, opts)
-      "ReduceL2" -> a |> Nx.pow(2) |> Nx.sum(opts) |> Nx.sqrt()
-      "ReduceSumSquare" -> a |> Nx.pow(2) |> Nx.sum(opts)
-      "ReduceL1" -> a |> Nx.abs() |> Nx.sum(opts)
-      "ReduceLogSum" -> a |> Nx.sum(opts) |> Nx.log()
-      "ReduceLogSumExp" -> log_sum_exp(a, opts)
-    end
-  end
-
+  # The compiled EMLX argmax ignores tie_break, so the last index of a tie is the first
+  # index in the reversed axis, counted from the end.
   defp op(node = %{op_type: arg}, [a]) when arg in ["ArgMax", "ArgMin"] do
-    0 = attr(node, "select_last_index", 0)
-    opts = [axis: attr(node, "axis", 0), keep_axis: attr(node, "keepdims", 1) == 1, type: :s64]
-    if arg == "ArgMax", do: Nx.argmax(a, opts), else: Nx.argmin(a, opts)
+    axis = normalize_axis(attr(node, "axis", 0), Nx.rank(a))
+    opts = [axis: axis, keep_axis: attr(node, "keepdims", 1) == 1, type: :s64]
+    fun = if arg == "ArgMax", do: &Nx.argmax/2, else: &Nx.argmin/2
+
+    if attr(node, "select_last_index", 0) == 1,
+      do: Nx.subtract(Nx.axis_size(a, axis) - 1, fun.(Nx.reverse(a, axes: [axis]), opts)),
+      else: fun.(a, opts)
   end
 
-  defp op(node = %{op_type: "CumSum"}, [x, axis]) do
-    [axis] = ints!(axis)
-    axis = if axis < 0, do: axis + Nx.rank(x), else: axis
-    sum = Nx.cumulative_sum(x, axis: axis, reverse: attr(node, "reverse", 0) == 1)
-    if attr(node, "exclusive", 0) == 1, do: Nx.subtract(sum, x), else: sum
+  # The exclusive forms shift the inclusive result by one along the axis, with the
+  # identity element in the first place.
+  defp op(node = %{op_type: cumulative}, [x, axis]) when cumulative in ["CumSum", "CumProd"] do
+    axis = normalize_axis(axis |> ints!() |> hd(), Nx.rank(x))
+    reverse = attr(node, "reverse", 0) == 1
+
+    {out, identity} =
+      if cumulative == "CumSum",
+        do: {Nx.cumulative_sum(x, axis: axis, reverse: reverse), 0},
+        else: {Nx.cumulative_product(x, axis: axis, reverse: reverse), 1}
+
+    if attr(node, "exclusive", 0) == 1 do
+      shift = if reverse, do: {-1, 1, 0}, else: {1, -1, 0}
+      config = for a <- Nx.axes(x), do: if(a == axis, do: shift, else: {0, 0, 0})
+      Nx.pad(out, Nx.tensor(identity, type: Nx.type(out)), config)
+    else
+      out
+    end
   end
 
   defp op(node = %{op_type: "TopK"}, [x, k]) do
@@ -77,7 +69,15 @@ defmodule Transmuter.Ops.Reduction do
     rank = Nx.rank(x)
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + rank, else: axis
-    direction = if attr(node, "largest", 1) == 1, do: :desc, else: :asc
+
+    # EMLX sorts in descending order by negating, which wraps integers. A bitwise not
+    # reverses the order of every integer type without wrapping.
+    {keys, direction} =
+      cond do
+        attr(node, "largest", 1) == 0 -> {x, :asc}
+        Nx.Type.integer?(Nx.type(x)) -> {Nx.bitwise_not(x), :asc}
+        true -> {x, :desc}
+      end
 
     if k == 0 do
       empty = {:empty, x |> Nx.shape() |> put_elem(axis, 0)}
@@ -85,7 +85,7 @@ defmodule Transmuter.Ops.Reduction do
     else
       # A stable sort keeps the lower index first among equal values, as ORT does.
       idx =
-        x
+        keys
         |> Nx.argsort(axis: axis, direction: direction, stable: true)
         |> Nx.slice_along_axis(0, k, axis: axis)
 
@@ -93,26 +93,16 @@ defmodule Transmuter.Ops.Reduction do
     end
   end
 
-  defp op(node = %{op_type: "CumProd"}, [x, axis]) do
-    axis = normalize_axis(axis |> ints!() |> hd(), Nx.rank(x))
-    reverse = attr(node, "reverse", 0) == 1
-    x = if reverse, do: Nx.reverse(x, axes: [axis]), else: x
-    product = Nx.cumulative_product(x, axis: axis)
-
-    product =
-      if attr(node, "exclusive", 0) == 1 do
-        ones = x |> Nx.slice_along_axis(0, 1, axis: axis) |> Nx.multiply(0) |> Nx.add(1)
-
-        Nx.concatenate(
-          [ones, Nx.slice_along_axis(product, 0, Nx.axis_size(x, axis) - 1, axis: axis)],
-          axis: axis
-        )
-      else
-        product
-      end
-
-    if reverse, do: Nx.reverse(product, axes: [axis]), else: product
-  end
+  defp reduce("ReduceSum", a, opts), do: Nx.sum(a, opts)
+  defp reduce("ReduceMean", a, opts), do: Nx.mean(a, opts)
+  defp reduce("ReduceMax", a, opts), do: Nx.reduce_max(a, opts)
+  defp reduce("ReduceMin", a, opts), do: Nx.reduce_min(a, opts)
+  defp reduce("ReduceProd", a, opts), do: Nx.product(a, opts)
+  defp reduce("ReduceL1", a, opts), do: a |> Nx.abs() |> Nx.sum(opts)
+  defp reduce("ReduceL2", a, opts), do: a |> Nx.pow(2) |> Nx.sum(opts) |> Nx.sqrt()
+  defp reduce("ReduceSumSquare", a, opts), do: a |> Nx.pow(2) |> Nx.sum(opts)
+  defp reduce("ReduceLogSum", a, opts), do: a |> Nx.sum(opts) |> Nx.log()
+  defp reduce("ReduceLogSumExp", a, opts), do: log_sum_exp(a, opts)
 
   defp log_sum_exp(a, opts) do
     keep = Keyword.put(opts, :keep_axes, true)

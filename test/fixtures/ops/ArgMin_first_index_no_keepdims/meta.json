@@ -1,0 +1,34 @@
+{
+ "repo": "op/ArgMin_first_index_no_keepdims",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "ArgMin": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "s64",
+   "shape": [
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

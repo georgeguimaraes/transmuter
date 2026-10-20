@@ -1045,3 +1045,37 @@ case("Where_broadcast", [node("Where", ["c", "x", "y"], ["z"])],
      {"c": r.random((2, 1, 4)) > 0.5, "x": r.standard_normal((3, 1)).astype(np.float32), "y": r.standard_normal((2, 3, 4)).astype(np.float32)})
 case("Gelu", [node("Gelu", ["x"], ["y"])], {"x": r.standard_normal((3, 6)).astype(np.float32) * 3}, opset=20)
 case("Gelu_tanh", [node("Gelu", ["x"], ["y"], approximate="tanh")], {"x": r.standard_normal((3, 6)).astype(np.float32) * 3}, opset=20)
+
+# ---------- reductions, cumulative ops, arg reductions and TopK ----------
+
+r = rng_for("reductions")
+x345 = r.standard_normal((3, 4, 5)).astype(np.float32)
+no_axes = np.array([], np.int64)
+case("ReduceMean_omitted_axes", [node("ReduceMean", ["x", ""], ["y"], keepdims=0)], {"x": x345})
+case("ReduceMean_empty_axes", [node("ReduceMean", ["x", "axes"], ["y"])], {"x": x345}, {"axes": no_axes})
+case("ReduceMean_axes_attribute", [node("ReduceMean", ["x"], ["y"], axes=[-1, 0], keepdims=0)], {"x": x345}, opset=13)
+case("ReduceMean_noop_with_empty_axes", [node("ReduceMean", ["x", "axes"], ["y"], noop_with_empty_axes=1)], {"x": x345}, {"axes": no_axes})
+case("ReduceMax_noop_with_empty_axes", [node("ReduceMax", ["x", ""], ["y"], noop_with_empty_axes=1)], {"x": x345})
+case("ReduceSum_negative_axes", [node("ReduceSum", ["x", "axes"], ["y"], keepdims=0)], {"x": x345}, {"axes": np.array([-2], np.int64)})
+case("ReduceSum_empty_axes", [node("ReduceSum", ["x", "axes"], ["y"], keepdims=0)], {"x": x345}, {"axes": no_axes})
+case("ReduceL2_empty_axes", [node("ReduceL2", ["x", "axes"], ["y"])], {"x": x345}, {"axes": no_axes})
+# The exclusive sums and products shift by one with the identity element, so infinities stay apart.
+inf_rows = np.array([[1, np.inf, 2, 3], [np.inf, 2, 3, 4], [2, 3, -np.inf, 1]], np.float32)
+case("CumSum_exclusive_inf", [node("CumSum", ["x", "axis"], ["y"], exclusive=1)], {"x": inf_rows}, {"axis": np.array(1, np.int64)})
+case("CumSum_exclusive_reverse_inf", [node("CumSum", ["x", "axis"], ["y"], exclusive=1, reverse=1)], {"x": inf_rows}, {"axis": np.array(-1, np.int64)})
+case("CumProd_exclusive_inf", [node("CumProd", ["x", "axis"], ["y"], exclusive=1)], {"x": inf_rows}, {"axis": np.array(1, np.int64)}, opset=26)
+case("CumProd_exclusive_size_1_axis", [node("CumProd", ["x", "axis"], ["y"], exclusive=1)], {"x": inf_rows[:, :1].copy()}, {"axis": np.array(1, np.int64)}, opset=26)
+ties = np.array([[3, 1, 3, 2], [0, 0, -1, -1], [5, 5, 5, 5]], np.float32)
+for op in ["ArgMax", "ArgMin"]:
+    case(f"{op}_select_last_index", [node(op, ["x"], ["y"], axis=1, select_last_index=1)], {"x": ties})
+    case(f"{op}_first_index_no_keepdims", [node(op, ["x"], ["y"], axis=-1, keepdims=0)], {"x": ties})
+case("TopK_uint8_largest", [node("TopK", ["x", "k"], ["values", "indices"])],
+     {"x": np.array([[0, 255, 3, 128, 255, 1], [7, 0, 0, 200, 9, 254]], np.uint8)}, {"k": np.array([3], np.int64)})
+case("TopK_smallest_axis_0", [node("TopK", ["x", "k"], ["values", "indices"], axis=0, largest=0)],
+     {"x": np.array([[3, 1], [1, 1], [2, 0], [1, 5]], np.float32)}, {"k": np.array([2], np.int64)})
+# Sums, log-sum-exps and cumulative sums in f16 lose precision unless they run in f32.
+wide = (r.standard_normal((4, 256)) * 4).astype(np.float16)
+case("LogSoftmax_f16", [node("LogSoftmax", ["x"], ["y"])], {"x": wide}, extra=HALF)
+case("ReduceLogSumExp_f16", [node("ReduceLogSumExp", ["x", "axes"], ["y"])], {"x": wide}, {"axes": np.array([1], np.int64)}, extra=HALF)
+case("ReduceL1_f16", [node("ReduceL1", ["x", "axes"], ["y"])], {"x": wide}, {"axes": np.array([1], np.int64)}, extra=HALF)
+case("CumSum_f16", [node("CumSum", ["x", "axis"], ["y"])], {"x": wide}, {"axis": np.array(1, np.int64)}, extra=HALF)
