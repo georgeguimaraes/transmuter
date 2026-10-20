@@ -1370,3 +1370,18 @@ case("AttentionCore_f16",
      {"scale": np.array(0.35, np.float16)}, extra=HALF)
 case("SkipSimplifiedLayerNormalization_f16", [node("SkipSimplifiedLayerNormalization", ["x", "skip", "w"], ["y", "", "", "sum"], domain=MS, epsilon=1e-6)],
      {"x": hf(2, 3, 16), "skip": hf(2, 3, 16)}, {"w": hf(16)}, ms=True, extra=HALF)
+
+# ---------- KV cache writes ----------
+
+# GQA with a static cache: the past is as long as the total length. Each row writes its new
+# keys and values at its own offset, seqlens + 1 - S, and the rows after them are zero.
+r = rng_for("KV cache writes")
+gqa_static = lambda b, S, seqlens: (
+    {"q": r.standard_normal((b, S, 4 * G)).astype(np.float32), "k": r.standard_normal((b, S, 2 * G)).astype(np.float32),
+     "v": r.standard_normal((b, S, 2 * G)).astype(np.float32), "pk": r.standard_normal((b, 2, 8, G)).astype(np.float32),
+     "pv": r.standard_normal((b, 2, 8, G)).astype(np.float32), "seqlens": np.array(seqlens, np.int32), "total": np.array(8, np.int32)})
+gqa_node = lambda: [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
+                         num_heads=4, kv_num_heads=2)]
+case("GroupQueryAttention_static_cache_decode", gqa_node(), gqa_static(2, 1, [6, 3]), ms=True, static=("total",))
+# ONNX Runtime takes more than one new token after a past only in a batch of one.
+case("GroupQueryAttention_static_cache_prefill", gqa_node(), gqa_static(1, 3, [5]), ms=True, static=("total",))

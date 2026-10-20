@@ -522,30 +522,43 @@ defmodule Transmuter.Ops.Transformer do
         Nx.concatenate([rotated, Nx.slice_along_axis(x, rot, head_size - rot, axis: 3)], axis: 3)
   end
 
-  # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at a per-sequence offset.
+  # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at the offset of each
+  # sequence. Row j of a sequence keeps the past before the offset, takes the new row
+  # j - offset, and is zero after the new rows, as in ONNX Runtime. One select writes all
+  # sequences. A negative offset writes at 0, as the first prompt of ONNX Runtime does.
+  # Generation gives buffers with room for the new rows, so none falls after the buffer.
   defp write_cache(past, new, offsets, capacity) do
     {b, heads, past_len, head_size} = shape_of(past)
-
-    j = Nx.iota({1, 1, capacity, 1}, axis: 2)
-    offsets = Nx.reshape(offsets, {b, 1, 1, 1})
+    s = Nx.axis_size(new, 2)
+    shape = {b, heads, capacity, head_size}
     zero = Nx.tensor(0, type: Nx.type(new))
 
-    # A separate present buffer gets each sequence's valid past and zeros after it.
-    # A shared buffer (past as long as the capacity) is updated in place.
-    base =
-      if past_len < capacity do
-        zeros = Nx.broadcast(zero, {b, heads, capacity - past_len, head_size})
-        padded = [past, zeros] |> Enum.reject(&empty?/1) |> Nx.concatenate(axis: 2)
-        Nx.select(Nx.broadcast(Nx.less(j, offsets), Nx.shape(padded)), padded, zero)
-      else
-        past
+    position =
+      Nx.subtract(
+        Nx.iota({1, 1, capacity, 1}, axis: 2),
+        Nx.reshape(Nx.max(offsets, 0), {b, 1, 1, 1})
+      )
+
+    past =
+      cond do
+        empty?(past) ->
+          Nx.broadcast(zero, shape)
+
+        past_len < capacity ->
+          Nx.pad(past, zero, [{0, 0, 0}, {0, 0, 0}, {0, capacity - past_len, 0}, {0, 0, 0}])
+
+        true ->
+          past
       end
 
-    # Each sequence writes its new rows at its own offset.
-    Enum.reduce(0..(b - 1)//1, base, fn i, acc ->
-      row = Nx.slice_along_axis(new, i, 1, axis: 0)
-      Nx.put_slice(acc, [i, 0, Nx.reshape(offsets[i], {}), 0], row)
-    end)
+    # A step of one token broadcasts its row, a longer step gathers row j - offset.
+    rows =
+      if s == 1,
+        do: Nx.broadcast(new, shape),
+        else: Nx.take_along_axis(new, Nx.broadcast(Nx.clip(position, 0, s - 1), shape), axis: 2)
+
+    written = Nx.select(Nx.broadcast(Nx.less(position, s), shape), rows, zero)
+    Nx.select(Nx.broadcast(Nx.less(position, 0), shape), past, written)
   end
 
   defp outside_window(_key_pos, _query_pos, window) when window <= 0, do: Nx.tensor(0, type: :u8)
