@@ -930,7 +930,6 @@ branch = lambda name: helper.make_graph(
 case("If_external_data_in_branches",
      [node("If", ["cond"], ["b"], then_branch=branch("then"), else_branch=branch("else")), node("Add", ["x", "b"], ["y"])],
      {"x": rf32(3)}, {"cond": np.array(True)}, external=True)
-||||||| parent of 9022190 (feat: Add com.microsoft MoE and QMoE operators)
 
 
 # ---------- MoE and QMoE ----------
