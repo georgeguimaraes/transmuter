@@ -1,0 +1,66 @@
+{
+ "repo": "op/MultiHeadAttention_bias",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:MultiHeadAttention": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "q",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    8
+   ]
+  },
+  {
+   "name": "k",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    8
+   ]
+  },
+  {
+   "name": "v",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    5,
+    8
+   ]
+  },
+  {
+   "name": "mask",
+   "file": "in_3.bin",
+   "dtype": "s32",
+   "shape": [
+    2,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    8
+   ]
+  }
+ ],
+ "ort_ok": true
+}

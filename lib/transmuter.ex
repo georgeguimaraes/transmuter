@@ -446,9 +446,16 @@ defmodule Transmuter do
         do: Ops.attr(node, "then_branch"),
         else: Ops.attr(node, "else_branch")
 
-    env = Enum.reduce(branch.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+    env = put_initializers(env, branch, ctx)
     env = run_nodes(branch.node, env, ctx)
     Enum.map(branch.output, &Map.fetch!(env, &1.name))
+  end
+
+  # The initializers of a subgraph get compute_type, as those of the main graph do.
+  defp put_initializers(env, graph, ctx) do
+    Enum.reduce(graph.initializer, env, fn t, env ->
+      Map.put(env, t.name, t |> Ops.tensor() |> upcast(ctx.compute_type))
+    end)
   end
 
   # A long traced loop with a condition that stays true runs as an Nx while loop. Other
@@ -462,7 +469,7 @@ defmodule Transmuter do
         do: trip_count |> Ops.known!("the Loop trip count") |> Nx.reshape({}) |> Nx.to_number(),
         else: @max_loop_iterations
 
-    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+    env = put_initializers(env, body, ctx)
 
     step = fn i, carried, env ->
       step_env =
@@ -662,10 +669,7 @@ defmodule Transmuter do
     length = Nx.axis_size(hd(scans), hd(in_axes))
     scan_inputs = scans |> Enum.with_index(&{{:scan, &2}, &1}) |> Map.new()
 
-    env =
-      body.initializer
-      |> Enum.reduce(env, &Map.put(&2, &1.name, Ops.tensor(&1)))
-      |> Map.merge(scan_inputs)
+    env = env |> put_initializers(body, ctx) |> Map.merge(scan_inputs)
 
     step = fn t, states, env ->
       slices =
@@ -725,7 +729,7 @@ defmodule Transmuter do
   defp run_sequence_map(node, inputs = [{:sequence, first} | _], env, ctx) do
     body = Ops.attr(node, "body")
     names = Enum.map(body.input, & &1.name)
-    env = Enum.reduce(body.initializer, env, &Map.put(&2, &1.name, Ops.tensor(&1)))
+    env = put_initializers(env, body, ctx)
 
     steps =
       for i <- 0..(length(first) - 1)//1 do

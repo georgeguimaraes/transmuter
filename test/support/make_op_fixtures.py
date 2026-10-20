@@ -1296,6 +1296,21 @@ for name, mask in [("lengths", np.array([5, 3], np.int32)), ("2d", (r.random((B,
     case(f"MultiHeadAttention_key_padding_mask_{name}", [node("MultiHeadAttention", ["q", "k", "v", "", "mask"], ["y"], domain=MS, num_heads=H)],
          {"q": af(B, S, hidden), "k": af(B, T, hidden), "v": af(B, T, hidden), "mask": mask}, ms=True)
 
+case("MultiHeadAttention_bias", [node("MultiHeadAttention", ["q", "k", "v", "bias", "mask"], ["y"], domain=MS, num_heads=H)],
+     {"q": af(B, S, hidden), "k": af(B, T, hidden), "v": af(B, T, hidden), "mask": (r.random((B, T)) > 0.3).astype(np.int32)},
+     {"bias": af(3 * hidden)}, ms=True)
+
+# ---------- subgraph initializers ----------
+
+# An If branch with f16 initializers, as in f16 exports, under compute_type :f32.
+r = rng_for("subgraph initializers")
+ln_branch = lambda name: helper.make_graph(
+    [node("LayerNormalization", ["x", name + "_s", name + "_b"], ["out"])], name, [],
+    [helper.make_tensor_value_info("out", TensorProto.FLOAT16, None)],
+    [numpy_helper.from_array(r.standard_normal(8).astype(np.float16), name + "_s"), numpy_helper.from_array(r.standard_normal(8).astype(np.float16), name + "_b")])
+case("If_f16_branch_initializers", [node("If", ["cond"], ["y"], then_branch=ln_branch("then"), else_branch=ln_branch("else"))],
+     {"x": r.standard_normal((3, 8)).astype(np.float16)}, {"cond": np.array(True)})
+
 # ---------- MoE and QMoE with biases and zero points ----------
 
 r = rng_for("MoE zero points")

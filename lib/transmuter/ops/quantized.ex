@@ -18,7 +18,10 @@ defmodule Transmuter.Ops.Quantized do
 
   # com.microsoft MatMulNBits: B holds N rows of K weights in blocks of block_size.
   defp op(node = %{op_type: "MatMulNBits"}, [a, b, scales | rest]) do
-    [zero_points, nil, bias] = Enum.take(rest ++ [nil, nil, nil], 3)
+    [zero_points, g_idx, bias] = Enum.take(rest ++ [nil, nil, nil], 3)
+
+    if g_idx,
+      do: raise(ArgumentError, "MatMulNBits with the g_idx input is not supported")
 
     {k, n, bits, block_size} =
       {attr(node, "K"), attr(node, "N"), attr(node, "bits", 4), attr(node, "block_size")}
@@ -38,9 +41,14 @@ defmodule Transmuter.Ops.Quantized do
   # com.microsoft GatherBlockQuantized: gathers rows of a table quantized along its last axis.
   defp op(node = %{op_type: "GatherBlockQuantized"}, [data, indices, scales | rest]) do
     zero_points = List.first(rest)
-    0 = attr(node, "gather_axis", 0)
     last = Nx.rank(data) - 1
-    ^last = normalize_axis(attr(node, "quantize_axis", 1), Nx.rank(data))
+
+    unless attr(node, "gather_axis", 0) == 0 and
+             normalize_axis(attr(node, "quantize_axis", 1), Nx.rank(data)) == last do
+      raise ArgumentError,
+            "GatherBlockQuantized supports gather_axis 0 and quantize_axis on the last axis"
+    end
+
     bits = attr(node, "bits", 4)
     block_size = attr(node, "block_size", 128)
     type = Nx.type(scales)

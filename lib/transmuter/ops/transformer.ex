@@ -157,8 +157,9 @@ defmodule Transmuter.Ops.Transformer do
 
   # com.microsoft MultiHeadAttention: query {B, S, N*H}, key/value {B, L, N*H} or {B, N, L, H}.
   defp op(node = %{op_type: "MultiHeadAttention"}, [q, k, v | optional]) do
-    [nil, key_padding_mask, attention_bias, past_k, past_v] = pad(optional, 5)
+    [bias, key_padding_mask, attention_bias, past_k, past_v] = pad(optional, 5)
     heads = attr(node, "num_heads")
+    {q, k, v} = add_qkv_bias(q, k, v, bias)
     q = to_heads(q, heads)
     k = if Nx.rank(k) == 4, do: k, else: to_heads(k, heads)
     v = if Nx.rank(v) == 4, do: v, else: to_heads(v, heads)
@@ -525,6 +526,18 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   defp split_packed_qkv(q, k, v, _heads, _kv_heads), do: {q, k, v}
+
+  # The bias of MultiHeadAttention holds the biases of q, k and v, in this order.
+  defp add_qkv_bias(q, k, v, nil), do: {q, k, v}
+
+  defp add_qkv_bias(q, k, v, bias) do
+    unless Nx.rank(k) == 3 and Nx.rank(v) == 3 do
+      raise ArgumentError, "MultiHeadAttention with a bias needs key and value of rank 3"
+    end
+
+    [qb, kb, vb] = split(bias, List.duplicate(div(Nx.size(bias), 3), 3), 0)
+    {Nx.add(q, qb), Nx.add(k, kb), Nx.add(v, vb)}
+  end
 
   defp split(t, sizes, axis) do
     sizes

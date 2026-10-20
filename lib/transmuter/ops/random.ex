@@ -33,9 +33,12 @@ defmodule Transmuter.Ops.Random do
   defp op(node = %{op_type: "RandomUniformLike"}, [x], key),
     do: uniform(node, key, Nx.shape(x), like_type(node, x))
 
+  # The uniform draw is at least f32, because f16 values below p are too coarse for a
+  # small p.
   defp op(node = %{op_type: "Bernoulli"}, [p], key) do
-    {u, _key} = Nx.Random.uniform(key, shape: Nx.shape(p), type: Nx.type(p))
-    u |> Nx.less(p) |> Nx.as_type(like_type(node, p))
+    type = Nx.Type.merge(Nx.type(p), {:f, 32})
+    {u, _key} = Nx.Random.uniform(key, shape: Nx.shape(p), type: type)
+    u |> Nx.less(Nx.as_type(p, type)) |> Nx.as_type(like_type(node, p))
   end
 
   # Gumbel-max: the argmax of the log-probabilities plus Gumbel noise is a sample of
