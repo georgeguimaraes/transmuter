@@ -16,12 +16,10 @@ defmodule Transmuter.Serving do
   # heap of 2 MB (in 8-byte words) from the start removes them.
   @generation_heap_size 262_144
 
-  # A step reads its compiled segments from the cache table of Transmuter.GraphBreaks, and
-  # each read references the binary of the graph again. The references count in the binary
-  # heap of the process, but they use no new memory. With a small binary heap, the collector
-  # moves these references between the young and the old heap, and it sweeps the whole heap
-  # again and again. A binary heap of 256 MB (in 8-byte words) from the start removes these
-  # sweeps.
+  # The masks of tokens of a step are binaries on the host, and each step makes new ones
+  # as large as the vocabulary: 195 binaries of 256 KB in one request of 64 tokens with
+  # Gemma 3. With the default binary heap, they start about two collections in each step. A
+  # binary heap of 256 MB (in 8-byte words) from the start removes these collections.
   @generation_bin_vheap_size 33_554_432
 
   @doc """

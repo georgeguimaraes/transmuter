@@ -8,7 +8,7 @@ defmodule Transmuter.GraphBreaks do
   """
 
   alias Nx.Defn.{Compiler, Composite}
-  alias Transmuter.{Ops, UnknownValueError}
+  alias Transmuter.{Ops, Shared, UnknownValueError}
 
   # A segment of fewer nodes runs eagerly. The cache keeps :cache_size segments for each
   # position, and a new key at a full position evicts the least recently used one.
@@ -34,6 +34,7 @@ defmodule Transmuter.GraphBreaks do
         opts: opts,
         backend: Nx.Defn.to_backend(opts),
         table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
+        scope: Shared.scope(),
         random?: Transmuter.random?(model.nodes)
       }
 
@@ -56,8 +57,8 @@ defmodule Transmuter.GraphBreaks do
     end
 
     # A graph without breaks keeps its compiled function here for the shapes of these
-    # inputs, because a read from the cache table copies the function. Inputs of other
-    # shapes compile on their first call and are cached.
+    # inputs, so a call with these shapes does not search the cache. Inputs of other shapes
+    # compile on their first call and are cached.
     case segment(plan, initial(plan, inputs, static_inputs), 0) do
       {:end, entry} ->
         shapes = input_shapes(inputs)
@@ -129,7 +130,7 @@ defmodule Transmuter.GraphBreaks do
     key = {pos, shapes, static_key(plan, statics)}
     metadata = %{source: plan.source, position: pos, shapes: shapes}
 
-    case lookup(plan.table, key) do
+    case lookup(plan, key) do
       {:ok, entry} ->
         :telemetry.execute([:transmuter, :cache, :hit], %{count: 1}, metadata)
         classify(entry)
@@ -185,8 +186,8 @@ defmodule Transmuter.GraphBreaks do
 
   # The traced body of a segment. It records where it stopped, which traced values it
   # returns and which static values it folded, so the caller can resume after it. The
-  # compiled function keeps this closure, and each read from the cache table copies the
-  # function. So the closure holds the graph as one binary, which the table does not copy.
+  # compiled function keeps this closure, and each cached segment has a copy of the
+  # function. So the closure holds the graph as one binary, which all copies share.
   defp trace(graph, statics, args, pos, ref) do
     {nodes, last_use, opset, compute_type} = :erlang.binary_to_term(graph)
     plan = %{nodes: nodes, last_use: last_use, model: %{opset: opset, compute_type: compute_type}}
@@ -382,31 +383,33 @@ defmodule Transmuter.GraphBreaks do
 
   defp to_backend(other, _backend), do: other
 
-  # The cache table belongs to the process that called Transmuter.compile/3. When that
-  # process is gone, segments compile again on each call.
-  defp lookup(table, key) do
-    case :ets.lookup(table, key) do
-      [{^key, entry, _used}] ->
-        :ets.update_element(table, key, {3, :erlang.unique_integer([:monotonic])})
-        {:ok, entry}
-
-      [] ->
+  # The entries are in the scope of Transmuter.Shared, because each read from ETS copies
+  # the compiled function. The cache table has the time of use of each key. Both belong to
+  # the process that called Transmuter.compile/3. When that process is gone, segments
+  # compile again on each call.
+  defp lookup(plan, key) do
+    case Shared.get(plan.scope, key) do
+      nil ->
         :miss
+
+      entry ->
+        :ets.update_element(plan.table, key, {2, :erlang.unique_integer([:monotonic])})
+        {:ok, entry}
     end
   rescue
     ArgumentError -> :miss
   end
 
   defp store(plan, key = {pos, _templates, _static_key}, entry) do
-    # Only the keys and the times of use, because a read of an entry copies its function.
     used =
       :ets.select(plan.table, [
-        {{:"$1", :_, :"$2"}, [{:==, {:element, 1, :"$1"}, pos}], [{{:"$1", :"$2"}}]}
+        {{:"$1", :"$2"}, [{:==, {:element, 1, :"$1"}, pos}], [{{:"$1", :"$2"}}]}
       ])
 
     if length(used) >= plan.cache_size do
       {oldest = {_pos, shapes, _static_key}, _used} = Enum.min_by(used, &elem(&1, 1))
       :ets.delete(plan.table, oldest)
+      Shared.erase(plan.scope, oldest)
 
       :telemetry.execute([:transmuter, :cache, :evict], %{count: 1}, %{
         source: plan.source,
@@ -416,7 +419,8 @@ defmodule Transmuter.GraphBreaks do
       })
     end
 
-    :ets.insert(plan.table, {key, entry, :erlang.unique_integer([:monotonic])})
+    :ets.insert(plan.table, {key, :erlang.unique_integer([:monotonic])})
+    Shared.put(plan.scope, key, entry)
   rescue
     ArgumentError -> :ok
   end

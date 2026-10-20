@@ -112,6 +112,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Audio.SpeechToText,
           Transmuter.Fusion,
           Transmuter.GraphBreaks,
+          Transmuter.Shared,
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,
           Transmuter.Ops.LinAlg,
