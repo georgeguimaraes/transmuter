@@ -1,5 +1,67 @@
 # Changelog
 
+## [1.0.0](https://github.com/georgeguimaraes/transmuter/compare/v0.2.0...v1.0.0) (2026-10-20)
+
+
+### Features
+
+* Add image servings in Transmuter.Vision ([0295431](https://github.com/georgeguimaraes/transmuter/commit/0295431959177c7b433180497c010a6831289ea0))
+* Add speech-to-text with Whisper ([a5e93dc](https://github.com/georgeguimaraes/transmuter/commit/a5e93dced04f75d6c87e503b487f6422b1bbb439))
+* Add text-to-text generation for encoder-decoder models ([de0f08d](https://github.com/georgeguimaraes/transmuter/commit/de0f08d6856148ac182d08be4132fb5c9f104665))
+* Add zero-shot classification and question answering servings ([d5ebf37](https://github.com/georgeguimaraes/transmuter/commit/d5ebf370b9c9c6d58795f98b10767f1ce4172ea9))
+* Generate for a batch of inputs ([36d7246](https://github.com/georgeguimaraes/transmuter/commit/36d72461dda628e23d2fff7a916a2899c38d947f))
+* Let one input of a text serving give more than one row ([1cff559](https://github.com/georgeguimaraes/transmuter/commit/1cff55952b240353040ebb15fcdb53563c8e705a))
+* Render chat templates with Otera ([2f1189e](https://github.com/georgeguimaraes/transmuter/commit/2f1189ee41c63ecbea2a099f37d45173002df0db))
+* Run half-precision exports in native f16 by default ([8693d6b](https://github.com/georgeguimaraes/transmuter/commit/8693d6b8231a440b565ac01734cc57c29ce4a1aa))
+* Stream the tokens of generation ([f922a7d](https://github.com/georgeguimaraes/transmuter/commit/f922a7d549dd1e56bb7bd4afe9d2237b7ac036ee))
+* Transcribe long audio with Whisper and give timestamps ([516996b](https://github.com/georgeguimaraes/transmuter/commit/516996b30c25cfccab91661c54ee6980053c1a00))
+
+
+### Bug Fixes
+
+* Add the Otera changes that commit 2f1189e did not include ([489baf8](https://github.com/georgeguimaraes/transmuter/commit/489baf89af95ce1529b657f11505493fc26384c9))
+
+
+### Miscellaneous
+
+* Release 1.0.0 ([6a53633](https://github.com/georgeguimaraes/transmuter/commit/6a53633185e4939b6cfe610b7367421b2ba8660e))
+* Update protox to 2.1 and remove decimal ([790b843](https://github.com/georgeguimaraes/transmuter/commit/790b843e3ee1ab15c86c936f53ff0beb33dd6c7b))
+
+
+### Documentation
+
+* Correct the claims that recent changes made out of date ([9d25e8a](https://github.com/georgeguimaraes/transmuter/commit/9d25e8a9fce3131d81963eb5b0788d330c8c295a))
+* Give the measured drift of the Qwen2-VL vision encoder in native f16 ([dd97638](https://github.com/georgeguimaraes/transmuter/commit/dd976385be60e44a3b17b0cd388a870f92d4952b))
+* Point the getting started guide to the servings ([5f76652](https://github.com/georgeguimaraes/transmuter/commit/5f766525e4514b3f68341188f7c3ddf9c0fd5e2b))
+* Say that the grow mode compiles each cache length ([64f1fea](https://github.com/georgeguimaraes/transmuter/commit/64f1feae4e6f6b77f6ceed2c2ce7edef04b1a0b3))
+
+
+### Code Refactoring
+
+* Move the generation loop into Transmuter.Generation ([e18be59](https://github.com/georgeguimaraes/transmuter/commit/e18be592b0d37d05618b557de63d83b102624ebf))
+
+
+### Tests
+
+* Give the concurrent streams test 60 s on slow runners ([3f3999c](https://github.com/georgeguimaraes/transmuter/commit/3f3999c83fe2758ea940c54ce3190df39879b869))
+
+
+### Performance Improvements
+
+* Build the large host tensors of a request from binaries ([43bfbe4](https://github.com/georgeguimaraes/transmuter/commit/43bfbe4e78af80d2ec54b41079659bb0a97fd9cf))
+* Compile a graph segment from the templates of its arguments ([4568251](https://github.com/georgeguimaraes/transmuter/commit/456825102c18ae01b9f13d1f74798c5d72d04a73))
+* Compile each cache length of the grow mode ([bf85c93](https://github.com/georgeguimaraes/transmuter/commit/bf85c930aa6594b7073b404af8b04beba211f86e))
+* Find the arguments of a graph segment in one pass ([f985617](https://github.com/georgeguimaraes/transmuter/commit/f985617cfe2f13988e8bda13d43610c2f1aa3672))
+* Fuse the normalizations and attention cores that exports write as separate operators ([5e1ffea](https://github.com/georgeguimaraes/transmuter/commit/5e1ffea6fc4ff2fcd35524df6b4aad91f96a7252))
+* Keep the batch functions of a serving in persistent_term ([473e816](https://github.com/georgeguimaraes/transmuter/commit/473e816c00a2f818a33bfaaffb02085bd238191f))
+* Keep the compiled closure of a graph segment small ([c0ff088](https://github.com/georgeguimaraes/transmuter/commit/c0ff0885789f21554aebfcd7779a33ce78461d29))
+* Keep the compiled segments of a graph in persistent_term ([a738a87](https://github.com/georgeguimaraes/transmuter/commit/a738a87707e638f61fa1f4b10cac998c260b9428))
+* Make the empty KV cache on the device ([1abfac6](https://github.com/georgeguimaraes/transmuter/commit/1abfac65eeb510ea14588d61dfd055d957488168))
+* Run the attention core as a fused EMLX kernel ([babf726](https://github.com/georgeguimaraes/transmuter/commit/babf726b40c795297d71d1fafd0beae708e1c499))
+* Run the normalization operators as fused EMLX kernels ([65b8265](https://github.com/georgeguimaraes/transmuter/commit/65b8265bdf7730dc599384fd25b2bfc611801af4))
+* Start each generation task with a heap of 2 MB ([0bafca2](https://github.com/georgeguimaraes/transmuter/commit/0bafca2a60a9ee97ff18f5139a3699a20f5d6a73))
+* Write the appended KV cache rows in one compiled call ([864e81a](https://github.com/georgeguimaraes/transmuter/commit/864e81a880bb1e68d3d8238672ef644578d7fdf9))
+
 ## [0.2.0](https://github.com/georgeguimaraes/transmuter/compare/v0.1.1...v0.2.0) (2026-10-19)
 
 
