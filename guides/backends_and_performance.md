@@ -97,6 +97,20 @@ The q8 exports (`model_quantized.onnx`) quantize the activations when the model 
 
 Transmuter computes these operators as ONNX Runtime does, so a batch gives the results of ONNX Runtime on the same batch. When the results of an input must not depend on the batch, use a batch size of 1, or a q4 or fp32 variant.
 
+The q8 results are also sensitive to very small float differences. Each `DynamicQuantizeLinear` puts its input values in 256 buckets. A difference of one float rounding step can move a value to the next bucket, and the next `MatMulInteger` multiplies that difference by the weights. Each block adds new differences, and activations with large outliers make the buckets wider. The output of a deep q8 graph thus changes when a sum is computed in a different order.
+
+ONNX Runtime shows the same effect against itself. These numbers compare the outputs of the q8 vision encoder of SmolVLM 256M on one image (13 tiles):
+
+| Comparison | Mean abs difference | Max abs difference |
+| --- | --- | --- |
+| ONNX Runtime `ORT_ENABLE_ALL` against `ORT_DISABLE_ALL` | 0.512 | 11.06 |
+| Transmuter on EMLX against `ORT_DISABLE_ALL` | 0.504 | 8.60 |
+| Transmuter on EMLX against `ORT_ENABLE_ALL` | 0.506 | 8.90 |
+
+The mean absolute value of the output is 3.72. With the exact inputs that ONNX Runtime gives each node, the `DynamicQuantizeLinear`, `MatMulInteger` and `ConvInteger` nodes of Transmuter give the same bits as ONNX Runtime. The other nodes differ by less than 0.000003 relative. The q8 encoder of vit-gpt2 shows the same pattern: 0.0151 mean abs difference between the two ONNX Runtime levels, and 0.0175 for Transmuter, on a mean abs value of 0.198.
+
+Thus a q8 model does not give the same output in two runtimes, or in one runtime with two optimization levels. The generated text can change after some tokens. For outputs that agree with ONNX Runtime to float precision, use the fp32 variant, or a q4 variant (`MatMulNBits` quantizes only the weights). On the same image, the max abs difference between Transmuter and ONNX Runtime is 0.0002 for the q4 vision encoder of SmolVLM 256M.
+
 ## Memory management with EMLX
 
 EMLX maintains two caches of its own that grow with new shapes.
