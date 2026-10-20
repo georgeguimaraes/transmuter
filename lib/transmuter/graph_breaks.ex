@@ -7,7 +7,7 @@ defmodule Transmuter.GraphBreaks do
   Static values are those of the model, the static inputs, promoted values and values folded from them. Everything else enters a segment as an argument.
   """
 
-  alias Nx.Defn.Compiler
+  alias Nx.Defn.{Compiler, Composite}
   alias Transmuter.{Ops, UnknownValueError}
 
   # A segment of fewer nodes runs eagerly. The cache keeps :cache_size segments for each
@@ -153,7 +153,7 @@ defmodule Transmuter.GraphBreaks do
   # The first segment compiles at once, as a model without breaks always did. A later
   # segment is traced first, and a short one runs eagerly without compiling.
   defp compile_segment(plan, fun, args, 0, ref) do
-    compiled = Nx.Defn.compile(fun, [args], plan.opts)
+    compiled = compile(plan, fun, args)
     {stop, out_names, produced} = Process.get(ref)
     %{compiled: compiled, stop: stop, out_names: out_names, produced: produced}
   end
@@ -164,10 +164,15 @@ defmodule Transmuter.GraphBreaks do
     stop_index = if stop == :end, do: tuple_size(plan.nodes), else: stop
 
     compiled =
-      if stop_index - pos >= @min_compiled_nodes, do: Nx.Defn.compile(fun, [args], plan.opts)
+      if stop_index - pos >= @min_compiled_nodes, do: compile(plan, fun, args)
 
     %{compiled: compiled, stop: stop, out_names: out_names, produced: produced}
   end
+
+  # The compiled function keeps its example arguments, so it gets templates. With the
+  # values, each cached segment would keep the device tensors of its first call.
+  defp compile(plan, fun, args),
+    do: Nx.Defn.compile(fun, [Composite.traverse(args, &Nx.to_template/1)], plan.opts)
 
   defp classify(%{compiled: nil, stop: stop}), do: {:eager, stop}
   defp classify(entry = %{stop: :end}), do: {:end, entry}
