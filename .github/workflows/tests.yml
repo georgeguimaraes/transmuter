@@ -22,7 +22,7 @@ jobs:
           - { elixir: "1.18", otp: "27" }
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # EMLX runs MLX on the CPU on Linux and needs OpenBLAS. apt-get can block on
       # the dpkg lock without a timeout, so each call is bounded and retried once.
       - name: Install OpenBLAS (for emlx)
@@ -57,12 +57,12 @@ jobs:
           echo "::error::could not install libopenblas0. A stall is usually the Ubuntu mirror; the apt output above says which."
           exit 1
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
       - name: Restore dependencies cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -74,7 +74,7 @@ jobs:
       # without the models that the tests no longer use.
       - name: Restore model cache
         id: models
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/transmuter
           key: ${{ runner.os }}-transmuter-models-v2-
@@ -101,7 +101,7 @@ jobs:
           echo "Model cache: $(du -sh . | cut -f1), file list hash $hash"
       - name: Save model cache
         if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/transmuter
           key: ${{ runner.os }}-transmuter-models-v2-${{ steps.model-files.outputs.hash }}
