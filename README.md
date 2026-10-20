@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR) and `image_text_to_text` (chats about images with SmolVLM). `Transmuter.Audio.speech_to_text/2` runs Whisper. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR) and `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL). `Transmuter.Audio.speech_to_text/2` runs Whisper. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 
@@ -172,7 +172,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Piper en_US lessac medium](https://huggingface.co/rhasspy/piper-voices) | The same audio length and a waveform within 1.3e-5, with the noise scales at 0 |
 | [Florence-2 base](https://huggingface.co/onnx-community/Florence-2-base-ft) | The same tokens for the caption, detailed caption and object detection tasks |
 | [SmolVLM 256M](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | The same 100 tokens for an image with 13 tiles |
-| [Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct) | With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes. The fp32 vision encoder is within 2e-5 |
+| [Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct) | With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes. The fp32 vision encoder is within 2e-5. With the fp32 vision encoder, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a chat without images |
 | [InsightFace buffalo_l](https://huggingface.co/WePrompt/buffalo_l) | SCRFD detection within 2.7e-5, and ArcFace embeddings with a cosine similarity of 1.0 to ONNX Runtime |
 | [RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR v4) | The same text for three lines of rendered text, after detection, cropping and recognition |
 | [Real-ESRGAN x4](https://huggingface.co/imgdesignart/realesrgan-x4-onnx) | The upscaled image within 1.3e-5 |

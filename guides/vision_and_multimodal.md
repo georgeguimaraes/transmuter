@@ -97,7 +97,7 @@ A VLM (vision-language model) combines a vision encoder with a decoder. The typi
 2. **Token embedding** (`embed_tokens.onnx`): encodes the text tokens.
 3. **Merged decoder** (`decoder_model_merged.onnx`): generates tokens from the combined image and text embeddings.
 
-For SmolVLM and other Idefics3 models, `Transmuter.Vision.image_text_to_text/2` runs this pipeline as a serving, with the image processor, the merge and the generation loop. See the [Pipelines guide](pipelines.md). For other models, load and run each component:
+For SmolVLM, Qwen2-VL and other models with their image processors, `Transmuter.Vision.image_text_to_text/2` runs this pipeline as a serving, with the image processor, the merge and the generation loop. See the [Pipelines guide](pipelines.md). For other models, load and run each component:
 
 ```elixir
 vision_encoder = Transmuter.load!(

@@ -311,13 +311,24 @@ Nx.Serving.run(serving, chat)
 #=> %{results: [%{text: " In the image we can see a cat sleeping on a pink bed. ...", token_summary: %{input: 876, output: 24, padding: 0}}]}
 ```
 
-The serving runs decoder-only vision language models whose repository has `vision_encoder`, `embed_tokens` and `decoder_model_merged`, as the `ImageTextToText` exports of transformers.js. It supports Idefics3 models, such as SmolVLM. The messages use the chat format of Python transformers: the content of a message is a list of parts, `%{type: "image", image: image}` and `%{type: "text", text: text}`. A chat can have more than one image.
+The serving runs decoder-only vision language models whose repository has `vision_encoder`, `embed_tokens` and `decoder_model_merged`, as the `ImageTextToText` exports of transformers.js. It supports Idefics3 models, such as SmolVLM, and Qwen2-VL. The messages use the chat format of Python transformers: the content of a message is a list of parts, `%{type: "image", image: image}` and `%{type: "text", text: text}`. A chat can have more than one image.
 
-The image processor is the one of Idefics3. The long side of each image becomes 2048 pixels, each side becomes a multiple of 512, and the image splits into tiles of 512x512 pixels. The image resized to one tile comes after the tiles. Each tile gives 64 image tokens in the prompt, so an image of 4x3 tiles gives 832 image tokens. The vision encoder turns the tiles into features, and the features replace the embeddings of the image tokens. Then the decoder generates as `Transmuter.Text.generation/2` does, with the same options.
+For SmolVLM, the image processor is the one of Idefics3. The long side of each image becomes 2048 pixels, each side becomes a multiple of 512, and the image splits into tiles of 512x512 pixels. The image resized to one tile comes after the tiles. Each tile gives 64 image tokens in the prompt, so an image of 4x3 tiles gives 832 image tokens. The vision encoder turns the tiles into features, and the features replace the embeddings of the image tokens. Then the decoder generates as `Transmuter.Text.generation/2` does, with the same options.
 
 The default files are the q4 vision encoder, the q8 embeddings and the q4 decoder: 179 MB for SmolVLM-256M. The fp32 files give the text of ONNX Runtime on the fp32 files too. They do not give the text of the PyTorch model, because the vision encoder of the export gives other features than transformers 4.57.
 
-With `compile: [batch_size: n]`, chats go into one batch when the number of their tiles rounds up to the same power of two. Tiles of zeros fill each row to that number, and the vision encoder removes them.
+For Qwen2-VL, the image processor is the one of Qwen2-VL. Each side of the image becomes the nearest multiple of 28 pixels, within `min_pixels` and `max_pixels` of `preprocessor_config.json`, and the image splits into patches of 14x14 pixels. Each group of 2x2 patches gives one image token, so the 320x240 image of the tests gives 99 image tokens. The vision encoder of the export takes one image in each call. The decoder takes 3-D positions (M-RoPE): the image tokens have the positions of their rows and columns in the image, as `get_rope_index` of Python transformers.
+
+```elixir
+serving =
+  Transmuter.Vision.image_text_to_text({:hf, "onnx-community/Qwen2-VL-2B-Instruct"},
+    variant: %{vision_encoder: :fp32}
+  )
+```
+
+The configuration of the repository picks the 8-bit vision encoder, the fp16 embeddings and the q4 decoder. The 8-bit vision encoder gives other features in Transmuter than in ONNX Runtime, so the generated text can be different. With the fp32 vision encoder (2.7 GB), the text is the same as the text of ONNX Runtime. The q4 decoder is 1 GB and the fp16 embeddings are 0.5 GB.
+
+With `compile: [batch_size: n]`, chats go into one batch when the number of their tiles or patches rounds up to the same power of two. Rows of zeros fill each chat to that number. The vision encoder of SmolVLM removes the tiles of zeros, and the processor of Qwen2-VL gives the vision encoder only the patches of each image.
 
 ## Options of all tasks
 
