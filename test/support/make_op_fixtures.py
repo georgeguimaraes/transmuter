@@ -1258,3 +1258,22 @@ case("RNN_layout_batch_first", [node("RNN", ["x", "w", "r", "", "", "h0"], ["y",
      {"x": rf(B, T, In), "h0": rf(B, 1, Hs)}, {"w": rf(1, Hs, In), "r": rf(1, Hs, Hs)})
 case("LSTM_layout_batch_first", [node("LSTM", ["x", "w", "r"], ["y", "yh", "yc"], hidden_size=Hs, layout=1, direction="reverse")],
      {"x": rf(B, T, In)}, {"w": rf(1, 4 * Hs, In), "r": rf(1, 4 * Hs, Hs)})
+
+# ---------- exact integer sums and dynamic quantization ----------
+
+# A long contraction of extreme 8-bit values sums past 2^24, where f32 stops being exact.
+r = rng_for("exact integer sums")
+extremes = lambda *shape: (r.integers(0, 2, shape) * 255).astype(np.uint8)
+case("MatMulInteger_k4096_extremes", [node("MatMulInteger", ["a", "b", "az", "bz"], ["y"])],
+     {"a": extremes(2, 4096)}, {"b": extremes(4096, 3), "az": np.array(0, np.uint8), "bz": np.array(0, np.uint8)})
+case("MatMulInteger_k4096_signed", [node("MatMulInteger", ["a", "b", "az", "bz"], ["y"])],
+     {"a": np.full((2, 4096), 127, np.int8)}, {"b": np.full((4096, 3), -128, np.int8), "az": np.array(-128, np.int8), "bz": np.array(127, np.int8)})
+case("ConvInteger_c4096_extremes", [node("ConvInteger", ["x", "w", "xz", "wz"], ["y"], pads=[1, 1, 1, 1])],
+     {"x": extremes(1, 4096, 2, 2)}, {"w": extremes(2, 4096, 2, 2), "xz": np.array(0, np.uint8), "wz": np.array(0, np.uint8)})
+case("DynamicQuantizeLinear_all_zeros", [node("DynamicQuantizeLinear", ["x"], ["y", "s", "z"])], {"x": np.zeros((2, 3), np.float32)})
+# The range [-1.25, 126.25] gives scale 0.5 and zero point round(2.5) = 2. 1.25 and 1.75 are ties.
+case("DynamicQuantizeLinear_ties", [node("DynamicQuantizeLinear", ["x"], ["y", "s", "z"])],
+     {"x": np.array([[-1.25, 126.25, 1.25, 1.75], [0.25, -0.75, 2.75, 3.25]], np.float32)})
+# int32 values above 2048 are not exact in f16, so the dequantization computes in f32.
+case("DequantizeLinear_int32_f16_scale", [node("DequantizeLinear", ["x", "s", "z"], ["y"])],
+     {"x": np.array([[100000, -70001, 2049], [5, 40961, -3]], np.int32)}, {"s": np.array(0.001, np.float16), "z": np.array(3, np.int32)}, extra=HALF)

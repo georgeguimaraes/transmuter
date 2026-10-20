@@ -449,7 +449,7 @@ defmodule Transmuter.Ops.NN do
   @doc """
   Computes a convolution of zero-shifted integers, with x and w as f32, to s32.
 
-  It is one matrix product per kernel tap, and f32 matrix products of integers are exact below 2^24. A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels, and is off by up to 15 on sums of about 1.6e6.
+  It is one exact integer product (see `integer_product/5`) per kernel tap. A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels, and is off by up to 15 on sums of about 1.6e6.
   """
   def integer_conv(node, x, w) do
     [n, c | _] = Tuple.to_list(Nx.shape(x))
@@ -503,7 +503,7 @@ defmodule Transmuter.Ops.NN do
           ])
           |> Nx.reshape({groups, div(o, groups), group_c})
 
-        tap_w |> Nx.dot([2], [0], window, [2], [0]) |> Nx.as_type(:s32)
+        integer_product(tap_w, 2, window, 2, &Nx.dot(&1, [2], [0], &2, [2], [0]))
       end)
       |> Enum.reduce(&Nx.add/2)
 
@@ -511,6 +511,26 @@ defmodule Transmuter.Ops.NN do
     sum
     |> Nx.transpose(axes: [2, 0, 1 | Enum.to_list(3..(spatial + 2))])
     |> Nx.reshape(List.to_tuple([n, o | out]))
+  end
+
+  @doc """
+  Computes `product.(a, b)`, a sum of products along axis `a_axis` of a and `b_axis` of b, exactly, as s32.
+
+  a and b are f32 tensors of integers of magnitude up to 255, such as zero-shifted 8-bit values. An f32 sum of up to 256 such products is exact, because 256 * 255^2 < 2^24. A longer sum splits into chunks of 256 along the axes, and the s32 sums of the chunks are exact.
+  """
+  def integer_product(a, a_axis, b, b_axis, product) do
+    size = Nx.axis_size(a, a_axis)
+
+    for start <- 0..(size - 1)//256 do
+      length = min(256, size - start)
+
+      product.(
+        Nx.slice_along_axis(a, start, length, axis: a_axis),
+        Nx.slice_along_axis(b, start, length, axis: b_axis)
+      )
+      |> Nx.as_type(:s32)
+    end
+    |> Enum.reduce(&Nx.add/2)
   end
 
   # {low, high} padding per spatial axis of a window of size kernel over sizes, for

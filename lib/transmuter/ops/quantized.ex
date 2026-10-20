@@ -66,12 +66,22 @@ defmodule Transmuter.Ops.Quantized do
     |> Nx.reshape(Nx.shape(q))
   end
 
+  # The zero point is subtracted in s32 for integer x, and the product with the scale is
+  # in f32, so int32 values stay exact with an f16 scale. The output has the scale type.
   defp op(node = %{op_type: "DequantizeLinear"}, [x, scale | rest]) do
     zero = List.first(rest)
-    type = Nx.type(scale)
-    scale = expand_quant_param(scale, x, node)
-    zero = if zero, do: zero |> Nx.as_type(type) |> expand_quant_param(x, node), else: 0
-    x |> Nx.as_type(type) |> Nx.subtract(zero) |> Nx.multiply(scale)
+    work = if Nx.Type.integer?(Nx.type(x)), do: :s32, else: :f32
+    shifted = Nx.as_type(x, work)
+
+    shifted =
+      if zero,
+        do: Nx.subtract(shifted, zero |> Nx.as_type(work) |> expand_quant_param(x, node)),
+        else: shifted
+
+    shifted
+    |> Nx.as_type(:f32)
+    |> Nx.multiply(scale |> Nx.as_type(:f32) |> expand_quant_param(x, node))
+    |> Nx.as_type(Nx.type(scale))
   end
 
   defp op(node = %{op_type: "QuantizeLinear"}, [x, scale | rest]) do
@@ -85,26 +95,26 @@ defmodule Transmuter.Ops.Quantized do
   defp op(%{op_type: "DynamicQuantizeLinear"}, [x]) do
     low = Nx.min(Nx.reduce_min(x), 0)
     high = Nx.max(Nx.reduce_max(x), 0)
+    # A constant x has the range 0 and gets the scale 1, as in ONNX Runtime.
     scale = Nx.divide(Nx.subtract(high, low), 255)
-    safe = Nx.select(Nx.equal(scale, 0), 1, scale)
-    zero = low |> Nx.negate() |> Nx.divide(safe) |> round_half_even() |> saturate({:u, 8})
-    y = x |> Nx.divide(safe) |> round_half_even() |> Nx.add(zero) |> saturate({:u, 8})
+    scale = Nx.select(Nx.equal(scale, 0), 1, scale)
+    zero = low |> Nx.negate() |> Nx.divide(scale) |> round_half_even() |> saturate({:u, 8})
+    y = x |> Nx.divide(scale) |> round_half_even() |> Nx.add(zero) |> saturate({:u, 8})
     [y, scale, zero]
   end
 
-  # Accumulates in f32, which is exact while partial sums stay under 2^24.
   defp op(%{op_type: "MatMulInteger"}, [a, b | rest]) do
     [a_zero, b_zero] = Enum.take(rest ++ [nil, nil], 2)
     a = a |> Nx.as_type(:f32) |> subtract_zero(a_zero, Nx.rank(a) - 2)
     b = b |> Nx.as_type(:f32) |> subtract_zero(b_zero, Nx.rank(b) - 1)
-    a |> matmul(b) |> Nx.round() |> Nx.as_type(:s32)
+    integer_matmul(a, b)
   end
 
   # Integer matmul on zero-shifted values, then requantized: y = round(acc * a_scale * b_scale / y_scale) + y_zero.
   defp op(%{op_type: "QLinearMatMul"}, [a, a_scale, a_zero, b, b_scale, b_zero, y_scale, y_zero]) do
     a = a |> Nx.as_type(:f32) |> subtract_zero(a_zero, Nx.rank(a) - 2)
     b = b |> Nx.as_type(:f32) |> subtract_zero(b_zero, Nx.rank(b) - 1)
-    acc = matmul(a, b)
+    acc = a |> integer_matmul(b) |> Nx.as_type(:f32)
 
     multiplier =
       Nx.divide(
@@ -221,6 +231,9 @@ defmodule Transmuter.Ops.Quantized do
     out = Nx.dot(a, [-1], w, [1])
     if bias, do: Nx.add(out, bias), else: out
   end
+
+  defp integer_matmul(a, b),
+    do: NN.integer_product(a, Nx.rank(a) - 1, b, max(Nx.rank(b) - 2, 0), &matmul/2)
 
   defp zero_or(nil), do: 0
   defp zero_or(zero), do: Nx.as_type(zero, :f32)
