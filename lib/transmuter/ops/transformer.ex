@@ -527,7 +527,8 @@ defmodule Transmuter.Ops.Transformer do
 
   defp split_packed_qkv(q, k, v, _heads, _kv_heads), do: {q, k, v}
 
-  # The bias of MultiHeadAttention holds the biases of q, k and v, in this order.
+  # The bias of MultiHeadAttention holds the biases of q, k and v, in this order. v can
+  # have another hidden size than q and k.
   defp add_qkv_bias(q, k, v, nil), do: {q, k, v}
 
   defp add_qkv_bias(q, k, v, bias) do
@@ -535,7 +536,8 @@ defmodule Transmuter.Ops.Transformer do
       raise ArgumentError, "MultiHeadAttention with a bias needs key and value of rank 3"
     end
 
-    [qb, kb, vb] = split(bias, List.duplicate(div(Nx.size(bias), 3), 3), 0)
+    hidden = Nx.axis_size(q, -1)
+    [qb, kb, vb] = split(bias, [hidden, hidden, Nx.size(bias) - 2 * hidden], 0)
     {Nx.add(q, qb), Nx.add(k, kb), Nx.add(v, vb)}
   end
 

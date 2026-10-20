@@ -220,7 +220,8 @@ defmodule Transmuter.Ops.NN do
   # Resize one axis at a time. Each output element reads a few input elements, so the
   # taps become static index and weight tensors, and the result is a weighted sum of gathers.
   # Scales, sizes and the roi list the axes of the axes attribute (opset 18), all by
-  # default. Integers resize in f32 and truncate back, as in ONNX Runtime.
+  # default. Integers resize in f32 and truncate back, as in ONNX Runtime, except with
+  # nearest, which copies values and stays exact in the integer type.
   defp op(node = %{op_type: "Resize"}, [x | rest]) do
     {roi, scales, sizes} =
       case rest do
@@ -258,12 +259,18 @@ defmodule Transmuter.Ops.NN do
 
     count = length(axes)
 
+    # Only tf_crop_and_resize reads the roi, so a traced roi does not break the graph.
+    crop? = attr(node, "coordinate_transformation_mode") == "tf_crop_and_resize"
+
     roi =
-      if given.(roi), do: ints!(roi), else: List.duplicate(0, count) ++ List.duplicate(1, count)
+      if crop? and given.(roi),
+        do: ints!(roi),
+        else: List.duplicate(0, count) ++ List.duplicate(1, count)
 
     regions = Enum.zip(Enum.take(roi, count), Enum.drop(roi, count))
     type = Nx.type(x)
-    x = if Nx.Type.integer?(type), do: Nx.as_type(x, :f32), else: x
+    widen? = Nx.Type.integer?(type) and attr(node, "mode", "nearest") != "nearest"
+    x = if widen?, do: Nx.as_type(x, :f32), else: x
 
     out =
       [axes, in_sizes, sizes, scales, regions]
@@ -272,7 +279,7 @@ defmodule Transmuter.Ops.NN do
         resize_axis(acc, node, axis, {in_size, out_size, scale, region})
       end)
 
-    if Nx.Type.integer?(type),
+    if widen?,
       do:
         out
         |> Nx.clip(Nx.Constants.min_finite(type), Nx.Constants.max_finite(type))

@@ -1192,6 +1192,9 @@ for name, attrs, extra_inputs, opset in resizes:
     while names[-1] == "":
         names.pop()
     case(f"Resize_{name}", [node("Resize", names, ["y"], **attrs)], {"x": x46}, extra_inputs, opset=opset)
+# Nearest copies values, so int32 values above 2^24 stay exact.
+case("Resize_nearest_int32_large", [node("Resize", ["x", "", "scales"], ["y"], mode="nearest")],
+     {"x": np.array([[[[16777217, -2147483647], [2147483647, 3]]]], np.int32)}, {"scales": f32s(1, 1, 2, 1.5)})
 case("Resize_linear_uint8", [node("Resize", ["x", "", "scales"], ["y"], mode="linear")],
      {"x": r.integers(0, 256, (1, 1, 4, 5)).astype(np.uint8)}, {"scales": f32s(1, 1, 1.75, 2.5)})
 
