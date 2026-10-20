@@ -26,31 +26,32 @@ defmodule Transmuter.Ops.LinAlg do
 
   defp op(%{op_type: "MatMul"}, [a, b]), do: matmul(a, b)
 
+  # Terms become lists of axis labels: letters, and {:ellipsis, i} for the axes of an
+  # ellipsis, numbered from the right so that they line up across operands. Without an
+  # output term, the output has the ellipsis axes and the letters that appear once, sorted.
   defp op(node = %{op_type: "Einsum"}, operands) do
-    [inputs, output] = node |> attr("equation") |> String.replace(" ", "") |> String.split("->")
-    inputs = String.split(inputs, ",")
-    letters = Enum.map(?A..?Z, &<<&1>>)
-
-    expand = fn term, rank ->
-      if String.contains?(term, "...") do
-        n = rank - (String.length(term) - 3)
-        String.replace(term, "...", Enum.join(Enum.take(letters, n)))
-      else
-        term
+    {inputs, output} =
+      case node |> attr("equation") |> String.replace(" ", "") |> String.split("->") do
+        [inputs, output] -> {String.split(inputs, ","), output}
+        [inputs] -> {String.split(inputs, ","), nil}
       end
-    end
 
-    terms =
-      Enum.zip_with(inputs, operands, fn term, t ->
-        expand.(term, Nx.rank(t)) |> String.graphemes()
-      end)
+    terms = Enum.zip_with(inputs, operands, &labels(&1, Nx.rank(&2)))
 
-    ell = terms |> Enum.map(&Enum.count(&1, fn c -> c in letters end)) |> Enum.max()
+    width =
+      terms |> Enum.map(&Enum.count(&1, fn l -> match?({:ellipsis, _}, l) end)) |> Enum.max()
 
     output =
-      output |> String.replace("...", Enum.join(Enum.take(letters, ell))) |> String.graphemes()
+      if output do
+        labels(output, String.length(String.replace(output, "...", "")) + width)
+      else
+        letters = terms |> List.flatten() |> Enum.frequencies()
+        once = for {l, 1} <- letters, is_binary(l), do: l
+        Enum.map(width..1//-1, &{:ellipsis, &1}) ++ Enum.sort(once)
+      end
 
-    einsum(terms, operands, output)
+    {terms, operands} = terms |> Enum.zip(operands) |> Enum.map(&diagonal/1) |> Enum.unzip()
+    einsum(terms, broadcast_labels(terms, operands), output)
   end
 
   defp op(%{op_type: "Det"}, [x]) do
@@ -64,6 +65,56 @@ defmodule Transmuter.Ops.LinAlg do
         dets = for i <- 0..(Nx.axis_size(flat, 0) - 1), do: Nx.LinAlg.determinant(flat[i])
         dets |> Nx.stack() |> Nx.reshape(List.to_tuple(batch))
     end
+  end
+
+  defp labels(term, rank) do
+    case String.split(term, "...") do
+      [letters] ->
+        String.graphemes(letters)
+
+      [before, rest] ->
+        count = rank - String.length(before) - String.length(rest)
+
+        String.graphemes(before) ++
+          Enum.map(count..1//-1, &{:ellipsis, &1}) ++ String.graphemes(rest)
+    end
+  end
+
+  # A label that repeats in one term takes the diagonal of its axes.
+  defp diagonal({term, t}) do
+    case Enum.find(term, &(Enum.count(term, fn l -> l == &1 end) > 1)) do
+      nil ->
+        {term, t}
+
+      label ->
+        [first, second | _] = for {^label, i} <- Enum.with_index(term), do: i
+        shape = Nx.shape(t)
+        on = Nx.equal(Nx.iota(shape, axis: first), Nx.iota(shape, axis: second))
+
+        t =
+          on
+          |> Nx.select(t, Nx.tensor(0, type: Nx.type(t)))
+          |> Nx.sum(axes: [second])
+          |> Nx.as_type(Nx.type(t))
+
+        diagonal({List.delete_at(term, second), t})
+    end
+  end
+
+  # An axis of size 1 broadcasts to the size of its label in the other operands.
+  defp broadcast_labels(terms, operands) do
+    sizes =
+      Enum.zip_reduce(terms, operands, %{}, fn term, t, sizes ->
+        term
+        |> Enum.zip(Tuple.to_list(Nx.shape(t)))
+        |> Enum.reduce(sizes, fn {l, size}, sizes ->
+          Map.update(sizes, l, size, &max(&1, size))
+        end)
+      end)
+
+    Enum.zip_with(terms, operands, fn term, t ->
+      Nx.broadcast(t, term |> Enum.map(&sizes[&1]) |> List.to_tuple())
+    end)
   end
 
   defp einsum([term], [a], output) do

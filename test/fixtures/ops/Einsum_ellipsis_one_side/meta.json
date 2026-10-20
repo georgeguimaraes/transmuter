@@ -1,0 +1,44 @@
+{
+ "repo": "op/Einsum_ellipsis_one_side",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Einsum": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x0",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    4
+   ]
+  },
+  {
+   "name": "x1",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}

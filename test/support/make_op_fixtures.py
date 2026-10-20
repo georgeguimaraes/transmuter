@@ -1120,3 +1120,20 @@ case("ScatterElements_add_int64", [node("ScatterElements", ["d", "i", "u"], ["y"
      {"d": i64(2**40, -5, 7, 2**62), "u": i64(2**35, -(2**41), 3)}, {"i": i64(0, 3, 0)}, opset=18)
 case("ScatterND_add_int64", [node("ScatterND", ["d", "i", "u"], ["y"], reduction="add")],
      {"d": i64([1, 2**40], [3, -4], [5, 6]), "u": i64([2**36, 1], [-(2**33), 7])}, {"i": i64([2], [2])}, opset=18)
+
+# ---------- Einsum ----------
+
+r = rng_for("Einsum")
+for name, equation, shapes in [
+    ("matmul_implicit_output", "ij,jk", [(3, 4), (4, 2)]),
+    ("ellipsis_broadcast", "...ij,...jk->...ik", [(2, 1, 3, 4), (2, 5, 4, 2)]),
+    ("ellipsis_one_side", "...i,i->...", [(2, 3, 4), (4,)]),
+    ("diagonal", "ii->i", [(4, 4)]),
+    ("trace_implicit", "ii", [(4, 4)]),
+    ("batch_diagonal", "bii->bi", [(2, 3, 3)]),
+    ("three_operands", "ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),
+    ("outer", "i,j->ij", [(3,), (4,)]),
+    ("sum_axis", "ij->j", [(3, 4)]),
+]:
+    case(f"Einsum_{name}", [node("Einsum", [f"x{i}" for i in range(len(shapes))], ["y"], equation=equation)],
+         {f"x{i}": r.standard_normal(shape).astype(np.float32) for i, shape in enumerate(shapes)})
