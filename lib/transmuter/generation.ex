@@ -63,6 +63,14 @@ defmodule Transmuter.Generation do
     }
   end
 
+  @doc """
+  Returns the `:max_new_tokens` of a decoder whose `max_length` counts its prompt, such as the decoder of an encoder-decoder model. The value comes from `opts`, from `max_new_tokens` of `generation_config.json`, or from `max_length` minus `prompt_length`. As in Python transformers, `max_length` is `20` when the configuration does not give it.
+  """
+  def max_new_tokens(repo, opts, prompt_length) do
+    gen = repo.generation_config
+    opts[:max_new_tokens] || gen["max_new_tokens"] || (gen["max_length"] || 20) - prompt_length
+  end
+
   # The tokens that each step suppresses: suppress_tokens and the bad words of one token.
   defp suppress_tokens(gen),
     do: List.wrap(gen["suppress_tokens"]) ++ for([id] <- List.wrap(gen["bad_words_ids"]), do: id)

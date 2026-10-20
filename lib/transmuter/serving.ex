@@ -113,13 +113,7 @@ defmodule Transmuter.Serving do
   def image(model, featurizer, opts, fun, postprocess, inputs \\ %{}) do
     compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
     batch_size = compile[:batch_size]
-
-    {height, width} =
-      Featurizer.size(featurizer) ||
-        raise ArgumentError,
-              "the featurizer gives images of different sizes, so they cannot go in one batch. " <>
-                "Set a size with height and width, or a crop size, in preprocessor_config.json"
-
+    {height, width} = image_size!(featurizer)
     key = {:image_size, {height, width}}
     templates = %{key => %{"pixel_values" => zeros({batch_size, 3, height, width}, :f32)}}
     backend = opts[:backend] || Nx.default_backend()
@@ -139,6 +133,16 @@ defmodule Transmuter.Serving do
 
     shapes = %{batch_size: batch_size, templates: templates, inputs: inputs}
     new(model, opts, shapes, preprocess, fun, postprocess, validate)
+  end
+
+  @doc """
+  Returns the `{height, width}` of the images of `featurizer`. Raises when the size depends on the image, because images of different sizes cannot go in one batch.
+  """
+  def image_size!(featurizer) do
+    Featurizer.size(featurizer) ||
+      raise ArgumentError,
+            "the featurizer gives images of different sizes, so they cannot go in one batch. " <>
+              "Set a size with height and width, or a crop size, in preprocessor_config.json"
   end
 
   # `shapes` has the batch size, the input templates of each batch key, and the inputs

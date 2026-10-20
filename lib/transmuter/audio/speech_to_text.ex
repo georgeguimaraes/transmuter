@@ -61,11 +61,7 @@ defmodule Transmuter.Audio.SpeechToText do
     prompt = prompt(gen, opts[:language], opts[:task], timestamps?)
     [input] = encoder.inputs
 
-    # As the pipeline of transformers, max_length of generation_config.json counts the prompt.
-    max_new_tokens =
-      opts[:max_new_tokens] || gen["max_new_tokens"] ||
-        (gen["max_length"] && gen["max_length"] - length(prompt))
-
+    max_new_tokens = Generation.max_new_tokens(repo, opts, length(prompt))
     opts = Keyword.put(opts, :max_new_tokens, max_new_tokens)
     ctx = Generation.context(repo, decoder, opts, ["encoder_hidden_states"])
 
