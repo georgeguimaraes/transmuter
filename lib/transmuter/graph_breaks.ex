@@ -59,13 +59,14 @@ defmodule Transmuter.GraphBreaks do
     # inputs, so a call with these shapes does not search the cache. Inputs of other shapes
     # compile on their first call and are cached.
     case segment(plan, initial(plan, inputs, static_inputs), 0) do
-      {:end, entry} ->
+      {{:end, entry}, _args} ->
         shapes = input_shapes(inputs)
 
         fast = fn inputs ->
           if input_shapes(inputs) == shapes do
             state = initial(plan, inputs, static_inputs)
-            state |> merge(run_compiled(entry, arguments(plan, state, 0))) |> outputs(plan)
+            {args, _statics} = live(plan, state, 0)
+            state |> merge(run_compiled(entry, args)) |> outputs(plan)
           else
             general(plan, inputs, static_inputs)
           end
@@ -111,23 +112,23 @@ defmodule Transmuter.GraphBreaks do
 
   defp run(plan, state, pos) do
     case segment(plan, state, pos) do
-      {:end, entry} ->
-        merge(state, run_compiled(entry, arguments(plan, state, pos)))
+      {{:end, entry}, args} ->
+        merge(state, run_compiled(entry, args))
 
-      {:break, entry} ->
-        state = merge(state, run_compiled(entry, arguments(plan, state, pos)))
+      {{:break, entry}, args} ->
+        state = merge(state, run_compiled(entry, args))
         run(plan, run_break(plan, state, entry.stop), entry.stop + 1)
 
-      {:eager, stop} ->
+      {{:eager, stop}, _args} ->
         state = run_eager(plan, state, pos, stop)
         if stop == :end, do: state, else: run(plan, run_break(plan, state, stop), stop + 1)
     end
   end
 
-  # Finds or builds the compiled segment that starts at pos for these values.
+  # Finds or builds the compiled segment that starts at pos for these values, and gives
+  # its arguments.
   defp segment(plan, state, pos) do
-    args = arguments(plan, state, pos)
-    statics = live(plan, state, pos, &(not argument?(state, &1, &2)))
+    {args, statics} = live(plan, state, pos)
     shapes = templates(args)
     key = {pos, shapes, static_key(plan, statics)}
     metadata = %{source: plan.source, position: pos, shapes: shapes}
@@ -135,11 +136,11 @@ defmodule Transmuter.GraphBreaks do
     case lookup(plan, key) do
       {:ok, entry} ->
         :telemetry.execute([:transmuter, :cache, :hit], %{count: 1}, metadata)
-        classify(entry)
+        {classify(entry), args}
 
       :miss ->
         :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
-        build(plan, key, statics, args, metadata)
+        {build(plan, key, statics, args, metadata), args}
     end
   end
 
@@ -295,11 +296,6 @@ defmodule Transmuter.GraphBreaks do
     |> Transmuter.host_outputs(Compiler)
   end
 
-  # The non-static values that nodes at pos or later read.
-  defp arguments(plan, state, pos) do
-    plan |> live(state, pos, &argument?(state, &1, &2)) |> encode()
-  end
-
   # Zero-size values, strings and empty optionals hold no device data, so they are
   # captured like static values whatever their origin.
   defp argument?(state, name, value),
@@ -309,12 +305,15 @@ defmodule Transmuter.GraphBreaks do
   defp device_value?({:sequence, elements}), do: Enum.all?(elements, &device_value?/1)
   defp device_value?(_value), do: false
 
-  defp live(plan, state, pos, keep?) do
-    for {name, value} <- state.env,
-        keep?.(name, value),
-        Map.get(plan.last_use, name, -1) >= pos,
-        into: %{},
-        do: {name, value}
+  # The values that nodes at pos or later read: the arguments of a segment and the static
+  # values that it captures.
+  defp live(plan, state, pos) do
+    {args, statics} =
+      state.env
+      |> Enum.filter(fn {name, _value} -> Map.get(plan.last_use, name, -1) >= pos end)
+      |> Enum.split_with(fn {name, value} -> argument?(state, name, value) end)
+
+    {encode(args), Map.new(statics)}
   end
 
   defp context(plan, env) do
