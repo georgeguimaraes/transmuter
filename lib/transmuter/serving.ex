@@ -11,6 +11,11 @@ defmodule Transmuter.Serving do
 
   @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
 
+  # Nx.Serving runs each batch in a new process, whose heap starts small. A step of
+  # generation allocates more than that, so the heap grows through many collections. A
+  # heap of 2 MB (in 8-byte words) from the start removes them.
+  @generation_heap_size 262_144
+
   @doc """
   The options that all text tasks take. See `Transmuter.Text`.
   """
@@ -214,6 +219,7 @@ defmodule Transmuter.Serving do
         ctx = Generation.compile(ctx, defn_options)
 
         fn batch ->
+          Process.flag(:min_heap_size, @generation_heap_size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
           {%{"prompt" => prompt, "seed" => seed}, rest} = Map.split(inputs, ["prompt", "seed"])
           ids = Nx.to_flat_list(prompt)
