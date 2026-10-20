@@ -179,6 +179,49 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The reference is ONNX Runtime on the same files: the q4 vision encoder and decoder and
+  # the 8-bit embeddings. The batch has rows of 13, 13 and 22 tiles and a row without images.
+  test "image-text-to-text matches ONNX Runtime alone, in a batch and in a stream" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+    crop = StbImage.to_nx(@image)[0..99]
+
+    chats =
+      for content <- [
+            [
+              %{type: "image", image: @image},
+              %{type: "text", text: "Can you describe this image?"}
+            ],
+            [
+              %{type: "image", image: tall},
+              %{type: "text", text: "What animals are in the image?"}
+            ],
+            [
+              %{type: "image", image: @image},
+              %{type: "image", image: crop},
+              %{type: "text", text: "How are these two images different?"}
+            ],
+            [%{type: "text", text: "What is the capital of France?"}]
+          ],
+          do: %{messages: [%{role: "user", content: content}]}
+
+    expected = [
+      " In the image we can see a cat sleeping on a pink bed. On the right there are two white and grey color",
+      " There are two cats in the image.",
+      " The first image shows a cat sleeping on a pink couch, while the second image shows a cat sleeping on a pink and",
+      " The capital of France is Paris."
+    ]
+
+    opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
+    alone = Nx.Serving.run(Vision.image_text_to_text(@smolvlm, opts), chats)
+    assert Enum.map(alone, fn %{results: [%{text: text}]} -> text end) == expected
+
+    batched = Vision.image_text_to_text(@smolvlm, [compile: [batch_size: 2]] ++ opts)
+    assert Nx.Serving.run(batched, chats) == alone
+
+    stream = Vision.image_text_to_text(@smolvlm, [stream: true] ++ opts)
+    assert Enum.join(Nx.Serving.run(stream, hd(chats))) == hd(expected)
+  end
+
   defp assert_predictions(%{predictions: predictions}, expected) do
     assert Enum.map(predictions, & &1.label) == Enum.map(expected, &elem(&1, 0))
 

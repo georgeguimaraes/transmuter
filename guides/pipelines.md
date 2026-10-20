@@ -163,7 +163,7 @@ The serving returns a stream of strings. Consume the stream in the process that 
 - A newline or a CJK character ends a chunk at once.
 - A character of several byte-level tokens, such as an emoji, comes out only when all of its tokens are there.
 
-Set `stream_done: true` to get `{:done, %{token_summary: summary}}` after the last chunk. With `:stream`, the input must be one input, not a list. `text_to_text/2` and `Transmuter.Vision.image_to_text/2` take the same options. `Transmuter.Audio.speech_to_text/2` does not stream, because it merges the windows of long audio only at the end.
+Set `stream_done: true` to get `{:done, %{token_summary: summary}}` after the last chunk. With `:stream`, the input must be one input, not a list. `text_to_text/2`, `Transmuter.Vision.image_to_text/2` and `Transmuter.Vision.image_text_to_text/2` take the same options. `Transmuter.Audio.speech_to_text/2` does not stream, because it merges the windows of long audio only at the end.
 
 #### Batches
 
@@ -242,8 +242,9 @@ image = StbImage.read_file!("cats.jpg")
 | `image_embedding/2` | image | `%{embedding: tensor}` |
 | `zero_shot_image_classification/3` | image | `%{predictions: [%{label: label, score: score}]}` |
 | `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
+| `image_text_to_text/2` | `%{messages: messages}` with image parts | `%{results: [%{text: text, token_summary: summary}]}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of `generate` in Python transformers.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of `generate` in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files.
 
 ### Image preprocessing
 
@@ -294,6 +295,29 @@ Nx.Serving.run(serving, image)
 ```
 
 The serving runs encoder-decoder exports of `VisionEncoderDecoderModel`, such as ViT-GPT2 for captions and TrOCR for handwritten text. The encoder reads the image once, and the decoder generates the text. The settings come from `generation_config.json`, so ViT-GPT2 and TrOCR use greedy selection. When the configuration has no `max_length`, the text has at most 20 tokens with the start token, as in Python transformers. Use `:max_new_tokens` to change this limit. The serving takes the options of generation, such as `:compile`, `:stream` and `:strategy`.
+
+### Image-text-to-text
+
+```elixir
+serving = Transmuter.Vision.image_text_to_text({:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"})
+
+chat = %{
+  messages: [
+    %{role: "user", content: [%{type: "image", image: image}, %{type: "text", text: "Can you describe this image?"}]}
+  ]
+}
+
+Nx.Serving.run(serving, chat)
+#=> %{results: [%{text: " In the image we can see a cat sleeping on a pink bed. ...", token_summary: %{input: 876, output: 24, padding: 0}}]}
+```
+
+The serving runs decoder-only vision language models whose repository has `vision_encoder`, `embed_tokens` and `decoder_model_merged`, as the `ImageTextToText` exports of transformers.js. It supports Idefics3 models, such as SmolVLM. The messages use the chat format of Python transformers: the content of a message is a list of parts, `%{type: "image", image: image}` and `%{type: "text", text: text}`. A chat can have more than one image.
+
+The image processor is the one of Idefics3. The long side of each image becomes 2048 pixels, each side becomes a multiple of 512, and the image splits into tiles of 512x512 pixels. The image resized to one tile comes after the tiles. Each tile gives 64 image tokens in the prompt, so an image of 4x3 tiles gives 832 image tokens. The vision encoder turns the tiles into features, and the features replace the embeddings of the image tokens. Then the decoder generates as `Transmuter.Text.generation/2` does, with the same options.
+
+The default files are the q4 vision encoder, the q8 embeddings and the q4 decoder: 179 MB for SmolVLM-256M. The fp32 files give the text of ONNX Runtime on the fp32 files too. They do not give the text of the PyTorch model, because the vision encoder of the export gives other features than transformers 4.57.
+
+With `compile: [batch_size: n]`, chats go into one batch when the number of their tiles rounds up to the same power of two. Tiles of zeros fill each row to that number, and the vision encoder removes them.
 
 ## Options of all tasks
 

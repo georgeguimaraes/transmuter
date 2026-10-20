@@ -184,3 +184,65 @@ for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"
 
 asr = pipeline("automatic-speech-recognition", model="openai/whisper-tiny.en", chunk_length_s=30, device="cpu")
 print("short timestamps", asr(audio.copy(), return_timestamps=True, generate_kwargs={"do_sample": False, "num_beams": 1})["chunks"])
+
+# Image-text-to-text with SmolVLM. The image processor is the slow one, so the pixel values
+# are those of Transmuter. The reference of the default files of Transmuter (the q4 vision
+# encoder and decoder and the 8-bit embeddings) is ONNX Runtime on the same files: the
+# features of the image tokens replace their embeddings, and the decoder runs greedy with a
+# cache that grows from 0 rows. The PyTorch model gives another text, also with the fp32
+# ONNX files, because the vision encoder of the export gives other features than
+# transformers 4.57 (a mean absolute difference of about 1.9 on each tile). ONNX Runtime and
+# Transmuter give the same text with the fp32 files.
+import hashlib
+
+from transformers import AutoImageProcessor, AutoProcessor
+
+repo = "HuggingFaceTB/SmolVLM-256M-Instruct"
+image = Image.open("test/fixtures/cats.png")
+processor = AutoProcessor.from_pretrained(repo, image_processor=AutoImageProcessor.from_pretrained(repo, use_fast=False))
+
+# The prompt and the pixel values of a wide image, a tall image, and an image that gets
+# larger than a multiple of 512 before it splits: pixel_values[0] at (tile, channel, y, x),
+# the mean of the absolute values, and the number and a SHA-256 of the int64 input ids.
+chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
+prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
+positions = [(0, 0, 0, 0), (1, 1, 100, 37), (-1, 2, 511, 511), (2, 0, 257, 190)]
+for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE)), ("crop", image.crop((0, 0, 320, 100)))]:
+    inputs = processor(text=prompt, images=[picture], return_tensors="np")
+    ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"][0]
+    print("idefics3", name, values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+
+chats = {
+    "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
+    "tall image": ([image.transpose(Image.Transpose.TRANSPOSE)], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What animals are in the image?"}]}]),
+    "two images": ([image, image.crop((0, 0, 320, 100))], [{"role": "user", "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "How are these two images different?"}]}]),
+    "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
+}
+
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_quantized.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
+vision, embed, decoder = session("vision_encoder_q4"), session("embed_tokens_quantized"), session("decoder_model_merged_q4")
+names = [o.name for o in decoder.get_outputs()]
+image_token, eos = processor.tokenizer.convert_tokens_to_ids(["<image>", "<end_of_utterance>"])
+
+for name, (images, messages) in chats.items():
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=prompt, images=images or None, return_tensors="np")
+    ids = inputs["input_ids"]
+    embeds = embed.run(None, {"input_ids": ids})[0]
+    if images:
+        features = vision.run(None, {"pixel_values": inputs["pixel_values"], "pixel_attention_mask": inputs["pixel_attention_mask"].astype(bool)})[0]
+        embeds[ids == image_token] = features.reshape(-1, embeds.shape[-1])
+    past = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in decoder.get_inputs() if i.name.startswith("past_key_values")}
+    tokens, length = [], ids.shape[1]
+    for _ in range(24):
+        n = embeds.shape[1]
+        feeds = {"inputs_embeds": embeds, "attention_mask": np.ones((1, length), np.int64), "position_ids": np.arange(length - n, length)[None], **past}
+        outputs = dict(zip(names, decoder.run(None, feeds)))
+        tokens.append(int(outputs["logits"][0, -1].argmax()))
+        if tokens[-1] == eos:
+            break
+        past = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+        embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0]
+        length += 1
+    print("smolvlm onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
