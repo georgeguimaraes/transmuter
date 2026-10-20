@@ -4,7 +4,7 @@ defmodule Transmuter.Serving do
 
   `text/7` and `image/6` build the servings that run the model once. The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
 
-  `generation/3` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop.
+  `generation/4` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop. With `stream: true`, the loop sends each new token to the client through the `:token` hook of `Nx.Serving.streaming/2`, and the client decodes the text.
   """
 
   alias Transmuter.{Featurizer, Generation, Repo, Tokenizer}
@@ -214,13 +214,13 @@ defmodule Transmuter.Serving do
   @prompt_widths for exponent <- 12..20, do: 2 ** exponent
 
   @doc """
-  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`. The rows of a batch generate together.
+  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`. The rows of a batch generate together. `tokenizer` decodes the text of a stream.
 
   `task` is a map:
 
     * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
-    * `:preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, and a batch key in `:key`. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
+    * `:preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
     * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. The function returns the token ids of each row.
 
@@ -228,11 +228,12 @@ defmodule Transmuter.Serving do
 
     * `:keys` lists the keys of the runs. The default is `[nil]`.
 
-  `opts` are the options of the task. The serving reads `:batch_size` of `:compile` and `:defn_options`.
+  `opts` are the options of the task. The serving reads `:batch_size` of `:compile`, `:stream`, `:stream_done` and `:defn_options`.
   """
-  def generation(ctx, task, opts) do
+  def generation(ctx, tokenizer, task, opts) do
     batch_size = Keyword.get(opts[:compile] || [], :batch_size, 1)
     keys = for key <- Map.get(task, :keys, [nil]), width <- @prompt_widths, do: {key, width}
+    stream? = Keyword.get(opts, :stream, false)
     # The closures of the serving copy what they reference, so each one takes only its
     # function of the task.
     %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess} = task
@@ -240,7 +241,9 @@ defmodule Transmuter.Serving do
     # One function runs the batches of all keys.
     Nx.Serving.new(
       fn defn_options ->
-        defn_options = Keyword.delete(defn_options, :batch_keys)
+        {hooks, defn_options} =
+          defn_options |> Keyword.delete(:batch_keys) |> Keyword.pop(:hooks, %{})
+
         run = init.(defn_options)
         backend = Nx.Defn.to_backend(defn_options)
         ctx = Generation.compile(ctx, batch_size, defn_options)
@@ -265,7 +268,8 @@ defmodule Transmuter.Serving do
           tensors =
             Map.new(tensors, fn {name, tensor} -> {name, pad_rows(tensor, padding, backend)} end)
 
-          generated = run.(tensors, prompts, &Generation.generate(ctx, &2, seeds, &1))
+          generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
+          generated = run.(tensors, prompts, generate)
           lengths = Enum.map(generated, &length/1)
 
           # A trailing zero, because Nx has no tensors of length 0.
@@ -282,9 +286,13 @@ defmodule Transmuter.Serving do
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: keys)
-    |> Nx.Serving.streaming()
+    |> Nx.Serving.streaming(hooks: if(stream?, do: [:token], else: []))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
+
+      if stream? and multi? do
+        raise ArgumentError, "a serving with stream: true takes one input, got a list"
+      end
 
       runs = Enum.map(inputs, preprocess)
 
@@ -298,19 +306,89 @@ defmodule Transmuter.Serving do
           rows |> Enum.map(&elem(&1, 1)) |> Nx.Batch.stack() |> Nx.Batch.key(key)
         end)
 
-      {batches, {multi?, runs}}
+      # Streaming hooks take one batch, not a stream of batches.
+      {if(stream?, do: hd(batches), else: batches), {multi?, runs}}
     end)
-    |> Nx.Serving.client_postprocessing(fn stream, {multi?, runs} ->
-      results =
-        stream
-        |> Enum.flat_map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
-          Enum.zip_with(Nx.to_list(ids), Nx.to_list(length), &Enum.take/2)
-        end)
-        |> split_like(runs)
-        |> Enum.zip_with(runs, postprocess)
+    |> generation_postprocessing(tokenizer, postprocess, stream?, opts[:stream_done])
+  end
 
-      if multi?, do: results, else: hd(results)
+  defp generation_postprocessing(serving, tokenizer, postprocess, stream?, done?) do
+    if stream? do
+      Nx.Serving.client_postprocessing(serving, fn stream, {false, [[run]]} ->
+        stream_text(stream, tokenizer, run.summary, done?)
+      end)
+    else
+      Nx.Serving.client_postprocessing(serving, fn stream, {multi?, runs} ->
+        results =
+          stream
+          |> Enum.flat_map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
+            Enum.zip_with(Nx.to_list(ids), Nx.to_list(length), &Enum.take/2)
+          end)
+          |> split_like(runs)
+          |> Enum.zip_with(runs, postprocess)
+
+        if multi?, do: results, else: hd(results)
+      end)
+    end
+  end
+
+  # The rule of Bumblebee and of TextStreamer in Python transformers. The text of the
+  # pending tokens comes out up to its last space, because a byte-level token can hold a
+  # part of a character, and a tokenizer can add or remove the space before a word from
+  # the tokens around it. A newline or a CJK character ends a chunk at once, and the
+  # pending tokens start again after a newline.
+  defp stream_text(stream, tokenizer, summary, done?) do
+    Stream.transform(stream, %{ids: [], count: 0, sent: 0, finished?: false}, fn
+      _event, state = %{finished?: true} ->
+        {:halt, state}
+
+      {:batch, _outputs, _metadata}, state ->
+        {:halt, state}
+
+      {:token, %{token: token, finished?: finished?}}, state ->
+        token = Nx.to_number(token[0])
+        finished? = Nx.to_number(finished?[0]) == 1
+
+        state =
+          if token < 0,
+            do: state,
+            else: %{state | ids: state.ids ++ [token], count: state.count + 1}
+
+        text = tokenizer |> Tokenizer.decode(state.ids) |> binary_slice(state.sent..-1//1)
+        {chunk, state} = chunk(text, finished?, state)
+        token_summary = Map.put(summary, :output, state.count)
+        done = if finished? and done?, do: [{:done, %{token_summary: token_summary}}], else: []
+        {Enum.reject([chunk], &(&1 == "")) ++ done, %{state | finished?: finished?}}
     end)
+  end
+
+  defp chunk(text, finished?, state) do
+    cond do
+      finished? or String.ends_with?(text, "\n") ->
+        {text, %{state | ids: [], sent: 0}}
+
+      text != "" and cjk?(text |> String.last() |> String.to_charlist() |> List.last()) ->
+        {text, %{state | sent: state.sent + byte_size(text)}}
+
+      true ->
+        case :binary.matches(text, " ") do
+          [_ | _] = matches ->
+            {space, _} = List.last(matches)
+            {binary_part(text, 0, space), %{state | sent: state.sent + space}}
+
+          [] ->
+            {"", state}
+        end
+    end
+  end
+
+  # The CJK ranges of BERT. CJK text has no spaces, so a chunk ends after each whole CJK
+  # character. A part of a character decodes to U+FFFD, which is not in these ranges.
+  defp cjk?(codepoint) do
+    codepoint in 0x4E00..0x9FFF or codepoint in 0x3400..0x4DBF or
+      codepoint in 0x20000..0x2A6DF or codepoint in 0x2A700..0x2B73F or
+      codepoint in 0x2B740..0x2B81F or codepoint in 0x2B820..0x2CEAF or
+      codepoint in 0xF900..0xFAFF or codepoint in 0x2F800..0x2FA1F
   end
 
   defp pad_rows(tensor, padding, backend) do

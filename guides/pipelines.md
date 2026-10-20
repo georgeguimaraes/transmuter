@@ -146,6 +146,26 @@ The serving works with any decoder export that has a KV cache. It reads the shap
 
 The prompt runs in parts with a power-of-two length, and each new token is a part of length 1. So a small number of compiled shapes covers all prompt lengths.
 
+#### Streaming
+
+Set `stream: true` to get the text in chunks as the tokens arrive:
+
+```elixir
+serving = Transmuter.Text.generation({:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, stream: true)
+
+serving
+|> Nx.Serving.run(%{messages: [%{role: "user", content: "Write a haiku about Elixir."}]})
+|> Enum.each(&IO.write/1)
+```
+
+The serving returns a stream of strings. Consume the stream in the process that called the serving. The chunks join to the text of a serving without `:stream`. The serving decodes the text with the rule of Bumblebee and of `TextStreamer` in Python transformers:
+
+- A chunk ends before the last space of the pending text, so a token that changes the space before it does not change a chunk that is already out.
+- A newline or a CJK character ends a chunk at once.
+- A character of several byte-level tokens, such as an emoji, comes out only when all of its tokens are there.
+
+Set `stream_done: true` to get `{:done, %{token_summary: summary}}` after the last chunk. With `:stream`, the input must be one input, not a list. `text_to_text/2` takes the same options. `Transmuter.Audio.speech_to_text/2` does not stream, because it merges the windows of long audio only at the end.
+
 #### Batches
 
 Set `compile: [batch_size: n]` to generate for up to `n` inputs in one loop. The inputs come from a list, or from concurrent calls to `Nx.Serving.batched_run/2`. Each step of the loop runs the model once for all rows. On a GPU, a batch gives more tokens per second in total:
@@ -163,7 +183,7 @@ The mode of the KV cache decides how the rows share the cache:
 
 - With GroupQueryAttention, the attention mask of each row tells the operator how many rows of the cache are valid. The operator writes the new keys and values of each row after its valid rows.
 - With `position_ids`, the attention mask hides the free rows of each row, and the new rows go into the buffer after the valid rows of each row.
-- A merged decoder without `position_ids` gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group.
+- A merged decoder without `position_ids` gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 

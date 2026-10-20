@@ -41,6 +41,8 @@ defmodule Transmuter.Audio do
     * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty` and `:seed` - as in `Transmuter.Text.generation/2`. `:max_new_tokens` applies to each pass of the decoder over a window. Its default is `max_length` of `generation_config.json` (448 for Whisper) minus the length of the prompt, as in the pipeline of transformers.
 
   An English-only model, such as `whisper-tiny.en`, raises an error for a `:language` or `:task` other than English transcription.
+
+  The serving does not stream the text, because it merges the windows of long audio only at the end.
   """
   defdelegate speech_to_text(source, opts \\ []), to: Transmuter.Audio.SpeechToText
 end

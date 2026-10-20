@@ -163,6 +163,10 @@ defmodule Transmuter.Text do
 
     * `:compile` - `:batch_size`, the number of inputs that generate together. The default is `1`. The serving does not use `:sequence_length`, because it does not pad or truncate the prompt.
 
+    * `:stream` - `true` makes the serving return a stream of text chunks. The default is `false`. With `:stream`, the input must be one input, not a list.
+
+    * `:stream_done` - `true` adds `{:done, %{token_summary: summary}}` at the end of the stream. The default is `false`.
+
   The other options are those of the module documentation.
 
   ## Batches
@@ -174,6 +178,20 @@ defmodule Transmuter.Text do
   `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A merged decoder without `position_ids`, such as `Xenova/gpt2` or Gemma 3, runs the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length.
 
   Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
+
+  ## Streaming
+
+  With `stream: true`, `Nx.Serving.run/2` and `Nx.Serving.batched_run/2` return a stream. Consume the stream in the process that called the serving:
+
+      serving = Transmuter.Text.generation({:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, stream: true)
+
+      serving
+      |> Nx.Serving.run(%{messages: [%{role: "user", content: "Write a haiku."}]})
+      |> Enum.each(&IO.write/1)
+
+  The chunks come out as the tokens arrive, and they join to the text of a serving without `:stream`. The serving decodes the text as Bumblebee and `TextStreamer` of Python transformers do. A chunk ends before the last space of the pending text, at a newline, or after a CJK character. So a chunk never has a part of a character, and a word does not lose the space that its next token gives.
+
+  With a batch, a stream gets the tokens of its row as each step of the loop ends. For a merged decoder without `position_ids`, the rows of a later group get their first token when the groups before it finish.
   """
   defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
 
@@ -192,7 +210,7 @@ defmodule Transmuter.Text do
 
     * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits. `:batch_size` is the number of inputs that generate together, as in `generation/2`. Inputs of the same sequence length go into one batch.
 
-    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, and `:seed` - as in `generation/2`.
+    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

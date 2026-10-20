@@ -25,6 +25,8 @@ defmodule Transmuter.Text.Generation do
         :repetition_penalty,
         :seed,
         :template_options,
+        stream: false,
+        stream_done: false,
         compile: [],
         defn_options: []
       ])
@@ -54,7 +56,7 @@ defmodule Transmuter.Text.Generation do
       postprocess: postprocess
     }
 
-    Serving.generation(ctx, task, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
   end
 
   # A chat goes through the chat template, which adds the special tokens itself.

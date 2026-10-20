@@ -313,6 +313,31 @@ defmodule Transmuter.TextTest do
     assert text.(1) != text.(2)
   end
 
+  test "streamed chunks join to the text, and characters of several byte tokens stay whole" do
+    # Each of 景 and 谊 is three byte-level tokens of SmolLM2.
+    repo = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [variant: :fp32, strategy: :greedy, max_new_tokens: 14] ++ @opts
+
+    chat = %{
+      messages: [%{role: "user", content: "Write the word 'hello' in Chinese and Japanese."}]
+    }
+
+    %{results: [%{text: text, token_summary: summary}]} =
+      Nx.Serving.run(Transmuter.Text.generation(repo, opts), chat)
+
+    events =
+      repo
+      |> Transmuter.Text.generation([stream: true, stream_done: true] ++ opts)
+      |> Nx.Serving.run(chat)
+      |> Enum.to_list()
+
+    {chunks, [{:done, %{token_summary: streamed_summary}}]} = Enum.split(events, -1)
+    assert text =~ "景谊"
+    assert Enum.join(chunks) == text
+    refute Enum.any?(chunks, &String.contains?(&1, "�"))
+    assert streamed_summary == summary
+  end
+
   test "a batch gives the text of each prompt alone in each mode of the KV cache" do
     questions = [
       "What is the capital of France?",
@@ -336,6 +361,30 @@ defmodule Transmuter.TextTest do
       alone = for input <- inputs, do: Nx.Serving.run(single, input)
       assert Nx.Serving.run(batched, inputs) == alone
     end
+  end
+
+  test "concurrent streams of a started serving get the tokens of their own rows" do
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+        [
+          variant: :fp32,
+          strategy: :greedy,
+          max_new_tokens: 12,
+          compile: [batch_size: 2],
+          stream: true
+        ] ++ @opts
+      )
+
+    start_supervised!({Nx.Serving, serving: serving, name: __MODULE__.Stream, batch_timeout: 100})
+
+    texts =
+      ["What is the capital of France?", "Hi"]
+      |> Enum.map(&%{messages: [%{role: "user", content: &1}]})
+      |> Task.async_stream(&Enum.join(Nx.Serving.batched_run(__MODULE__.Stream, &1)))
+      |> Enum.map(fn {:ok, text} -> text end)
+
+    assert texts == ["The capital of France is Paris.", "Hello! How can I help you today?"]
   end
 
   test "greedy text-to-text matches transformers for T5 and Marian" do

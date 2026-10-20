@@ -184,12 +184,15 @@ defmodule Transmuter.Generation do
   @doc """
   Generates tokens after each prompt of `prompts` with a context from `compile/3`. A prompt is a list of token ids, and an empty prompt is a padding row. `seeds` has the seed of sampling of each row. `inputs` are the inputs of each step that `context/4` names in `given`, with one row for each prompt.
 
+  `on_token` is `nil` or a function that receives `%{token: tensor, finished?: tensor}` after each step of a group, with one row for each prompt. `:token` is the new token of the row, or -1 when the row has no new token. `:finished?` is 1 when the row has no more tokens.
+
   Returns the new token ids of each row, without the eos token.
   """
-  def generate(ctx, prompts, seeds, inputs \\ %{}) do
+  def generate(ctx, prompts, seeds, inputs \\ %{}, on_token \\ nil) do
     ids =
       for prompts <- groups(ctx, prompts) do
-        group = decode(ctx, start(ctx, prompts, seeds, inputs), ctx.max_new_tokens)
+        notify = &notify(on_token, prompts, &1)
+        group = decode(ctx, start(ctx, prompts, seeds, inputs), ctx.max_new_tokens, notify)
         Enum.map(group.ids, &Enum.reverse/1)
       end
 
@@ -240,12 +243,13 @@ defmodule Transmuter.Generation do
     }
   end
 
-  defp decode(ctx, group, remaining) do
+  defp decode(ctx, group, remaining, notify) do
     group = select(ctx, group, remaining)
+    notify.(group)
 
     if Enum.all?(group.done),
       do: group,
-      else: decode(ctx, advance(ctx, group), remaining - 1)
+      else: decode(ctx, advance(ctx, group), remaining - 1, notify)
   end
 
   defp select(ctx, group, remaining) do
@@ -271,6 +275,23 @@ defmodule Transmuter.Generation do
         done: Enum.map(new, &(&1 == nil or remaining == 1)),
         ids: Enum.zip_with(new, group.ids, &if(&1, do: [&1 | &2], else: &2))
     }
+  end
+
+  # The rows of other groups have no token and are not finished.
+  defp notify(nil, _prompts, _group), do: :ok
+
+  defp notify(on_token, prompts, group) do
+    {tokens, finished} =
+      Enum.zip_with([prompts, group.new, group.done], fn
+        [[], _token, _done?] -> {-1, 0}
+        [_prompt, token, done?] -> {token || -1, if(done?, do: 1, else: 0)}
+      end)
+      |> Enum.unzip()
+
+    on_token.(%{
+      token: Nx.tensor(tokens, type: :s64, backend: Nx.BinaryBackend),
+      finished?: Nx.tensor(finished, type: :u8, backend: Nx.BinaryBackend)
+    })
   end
 
   defp advance(ctx, group),

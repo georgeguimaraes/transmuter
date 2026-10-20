@@ -24,6 +24,8 @@ defmodule Transmuter.Text.TextToText do
         :top_p,
         :repetition_penalty,
         :seed,
+        stream: false,
+        stream_done: false,
         defn_options: []
       ])
 
@@ -84,7 +86,7 @@ defmodule Transmuter.Text.TextToText do
       keys: lengths
     }
 
-    Serving.generation(ctx, task, Keyword.put(opts, :compile, compile))
+    Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
   end
 
   defp validate(text) when is_binary(text), do: {:ok, %{text: text}}

@@ -132,7 +132,7 @@ defmodule Transmuter.Audio.SpeechToText do
     end
 
     task = %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess}
-    Serving.generation(ctx, task, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
   end
 
   defp timestamps?(nil), do: false
