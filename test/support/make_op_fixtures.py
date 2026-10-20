@@ -252,6 +252,11 @@ case("ScatterElements_add", [node("ScatterElements", ["d", "i", "u"], ["y"], axi
      {"d": f32(3, 5), "u": f32(3, 2)}, {"i": np.array([[0, 4], [1, 1], [-1, 2]], np.int64)})
 case("ScatterElements_none", [node("ScatterElements", ["d", "i", "u"], ["y"], axis=0)],
      {"d": f32(4, 3), "u": f32(2, 3)}, {"i": np.array([[1, 0, 3], [2, 3, 0]], np.int64)})
+# EMLX does not scatter 64-bit integers on the GPU. The values need more than 32 bits.
+case("ScatterND_int64", [node("ScatterND", ["d", "i", "u"], ["y"])],
+     {"d": np.array([[1, -2, 3], [2**40, -(2**40), 5], [7, 8, 9], [-1, 0, 2**62]], np.int64),
+      "u": np.array([[-(2**33) - 1, 2**35 + 3, -4], [0, -1, 2**63 - 1]], np.int64)},
+     {"i": np.array([[1], [3]], np.int64)})
 case("GatherND", [node("GatherND", ["d", "i"], ["y"])], {"d": f32(3, 4, 5)}, {"i": np.array([[0, 1], [2, 3], [1, -1]], np.int64)})
 case("GatherND_batch", [node("GatherND", ["d", "i"], ["y"], batch_dims=1)], {"d": f32(2, 4, 5)}, {"i": np.array([[[1], [3]], [[0], [2]]], np.int64)})
 case("PRelu", [node("PRelu", ["x", "s"], ["y"])], {"x": f32(2, 3, 4)}, {"s": f32(3, 1)})

@@ -318,7 +318,7 @@ defmodule Transmuter.Ops.Shape do
     updates = Nx.reshape(updates, {:auto})
 
     case attr(node, "reduction", "none") do
-      "none" -> Nx.indexed_put(data, coords, updates)
+      "none" -> put(data, coords, updates, [])
       "add" -> Nx.indexed_add(data, coords, updates)
     end
   end
@@ -348,7 +348,7 @@ defmodule Transmuter.Ops.Shape do
     n = div(Nx.size(indices), k)
     slice = data |> Nx.shape() |> Tuple.to_list() |> Enum.drop(k)
 
-    Nx.indexed_put(
+    put(
       data,
       Nx.reshape(indices, {n, k}),
       Nx.reshape(updates, List.to_tuple([n | slice])),
@@ -526,5 +526,33 @@ defmodule Transmuter.Ops.Shape do
     |> Enum.map_reduce(index, fn dim, rest -> {rem(rest, dim), div(rest, dim)} end)
     |> elem(0)
     |> Enum.reverse()
+  end
+
+  # EMLX 0.5 does not scatter 64-bit integers on the GPU. For them, the scatter writes the
+  # number of each update into a map of 32-bit integers, and a gather takes the values. The
+  # indices address the leading axes of data, all of them without :axes.
+  defp put(data, indices, updates, opts) do
+    case Nx.type(data) do
+      {kind, 64} when kind in [:s, :u] ->
+        {outer, _inner} =
+          data |> Nx.shape() |> Tuple.to_list() |> Enum.split(Nx.axis_size(indices, 1))
+
+        count = Nx.axis_size(indices, 0)
+
+        source =
+          Nx.tensor(-1, type: :s32)
+          |> Nx.broadcast(List.to_tuple(outer))
+          |> Nx.indexed_put(indices, Nx.iota({count}, type: :s32), opts)
+
+        written =
+          source
+          |> Nx.greater_equal(0)
+          |> Nx.broadcast(Nx.shape(data), axes: Enum.to_list(0..(length(outer) - 1)))
+
+        Nx.select(written, Nx.take(updates, Nx.max(source, 0), axis: 0), data)
+
+      _type ->
+        Nx.indexed_put(data, indices, updates, opts)
+    end
   end
 end
