@@ -1,7 +1,7 @@
 defmodule Transmuter.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "1.0.0"
   @source_url "https://github.com/georgeguimaraes/transmuter"
 
   def project do
