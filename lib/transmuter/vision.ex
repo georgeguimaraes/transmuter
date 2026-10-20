@@ -1,6 +1,6 @@
 defmodule Transmuter.Vision do
   @moduledoc """
-  Servings for image tasks. Each function loads a model repository (the ONNX file, `preprocessor_config.json` and the configuration) and returns an `Nx.Serving` that takes images and gives results in the shapes of Bumblebee.
+  Servings for image tasks. Each function loads a model repository (the ONNX files, `preprocessor_config.json`, the configuration and, for text, the tokenizer) and returns an `Nx.Serving` that takes images and gives results in the shapes of Bumblebee.
 
       serving = Transmuter.Vision.image_classification({:hf, "Xenova/vit-base-patch16-224"})
       image = StbImage.read_file!("cat.jpg")
@@ -87,4 +87,31 @@ defmodule Transmuter.Vision do
   """
   defdelegate zero_shot_image_classification(source, labels, opts \\ []),
     to: Transmuter.Vision.ZeroShotImageClassification
+
+  @doc """
+  Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
+
+  The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.
+
+  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the `VisionEncoderDecoderModel` exports of Xenova, such as `Xenova/vit-gpt2-image-captioning` and `Xenova/trocr-small-handwritten`. The default variant is fp32. The encoder reads `pixel_values` from `Transmuter.Featurizer`. The decoder starts from `decoder_start_token_id` and reads the output of the encoder in each step.
+
+      serving = Transmuter.Vision.image_to_text({:hf, "Xenova/vit-gpt2-image-captioning"})
+      Nx.Serving.run(serving, image)
+      #=> %{results: [%{text: "a cat laying on a blanket next to a cat laying on a bed "}]}
+
+  The settings of generation come from `generation_config.json`, as in `Transmuter.Text.generation/2`. The serving does not do beam search. It ignores `num_beams`.
+
+  ## Options
+
+    * `:max_new_tokens` - the maximum number of new tokens. The default is `max_new_tokens` of `generation_config.json`, or else `max_length` minus 1 for the start token. When the configuration has no `max_length`, the value is 20, as in Python transformers. So the default for ViT-GPT2 and TrOCR is 19 new tokens.
+
+    * `:compile` - `:batch_size`, the number of images that generate together. The default is `1`.
+
+    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+
+    * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
+
+  The text needs the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps. The other options are those of the module documentation, but `:model` does not apply, because the task has two models.
+  """
+  defdelegate image_to_text(source, opts \\ []), to: Transmuter.Vision.ImageToText
 end

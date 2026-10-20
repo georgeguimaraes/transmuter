@@ -163,7 +163,7 @@ The serving returns a stream of strings. Consume the stream in the process that 
 - A newline or a CJK character ends a chunk at once.
 - A character of several byte-level tokens, such as an emoji, comes out only when all of its tokens are there.
 
-Set `stream_done: true` to get `{:done, %{token_summary: summary}}` after the last chunk. With `:stream`, the input must be one input, not a list. `text_to_text/2` takes the same options. `Transmuter.Audio.speech_to_text/2` does not stream, because it merges the windows of long audio only at the end.
+Set `stream_done: true` to get `{:done, %{token_summary: summary}}` after the last chunk. With `:stream`, the input must be one input, not a list. `text_to_text/2` and `Transmuter.Vision.image_to_text/2` take the same options. `Transmuter.Audio.speech_to_text/2` does not stream, because it merges the windows of long audio only at the end.
 
 #### Batches
 
@@ -241,8 +241,9 @@ image = StbImage.read_file!("cats.jpg")
 | `image_classification/2` | image | `%{predictions: [%{label: label, score: score}]}` |
 | `image_embedding/2` | image | `%{embedding: tensor}` |
 | `zero_shot_image_classification/3` | image | `%{predictions: [%{label: label, score: score}]}` |
+| `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of `generate` in Python transformers.
 
 ### Image preprocessing
 
@@ -283,6 +284,16 @@ Nx.Serving.run(serving, image)
 The serving uses `model.onnx`, which has the text tower, the image tower, and the logit scale and bias of the model. `vision_model.onnx` and `text_model.onnx` do not have the logit scale and bias. Each label goes into the template `"This is a photo of {}."`, as in Python transformers. Use `:hypothesis_template` to change it.
 
 The scores are a softmax over the labels for CLIP. For SigLIP, the scores are a sigmoid of each label, so they do not add up to 1. The SigLIP tokenizer also removes the punctuation of the text and makes it lowercase, as in Python transformers.
+
+### Image to text
+
+```elixir
+serving = Transmuter.Vision.image_to_text({:hf, "Xenova/vit-gpt2-image-captioning"})
+Nx.Serving.run(serving, image)
+#=> %{results: [%{text: "a cat laying on a blanket next to a cat laying on a bed "}]}
+```
+
+The serving runs encoder-decoder exports of `VisionEncoderDecoderModel`, such as ViT-GPT2 for captions and TrOCR for handwritten text. The encoder reads the image once, and the decoder generates the text. The settings come from `generation_config.json`, so ViT-GPT2 and TrOCR use greedy selection. When the configuration has no `max_length`, the text has at most 20 tokens with the start token, as in Python transformers. Use `:max_new_tokens` to change this limit. The serving takes the options of generation, such as `:compile`, `:stream` and `:strategy`.
 
 ## Options of all tasks
 

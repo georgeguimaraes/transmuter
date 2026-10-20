@@ -105,6 +105,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.ImageClassification,
           Transmuter.Vision.ImageEmbedding,
           Transmuter.Vision.ZeroShotImageClassification,
+          Transmuter.Vision.ImageToText,
           Transmuter.Audio.SpeechToText,
           Transmuter.Fusion,
           Transmuter.GraphBreaks,

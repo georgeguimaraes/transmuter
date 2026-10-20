@@ -1,6 +1,6 @@
 defmodule Transmuter.Generation do
   @moduledoc """
-  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2` and `Transmuter.Audio.speech_to_text/2` use it.
+  The generation loop of a decoder with a KV cache. `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2`, `Transmuter.Vision.image_to_text/2` and `Transmuter.Audio.speech_to_text/2` use it.
 
   Generation runs the model in steps. A step takes new tokens and the KV cache, and gives the logits and the next cache. The prompt runs in steps of power-of-two lengths (45 tokens run as 32, 8, 4 and 1), and each new token is a step of length 1, so a small number of compiled shapes covers all prompts.
 
@@ -24,7 +24,7 @@ defmodule Transmuter.Generation do
 
   In `:in_place` and `:append`, all rows share one buffer. Each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. In `:in_place`, the attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, the attention mask hides the free rows of each row, and the new rows go into the buffer at the length of each row. Both modes give the positions of each row in `position_ids`.
 
-  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
+  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
   """
 
   alias Transmuter.Serving

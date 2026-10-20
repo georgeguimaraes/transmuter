@@ -106,6 +106,38 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @handwriting StbImage.read_file!(Path.expand("../fixtures/handwriting.png", __DIR__))
+  @trocr {:hf, "Xenova/trocr-small-handwritten"}
+
+  # The reference is generate of the PyTorch models. The 8-bit TrOCR gives the text of
+  # PyTorch. The 8-bit ViT-GPT2 gives another caption, also in ONNX Runtime, so its test
+  # uses fp32.
+  test "image to text matches generate of transformers" do
+    for {source, variant, image, text} <- [
+          {{:hf, "Xenova/vit-gpt2-image-captioning"}, :fp32, @image,
+           "a cat laying on a blanket next to a cat laying on a bed "},
+          {@trocr, :q8, @handwriting, "Meet me at the station at noon ."}
+        ] do
+      serving = Vision.image_to_text(source, [variant: variant] ++ @opts)
+      # A tensor and a StbImage give the same result.
+      results = Nx.Serving.run(serving, [image, StbImage.to_nx(image)])
+      assert results == List.duplicate(%{results: [%{text: text}]}, 2)
+    end
+  end
+
+  # The rows of a batch stop at different steps.
+  test "a batch of images gives the text of each image alone, and a stream joins to it" do
+    opts = [variant: :q8] ++ @opts
+    single = Vision.image_to_text(@trocr, opts)
+    alone = for image <- [@handwriting, @image], do: Nx.Serving.run(single, image)
+    batched = Vision.image_to_text(@trocr, [compile: [batch_size: 2]] ++ opts)
+    assert Nx.Serving.run(batched, [@handwriting, @image]) == alone
+
+    [%{results: [%{text: text}]} | _] = alone
+    stream = Vision.image_to_text(@trocr, [stream: true] ++ opts)
+    assert Enum.join(Nx.Serving.run(stream, @handwriting)) == text
+  end
+
   defp assert_predictions(%{predictions: predictions}, expected) do
     assert Enum.map(predictions, & &1.label) == Enum.map(expected, &elem(&1, 0))
 

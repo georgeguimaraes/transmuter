@@ -132,6 +132,18 @@ for repo in ["openai/clip-vit-base-patch32", "google/siglip-base-patch16-224"]:
     classify = pipeline("zero-shot-image-classification", model=repo, image_processor=processor(repo), device="cpu")
     print(repo, [(p["label"], round(p["score"], 6)) for p in classify(image, candidate_labels=labels)])
 
+# Image-to-text: generate of the original PyTorch models of the Xenova exports, greedy, as
+# Transmuter.Vision.image_to_text/2. The configurations have no max_length, so the text has
+# at most 20 tokens with the start token, the default of GenerationConfig.
+# test/fixtures/handwriting.png is a line of text that Pillow drew with the Caveat font
+# (SIL Open Font License 1.1, github.com/google/fonts).
+from transformers import VisionEncoderDecoderModel
+
+for repo, path in [("nlpconnect/vit-gpt2-image-captioning", "test/fixtures/cats.png"), ("microsoft/trocr-small-handwritten", "test/fixtures/handwriting.png")]:
+    pixel_values = processor(repo)(Image.open(path), return_tensors="pt").pixel_values
+    output = VisionEncoderDecoderModel.from_pretrained(repo).generate(pixel_values, do_sample=False, num_beams=1)
+    print(repo, repr(AutoTokenizer.from_pretrained(repo).batch_decode(output, skip_special_tokens=True)[0]))
+
 # Text-to-text: greedy, as Transmuter.Text.text_to_text/2 with strategy: :greedy.
 from transformers import AutoModelForSeq2SeqLM
 
