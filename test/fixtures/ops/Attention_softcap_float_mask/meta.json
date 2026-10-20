@@ -1,0 +1,72 @@
+{
+ "repo": "op/Attention_softcap_float_mask",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Attention": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "q",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    3,
+    4
+   ]
+  },
+  {
+   "name": "k",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    5,
+    4
+   ]
+  },
+  {
+   "name": "v",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    5,
+    4
+   ]
+  },
+  {
+   "name": "mask",
+   "file": "in_3.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    3,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    3,
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

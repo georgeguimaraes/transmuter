@@ -1277,3 +1277,21 @@ case("DynamicQuantizeLinear_ties", [node("DynamicQuantizeLinear", ["x"], ["y", "
 # int32 values above 2048 are not exact in f16, so the dequantization computes in f32.
 case("DequantizeLinear_int32_f16_scale", [node("DequantizeLinear", ["x", "s", "z"], ["y"])],
      {"x": np.array([[100000, -70001, 2049], [5, 40961, -3]], np.int32)}, {"s": np.array(0.001, np.float16), "z": np.array(3, np.int32)}, extra=HALF)
+
+# ---------- attention masks, softcap and the QK output ----------
+
+r = rng_for("attention masks")
+af = lambda *shape, scale=1.0: (r.standard_normal(shape) * scale).astype(np.float32)
+B, H, S, T, Hd = 2, 2, 3, 5, 4
+float_mask = np.where(r.random((B, 1, S, T)) < 0.3, -1e4, r.standard_normal((B, 1, S, T)) * 2).astype(np.float32)
+case("Attention_softcap_float_mask", [node("Attention", ["q", "k", "v", "mask"], ["y"], softcap=2.0)],
+     {"q": af(B, H, S, Hd, scale=3.0), "k": af(B, H, T, Hd, scale=3.0), "v": af(B, H, T, Hd), "mask": float_mask})
+for mode in range(4):
+    case(f"Attention_qk_matmul_output_mode_{mode}",
+         [node("Attention", ["q", "k", "v", "mask"], ["y", "", "", "qk"], softcap=3.0, qk_matmul_output_mode=mode)],
+         {"q": af(B, H, S, Hd, scale=2.0), "k": af(B, H, T, Hd, scale=2.0), "v": af(B, H, T, Hd), "mask": float_mask}, outputs=["y", "qk"])
+hidden = H * Hd
+for name, mask in [("lengths", np.array([5, 3], np.int32)), ("2d", (r.random((B, T)) > 0.3).astype(np.int32)),
+                   ("3d", (r.random((B, S, T)) > 0.3).astype(np.int32))]:
+    case(f"MultiHeadAttention_key_padding_mask_{name}", [node("MultiHeadAttention", ["q", "k", "v", "", "mask"], ["y"], domain=MS, num_heads=H)],
+         {"q": af(B, S, hidden), "k": af(B, T, hidden), "v": af(B, T, hidden), "mask": mask}, ms=True)

@@ -63,16 +63,22 @@ defmodule Transmuter.Ops.Transformer do
             Nx.add(Nx.iota({1, 1, s, 1}, axis: 2), t - s)
           )
 
+    # As in ONNX Runtime, the softcap comes before the masks. The fourth output is the
+    # scores after the matmul, the softcap, the masks or the softmax, by
+    # qk_matmul_output_mode, in the stage order of ONNX Runtime.
     masks = &(&1 |> add_mask(mask) |> mask_where(hidden))
-    scores = q |> grouped_scores(k, scale) |> softcap(cap) |> masks.()
+    raw = grouped_scores(q, k, scale)
+    capped = softcap(raw, cap)
+    scores = masks.(capped)
+    probs = softmax_last(scores)
 
     out =
       if emlx?(q) and cap == 0,
         do: emlx_attention(q, k, v, scale, masks, [hidden, mask]),
-        else: scores |> softmax_last() |> grouped_values(v)
+        else: grouped_values(probs, v)
 
     out = if rank == 3, do: from_heads(out), else: out
-    [out, k, v, scores]
+    [out, k, v, Enum.at([raw, capped, scores, probs], attr(node, "qk_matmul_output_mode", 0))]
   end
 
   # GroupQueryAttention with a KV buffer per sequence. seqlens_k holds each sequence's
@@ -161,10 +167,7 @@ defmodule Transmuter.Ops.Transformer do
     {b, _, s, head_size} = Nx.shape(q)
     t = Nx.axis_size(k, 2)
 
-    padding =
-      if key_padding_mask,
-        do: key_padding_mask |> Nx.reshape({b, 1, 1, t}) |> Nx.equal(0),
-        else: Nx.tensor(0, type: :u8)
+    padding = padding_mask(key_padding_mask, b, t)
 
     causal =
       if attr(node, "unidirectional", 0) == 1,
@@ -397,7 +400,9 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   # true where a key is hidden. A 1-D mask holds key lengths, 2-D and 3-D masks hold 1 to keep.
-  defp padding_mask(nil, _b, _s), do: Nx.tensor(0, type: :u8)
+  # Hidden keys from a mask of key lengths {B}, of keys {B, T}, or of queries and keys
+  # {B, S, T}. A zero in the mask hides a key.
+  defp padding_mask(nil, _b, _t), do: Nx.tensor(0, type: :u8)
 
   defp padding_mask(mask, b, s) do
     case Nx.rank(mask) do
