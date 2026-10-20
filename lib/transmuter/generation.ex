@@ -10,7 +10,7 @@ defmodule Transmuter.Generation do
 
     * `:append` - the graph declares `position_ids`. The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph has no `position_ids`, so it computes the positions from the length of the cache. The cache has its exact length, and each step runs eagerly, because each length is a new shape. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0.
+    * `:grow` - the graph has no `position_ids`, so it computes the positions from the length of the cache. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0.
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
@@ -119,23 +119,32 @@ defmodule Transmuter.Generation do
   end
 
   @doc """
-  Compiles the model and the token selection of `ctx`. Buffer modes compile here, so call this function in the serving process, which owns the cache of compiled shapes.
+  Compiles the model and the token selection of `ctx`. Call this function in the serving process, which owns the cache of compiled shapes.
   """
   def compile(ctx, defn_options) do
     ctx = Map.put(ctx, :backend, Nx.Defn.to_backend(defn_options))
 
-    ctx =
-      if ctx.mode == :grow do
-        Map.put(ctx, :run, fn inputs, static ->
-          Transmuter.run(ctx.model, ctx.model.params, inputs, static)
-        end)
-      else
-        state = initial_state(ctx, @min_capacity)
-        {inputs, static} = step_inputs(ctx, state, [0])
-        opts = [static_inputs: static, cache_size: 32] ++ defn_options
-        compiled = Transmuter.compile(ctx.model, inputs, opts)
-        Map.put(ctx, :run, fn inputs, _static -> compiled.(inputs) end)
-      end
+    # The first step of :grow takes the branch without cache, so each value of the static
+    # inputs has a function. The inputs that the caller gives have their declared dimensions,
+    # with 1 for a symbolic one. Other shapes compile on their first step and stay cached,
+    # and one request of :grow has a shape for each new token and each prompt chunk.
+    state = initial_state(ctx, @min_capacity)
+    opts = [cache_size: ctx.max_new_tokens + @min_capacity] ++ defn_options
+
+    runs =
+      [0, 1]
+      |> Enum.map(&step_inputs(ctx, %{state | length: &1}, [0]))
+      |> Enum.uniq_by(fn {_inputs, static} -> static end)
+      |> Map.new(fn {inputs, static} ->
+        given = templates(ctx.model, ctx.model.inputs -- Map.keys(Map.merge(inputs, static)))
+
+        compiled =
+          Transmuter.compile(ctx.model, Map.merge(given, inputs), [static_inputs: static] ++ opts)
+
+        {static, compiled}
+      end)
+
+    ctx = Map.put(ctx, :run, fn inputs, static -> runs[static].(inputs) end)
 
     settings =
       Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p, :processor])
@@ -143,6 +152,14 @@ defmodule Transmuter.Generation do
     ctx
     |> Map.put(:select, Nx.Defn.jit(&select_token(&1, &2, &3, &4, &5, settings), defn_options))
     |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
+  end
+
+  defp templates(model, names) do
+    Map.new(names, fn name ->
+      {type, dims} = model.input_types[name]
+      zero = Nx.tensor(0, type: type, backend: Nx.BinaryBackend)
+      {name, Nx.broadcast(zero, List.to_tuple(Enum.map(dims, &(&1 || 1))))}
+    end)
   end
 
   @doc """
