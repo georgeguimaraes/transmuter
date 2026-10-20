@@ -1295,3 +1295,23 @@ for name, mask in [("lengths", np.array([5, 3], np.int32)), ("2d", (r.random((B,
                    ("3d", (r.random((B, S, T)) > 0.3).astype(np.int32))]:
     case(f"MultiHeadAttention_key_padding_mask_{name}", [node("MultiHeadAttention", ["q", "k", "v", "", "mask"], ["y"], domain=MS, num_heads=H)],
          {"q": af(B, S, hidden), "k": af(B, T, hidden), "v": af(B, T, hidden), "mask": mask}, ms=True)
+
+# ---------- MoE and QMoE with biases and zero points ----------
+
+r = rng_for("MoE zero points")
+mf = lambda *shape, scale=1.0: (r.standard_normal(shape) * scale).astype(np.float32)
+E, Hm, Im = 4, 32, 16
+case("MoE_relu_biases_k2", [node("MoE", ["input", "router", "fc1", "b1", "fc2", "b2"], ["output"], domain=MS, k=2, activation_type="relu")],
+     {"input": mf(2, 3, Hm), "router": mf(6, E)}, {"fc1": mf(E, Im, Hm, scale=0.3), "b1": mf(E, Im), "fc2": mf(E, Hm, Im, scale=0.3), "b2": mf(E, Hm)}, ms=True)
+for bits in [4, 8]:
+    fc1_q = r.integers(0, 2**bits, (E, Im, Hm)).astype(np.uint8)
+    fc2_q = r.integers(0, 2**bits, (E, Hm, Im)).astype(np.uint8)
+    pack_rows = lambda q: pack_weights(q, bits) if bits == 4 else q
+    zp1 = r.integers(0, 2**bits, (E, Im)).astype(np.uint8)
+    zp2 = r.integers(0, 2**bits, (E, Hm)).astype(np.uint8)
+    case(f"QMoE_{bits}bit_per_row_zero_points",
+         [node("QMoE", ["input", "router", "fc1", "fc1s", "", "fc2", "fc2s", "", "", "", "", "zp1", "zp2"], ["output"], domain=MS,
+               k=2, activation_type="silu", expert_weight_bits=bits, block_size=0)],
+         {"input": mf(2, 3, Hm), "router": mf(6, E)},
+         {"fc1": pack_rows(fc1_q), "fc1s": (np.abs(mf(E, Im, scale=0.01)) + 0.002), "fc2": pack_rows(fc2_q),
+          "fc2s": (np.abs(mf(E, Hm, scale=0.01)) + 0.002), "zp1": pack_rows(zp1), "zp2": pack_rows(zp2)}, ms=True)

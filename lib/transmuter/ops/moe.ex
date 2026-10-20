@@ -17,8 +17,7 @@ defmodule Transmuter.Ops.MoE do
 
   # com.microsoft MoE: float expert weights, full-softmax routing.
   defp op(node = %{op_type: "MoE"}, [input, router_probs | rest]) do
-    [fc1_w, fc1_bias, fc2_w, fc2_bias | opt] = pad(rest, 4)
-    [fc3_w, fc3_bias] = pad(opt, 2)
+    [fc1_w, fc1_bias, fc2_w, fc2_bias, fc3_w, fc3_bias] = pad(rest, 6)
 
     {k, normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
     type = Nx.type(input)
@@ -54,8 +53,8 @@ defmodule Transmuter.Ops.MoE do
 
   # com.microsoft QMoE: block-wise quantized expert weights, local-softmax routing.
   defp op(node = %{op_type: "QMoE"}, [input, router_probs | rest]) do
-    [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = pad(rest, 6)
-    [fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp | _] = pad(opt, 6)
+    [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = pad(rest, 12)
+    [fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp] = opt
 
     {k, normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
     bits = attr(node, "expert_weight_bits", 4)
@@ -267,8 +266,13 @@ defmodule Transmuter.Ops.MoE do
       |> Nx.slice_along_axis(0, k, axis: 2)
       |> Nx.as_type(type)
     else
-      # Per-row scales: {M, N} or {M, N, 1}.
-      q_sub = Nx.subtract(q, default_zero)
+      # Per-row scales {M, N} or {M, N, 1}, and per-row zero points {M, N}, packed along N.
+      zero =
+        if zp,
+          do: zp |> unpack(bits) |> Nx.as_type(type) |> Nx.reshape({m, n, 1}),
+          else: default_zero
+
+      q_sub = Nx.subtract(q, zero)
 
       if scales do
         s = scales |> Nx.as_type(type) |> Nx.reshape({m, n, 1})
