@@ -15,6 +15,8 @@ defmodule Transmuter.Generation do
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
   The token selection applies the logits processors of Python transformers that `generation_config.json` sets: `repetition_penalty`, `suppress_tokens`, `begin_suppress_tokens` (on the first new token), the bad words of one token in `bad_words_ids`, `temperature`, `top_k` and `top_p`.
+
+  A task can add one more processor in the `:processor` key of the context, as `{state, process}`. Before each step, `state` takes the new tokens (the last token first) and gives a tensor. `process` takes the logits and that tensor in the compiled selection, after the suppressed tokens and before the temperature, and gives the new logits.
   """
 
   alias Transmuter.Serving
@@ -46,7 +48,8 @@ defmodule Transmuter.Generation do
       suppress: suppress_tokens(gen),
       begin_suppress: List.wrap(gen["begin_suppress_tokens"]),
       eos: List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"]),
-      bos: gen["bos_token_id"] || repo.config["bos_token_id"]
+      bos: gen["bos_token_id"] || repo.config["bos_token_id"],
+      processor: {fn _generated -> 0 end, fn logits, _state -> logits end}
     }
   end
 
@@ -134,10 +137,11 @@ defmodule Transmuter.Generation do
         Map.put(ctx, :run, fn inputs, _static -> compiled.(inputs) end)
       end
 
-    settings = Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p])
+    settings =
+      Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p, :processor])
 
     ctx
-    |> Map.put(:select, Nx.Defn.jit(&select_token(&1, &2, &3, &4, settings), defn_options))
+    |> Map.put(:select, Nx.Defn.jit(&select_token(&1, &2, &3, &4, &5, settings), defn_options))
     |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
   end
 
@@ -165,7 +169,11 @@ defmodule Transmuter.Generation do
   defp decode(ctx, logits, state, key, seen, generated, remaining) do
     keys = Nx.Random.split(key)
     suppressed = if generated == [], do: ctx.first, else: ctx.suppressed
-    token = ctx.select.(logits, seen, suppressed, keys[0]) |> Nx.to_number()
+    {processor_state, _process} = ctx.processor
+
+    token =
+      ctx.select.(logits, seen, suppressed, processor_state.(generated), keys[0])
+      |> Nx.to_number()
 
     cond do
       token in ctx.eos ->
@@ -302,18 +310,21 @@ defmodule Transmuter.Generation do
   end
 
   # The logits processors of Python transformers, in its order: repetition penalty,
-  # suppressed tokens, temperature, top-k, top-p. The serving compiles this function,
-  # because eager random numbers over a large vocabulary are slow. Removed tokens get the
-  # smallest finite value, because EMLX 0.5 does not compile infinite constants.
-  defp select_token(logits, seen, suppressed, key, settings) do
+  # suppressed tokens, the processor of the task, temperature, top-k, top-p. The serving
+  # compiles this function, because eager random numbers over a large vocabulary are slow.
+  # Removed tokens get the smallest finite value, because EMLX 0.5 does not compile infinite
+  # constants.
+  defp select_token(logits, seen, suppressed, state, key, settings) do
     logits = Nx.as_type(logits, :f32)
     penalty = settings.repetition_penalty
+    {_state, process} = settings.processor
 
     penalized =
       Nx.select(Nx.greater(logits, 0), Nx.divide(logits, penalty), Nx.multiply(logits, penalty))
 
     logits = Nx.select(seen, penalized, logits)
     logits = Nx.select(suppressed, Nx.Constants.min_finite(:f32), logits)
+    logits = process.(logits, state)
 
     if settings.sampling? do
       logits

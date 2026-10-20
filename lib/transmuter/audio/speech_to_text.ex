@@ -12,6 +12,14 @@ defmodule Transmuter.Audio.SpeechToText do
     6. Take the log10 of the values, at least 1.0e-10, clamp to the maximum minus 8, and give `(x + 4) / 4`.
 
   The serving compiles the featurizer and the encoder, so each 30 s of audio runs one compiled shape.
+
+  Long audio follows `AutomaticSpeechRecognitionPipeline` of transformers with `chunk_length_s` and `stride_length_s`:
+
+    1. The client splits the audio into windows (`chunk_iter`). Each window is one batch of the serving.
+    2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again.
+    3. The client merges the tokens of the windows as `_decode_asr` of the Whisper tokenizer does. It removes the timestamps in the context of each window, and joins the overlap of two token sequences at the middle of their best alignment (`_find_longest_common_sequence`).
+
+  With timestamps, the processor of `WhisperTimeStampLogitsProcessor` selects the tokens.
   """
 
   alias Transmuter.{Generation, Hub, Serving, Tokenizer}
@@ -34,49 +42,391 @@ defmodule Transmuter.Audio.SpeechToText do
         :repetition_penalty,
         :seed,
         :language,
+        :chunk_num_seconds,
+        :context_num_seconds,
+        :timestamps,
         task: :transcribe,
         defn_options: []
       ])
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
-    ctx = Generation.context(repo, decoder, opts, ["encoder_hidden_states"])
+    gen = repo.generation_config
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     featurizer = featurizer(repo)
-    prompt = prompt(repo.generation_config, opts[:language], opts[:task])
+    timestamps? = timestamps?(opts[:timestamps])
+    settings = settings(repo, featurizer, opts)
+    prompt = prompt(gen, opts[:language], opts[:task], timestamps?)
     [input] = encoder.inputs
+
+    # As the pipeline of transformers, max_length of generation_config.json counts the prompt.
+    max_new_tokens =
+      opts[:max_new_tokens] || gen["max_new_tokens"] ||
+        (gen["max_length"] && gen["max_length"] - length(prompt))
+
+    opts = Keyword.put(opts, :max_new_tokens, max_new_tokens)
+    ctx = Generation.context(repo, decoder, opts, ["encoder_hidden_states"])
+
+    ctx =
+      if timestamps?,
+        do: %{ctx | processor: timestamp_processor(settings, gen["max_initial_timestamp_index"])},
+        else: ctx
 
     init = fn defn_options ->
       features = Nx.Defn.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
-      frames = div(featurizer.n_samples, featurizer.hop_length)
-      shape = {1, featurizer.feature_size, frames}
+      shape = {1, featurizer.feature_size, settings.frames}
       template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
       encode = Transmuter.compile(encoder, %{input => template}, defn_options)
 
-      fn %{"audio" => audio} ->
-        features = features.(audio, featurizer.filters, featurizer.window)
+      encode = fn features ->
         %{"last_hidden_state" => hidden} = encode.(%{input => features})
         %{"encoder_hidden_states" => hidden}
+      end
+
+      fn %{"audio" => audio}, generate ->
+        features = features.(audio, featurizer.filters, featurizer.window)
+        transcribe(features, 0, settings, &generate.(encode.(&1)))
       end
     end
 
     preprocess = fn audio ->
       seed = opts[:seed] || :rand.uniform(2 ** 32)
-      padding = featurizer.n_samples - Nx.size(audio)
 
-      %{
-        "audio" => Nx.pad(Nx.as_type(audio, :f32), 0.0, [{0, padding, 0}]),
-        "prompt" => Nx.tensor(prompt, type: :s64),
-        "seed" => Nx.tensor(seed, type: :s64)
-      }
+      for {start, stride = {size, _left, _right}} <- windows(Nx.size(audio), settings) do
+        padding = featurizer.n_samples - size
+
+        %{
+          "audio" => audio |> Nx.slice([start], [size]) |> Nx.pad(0.0, [{0, padding, 0}]),
+          "stride" => Nx.tensor(Tuple.to_list(stride), type: :s64),
+          "prompt" => Nx.tensor(prompt, type: :s64),
+          "seed" => Nx.tensor(seed, type: :s64)
+        }
+      end
     end
 
-    postprocess = fn ids, _inputs ->
-      text = Tokenizer.decode(tokenizer, ids)
-      %{chunks: [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}
+    postprocess = fn windows, runs ->
+      strides =
+        Enum.map(runs, fn %{"stride" => stride} ->
+          stride |> Nx.to_flat_list() |> Enum.map(&(&1 / featurizer.sampling_rate))
+        end)
+
+      chunks =
+        windows
+        |> Enum.zip(strides)
+        |> merge(settings)
+        |> Enum.map(fn {start, stop, ids} ->
+          text = Tokenizer.decode(tokenizer, ids)
+          %{text: text, start_timestamp_seconds: start, end_timestamp_seconds: stop}
+        end)
+
+      if timestamps? do
+        %{chunks: chunks}
+      else
+        text = Enum.map_join(chunks, & &1.text)
+        %{chunks: [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}
+      end
     end
 
-    validate = &validate(&1, featurizer)
+    validate = fn
+      audio = %Nx.Tensor{shape: {_samples}} -> {:ok, Nx.backend_transfer(audio, Nx.BinaryBackend)}
+      input -> {:error, "expected a tensor of PCM samples {samples}, got: #{inspect(input)}"}
+    end
+
     Serving.generation(ctx, init, validate, preprocess, postprocess, opts[:defn_options])
+  end
+
+  defp timestamps?(nil), do: false
+  defp timestamps?(:segments), do: true
+
+  defp timestamps?(other),
+    do:
+      raise(ArgumentError, "expected :timestamps to be nil or :segments, got: #{inspect(other)}")
+
+  # The windows in samples, as chunk_length_s and stride_length_s of transformers, and the
+  # settings of the timestamps. A timestamp is 0.02 s, and a feature frame is 0.01 s.
+  defp settings(repo, featurizer, opts) do
+    rate = featurizer.sampling_rate
+    seconds = featurizer.n_samples / rate
+    positions = repo.config["max_source_positions"]
+    frames = div(featurizer.n_samples, featurizer.hop_length)
+    chunk_seconds = opts[:chunk_num_seconds] || seconds
+    chunk = round(chunk_seconds * rate)
+    context = round((opts[:context_num_seconds] || chunk_seconds / 6) * rate)
+
+    unless chunk <= featurizer.n_samples and chunk - 2 * context > 0 do
+      raise ArgumentError,
+            "expected :chunk_num_seconds to be at most #{seconds} and more than twice :context_num_seconds"
+    end
+
+    %{
+      chunk: chunk,
+      context: context,
+      frames: frames,
+      frames_per_timestamp: div(frames, positions),
+      positions: positions,
+      precision: seconds / positions,
+      eos: repo.generation_config["eos_token_id"],
+      timestamp_begin: repo.generation_config["no_timestamps_token_id"] + 1
+    }
+  end
+
+  # chunk_iter of transformers: windows of `chunk` samples every `chunk - 2 * context` samples,
+  # as {start, {size, left context, right context}}. The first window has no left context
+  # and the last has no right context.
+  defp windows(samples, settings), do: windows(samples, 0, settings)
+
+  defp windows(samples, start, %{chunk: chunk, context: context} = settings)
+       when start < samples do
+    last? = start + chunk >= samples
+    size = min(chunk, samples - start)
+    left = if start == 0, do: 0, else: context
+    stride = {size, left, if(last?, do: 0, else: context)}
+    window = if size > left, do: [{start, stride}], else: []
+
+    if last?,
+      do: window,
+      else: window ++ windows(samples, start + chunk - 2 * context, settings)
+  end
+
+  defp windows(_samples, _start, _settings), do: []
+
+  # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of a window.
+  # Tokens that end with two timestamps leave the last segment incomplete, so the next pass
+  # starts at the last timestamp. The features after the frames are zeros.
+  defp transcribe(_features, seek, %{frames: frames}, _generate) when seek >= frames, do: []
+
+  defp transcribe(features, seek, settings, generate) do
+    %{frames: frames, timestamp_begin: begin} = settings
+
+    input =
+      features
+      |> Nx.slice_along_axis(seek, frames - seek, axis: 2)
+      |> Nx.pad(0.0, [{0, 0, 0}, {0, 0, 0}, {0, seek, 0}])
+
+    tokens = generate.(input)
+    timestamps = Enum.map(tokens, &(&1 >= begin))
+    pairs = for {[true, true], i} <- Enum.with_index(Enum.chunk_every(timestamps, 2, 1), 1), do: i
+
+    if pairs == [] or Enum.take(timestamps, -2) == [false, true] do
+      tokens
+    else
+      kept = Enum.take(tokens, List.last(pairs) + 1)
+      offset = (Enum.at(kept, -2) - begin) * settings.frames_per_timestamp
+      kept ++ transcribe(features, seek + offset, settings, generate)
+    end
+  end
+
+  # WhisperTimeStampLogitsProcessor. The state gives the bounds of the step:
+  # [below, from, above] removes the tokens before `below`, the timestamps before `from` and
+  # the tokens after `above`. Then, when the timestamps together are more probable than each
+  # text token, the step selects a timestamp.
+  defp timestamp_processor(%{timestamp_begin: begin, eos: eos}, max_initial) do
+    state = fn generated ->
+      Nx.tensor(bounds(generated, begin, eos, max_initial), type: :s32, backend: Nx.BinaryBackend)
+    end
+
+    process = fn logits, bounds ->
+      ids = Nx.iota(Nx.shape(logits))
+      min = Nx.Constants.min_finite(:f32)
+      timestamp? = Nx.greater_equal(ids, begin)
+
+      removed =
+        ids
+        |> Nx.less(bounds[0])
+        |> Nx.logical_or(Nx.equal(ids, begin - 1))
+        |> Nx.logical_or(Nx.logical_and(timestamp?, Nx.less(ids, bounds[1])))
+        |> Nx.logical_or(Nx.greater(ids, bounds[2]))
+
+      logits = Nx.select(removed, min, logits)
+      logprobs = Nx.subtract(logits, Nx.logsumexp(logits))
+      timestamps = Nx.logsumexp(Nx.select(timestamp?, logprobs, min))
+      text = Nx.reduce_max(Nx.select(timestamp?, min, logprobs))
+
+      Nx.select(
+        Nx.logical_and(Nx.greater(timestamps, text), Nx.logical_not(timestamp?)),
+        min,
+        logits
+      )
+    end
+
+    {state, process}
+  end
+
+  @no_limit 2 ** 31 - 1
+
+  # The first token is a timestamp of at most `max_initial`.
+  defp bounds([], begin, _eos, nil), do: [begin, begin, @no_limit]
+  defp bounds([], begin, _eos, max_initial), do: [begin, begin, begin + max_initial]
+
+  # Timestamps come in pairs, except before eos, and do not decrease. A pair is followed by
+  # text, a single timestamp by a timestamp or eos.
+  defp bounds(generated = [last | rest], begin, eos, _max_initial) do
+    last? = last >= begin
+    penultimate? = match?([], rest) or hd(rest) >= begin
+    single? = last? and not penultimate?
+
+    from =
+      case Enum.find(generated, &(&1 >= begin)) do
+        nil -> begin
+        timestamp when single? -> timestamp
+        timestamp -> timestamp + 1
+      end
+
+    [
+      if(single?, do: eos, else: 0),
+      from,
+      if(last? and penultimate?, do: begin - 1, else: @no_limit)
+    ]
+  end
+
+  # _decode_asr of the Whisper tokenizer: the windows are {tokens, [size, left, right]} in
+  # seconds. Returns the chunks as {start, end, tokens}, with timestamps in seconds.
+  defp merge(windows, settings) do
+    state = %{chunks: [], start: nil, previous: [], offset: 0.0, skip: false}
+    state = Enum.reduce(windows, state, &merge_window(&1, &2, settings))
+
+    chunks =
+      if state.previous == [],
+        do: state.chunks,
+        else: [{state.start, nil, longest_common_sequence(state.previous)} | state.chunks]
+
+    Enum.reverse(chunks)
+  end
+
+  defp merge_window({tokens, [size, left, right]}, state, settings) do
+    %{timestamp_begin: begin, precision: precision} = settings
+    state = %{state | offset: state.offset - left}
+    first = if left != 0, do: left / precision + begin, else: begin
+
+    # Timestamps in the right context do not end a chunk, and the last timestamp never does.
+    last =
+      if right != 0 do
+        tokens
+        |> Enum.reverse()
+        |> Enum.filter(&(&1 >= begin))
+        |> Enum.reduce_while(nil, fn token, last ->
+          if last != nil and (token - begin) * precision < size - right,
+            do: {:halt, last},
+            else: {:cont, token}
+        end)
+      end
+
+    window = %{
+      ids: List.to_tuple(tokens),
+      first: first,
+      last: last,
+      max: 0.0,
+      penultimate: 0.0,
+      before: 0.0,
+      current: []
+    }
+
+    {state, window} =
+      tokens
+      |> Enum.with_index()
+      |> Enum.reduce({state, window}, &merge_token(&1, &2, settings))
+
+    state = %{state | offset: state.offset + (size - right)}
+
+    cond do
+      window.current != [] ->
+        %{state | previous: state.previous ++ [Enum.reverse(window.current)]}
+
+      Enum.all?(state.previous, &(&1 == [])) ->
+        %{state | start: nil, previous: []}
+
+      true ->
+        state
+    end
+  end
+
+  defp merge_token({token, i}, {state, window}, settings) do
+    %{timestamp_begin: begin, eos: eos} = settings
+
+    cond do
+      token >= begin -> merge_timestamp(token, i, state, window, settings)
+      token >= eos -> {state, window}
+      true -> {state, %{window | current: [token | window.current]}}
+    end
+  end
+
+  # The tokens of a window can have several passes of generation, and the timestamps of each
+  # pass start again from 0. `before` is the length of the passes before.
+  defp merge_timestamp(token, i, state, window, settings) do
+    %{timestamp_begin: begin, precision: precision, positions: positions} = settings
+    timestamp = (token - begin) * precision
+
+    window =
+      cond do
+        timestamp >= window.max ->
+          window
+
+        i >= 2 and not (elem(window.ids, i - 1) >= begin and elem(window.ids, i - 2) >= begin) ->
+          %{window | before: window.before + precision * positions}
+
+        true ->
+          %{window | max: window.penultimate, before: window.before + window.penultimate}
+      end
+
+    window = %{window | penultimate: window.max, max: timestamp}
+    time = Float.round(timestamp + state.offset + window.before, 2)
+
+    cond do
+      window.last && token >= window.last ->
+        {%{state | skip: true}, window}
+
+      state.skip or (state.previous != [] and token < window.first) ->
+        {%{state | skip: false}, window}
+
+      state.start == nil ->
+        {%{state | start: time}, window}
+
+      time == state.start ->
+        {state, window}
+
+      true ->
+        tokens = longest_common_sequence(state.previous ++ [Enum.reverse(window.current)])
+        chunks = [{state.start, time, tokens} | state.chunks]
+        {%{state | chunks: chunks, start: nil, previous: []}, %{window | current: []}}
+    end
+  end
+
+  # _find_longest_common_sequence of the Whisper tokenizer: slides each sequence over the
+  # merged tokens, takes the alignment with the most matches (more than one), and cuts the
+  # overlap at its middle.
+  defp longest_common_sequence([first | rest]) do
+    {merged, last} =
+      Enum.reduce(rest, {[], first}, fn right, {merged, left} ->
+        {left_start, left_stop, right_start, right_stop} = best_overlap(left, right)
+        left_part = Enum.take(left, div(left_stop + left_start, 2))
+        {[left_part | merged], Enum.drop(right, div(right_stop + right_start, 2))}
+      end)
+
+    Enum.concat(Enum.reverse([last | merged]))
+  end
+
+  defp best_overlap(left, right) do
+    {l, r} = {length(left), length(right)}
+    {left_ids, right_ids} = {List.to_tuple(left), List.to_tuple(right)}
+
+    {_score, indices} =
+      Enum.reduce(1..(l + r - 1)//1, {0.0, {l, l, 0, 0}}, fn i, {best, indices} ->
+        {left_start, left_stop} = {max(0, l - i), min(l, l + r - i)}
+        right_start = max(0, i - l)
+
+        matches =
+          Enum.count(
+            0..(left_stop - left_start - 1)//1,
+            &(elem(left_ids, left_start + &1) == elem(right_ids, right_start + &1))
+          )
+
+        score = matches / i + i / 10_000.0
+
+        if matches > 1 and score > best,
+          do: {score, {left_start, left_stop, right_start, min(r, i)}},
+          else: {best, indices}
+      end)
+
+    indices
   end
 
   @doc """
@@ -160,9 +510,9 @@ defmodule Transmuter.Audio.SpeechToText do
     log |> Nx.max(floor) |> Nx.add(4.0) |> Nx.divide(4.0)
   end
 
-  # The prompt of transformers without timestamps: the start token, the language and the task
-  # of a multilingual model, and the token that turns timestamps off.
-  defp prompt(gen, language, task) do
+  # The prompt of transformers: the start token, the language and the task of a multilingual
+  # model, and without timestamps the token that turns them off.
+  defp prompt(gen, language, task, timestamps?) do
     tokens =
       if gen["is_multilingual"] do
         language = language || "en"
@@ -185,20 +535,7 @@ defmodule Transmuter.Audio.SpeechToText do
         []
       end
 
-    [gen["decoder_start_token_id"]] ++ tokens ++ [gen["no_timestamps_token_id"]]
+    [gen["decoder_start_token_id"]] ++
+      tokens ++ if(timestamps?, do: [], else: [gen["no_timestamps_token_id"]])
   end
-
-  defp validate(audio = %Nx.Tensor{shape: {samples}}, featurizer) do
-    if samples <= featurizer.n_samples do
-      {:ok, Nx.backend_transfer(audio, Nx.BinaryBackend)}
-    else
-      seconds = div(featurizer.n_samples, featurizer.sampling_rate)
-
-      {:error,
-       "the audio has #{samples} samples, and speech-to-text takes up to #{seconds} s (#{featurizer.n_samples} samples). Split longer audio into parts"}
-    end
-  end
-
-  defp validate(input, _featurizer),
-    do: {:error, "expected a tensor of PCM samples {samples}, got: #{inspect(input)}"}
 end

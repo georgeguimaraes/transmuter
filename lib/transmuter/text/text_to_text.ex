@@ -49,9 +49,13 @@ defmodule Transmuter.Text.TextToText do
       opts = [cache_size: length(lengths)] ++ defn_options
       encode = Transmuter.compile(encoder, Map.new(encoder.inputs, &{&1, template}), opts)
 
-      fn inputs ->
+      fn inputs, generate ->
         %{"last_hidden_state" => hidden} = encode.(Map.take(inputs, encoder.inputs))
-        %{"encoder_hidden_states" => hidden, "encoder_attention_mask" => inputs["attention_mask"]}
+
+        generate.(%{
+          "encoder_hidden_states" => hidden,
+          "encoder_attention_mask" => inputs["attention_mask"]
+        })
       end
     end
 
@@ -59,15 +63,18 @@ defmodule Transmuter.Text.TextToText do
       {tensors, _encodings} = Tokenizer.encode(tokenizer, [input.text])
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
 
-      tensors
-      |> Map.new(fn {name, tensor} -> {name, tensor[0]} end)
-      |> Map.merge(%{
-        "prompt" => Nx.tensor([start], type: :s64),
-        "seed" => Nx.tensor(seed, type: :s64)
-      })
+      run =
+        tensors
+        |> Map.new(fn {name, tensor} -> {name, tensor[0]} end)
+        |> Map.merge(%{
+          "prompt" => Nx.tensor([start], type: :s64),
+          "seed" => Nx.tensor(seed, type: :s64)
+        })
+
+      [run]
     end
 
-    postprocess = fn ids, %{"attention_mask" => mask} ->
+    postprocess = fn [ids], [%{"attention_mask" => mask}] ->
       count = Nx.to_number(Nx.sum(mask))
       summary = %{input: count, output: length(ids), padding: Nx.size(mask) - count}
       %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}

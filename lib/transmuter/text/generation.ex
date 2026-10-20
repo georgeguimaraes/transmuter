@@ -35,15 +35,15 @@ defmodule Transmuter.Text.Generation do
       {text, special?} = prompt(repo, input, opts)
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
       ids = token_ids(tokenizer, text, special?, ctx.bos)
-      %{"prompt" => Nx.tensor(ids, type: :s64), "seed" => Nx.tensor(seed, type: :s64)}
+      [%{"prompt" => Nx.tensor(ids, type: :s64), "seed" => Nx.tensor(seed, type: :s64)}]
     end
 
-    postprocess = fn ids, %{"prompt" => prompt} ->
+    postprocess = fn [ids], [%{"prompt" => prompt}] ->
       summary = %{input: Nx.size(prompt), output: length(ids), padding: 0}
       %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
     end
 
-    no_inputs = fn _defn_options -> fn _inputs -> %{} end end
+    no_inputs = fn _defn_options -> fn _inputs, generate -> generate.(%{}) end end
     Serving.generation(ctx, no_inputs, &validate/1, preprocess, postprocess, opts[:defn_options])
   end
 

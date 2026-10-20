@@ -56,7 +56,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
-| `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}` |
+| `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task.
 
@@ -174,7 +174,19 @@ Nx.Serving.run(serving, audio)
 #=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, ...", ...}]}
 ```
 
-`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. Convert other audio before you run it, for example with `ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32`. The audio can be up to 30 s long. See [Speech and audio](speech_and_audio.md) for the details.
+`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. Convert other audio before you run it, for example with `ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32`.
+
+The audio can have any length. The serving splits audio longer than 30 s into windows that overlap, as the pipeline of transformers with `chunk_length_s=30`. It transcribes each window and merges the texts at the overlaps. The `:chunk_num_seconds` and `:context_num_seconds` options set the windows.
+
+With `timestamps: :segments`, the result has one chunk for each segment of speech, with its start and end in seconds:
+
+```elixir
+serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, timestamps: :segments)
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr. Quilter is ...", start_timestamp_seconds: 0.0, end_timestamp_seconds: 50.44}, ...]}
+```
+
+See [Speech and audio](speech_and_audio.md) for the details.
 
 ## Images
 

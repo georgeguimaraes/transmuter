@@ -121,11 +121,58 @@ The serving does the steps of Python transformers:
 3. The decoder starts from the prompt `<|startoftranscript|>`, the language token, the task token and `<|notimestamps|>`. An English-only model, such as `whisper-tiny.en`, has no language and task tokens. The `:language` option (the default is `"en"`) and the `:task` option (`:transcribe` or `:translate`) select the tokens. The serving does not detect the language.
 4. The selection of each token suppresses `suppress_tokens`, and `begin_suppress_tokens` for the first token, from `generation_config.json`.
 
-With `strategy: :greedy`, the text is the same as the `generate` function of transformers for `whisper-tiny.en` and `whisper-base`. The serving does not give timestamps.
+With `strategy: :greedy`, the text is the same as the `generate` function of transformers for `whisper-tiny.en` and `whisper-base`.
 
-The serving takes audio of up to 30 s and raises an error for longer audio. Split long audio into parts of 30 s or less, for example at silences, and run each part.
+### Long audio
+
+The audio can have any length. The serving does the steps of the `automatic-speech-recognition` pipeline of transformers with `chunk_length_s` and `stride_length_s`:
+
+1. The client splits the audio into windows of `:chunk_num_seconds` (the default is 30 s). Two windows that follow each other overlap by two contexts of `:context_num_seconds` (the default is `:chunk_num_seconds / 6`, 5 s). The first window has no left context, and the last window has no right context. With the defaults, the windows start every 20 s.
+2. The serving transcribes each window as one batch.
+3. The client merges the tokens of the windows. It finds the alignment of two token sequences with the most equal tokens, and cuts the overlap at its middle. Audio of 30 s or less is one window with no context, so the merge does not change its text.
+
+The options map to the pipeline of transformers as follows:
+
+| Transmuter | transformers | Default |
+|---|---|---|
+| `:chunk_num_seconds` | `chunk_length_s` | 30 s, the length of the features |
+| `:context_num_seconds` | `stride_length_s` (the same on the left and the right) | `:chunk_num_seconds / 6` |
+
+`:chunk_num_seconds` must be 30 s or less and more than two times `:context_num_seconds`.
+
+On 62.5 s of speech, with greedy selection, the text is the same as the pipeline of transformers with `chunk_length_s=30` for `whisper-tiny.en` and `whisper-base`.
+
+### Timestamps
+
+With `timestamps: :segments`, the decoder predicts timestamp tokens, and the result has one chunk for each segment of speech:
+
+```elixir
+serving =
+  Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"},
+    timestamps: :segments,
+    backend: EMLX.Backend,
+    defn_options: [compiler: EMLX]
+  )
+
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+#=>              start_timestamp_seconds: 0.0, end_timestamp_seconds: 5.44}]}
+```
+
+The serving does the steps of `return_timestamps=True` in transformers:
+
+1. The prompt has no `<|notimestamps|>` token.
+2. The token selection applies the rules of `WhisperTimeStampLogitsProcessor`. The first token is a timestamp. Timestamps come in pairs, except before the end of the text. Timestamps do not decrease. When all the timestamps together are more probable than each text token, the decoder selects a timestamp.
+3. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps. It then transcribes the window again from the last timestamp, as the `generate` function of transformers does.
+4. The merge ignores the timestamps in the context of each window. A timestamp ends a chunk only outside the contexts.
+
+The timestamps have steps of 0.02 s. On 62.5 s of speech, the chunks and their timestamps are the same as the pipeline of transformers for `whisper-tiny.en` and `whisper-base`. The end of the last chunk can be after the end of the audio, as in transformers.
+
+### Speed
 
 On an Apple M-series GPU, 5.9 s of speech takes 0.9 s with `whisper-tiny.en` and 1.0 s with `whisper-base`, a real-time factor of 0.15 to 0.17. The featurizer and the encoder take less than 0.12 s, and the decoder gives 25 to 28 tokens per second. The decoder of these exports computes the positions from the length of the cache, so its steps run without compilation (see `Transmuter.Generation`).
+
+On 62.5 s of speech (3 windows), the real-time factor is 0.12 with `whisper-tiny.en` and 0.17 with `whisper-base`. With timestamps, it is 0.15 and 0.16. The overlaps of the windows and the passes again over windows add work.
 
 ### Whisper with tensors
 

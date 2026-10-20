@@ -197,29 +197,31 @@ defmodule Transmuter.Serving do
   end
 
   @doc """
-  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`, one input at a time.
+  Returns an `Nx.Serving` that generates tokens with a context of `Transmuter.Generation`.
 
-  `validate` takes one input and returns `{:ok, input}` or `{:error, message}`. `preprocess` takes a valid input and returns a map of `Nx.BinaryBackend` tensors without a batch axis: the prompt of the decoder in `"prompt"`, the seed of sampling in `"seed"`, and other tensors for `init`.
+  `validate` takes one input and returns `{:ok, input}` or `{:error, message}`. `preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map of `Nx.BinaryBackend` tensors without a batch axis: the prompt of the decoder in `"prompt"`, the seed of sampling in `"seed"`, and other tensors for `init`. Each run is one batch.
 
-  `init` takes the defn options and returns a function. The serving calls `init` in its process, so it can compile models there. The function takes the map of `preprocess` with a batch axis and returns the other inputs of the decoder, such as the outputs of an encoder.
+  `init` takes the defn options and returns a function. The serving calls `init` in its process, so it can compile models there. The function takes the map of a run with a batch axis, without the prompt and the seed, and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, one or more times, and returns the token ids of the run.
 
-  `postprocess` takes the new token ids and the map of `preprocess`, and returns the result.
+  `postprocess` takes the list of the token ids of each run and the list of runs from `preprocess`, and returns the result.
+
+  The serving streams the batches, so the token ids of each run can have any length.
   """
   def generation(ctx, init, validate, preprocess, postprocess, defn_options) do
     Nx.Serving.new(
       fn _key, defn_options ->
-        given = init.(defn_options)
+        run = init.(defn_options)
         ctx = Generation.compile(ctx, defn_options)
 
         fn batch ->
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
           {%{"prompt" => prompt, "seed" => seed}, rest} = Map.split(inputs, ["prompt", "seed"])
           ids = Nx.to_flat_list(prompt)
-          generated = Generation.generate(ctx, ids, Nx.to_number(seed[0]), given.(rest))
-          padded = generated ++ List.duplicate(0, ctx.max_new_tokens - length(generated))
+          generated = run.(rest, &Generation.generate(ctx, ids, Nx.to_number(seed[0]), &1))
 
+          # A trailing zero, because Nx has no tensors of length 0.
           %{
-            ids: Nx.tensor([padded], type: :s64, backend: Nx.BinaryBackend),
+            ids: Nx.tensor([generated ++ [0]], type: :s64, backend: Nx.BinaryBackend),
             length: Nx.tensor([length(generated)], backend: Nx.BinaryBackend)
           }
         end
@@ -227,17 +229,20 @@ defmodule Transmuter.Serving do
       defn_options
     )
     |> Nx.Serving.batch_size(1)
+    |> Nx.Serving.streaming()
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
       prepared = Enum.map(inputs, preprocess)
-      {Enum.map(prepared, &Nx.Batch.stack([&1])), {multi?, prepared}}
+      {prepared |> Enum.concat() |> Enum.map(&Nx.Batch.stack([&1])), {multi?, prepared}}
     end)
-    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, prepared} ->
+    |> Nx.Serving.client_postprocessing(fn stream, {multi?, prepared} ->
       results =
-        for {item, i} <- Enum.with_index(prepared) do
-          count = Nx.to_number(outputs.length[i])
-          postprocess.(outputs.ids[i] |> Nx.to_flat_list() |> Enum.take(count), item)
-        end
+        stream
+        |> Enum.map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
+          ids |> Nx.to_flat_list() |> Enum.take(Nx.to_number(length[0]))
+        end)
+        |> split_like(prepared)
+        |> Enum.zip_with(prepared, postprocess)
 
       if multi?, do: results, else: hd(results)
     end)

@@ -1,8 +1,9 @@
 defmodule Transmuter.AudioTest do
   use ExUnit.Case, async: true
 
-  # Reference values come from WhisperFeatureExtractor and the generate function of Python
-  # transformers, see test/support/pipeline_references.py. The audio is the first sample of
+  # Reference values come from WhisperFeatureExtractor, the generate function and the
+  # automatic-speech-recognition pipeline of Python transformers, see
+  # test/support/pipeline_references.py. The audio is the first sample of
   # hf-internal-testing/librispeech_asr_dummy, 5.86 s at 16 kHz.
   @moduletag timeout: 900_000
 
@@ -64,11 +65,70 @@ defmodule Transmuter.AudioTest do
              " Mr. Quilter est le passé de la classe de la ville, et nous sommes glad de bienvenue son gosse-boule."
   end
 
-  test "audio longer than 30 s raises" do
-    serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, @opts)
-    long = Nx.broadcast(Nx.tensor(0.0), {16_000 * 31})
+  test "short audio with timestamps gives one segment" do
+    serving =
+      Transmuter.Audio.speech_to_text(
+        {:hf, "Xenova/whisper-tiny.en"},
+        [timestamps: :segments] ++ @opts
+      )
 
-    assert_raise ArgumentError, ~r/takes up to 30 s/, fn -> Nx.Serving.run(serving, long) end
+    assert %{chunks: [%{text: @text, start_timestamp_seconds: +0.0, end_timestamp_seconds: 5.44}]} =
+             Nx.Serving.run(serving, @audio)
+  end
+
+  # The first 5 samples of librispeech_asr_dummy, 62.46 s. The pipeline of transformers with
+  # chunk_length_s=30 runs 3 windows. The texts differ between the models.
+  @long Nx.from_binary(File.read!("test/fixtures/librispeech_long.f32"), :f32)
+  @long_text " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is Mr. Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, "
+
+  test "long audio matches the pipeline of transformers" do
+    for {repo, text} <- [
+          {"Xenova/whisper-tiny.en",
+           "similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of rocky Ithaca. Linell's pictures are a sort of up-gards and atom paintings, and Mason's exquisite idles are as national as a jingo poem. Mr. Birkett Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth. And Mr. John Collier gives his sitter a cheerful slap in the back, before he says like a shampooer and a Turkish bath. Next man,"},
+          {"onnx-community/whisper-base",
+           "similarly he's drawn from eating and its results occur most readily to the mind. He has graved doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Lynelle's pictures are a sort of upgards and atom paintings, and Mason's exquisite ittles are as national as a jingo poem. Mr. Birkitt Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth. And Mr. John Collier gives his sitter a cheerful slap on the back before he says like a shampooer in a Turkish bath. Next man"}
+        ] do
+      serving = Transmuter.Audio.speech_to_text({:hf, repo}, @opts)
+      assert %{chunks: [%{text: result}]} = Nx.Serving.run(serving, @long)
+      assert result == @long_text <> text
+    end
+  end
+
+  # With timestamps, generate in transformers transcribes a window again from its last
+  # timestamp when the last segment is not complete: 6 passes for whisper-tiny.en and 5 for
+  # whisper-base.
+  test "long audio timestamps match the pipeline of transformers" do
+    for {repo, expected} <- [
+          {"Xenova/whisper-tiny.en",
+           [
+             {0.0, 50.44,
+              "similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of rocky Ithaca. Linnell's pictures are a sort of up-gards and atom paintings, and Mason's exquisite idles are as national as a jingo poem. Mr. Birkett Foster's landscapes smile at one much in the same way that Mr. Carker used to"},
+             {50.44, 52.92, " flash his teeth."},
+             {52.92, 58.68,
+              " And Mr. John Collier gives his sitter a cheerful slap in the back, before he says, like"},
+             {58.68, 62.0, " a shampooer and a Turkish bath, next man!"}
+           ]},
+          {"onnx-community/whisper-base",
+           [
+             {0.0, 47.88,
+              "similarly he's drawn from eating and its results occur most readily to the mind. He has graved doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Lynelle's pictures are a sort of upgards and atom paintings, and Mason's exquisite ittles are as national as a jingo poem. Mr. Birk at Foster's landscapes smile at one much"},
+             {47.88, 53.96,
+              " in the same way that Mr. Carker used to flash his teeth. And Mr. John Collier"},
+             {53.96, 59.52,
+              " gives his sitter a cheerful slap on the back before he says like a shampoo"},
+             {59.52, 63.76, " in a Turkish bath. Next man,"}
+           ]}
+        ] do
+      serving =
+        Transmuter.Audio.speech_to_text({:hf, repo}, [timestamps: :segments] ++ @opts)
+
+      %{chunks: chunks} = Nx.Serving.run(serving, @long)
+
+      [{start, stop, text} | rest] = expected
+
+      assert Enum.map(chunks, &{&1.start_timestamp_seconds, &1.end_timestamp_seconds, &1.text}) ==
+               [{start, stop, @long_text <> text} | rest]
+    end
   end
 
   defp assert_all_close(tensor, expected) do

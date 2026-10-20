@@ -157,3 +157,18 @@ for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"
         print("features", features[0, 0, :5].tolist(), features[0, 40, 100:103].tolist(), float(features.mean()))
     output = WhisperForConditionalGeneration.from_pretrained(repo).generate(features, do_sample=False, num_beams=1, **options)
     print(repo, options, repr(processor.batch_decode(output, skip_special_tokens=True)[0]))
+
+# Long audio: the first 5 samples, 62.46 s, in test/fixtures/librispeech_long.f32, which this
+# part writes. The pipeline runs windows of 30 s with 5 s of context on each side.
+dataset = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+long = np.concatenate([np.asarray(dataset[i]["audio"]["array"], dtype=np.float32) for i in range(5)])
+long.astype("<f4").tofile("test/fixtures/librispeech_long.f32")
+
+for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"language": "en", "task": "transcribe"})]:
+    asr = pipeline("automatic-speech-recognition", model=repo, chunk_length_s=30, device="cpu")
+    for timestamps in [False, True]:
+        result = asr(long.copy(), return_timestamps=timestamps, generate_kwargs={"do_sample": False, "num_beams": 1, **options})
+        print(repo, "long", "timestamps" if timestamps else "text", result.get("chunks") or repr(result["text"]))
+
+asr = pipeline("automatic-speech-recognition", model="openai/whisper-tiny.en", chunk_length_s=30, device="cpu")
+print("short timestamps", asr(audio.copy(), return_timestamps=True, generate_kwargs={"do_sample": False, "num_beams": 1})["chunks"])
