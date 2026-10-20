@@ -21,12 +21,16 @@ defmodule Transmuter.GraphBreaks do
     metadata = %{source: model[:source], compiler: compiler}
 
     :telemetry.span([:transmuter, :compile], metadata, fn ->
+      nodes = List.to_tuple(model.nodes)
+      last_use = last_use(model)
+
       plan = %{
         cache_size: cache_size,
         model: model,
         source: model[:source],
-        nodes: List.to_tuple(model.nodes),
-        last_use: last_use(model),
+        nodes: nodes,
+        last_use: last_use,
+        graph: :erlang.term_to_binary({nodes, last_use, model.opset, model[:compute_type]}),
         opts: opts,
         backend: Nx.Defn.to_backend(opts),
         table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
@@ -140,7 +144,8 @@ defmodule Transmuter.GraphBreaks do
     entry =
       :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
         ref = make_ref()
-        fun = fn args -> trace(plan, statics, args, pos, ref) end
+        graph = plan.graph
+        fun = fn args -> trace(graph, statics, args, pos, ref) end
         entry = compile_segment(plan, fun, args, pos, ref)
         Process.delete(ref)
         {entry, Map.merge(metadata, %{stop: entry.stop, compiled: entry.compiled != nil})}
@@ -179,8 +184,12 @@ defmodule Transmuter.GraphBreaks do
   defp classify(entry), do: {:break, entry}
 
   # The traced body of a segment. It records where it stopped, which traced values it
-  # returns and which static values it folded, so the caller can resume after it.
-  defp trace(plan, statics, args, pos, ref) do
+  # returns and which static values it folded, so the caller can resume after it. The
+  # compiled function keeps this closure, and each read from the cache table copies the
+  # function. So the closure holds the graph as one binary, which the table does not copy.
+  defp trace(graph, statics, args, pos, ref) do
+    {nodes, last_use, opset, compute_type} = :erlang.binary_to_term(graph)
+    plan = %{nodes: nodes, last_use: last_use, model: %{opset: opset, compute_type: compute_type}}
     env = Map.merge(statics, decode(args))
     ctx = context(plan, env)
     {env, stop} = run_until_break(plan, env, ctx, pos)
@@ -389,10 +398,14 @@ defmodule Transmuter.GraphBreaks do
   end
 
   defp store(plan, key = {pos, _templates, _static_key}, entry) do
-    entries = :ets.match_object(plan.table, {{pos, :_, :_}, :_, :_})
+    # Only the keys and the times of use, because a read of an entry copies its function.
+    used =
+      :ets.select(plan.table, [
+        {{:"$1", :_, :"$2"}, [{:==, {:element, 1, :"$1"}, pos}], [{{:"$1", :"$2"}}]}
+      ])
 
-    if length(entries) >= plan.cache_size do
-      {oldest = {_pos, shapes, _static_key}, _entry, _used} = Enum.min_by(entries, &elem(&1, 2))
+    if length(used) >= plan.cache_size do
+      {oldest = {_pos, shapes, _static_key}, _used} = Enum.min_by(used, &elem(&1, 1))
       :ets.delete(plan.table, oldest)
 
       :telemetry.execute([:transmuter, :cache, :evict], %{count: 1}, %{
