@@ -1,0 +1,62 @@
+{
+ "repo": "op/Split_more_outputs_than_dim",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Split": 1
+ },
+ "static_inputs": [],
+ "reference": "onnx.reference: [ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Non-zero status code returned while running Split node. Name:'' Status Messa",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    5,
+    2
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "a",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2
+   ]
+  },
+  {
+   "name": "b",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2
+   ]
+  },
+  {
+   "name": "c",
+   "file": "out_2.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2
+   ]
+  },
+  {
+   "name": "d",
+   "file": "out_3.bin",
+   "dtype": "f32",
+   "shape": [
+    0,
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

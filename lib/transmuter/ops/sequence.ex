@@ -4,7 +4,9 @@ defmodule Transmuter.Ops.Sequence do
   """
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, empty?: 1, ints!: 1, normalize_axis: 2, static_tensor: 2]
+    only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2, shape_of: 1, static_tensor: 2]
+
+  alias Transmuter.Ops.Shape
 
   @op_types ~w(SequenceEmpty SequenceConstruct SequenceAt SequenceInsert SequenceErase
                SequenceLength SplitToSequence ConcatFromSequence Optional OptionalHasElement
@@ -65,13 +67,16 @@ defmodule Transmuter.Ops.Sequence do
     {:sequence, if(squeeze?, do: Enum.map(parts, &Nx.squeeze(&1, axes: [axis])), else: parts)}
   end
 
+  # With new_axis, each element gets the axis of size 1 before the concatenation.
   defp op(node = %{op_type: "ConcatFromSequence"}, [{:sequence, elements}]) do
-    elements = Enum.reject(elements, &empty?/1)
-    rank = Nx.rank(hd(elements))
+    axis = attr(node, "axis")
 
-    if attr(node, "new_axis", 0) == 1,
-      do: Nx.stack(elements, axis: normalize_axis(attr(node, "axis"), rank + 1)),
-      else: Nx.concatenate(elements, axis: normalize_axis(attr(node, "axis"), rank))
+    if attr(node, "new_axis", 0) == 1 do
+      axis = normalize_axis(axis, tuple_size(shape_of(hd(elements))) + 1)
+      elements |> Enum.map(&new_axis(&1, axis)) |> Shape.concatenate(axis)
+    else
+      Shape.concatenate(elements, axis)
+    end
   end
 
   defp op(%{op_type: "Optional"}, inputs) when inputs in [[], [nil]], do: :none
@@ -84,6 +89,9 @@ defmodule Transmuter.Ops.Sequence do
     do: raise(ArgumentError, "the optional input is empty")
 
   defp op(%{op_type: "OptionalGetElement"}, [value]), do: value
+
+  defp new_axis({:empty, shape}, axis), do: {:empty, Tuple.insert_at(shape, axis, 1)}
+  defp new_axis(t, axis), do: Nx.new_axis(t, axis)
 
   # A negative position counts from the end of the sequence.
   defp position!(position, count, last) do

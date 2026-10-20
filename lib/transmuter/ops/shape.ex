@@ -14,6 +14,7 @@ defmodule Transmuter.Ops.Shape do
       known!: 2,
       normalize_axis: 2,
       shape_of: 1,
+      static?: 1,
       static_tensor: 2,
       tensor: 1
     ]
@@ -87,7 +88,7 @@ defmodule Transmuter.Ops.Shape do
     if axes, do: Nx.squeeze(a, axes: axes), else: Nx.squeeze(a)
   end
 
-  defp op(%{op_type: "Size"}, [a]), do: static_tensor(Nx.size(a), :s64)
+  defp op(%{op_type: "Size"}, [a]), do: a |> shape_of() |> Tuple.product() |> static_tensor(:s64)
 
   # start and end (opset 15) slice the dims, and are clamped to the rank like Slice.
   defp op(node = %{op_type: "Shape"}, [a]) do
@@ -125,18 +126,7 @@ defmodule Transmuter.Ops.Shape do
     end
   end
 
-  # Zero-size inputs add nothing, so Concat drops them.
-  defp op(node = %{op_type: "Concat"}, inputs) do
-    case Enum.reject(inputs, &empty?/1) do
-      [] ->
-        shapes = Enum.map(inputs, &shape_of/1)
-        axis = normalize_axis(attr(node, "axis"), tuple_size(hd(shapes)))
-        {:empty, put_elem(hd(shapes), axis, shapes |> Enum.map(&elem(&1, axis)) |> Enum.sum())}
-
-      tensors ->
-        Nx.concatenate(tensors, axis: attr(node, "axis"))
-    end
-  end
+  defp op(node = %{op_type: "Concat"}, inputs), do: concatenate(inputs, attr(node, "axis"))
 
   defp op(node = %{op_type: "Unsqueeze"}, [a | rest]) do
     axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
@@ -227,7 +217,7 @@ defmodule Transmuter.Ops.Shape do
 
         true ->
           chunk = ceil(dim / n_out)
-          Enum.map(0..(n_out - 1), &min(chunk, dim - &1 * chunk))
+          Enum.map(0..(n_out - 1), &((dim - &1 * chunk) |> min(chunk) |> max(0)))
       end
 
     sizes
@@ -262,17 +252,13 @@ defmodule Transmuter.Ops.Shape do
         Enum.map(0..(rank - 1), &Map.get(by_axis, &1, {0, 0, 0}))
       )
     else
+      # As in ONNX Runtime, negative pads crop first, and the padding repeats the cropped
+      # values. Each output position reads one input position.
       Enum.reduce(by_axis, a, fn {ax, {l, h, 0}}, acc ->
-        dim = Nx.axis_size(acc, ax)
-
-        # Nx has no zero-size tensors yet, so a side with no padding is left out.
-        sides = [
-          {l, pad_side(mode, acc, ax, 0, 1, l)},
-          {1, fn -> acc end},
-          {h, pad_side(mode, acc, ax, dim - 1, dim - 1 - h, h)}
-        ]
-
-        Nx.concatenate(for({n, part} <- sides, n > 0, do: part.()), axis: ax)
+        start = max(-l, 0)
+        n = Nx.axis_size(acc, ax) - start - max(-h, 0)
+        indices = for i <- -max(l, 0)..(n + max(h, 0) - 1)//1, do: start + pad_index(mode, i, n)
+        Nx.take(acc, static_tensor(indices, :s64), axis: ax)
       end)
     end
   end
@@ -312,22 +298,21 @@ defmodule Transmuter.Ops.Shape do
     rank = Nx.rank(data)
     axis = normalize_axis(attr(node, "axis", 0), rank)
     dim = Nx.axis_size(data, axis)
+    # Static indices make static coordinates, which a reduction can read.
+    iota_opts = if static?(indices), do: [backend: Nx.BinaryBackend], else: []
     indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices)
     shape = Nx.shape(indices)
 
     coords =
       for a <- 0..(rank - 1) do
-        if a == axis, do: Nx.as_type(indices, :s64), else: Nx.iota(shape, axis: a, type: :s64)
+        if a == axis,
+          do: Nx.as_type(indices, :s64),
+          else: Nx.iota(shape, [axis: a, type: :s64] ++ iota_opts)
       end
       |> Nx.stack(axis: -1)
       |> Nx.reshape({:auto, rank})
 
-    updates = Nx.reshape(updates, {:auto})
-
-    case attr(node, "reduction", "none") do
-      "none" -> put(data, coords, updates, [])
-      "add" -> Nx.indexed_add(data, coords, updates)
-    end
+    scatter(data, coords, Nx.reshape(updates, {:auto}), attr(node, "reduction", "none"), [])
   end
 
   defp op(node = %{op_type: "GatherND"}, [data, indices]) do
@@ -350,15 +335,15 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "ScatterND"}, [data, indices, updates]) do
-    "none" = attr(node, "reduction", "none")
     k = elem(Nx.shape(indices), Nx.rank(indices) - 1)
     n = div(Nx.size(indices), k)
     slice = data |> Nx.shape() |> Tuple.to_list() |> Enum.drop(k)
 
-    put(
+    scatter(
       data,
       Nx.reshape(indices, {n, k}),
       Nx.reshape(updates, List.to_tuple([n | slice])),
+      attr(node, "reduction", "none"),
       axes: Enum.to_list(0..(k - 1))
     )
   end
@@ -513,18 +498,34 @@ defmodule Transmuter.Ops.Shape do
   defp optional_ints(nil, default), do: default
   defp optional_ints(t, _default), do: ints!(t)
 
-  # The padding of one side: the edge element repeated, or the elements next to the
-  # edge in reverse order.
-  defp pad_side("edge", acc, ax, edge, _start, n) do
-    fn ->
-      acc
-      |> Nx.slice_along_axis(edge, 1, axis: ax)
-      |> Nx.broadcast(put_elem(Nx.shape(acc), ax, n))
-    end
+  # The input position that position i of a padded axis of size n reads: the nearest
+  # edge, the mirror image that does not repeat the edge, or i modulo n.
+  defp pad_index("edge", i, n), do: i |> max(0) |> min(n - 1)
+  defp pad_index("wrap", i, n), do: Integer.mod(i, n)
+  defp pad_index("reflect", _i, 1), do: 0
+
+  defp pad_index("reflect", i, n) do
+    j = Integer.mod(i, 2 * (n - 1))
+    if j < n, do: j, else: 2 * (n - 1) - j
   end
 
-  defp pad_side("reflect", acc, ax, _edge, start, n),
-    do: fn -> acc |> Nx.slice_along_axis(start, n, axis: ax) |> Nx.reverse(axes: [ax]) end
+  defp pad_index(mode, _i, _n), do: raise(ArgumentError, "Pad mode #{inspect(mode)} is unknown")
+
+  @doc """
+  Concatenates tensors and zero-size values along `axis`. Zero-size values add nothing, so they are left out.
+  """
+  def concatenate(values, axis) do
+    shapes = Enum.map(values, &shape_of/1)
+    axis = normalize_axis(axis, tuple_size(hd(shapes)))
+
+    case Enum.reject(values, &empty?/1) do
+      [] ->
+        {:empty, put_elem(hd(shapes), axis, shapes |> Enum.map(&elem(&1, axis)) |> Enum.sum())}
+
+      tensors ->
+        Nx.concatenate(tensors, axis: axis)
+    end
+  end
 
   defp unravel(index, shape) do
     shape
@@ -533,6 +534,59 @@ defmodule Transmuter.Ops.Shape do
     |> Enum.map_reduce(index, fn dim, rest -> {rem(rest, dim), div(rest, dim)} end)
     |> elem(0)
     |> Enum.reverse()
+  end
+
+  # Updates to one position apply in order. A reduction other than add reads the value
+  # that the updates before it left, so with known indices each round applies the next
+  # update of every position.
+  defp scatter(data, coords, updates, "none", opts), do: put(data, coords, updates, opts)
+  defp scatter(data, coords, updates, "add", opts), do: indexed_add(data, coords, updates, opts)
+
+  defp scatter(data, coords, updates, reduction, opts) do
+    combine =
+      case reduction do
+        "mul" -> &Nx.multiply/2
+        "max" -> &Nx.max/2
+        "min" -> &Nx.min/2
+        _ -> raise ArgumentError, "scatter reduction #{inspect(reduction)} is unknown"
+      end
+
+    coords
+    |> known!("the indices of a scatter with reduction #{reduction}")
+    |> Nx.to_list()
+    |> Enum.with_index()
+    |> Enum.map_reduce(%{}, fn {row, j}, seen ->
+      {{Map.get(seen, row, 0), j}, Map.update(seen, row, 1, &(&1 + 1))}
+    end)
+    |> elem(0)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.sort()
+    |> Enum.reduce(data, fn {_round, updated}, acc ->
+      updated = static_tensor(updated, :s64)
+      at = Nx.take(coords, updated, axis: 0)
+      new = combine.(Nx.gather(acc, at, opts), Nx.take(updates, updated, axis: 0))
+      put(acc, at, new, opts)
+    end)
+  end
+
+  # EMLX 0.5 does not scatter 64-bit integers on the GPU. A 64-bit add scatters the four
+  # 16-bit limbs of the updates as 32-bit sums and adds them back, which is exact while
+  # fewer than 2^15 updates go to one position.
+  defp indexed_add(data, coords, updates, opts) do
+    case Nx.type(data) do
+      {kind, 64} when kind in [:s, :u] ->
+        zeros = Nx.broadcast(Nx.tensor(0, type: :s32), Nx.shape(data))
+
+        for k <- 0..3, reduce: data do
+          acc ->
+            limb = updates |> Nx.right_shift(16 * k) |> Nx.bitwise_and(0xFFFF) |> Nx.as_type(:s32)
+            sums = zeros |> Nx.indexed_add(coords, limb, opts) |> Nx.as_type(Nx.type(data))
+            Nx.add(acc, Nx.left_shift(sums, 16 * k))
+        end
+
+      _type ->
+        Nx.indexed_add(data, coords, updates, opts)
+    end
   end
 
   # EMLX 0.5 does not scatter 64-bit integers on the GPU. For them, the scatter writes the

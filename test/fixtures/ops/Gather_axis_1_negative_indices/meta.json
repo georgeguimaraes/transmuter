@@ -1,0 +1,36 @@
+{
+ "repo": "op/Gather_axis_1_negative_indices",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Gather": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    2,
+    2
+   ]
+  }
+ ],
+ "ort_ok": true
+}

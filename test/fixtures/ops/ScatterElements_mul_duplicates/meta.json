@@ -1,0 +1,44 @@
+{
+ "repo": "op/ScatterElements_mul_duplicates",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "ScatterElements": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "d",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    5
+   ]
+  },
+  {
+   "name": "u",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    2
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    5
+   ]
+  }
+ ],
+ "ort_ok": true
+}

@@ -1,0 +1,37 @@
+{
+ "repo": "op/Unsqueeze_negative_axes",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Unsqueeze": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    4,
+    6,
+    1
+   ]
+  }
+ ],
+ "ort_ok": true
+}

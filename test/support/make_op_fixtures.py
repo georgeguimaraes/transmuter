@@ -1079,3 +1079,44 @@ case("LogSoftmax_f16", [node("LogSoftmax", ["x"], ["y"])], {"x": wide}, extra=HA
 case("ReduceLogSumExp_f16", [node("ReduceLogSumExp", ["x", "axes"], ["y"])], {"x": wide}, {"axes": np.array([1], np.int64)}, extra=HALF)
 case("ReduceL1_f16", [node("ReduceL1", ["x", "axes"], ["y"])], {"x": wide}, {"axes": np.array([1], np.int64)}, extra=HALF)
 case("CumSum_f16", [node("CumSum", ["x", "axis"], ["y"])], {"x": wide}, {"axis": np.array(1, np.int64)}, extra=HALF)
+
+# ---------- shape, index and scatter ops ----------
+
+r = rng_for("shape ops")
+x46 = r.standard_normal((4, 6)).astype(np.float32)
+i64 = lambda *values: np.array(values, np.int64)
+case("Slice_negative_steps", [node("Slice", ["x", "starts", "ends", "axes", "steps"], ["y"])], {"x": x46},
+     {"starts": i64(100, -1), "ends": i64(-100, 0), "axes": i64(-1, 0), "steps": i64(-2, -1)})
+case("Slice_clamped_bounds", [node("Slice", ["x", "starts", "ends", "axes"], ["y"])], {"x": x46}, {"starts": i64(-10, 1), "ends": i64(3, 1000), "axes": i64(0, 1)})
+case("Gather_axis_1_negative_indices", [node("Gather", ["x", "i"], ["y"], axis=1)], {"x": x46}, {"i": np.array([[-1, 0], [2, -6]], np.int64)})
+case("Gather_scalar_index", [node("Gather", ["x", "i"], ["y"])], {"x": x46}, {"i": np.array(-2, np.int64)})
+case("Range_float", [node("Range", ["a", "b", "d"], ["y"])], {}, {"a": np.array(1.5, np.float32), "b": np.array(-2.0, np.float32), "d": np.array(-0.75, np.float32)})
+case("Range_int_negative_delta", [node("Range", ["a", "b", "d"], ["y"])], {}, {"a": np.array(10, np.int32), "b": np.array(1, np.int32), "d": np.array(-3, np.int32)})
+case("Trilu_lower_k", [node("Trilu", ["x", "k"], ["y"], upper=0)], {"x": r.standard_normal((2, 4, 5)).astype(np.float32)}, {"k": np.array(1, np.int64)})
+case("Trilu_upper_negative_k", [node("Trilu", ["x", "k"], ["y"])], {"x": r.standard_normal((5, 3)).astype(np.float32)}, {"k": np.array(-2, np.int64)})
+case("Expand_rank_up", [node("Expand", ["x", "shape"], ["y"])], {"x": r.standard_normal((3, 1)).astype(np.float32)}, {"shape": i64(2, 1, 4)})
+case("Reshape_zero_and_minus_one", [node("Reshape", ["x", "shape"], ["y"])], {"x": r.standard_normal((2, 3, 4)).astype(np.float32)}, {"shape": i64(0, -1, 2)})
+case("Reshape_allowzero_empty", [node("Reshape", ["x", "shape"], ["y"], allowzero=1), node("Shape", ["y"], ["s"])],
+     {"x": np.zeros((0, 3), np.float32)}, {"shape": i64(3, 0)}, outputs=["s"])
+case("Unsqueeze_negative_axes", [node("Unsqueeze", ["x", "axes"], ["y"])], {"x": x46}, {"axes": i64(-1, 0)})
+# ONNX Runtime crops first, so wrap repeats the values that the crop leaves.
+for mode in ["wrap", "reflect", "edge", "constant"]:
+    case(f"Pad_{mode}_negative", [node("Pad", ["x", "pads"], ["y"], mode=mode)], {"x": x46}, {"pads": i64(-1, 3, 2, -2)}, opset=19)
+case("Pad_wrap", [node("Pad", ["x", "pads"], ["y"], mode="wrap")], {"x": x46}, {"pads": i64(2, 5, 3, 1)}, opset=19)
+case("Size_of_zero_size", [node("Slice", ["x", "zero", "zero", "one"], ["empty"]), node("Size", ["empty"], ["n"])],
+     {"x": x46}, {"zero": i64(0), "one": i64(1)})
+case("ConcatFromSequence_all_empty", [node("Slice", ["x", "zero", "zero", "one"], ["empty"]), node("SequenceConstruct", ["empty", "empty"], ["s"]),
+                                      node("ConcatFromSequence", ["s"], ["y"], axis=1), node("Shape", ["y"], ["shape"])],
+     {"x": x46}, {"zero": i64(0), "one": i64(1)}, outputs=["shape"])
+case("Split_more_outputs_than_dim", [node("Split", ["x"], ["a", "b", "c", "d"], axis=0, num_outputs=4)], {"x": r.standard_normal((5, 2)).astype(np.float32)}, opset=18)
+dupes = np.array([[0, 4], [1, 1], [0, 0]], np.int64)
+for reduction in ["add", "mul", "max", "min"]:
+    case(f"ScatterElements_{reduction}_duplicates", [node("ScatterElements", ["d", "i", "u"], ["y"], axis=1, reduction=reduction)],
+         {"d": r.standard_normal((3, 5)).astype(np.float32), "u": r.standard_normal((3, 2)).astype(np.float32)}, {"i": dupes}, opset=18)
+    case(f"ScatterND_{reduction}_duplicates", [node("ScatterND", ["d", "i", "u"], ["y"], reduction=reduction)],
+         {"d": r.standard_normal((4, 3)).astype(np.float32), "u": r.standard_normal((3, 3)).astype(np.float32)}, {"i": i64([1], [3], [1])}, opset=18)
+# EMLX does not scatter 64-bit integers on the GPU. The values need more than 32 bits.
+case("ScatterElements_add_int64", [node("ScatterElements", ["d", "i", "u"], ["y"], axis=0, reduction="add")],
+     {"d": i64(2**40, -5, 7, 2**62), "u": i64(2**35, -(2**41), 3)}, {"i": i64(0, 3, 0)}, opset=18)
+case("ScatterND_add_int64", [node("ScatterND", ["d", "i", "u"], ["y"], reduction="add")],
+     {"d": i64([1, 2**40], [3, -4], [5, 6]), "u": i64([2**36, 1], [-(2**33), 7])}, {"i": i64([2], [2])}, opset=18)
