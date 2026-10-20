@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Quantized do
   @moduledoc """
-  Quantized weights are dequantized to floats inside the graph. Packed sub-byte values hold the lowest bits first, so element 2i of a 4-bit tensor is the low nibble of byte i.
+  Quantized weights are dequantized to floats inside the graph. On EMLX, the `MatMulNBits` weights that `Transmuter.EMLX` keeps packed are not dequantized. Packed sub-byte values hold the lowest bits first, so element 2i of a 4-bit tensor is the low nibble of byte i.
   """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]

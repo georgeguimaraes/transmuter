@@ -128,7 +128,7 @@ With `strategy: :greedy`, the text is the same as the `generate` function of tra
 The audio can have any length. The serving does the steps of the `automatic-speech-recognition` pipeline of transformers with `chunk_length_s` and `stride_length_s`:
 
 1. The client splits the audio into windows of `:chunk_num_seconds` (the default is 30 s). Two windows that follow each other overlap by two contexts of `:context_num_seconds` (the default is `:chunk_num_seconds / 6`, 5 s). The first window has no left context, and the last window has no right context. With the defaults, the windows start every 20 s.
-2. The serving transcribes each window as one batch.
+2. The serving transcribes each window as one row of a batch. With `compile: [batch_size: n]`, the decoder transcribes up to `n` windows together.
 3. The client merges the tokens of the windows. It finds the alignment of two token sequences with the most equal tokens, and cuts the overlap at its middle. Audio of 30 s or less is one window with no context, so the merge does not change its text.
 
 The options map to the pipeline of transformers as follows:
@@ -170,7 +170,7 @@ The timestamps have steps of 0.02 s. On 62.5 s of speech, the chunks and their t
 
 ### Speed
 
-On an Apple M-series GPU, 5.9 s of speech takes 0.9 s with `whisper-tiny.en` and 1.0 s with `whisper-base`, a real-time factor of 0.15 to 0.17. The featurizer and the encoder take less than 0.12 s, and the decoder gives 25 to 28 tokens per second. The decoder of these exports computes the positions from the length of the cache, so its steps run without compilation (see `Transmuter.Generation`).
+On an Apple M-series GPU, 5.9 s of speech takes 0.9 s with `whisper-tiny.en` and 1.0 s with `whisper-base`, a real-time factor of 0.15 to 0.17. The featurizer and the encoder take less than 0.12 s, and the decoder gives 25 to 28 tokens per second. The decoder of these exports computes the positions from the length of the cache, so each cache length compiles on its first step and stays cached (see `Transmuter.Generation`).
 
 On 62.5 s of speech (3 windows), the real-time factor is 0.12 with `whisper-tiny.en` and 0.17 with `whisper-base`. With timestamps, it is 0.15 and 0.16. The overlaps of the windows and the passes again over windows add work.
 

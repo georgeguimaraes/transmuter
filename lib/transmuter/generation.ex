@@ -6,11 +6,11 @@ defmodule Transmuter.Generation do
 
   The cache works in one of three modes, from the structure of the graph:
 
-    * `:in_place` - the graph has GroupQueryAttention. The cache is a buffer as long as the attention mask, and the operator writes the new keys and values after the valid rows.
+    * `:in_place` - the graph has GroupQueryAttention, which counts the valid rows of the cache from the values of the attention mask. The cache is a buffer as long as the attention mask, and the operator writes the new keys and values after the valid rows.
 
     * `:append` - the graph declares `position_ids`. The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph has no `position_ids`, so it computes the positions from the length of the cache. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0.
+    * `:grow` - the graph computes the positions from the length of the cache. It has no `position_ids`, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0.
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 

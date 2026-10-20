@@ -41,7 +41,7 @@ Transmuter handles a graph break in three steps:
 2. It runs the break operator on the real output values of step 1.
 3. It compiles the operators after the break for the shapes that the values decide, and continues.
 
-Compiled segments are cached by input shapes, so a later call with the same shapes runs only compiled code.
+Compiled segments are cached by input shapes and the values of the static inputs, so a later call with the same shapes does not compile again. The break operators still run eagerly on each call. A segment of fewer than 20 nodes after a break is not compiled, and it also runs eagerly on each call.
 
 ## Reading the error
 
@@ -77,7 +77,7 @@ Common uses for static inputs:
 
 When a static input changes, Transmuter compiles a new version of the model. With `:cache_size` segments cached, a value that comes back later reuses its compiled version.
 
-## The recompile guard
+## Limit the number of compiled segments
 
 If the total number of compiled segments grows large (for example, with many unique audio lengths in Kokoro), set a `:cache_size` that matches the number of expected shapes:
 
@@ -109,7 +109,7 @@ Nx tensors hold only numbers. Transmuter keeps other ONNX values as Elixir terms
 | ONNX type | Elixir representation |
 |---|---|
 | String tensor | `{:strings, shape, values}` where `values` is a flat list of binaries |
-| Sequence of tensors | A list of tensors |
+| Sequence of tensors | `{:sequence, tensors}`. An eager run of `Transmuter.run/4` returns it as a list of tensors |
 | Empty optional | `:none` |
 | Tensor with a zero dimension | `{:empty, shape}` |
 

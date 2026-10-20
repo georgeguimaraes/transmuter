@@ -21,11 +21,11 @@ Transmuter supports all 203 operators in the ONNX standard domain (`ai.onnx`). I
 - `MoE`: mixture-of-experts with SiLU and SwiGLU activation, top-k routing, optional normalize
 - `QMoE`: quantized mixture-of-experts with 4-bit and 8-bit block-wise weights and top-k routing
 
-The full list of operators tested is in the [coverage section of the README](../README.md).
+The [coverage section of the README](../README.md) lists the tested models. `test/fixtures/ops` has one test graph for each operator variant.
 
 ## Data types
 
-Transmuter supports all numeric Nx types: `f32`, `f64`, `f16`, `bf16`, `s8`, `s16`, `s32`, `s64`, `u8`, `u16`, `u32`, `u64`, `c64`, `c128`.
+Transmuter supports these numeric Nx types: `f32`, `f64`, `f16`, `bf16`, `s8`, `s16`, `s32`, `s64`, `u8`, `u16`, `u32`, `u64`. It does not load the complex types of ONNX.
 
 Nx has no zero-size tensors. A tensor with a dimension of 0 is represented as `{:empty, shape}`. Operators that pass a zero-size tensor through (such as `Reshape`, `Transpose`, `MatMul`) propagate the empty shape without computing.
 
@@ -34,7 +34,7 @@ Non-tensor types have the following representations:
 | ONNX type | Elixir representation |
 |---|---|
 | String tensor | `{:strings, shape, values}` with `values` as a flat list of binaries |
-| Sequence | A list of tensors |
+| Sequence | `{:sequence, tensors}`. An eager run of `Transmuter.run/4` returns it as a list of tensors |
 | Empty optional | `:none` |
 
 Compiled functions can only return `Nx.Tensor` values. To read a string or sequence output, call `Transmuter.run/4` without compilation.
@@ -45,9 +45,11 @@ In native f16 and bf16 (the default), sums, normalizations, softmax, and attenti
 
 ## Known numeric differences
 
-Two models do not match ONNX Runtime value by value. In both cases, the difference comes from a known numerical accumulation in one operator, not a bug.
+Three models do not match ONNX Runtime value by value, because they make small rounding differences large. The differences are not bugs.
 
 **Grounding DINO**: `TopK` selects 900 of 13,294 queries. Some scores differ by only 9.5e-7, which can change the selected set. All operators before `TopK` match exactly. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
+
+**Gemma 4 E2B decoder**: The decoder has activations up to about 1300 and final norm weights up to about 700. When the test changes the float inputs of ONNX Runtime by 1e-7 of their values, the logits of ONNX Runtime change by up to 5.5. The logits of Transmuter differ from ONNX Runtime by 5.3 on the CPU and by 13.6 on the GPU, which is the same noise. The two give the same token for 7 of 8 positions of the random test input.
 
 **Kokoro TTS**: The model sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round the phase sum differently, and phases near zero amplitude can change by up to π. When given the ONNX Runtime outputs for the `Sin` and `STFT` nodes, all other Kokoro operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
 
@@ -62,7 +64,7 @@ The following table shows the result of running Transmuter against ONNX Runtime 
 | Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
 | Image classifiers from the ONNX Model Zoo, with int8 VGG16, AlexNet, and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
-| One graph for each operator variant | 240 of 240 match |
+| One graph for each operator variant | 255 of 255 match |
 
 "Within noise" means the output differs from ONNX Runtime by its own rounding noise.
 

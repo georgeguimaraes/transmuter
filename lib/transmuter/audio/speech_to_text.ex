@@ -15,7 +15,7 @@ defmodule Transmuter.Audio.SpeechToText do
 
   Long audio follows `AutomaticSpeechRecognitionPipeline` of transformers with `chunk_length_s` and `stride_length_s`:
 
-    1. The client splits the audio into windows (`chunk_iter`). Each window is one batch of the serving.
+    1. The client splits the audio into windows (`chunk_iter`). Each window is one row of a batch of the serving.
     2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again.
     3. The client merges the tokens of the windows as `_decode_asr` of the Whisper tokenizer does. It removes the timestamps in the context of each window, and joins the overlap of two token sequences at the middle of their best alignment (`_find_longest_common_sequence`).
 

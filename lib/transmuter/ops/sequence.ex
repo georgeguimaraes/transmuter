@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Sequence do
   @moduledoc """
-  Sequence and optional operators. A sequence is {:sequence, elements} and an empty optional is :none. The list work happens while tracing, so positions and split sizes must be static, but the elements can be traced tensors.
+  Sequence and optional operators. A sequence is {:sequence, elements} and an empty optional is :none. The list work happens while tracing, so positions and split sizes must be known: static, or read while the model runs eagerly, as at a graph break of `Transmuter.compile/3`. The elements can be traced tensors.
   """
 
   import Transmuter.Ops,

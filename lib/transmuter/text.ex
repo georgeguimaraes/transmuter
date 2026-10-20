@@ -175,7 +175,7 @@ defmodule Transmuter.Text do
 
   Each row samples with its own key from its seed, so the random numbers of a row do not depend on the batch. With greedy selection, and with sampling from a seed, an input gives the same text in a batch as alone. A batch can change the rounding of the logits, so in rare cases a token can be different.
 
-  `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A merged decoder without `position_ids`, such as `Xenova/gpt2` or Gemma 3, runs the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length.
+  `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A decoder that grows its cache, such as `Xenova/gpt2` or Gemma 3, runs the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length.
 
   Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 
@@ -191,7 +191,7 @@ defmodule Transmuter.Text do
 
   The chunks come out as the tokens arrive, and they join to the text of a serving without `:stream`. The serving decodes the text as Bumblebee and `TextStreamer` of Python transformers do. A chunk ends before the last space of the pending text, at a newline, or after a CJK character. So a chunk never has a part of a character, and a word does not lose the space that its next token gives.
 
-  With a batch, a stream gets the tokens of its row as each step of the loop ends. For a merged decoder without `position_ids`, the rows of a later group get their first token when the groups before it finish.
+  With a batch, a stream gets the tokens of its row as each step of the loop ends. For a decoder that grows its cache, the rows of a later group get their first token when the groups before it finish.
   """
   defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
 

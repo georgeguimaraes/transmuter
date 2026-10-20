@@ -14,14 +14,14 @@ Pass `compiler:` to `Transmuter.compile/3` to compile with that backend.
 
 ### EMLX
 
-EMLX runs on Apple silicon (M-series). It uses the Metal GPU and the ANE (Apple Neural Engine) where possible. Add it to your dependencies:
+EMLX runs on Apple silicon (M-series). It uses the Metal GPU, or the CPU with `device: :cpu`. Add it to your dependencies:
 
 ```elixir
 {:emlx, "~> 0.5"}
 ```
 
 Use EMLX for:
-- Apple silicon Macs and iPhones
+- Apple silicon Macs
 - Models with `MatMulNBits` (4-bit or 8-bit quantized weights), which EMLX keeps packed for fast matmul
 
 Set the device explicitly when needed:
@@ -107,18 +107,18 @@ Call this before loading or running the model. Without a limit, a Kokoro TTS ser
 
 ### Compiled function cache
 
-`EMLX.CompileCache` keeps each compiled function. Configure `max_items` in the `:emlx` application config:
+`EMLX.CompileCache` keeps each compiled function. Configure `max_items` for it in the `:emlx` application config:
 
 ```elixir
 # config/config.exs
-config :emlx, max_items: 128
+config :emlx, EMLX.CompileCache, max_items: 128
 ```
 
 EMLX also keeps each compiled MLX program without a configurable limit.
 
 ### Transmuter compile cache
 
-Transmuter's own cache (managed by `Transmuter.compile/3`) is per-process. The ETS table that holds the cache belongs to the process that called `Transmuter.compile/3`, such as an `Nx.Serving` process. When that process exits, the cache is lost and the model recompiles on the next call.
+Transmuter's own cache (managed by `Transmuter.compile/3`) is per-process. The compiled segments are in `:persistent_term`, so a read does not copy them. An ETS table keeps only the keys and the time of use of the segments. Both belong to the process that called `Transmuter.compile/3`, such as an `Nx.Serving` process. When that process exits, Transmuter erases the segments, and the model compiles its segments again on each call.
 
 Use `:cache_size` to balance memory and recompilation cost:
 

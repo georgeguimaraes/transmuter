@@ -9,7 +9,7 @@ The servings need the `tokenizers` package:
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 0.1"},
+    {:transmuter, "~> 1.0"},
     {:emlx, "~> 0.5"},
     {:tokenizers, "~> 0.5"}
   ]
@@ -140,9 +140,9 @@ Messages go through the chat template of the repository (see `Transmuter.ChatTem
 
 The serving works with any decoder export that has a KV cache. It reads the shape of the cache from the graph:
 
-- Exports with GroupQueryAttention, such as the `onnx-community` exports of Qwen3 and SmolLM2, write the cache in place.
+- Exports with GroupQueryAttention that counts the valid rows from the values of the attention mask, such as the `onnx-community` exports of Qwen3 and SmolLM2, write the cache in place.
 - Exports that declare `position_ids` keep the cache in a buffer with masked free rows.
-- Merged decoders without `position_ids`, such as `Xenova/gpt2`, grow the cache by one row for each token. Each cache length is a new shape, which compiles on its first step and stays cached. So the first request is slower. With `Xenova/gpt2` and 64 new tokens on an Apple silicon GPU, the first request takes 2.9 s and later requests take 0.4 s.
+- Merged decoders without `position_ids`, such as `Xenova/gpt2`, grow the cache by one row for each token. Gemma 3 also grows the cache, because its GroupQueryAttention counts the valid rows from the length of the attention mask. Each cache length is a new shape, which compiles on its first step and stays cached. So the first request is slower. With `Xenova/gpt2` and 64 new tokens on an Apple silicon GPU, the first request takes 2.9 s and later requests take 0.4 s.
 
 `Transmuter.Generation` describes the three modes of the cache.
 
@@ -183,9 +183,9 @@ The prompts of a batch can have different lengths. Each row has its own length i
 
 The mode of the KV cache decides how the rows share the cache:
 
-- With GroupQueryAttention, the attention mask of each row tells the operator how many rows of the cache are valid. The operator writes the new keys and values of each row after its valid rows.
+- When GroupQueryAttention writes the cache in place, the attention mask of each row tells the operator how many rows of the cache are valid. The operator writes the new keys and values of each row after its valid rows.
 - With `position_ids`, the attention mask hides the free rows of each row, and the new rows go into the buffer after the valid rows of each row.
-- A merged decoder without `position_ids` gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
+- A decoder that grows its cache gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 

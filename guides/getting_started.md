@@ -13,7 +13,7 @@ For Apple silicon, use EMLX:
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 0.1"},
+    {:transmuter, "~> 1.0"},
     {:emlx, "~> 0.5"}
   ]
 end
@@ -24,7 +24,7 @@ For NVIDIA GPUs, use EXLA:
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 0.1"},
+    {:transmuter, "~> 1.0"},
     {:exla, "~> 1.0"}
   ]
 end

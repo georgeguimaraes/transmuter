@@ -89,7 +89,7 @@ The example also fixes one node of the export. The export computes the STFT phas
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 0.1"},
+    {:transmuter, "~> 1.0"},
     {:emlx, "~> 0.5"},
     {:tokenizers, "~> 0.5"}
   ]
@@ -102,7 +102,7 @@ Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenize
 
 Some graphs use a tensor value to set a shape or to select a branch. `Transmuter.compile/3` breaks the graph at these operators, runs the break eagerly on the real values, and compiles the next segment for the shapes the values decide. Compiled segments are cached by input shapes.
 
-See the [Compiling and Graph Breaks guide](guides/graph_breaks.md) for a full explanation of graph breaks, static inputs, the `:cache_size` option, EMLX memory management, and how to read error messages.
+See the [Compiling and Graph Breaks guide](guides/graph_breaks.md) for a full explanation of graph breaks, static inputs, the `:cache_size` option, and how to read error messages. The [Backends and Performance guide](guides/backends_and_performance.md) explains EMLX memory management.
 
 ## Non-tensor values and random operators
 

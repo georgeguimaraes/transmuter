@@ -13,7 +13,7 @@ defmodule Transmuter.Featurizer do
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
     2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side.
-    3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`.
+    3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
 
