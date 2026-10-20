@@ -401,7 +401,7 @@ defmodule Transmuter.Ops.Shape do
 
   # The output shape depends on the data, so NonZero only works on values known at trace time.
   defp op(%{op_type: "NonZero"}, [a]) do
-    known!(a, "the NonZero input")
+    a = known!(a, "the NonZero input")
     rank = Nx.rank(a)
     a = if rank == 0, do: Nx.reshape(a, {1}), else: a
 
@@ -420,7 +420,7 @@ defmodule Transmuter.Ops.Shape do
   # Slices along the axis (or values of the flattened input) are compared as lists, in
   # the same lexicographic order as ONNX Runtime.
   defp op(node = %{op_type: "Unique"}, [x]) do
-    known!(x, "the Unique input")
+    x = known!(x, "the Unique input")
 
     {x, axis} =
       case attr(node, "axis") do
@@ -458,7 +458,7 @@ defmodule Transmuter.Ops.Shape do
 
   # Only the condition decides the output size, so the data can be traced.
   defp op(node = %{op_type: "Compress"}, [x, condition]) do
-    known!(condition, "the Compress condition")
+    condition = known!(condition, "the Compress condition")
 
     {x, axis} =
       case attr(node, "axis") do

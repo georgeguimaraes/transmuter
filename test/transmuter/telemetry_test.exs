@@ -86,6 +86,22 @@ defmodule Transmuter.TelemetryTest do
                      %{position: 0, shapes: [{"x", {{2, 7}, _type}}]}}
   end
 
+  # The fixture folds two values of 6400 elements from the shape of x, and NonZero reads one
+  # of them. They leave the host, but the graph has no break, and an eager run gives the same
+  # values on the backend of the model.
+  test "a large static value leaves the host without a graph break" do
+    model = load_fixture("Fold_large_static")
+    input = %{"x" => Nx.iota({80, 80}, type: :f32, backend: @backend)}
+    compiled = Transmuter.compile(model, input, @compiler).(input)
+    assert_received {[:transmuter, :compile, :stop], %{graph_break: false}}
+    refute_received {[:transmuter, :break, :stop], _metadata}
+
+    eager = Transmuter.run(model, model.params, input)
+    assert Nx.to_flat_list(compiled["y"]) == Nx.to_flat_list(eager["y"])
+    assert Nx.to_flat_list(compiled["nz"]) == Enum.to_list(1..6399)
+    assert Nx.to_flat_list(eager["nz"]) == Enum.to_list(1..6399)
+  end
+
   defp load_fixture(name) do
     Transmuter.load!(Path.expand("../fixtures/ops/#{name}/model.onnx", __DIR__),
       backend: @backend

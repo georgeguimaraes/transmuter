@@ -1,0 +1,54 @@
+{
+ "repo": "op/Fold_large_static",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Shape": 1,
+  "Gather": 2,
+  "Mul": 1,
+  "Unsqueeze": 3,
+  "ConstantOfShape": 1,
+  "Range": 1,
+  "Cast": 1,
+  "Add": 2,
+  "Concat": 1,
+  "Reshape": 1,
+  "NonZero": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    80,
+    80
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    80,
+    80
+   ]
+  },
+  {
+   "name": "nz",
+   "file": "out_1.bin",
+   "dtype": "s64",
+   "shape": [
+    1,
+    6399
+   ]
+  }
+ ],
+ "ort_ok": true
+}

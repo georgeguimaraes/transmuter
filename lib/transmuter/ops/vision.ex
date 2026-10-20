@@ -134,10 +134,11 @@ defmodule Transmuter.Ops.Vision do
     max? = attr(node, "mode", "avg") == "max"
 
     # With an adaptive sampling ratio the grid size depends on each ROI, so the ROIs must be known.
-    if ratio == 0, do: known!(rois, "the RoiAlign ROIs with sampling_ratio 0")
+    known =
+      if ratio == 0,
+        do: rois |> known!("the RoiAlign ROIs with sampling_ratio 0") |> Nx.to_list()
 
     count = Nx.axis_size(rois, 0)
-    known = if ratio == 0, do: Nx.to_list(rois)
 
     for r <- 0..(count - 1) do
       roi = Nx.slice_along_axis(rois, r, 1, axis: 0) |> Nx.reshape({4})
@@ -296,7 +297,7 @@ defmodule Transmuter.Ops.Vision do
             ~s(ImageDecoder needs the optional stb_image dependency, add {:stb_image, "~> 1.0"} to your deps)
     end
 
-    known!(encoded, "the ImageDecoder input")
+    encoded = known!(encoded, "the ImageDecoder input")
 
     # stb_image 1.0 returns the wrong shape when asked to convert channels, so the
     # source channels (gray, gray and alpha, RGB or RGBA) become RGB here.
@@ -322,11 +323,11 @@ defmodule Transmuter.Ops.Vision do
   # Greedy per batch and class, as the ONNX Runtime CPU kernel does it. The number of
   # selected boxes depends on the values, so the boxes and scores must be known.
   defp op(node = %{op_type: "NonMaxSuppression"}, [boxes, scores | rest]) do
-    [max_boxes, iou, score_threshold] = Enum.take(rest ++ [nil, nil, nil], 3)
+    [boxes, scores | rest] =
+      for value <- [boxes, scores | rest],
+          do: value && known!(value, "the NonMaxSuppression input")
 
-    for value <- [boxes, scores | rest],
-        value != nil,
-        do: known!(value, "the NonMaxSuppression input")
+    [max_boxes, iou, score_threshold] = Enum.take(rest ++ [nil, nil, nil], 3)
 
     limit = if max_boxes, do: max(hd(ints!(max_boxes)), 0), else: 0
     iou = if iou, do: hd(Nx.to_flat_list(iou)), else: 0.0

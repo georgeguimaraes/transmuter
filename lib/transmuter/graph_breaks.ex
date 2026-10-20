@@ -273,12 +273,10 @@ defmodule Transmuter.GraphBreaks do
         &(&1 == "" or MapSet.member?(state.static, &1))
       )
 
-    outputs =
-      if static?,
-        do: outputs,
-        else: Map.new(outputs, fn {k, v} -> {k, to_backend(v, plan.backend)} end)
-
-    merge(state, %{values: outputs, static: if(static?, do: Map.keys(outputs), else: [])})
+    # A node with static inputs leaves a large output on the backend, which is not static.
+    {static, other} = Map.split_with(outputs, fn {_k, v} -> static? and Ops.static?(v) end)
+    other = Map.new(other, fn {k, v} -> {k, to_backend(v, plan.backend)} end)
+    merge(state, %{values: Map.merge(static, other), static: Map.keys(static)})
   end
 
   defp merge(state, %{values: values, static: static}) do
@@ -323,7 +321,8 @@ defmodule Transmuter.GraphBreaks do
     %{
       opset: plan.model.opset,
       compute_type: plan.model[:compute_type],
-      key: Map.get(env, Transmuter.random_input())
+      key: Map.get(env, Transmuter.random_input()),
+      backend: plan[:backend]
     }
   end
 

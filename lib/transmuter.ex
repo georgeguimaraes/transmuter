@@ -29,6 +29,10 @@ defmodule Transmuter do
   @static_max_size 16
   @static_int_max_size 4096
 
+  # A value that a node computes from static values stays static up to the size of the
+  # largest static initializer. A graph break also makes values static only up to this size.
+  @fold_max_size @static_int_max_size
+
   @random_key "transmuter.random_key"
 
   @doc """
@@ -68,6 +72,7 @@ defmodule Transmuter do
   Returns a map with:
 
     * `:params` - the weights, on the `:backend` when it is given
+    * `:backend` - the `:backend` option. An eager `run/4` computes large values that do not depend on the inputs, such as attention masks from shapes, on this backend
     * `:inputs` - the names of the graph inputs
     * `:outputs` - the names of the graph outputs
     * `:source` - the source, which `Transmuter.Telemetry` events give as metadata
@@ -142,6 +147,7 @@ defmodule Transmuter do
       nodes: toposort(graph.node, inputs ++ initializers),
       static: Map.new(static, fn {k, t} -> {k, upcast(t, compute_type)} end),
       params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end),
+      backend: opts[:backend],
       compute_type: compute_type,
       inputs: inputs,
       input_types: Map.new(graph_inputs, &{&1.name, value_type(&1)}),
@@ -293,7 +299,14 @@ defmodule Transmuter do
 
   defp run_graph(model, params, inputs, static_inputs) do
     {key, inputs} = Map.pop_lazy(inputs, @random_key, &random_key/0)
-    ctx = %{opset: model.opset, compute_type: model[:compute_type], key: key}
+
+    ctx = %{
+      opset: model.opset,
+      compute_type: model[:compute_type],
+      key: key,
+      backend: model[:backend] || Nx.default_backend()
+    }
+
     cast = &Map.new(&1, fn {k, t} -> {k, upcast(t, ctx.compute_type)} end)
 
     env =
@@ -408,9 +421,7 @@ defmodule Transmuter do
               Random.apply(node, inputs, ctx.key)
 
             Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
-              Nx.with_default_backend(Nx.BinaryBackend, fn ->
-                Ops.apply(node, inputs, ctx.opset)
-              end)
+              node |> fold(inputs, ctx) |> Enum.map(&unfold(&1, ctx))
 
             true ->
               Ops.apply(node, inputs, ctx.opset)
@@ -439,6 +450,24 @@ defmodule Transmuter do
       Map.merge(env, Map.new(Enum.zip(node.output, outputs)))
     end)
   end
+
+  defp fold(node, inputs, ctx) do
+    Nx.with_default_backend(Nx.BinaryBackend, fn -> Ops.apply(node, inputs, ctx.opset) end)
+  end
+
+  # A large folded value is data, which the host computes slowly in Elixir. It becomes a
+  # literal of the traced function, or moves to the backend of an eager run, so the nodes
+  # that read it run on the device. A literal is still known, so a node in the same trace
+  # can read its values.
+  defp unfold(t = %Nx.Tensor{}, ctx) do
+    cond do
+      Nx.size(t) <= @fold_max_size -> t
+      Compiler.current() -> Expr.tensor(t)
+      true -> Nx.backend_transfer(t, ctx.backend)
+    end
+  end
+
+  defp unfold(value, _ctx), do: value
 
   defp run_if(node, [condition], env, ctx) do
     branch =
@@ -530,7 +559,11 @@ defmodule Transmuter do
   end
 
   defp always_true?(nil), do: true
-  defp always_true?(condition), do: Ops.known?(condition) and Nx.to_number(Nx.all(condition)) == 1
+
+  defp always_true?(condition) do
+    Ops.known?(condition) and
+      Nx.to_number(Nx.all(Ops.known!(condition, "the Loop condition"))) == 1
+  end
 
   # Runs step.(i, carried, env) for i in 0..(count - 1) as an Nx while loop, because an
   # unrolled graph can get too deep to compile. The step returns the next carried

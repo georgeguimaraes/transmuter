@@ -289,10 +289,13 @@ defmodule Transmuter.Ops do
   def ints!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
 
   @doc """
-  Returns `value`, or raises `Transmuter.UnknownValueError` when the value is not known on the host.
+  Returns the host value of `value`, or raises `Transmuter.UnknownValueError` when the value is not known on the host. A literal of a traced function gives its tensor, and any other known value gives itself, so callers read the value that this function returns.
 
   Every read of a tensor value on the host goes through here, so a traced value raises the one error that `Transmuter.compile/3` breaks the graph on.
   """
+  def known!(%Nx.Tensor{data: %Nx.Defn.Expr{op: :tensor, args: [value]}}, _description),
+    do: value
+
   def known!(value, description) do
     unless known?(value), do: raise(Transmuter.UnknownValueError, value: description)
     value
@@ -301,13 +304,13 @@ defmodule Transmuter.Ops do
   @doc """
   Returns whether the host can read a value.
 
-  Concrete values can be read on the host: static ones, and every tensor when the model runs eagerly. Only values inside a traced function are unknown.
+  Concrete values can be read on the host: static ones, literals of a traced function, and every tensor when the model runs eagerly. Other values inside a traced function are unknown.
   """
   def known?({:empty, _shape}), do: true
   def known?(:none), do: true
   def known?({:strings, _shape, _values}), do: true
   def known?({:sequence, elements}), do: Enum.all?(elements, &known?/1)
-  def known?(%Nx.Tensor{data: %Nx.Defn.Expr{}}), do: false
+  def known?(%Nx.Tensor{data: %Nx.Defn.Expr{op: op}}), do: op == :tensor
   def known?(%Nx.Tensor{}), do: true
 
   @doc """
