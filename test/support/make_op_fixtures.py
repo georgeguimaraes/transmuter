@@ -1351,3 +1351,22 @@ case("Fold_large_static",
       node("Reshape", ["ramp", "target"], ["grid"]), node("Add", ["grid", "x"], ["y"]), node("NonZero", ["idx"], ["nz"])],
      {"x": r.standard_normal((80, 80)).astype(np.float32)},
      {"zero": np.array(0, np.int64), "one": np.array(1, np.int64), "axes": np.array([0], np.int64)}, outputs=["y", "nz"])
+
+# ---------- half precision ----------
+
+# Normalizations and attention in f16, which the EMLX kernels compute without a cast to f32.
+r = rng_for("half precision")
+hf = lambda *shape: r.standard_normal(shape).astype(np.float16)
+case("GroupQueryAttention_f16",
+     [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
+           num_heads=4, kv_num_heads=2)],
+     {"q": hf(2, 1, 4 * G), "k": hf(2, 1, 2 * G), "v": hf(2, 1, 2 * G), "pk": hf(2, 2, 6, G), "pv": hf(2, 2, 6, G),
+      "seqlens": np.array([6, 3], np.int32), "total": np.array(7, np.int32)}, ms=True, static=("total",), extra=HALF)
+# The attention core of an f16 export, which Transmuter.Fusion turns into AttentionCore.
+case("AttentionCore_f16",
+     [node("MatMul", ["q", "kt"], ["qk"]), node("Mul", ["qk", "scale"], ["scaled"]), node("Add", ["scaled", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["p"], axis=-1), node("MatMul", ["p", "v"], ["y"])],
+     {"q": hf(2, 4, 3, 8), "kt": hf(2, 4, 8, 5), "v": hf(2, 4, 5, 8), "mask": np.where(r.random((1, 1, 3, 5)) < 0.3, -1e4, 0).astype(np.float16)},
+     {"scale": np.array(0.35, np.float16)}, extra=HALF)
+case("SkipSimplifiedLayerNormalization_f16", [node("SkipSimplifiedLayerNormalization", ["x", "skip", "w"], ["y", "", "", "sum"], domain=MS, epsilon=1e-6)],
+     {"x": hf(2, 3, 16), "skip": hf(2, 3, 16)}, {"w": hf(16)}, ms=True, extra=HALF)

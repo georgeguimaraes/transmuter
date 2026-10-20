@@ -14,7 +14,8 @@ defmodule Transmuter.Ops.NN do
       normalize: 3,
       normalize_axis: 2,
       round_half_even: 1,
-      static_tensor: 2
+      static_tensor: 2,
+      widen: 2
     ]
 
   @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
@@ -103,16 +104,16 @@ defmodule Transmuter.Ops.NN do
     axes = Enum.to_list(axis..(Nx.rank(x) - 1))
     eps = attr(node, "epsilon", 1.0e-5)
 
+    bias = List.first(bias) || Nx.tensor(0, type: Nx.type(x))
+
     if emlx?(x) do
-      bias = List.first(bias) || Nx.tensor(0, type: Nx.type(x))
       emlx_norm(&EMLX.Fast.layer_norm(&1, &2, &3, eps), x, axes, [scale, bias])
     else
-      out = x |> normalize(axes, eps) |> Nx.multiply(scale)
-
-      case bias do
-        [b | _] when b != nil -> Nx.add(out, b)
-        _ -> out
-      end
+      [x, scale, bias]
+      |> widen(fn [x, scale, bias] ->
+        [x |> normalize(axes, eps) |> Nx.multiply(scale) |> Nx.add(bias)]
+      end)
+      |> hd()
     end
   end
 

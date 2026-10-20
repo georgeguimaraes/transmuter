@@ -20,29 +20,38 @@ defmodule Transmuter.Ops do
     Vision
   }
 
-  # Sums, norms and softmax lose too much precision in f16 and bf16, so these ops
-  # run in f32 and cast their outputs back.
+  # Sums and softmax lose too much precision in f16 and bf16, so these ops run in f32 and
+  # cast their outputs back (see widen/2). The normalizations and the attention ops are not
+  # here: their EMLX kernels accumulate in f32, and their Nx operations widen themselves.
   @f32_ops ~w(ReduceSum ReduceMean ReduceSumSquare ReduceL1 ReduceL2 ReduceLogSum ReduceLogSumExp
               ReduceProd CumSum CumProd Softmax LogSoftmax LpNormalization
-              LayerNormalization InstanceNormalization GroupNormalization BatchNormalization
-              RMSNormalization SimplifiedLayerNormalization SkipLayerNormalization
-              SkipSimplifiedLayerNormalization EmbedLayerNormalization Attention
-              GroupQueryAttention MultiHeadAttention AttentionCore MoE QMoE)
+              InstanceNormalization GroupNormalization BatchNormalization MoE QMoE)
 
   @doc false
   def apply(node, inputs, opset) do
+    if node.op_type in @f32_ops,
+      do: widen(inputs, &dispatch(node, &1, opset)),
+      else: dispatch(node, inputs, opset)
+  end
+
+  @doc """
+  Calls `fun` with `values`, where f16 and bf16 tensors become f32, and casts the f32 tensors that `fun` returns back to that type. `fun` takes and returns a list.
+
+  Sums, means and softmax in f16 or bf16 lose too much precision, so the Nx operations of such ops run in f32.
+  """
+  def widen(values, fun) do
     half =
       Enum.find_value(
-        inputs,
+        values,
         &(is_struct(&1, Nx.Tensor) and Nx.type(&1) in [{:f, 16}, {:bf, 16}] and Nx.type(&1))
       )
 
-    if half && node.op_type in @f32_ops do
-      inputs
+    if half do
+      values
       |> Enum.map(
         &if(is_struct(&1, Nx.Tensor) and Nx.type(&1) == half, do: Nx.as_type(&1, :f32), else: &1)
       )
-      |> then(&dispatch(node, &1, opset))
+      |> fun.()
       |> Enum.map(
         &if(is_struct(&1, Nx.Tensor) and Nx.type(&1) == {:f, 32},
           do: Nx.as_type(&1, half),
@@ -50,7 +59,7 @@ defmodule Transmuter.Ops do
         )
       )
     else
-      dispatch(node, inputs, opset)
+      fun.(values)
     end
   end
 
@@ -339,7 +348,10 @@ defmodule Transmuter.Ops do
     shape = Nx.shape(x)
     {outer, inner} = shape |> Tuple.to_list() |> Enum.split(hd(axes))
     size = Enum.product(inner)
-    flat = &(&1 |> Nx.broadcast(List.to_tuple(inner)) |> Nx.reshape({size}))
+
+    flat =
+      &(&1 |> Nx.as_type(Nx.type(x)) |> Nx.broadcast(List.to_tuple(inner)) |> Nx.reshape({size}))
+
     view = Nx.reshape(x, List.to_tuple(outer ++ [size]))
     fun |> apply([view | Enum.map(weights, flat)]) |> Nx.reshape(shape)
   end

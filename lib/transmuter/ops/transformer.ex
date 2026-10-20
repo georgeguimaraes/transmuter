@@ -2,7 +2,7 @@ defmodule Transmuter.Ops.Transformer do
   @moduledoc """
   Attention, linear attention, KV cache writes, rotary embedding and normalization. The same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain decides the input layout.
 
-  On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations and the attention core run as fused kernels of `EMLX.Fast`. Attention with a softcap keeps the Nx operations, because the kernel has no softcap.
+  On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations and the attention core run as fused kernels of `EMLX.Fast`. The kernels take f16 and bf16 values as they are and accumulate in f32. Attention with a softcap keeps the Nx operations, because the kernel has no softcap. The Nx operations compute f16 and bf16 values in f32 (see `Transmuter.Ops.widen/2`).
 
   `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(q · k * scale + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, the softmax is along the last axis and the mask broadcasts to the scores.
   """
@@ -21,7 +21,8 @@ defmodule Transmuter.Ops.Transformer do
       normalize: 3,
       normalize_axis: 2,
       shape_of: 1,
-      softmax_last: 1
+      softmax_last: 1,
+      widen: 2
     ]
 
   @op_types ~w(Attention AttentionCore GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
@@ -67,18 +68,28 @@ defmodule Transmuter.Ops.Transformer do
     # scores after the matmul, the softcap, the masks or the softmax, by
     # qk_matmul_output_mode, in the stage order of ONNX Runtime.
     masks = &(&1 |> add_mask(mask) |> mask_where(hidden))
-    raw = grouped_scores(q, k, scale)
-    capped = softcap(raw, cap)
-    scores = masks.(capped)
-    probs = softmax_last(scores)
+
+    [plain, qk] =
+      widen([q, k, v, mask], fn [q, k, v, mask] ->
+        masks = &(&1 |> add_mask(mask) |> mask_where(hidden))
+        raw = grouped_scores(q, k, scale)
+        capped = softcap(raw, cap)
+        scores = masks.(capped)
+        probs = softmax_last(scores)
+
+        [
+          grouped_values(probs, v),
+          Enum.at([raw, capped, scores, probs], attr(node, "qk_matmul_output_mode", 0))
+        ]
+      end)
 
     out =
       if emlx?(q) and cap == 0,
         do: emlx_attention(q, k, v, scale, masks, [hidden, mask]),
-        else: grouped_values(probs, v)
+        else: plain
 
     out = if rank == 3, do: from_heads(out), else: out
-    [out, k, v, Enum.at([raw, capped, scores, probs], attr(node, "qk_matmul_output_mode", 0))]
+    [out, k, v, qk]
   end
 
   # GroupQueryAttention with a KV buffer per sequence. seqlens_k holds each sequence's
@@ -143,12 +154,18 @@ defmodule Transmuter.Ops.Transformer do
       if emlx?(q) and cap == 0 do
         emlx_attention(q, present_k, present_v, scale, masks, [hidden, attention_bias])
       else
-        q
-        |> grouped_scores(present_k, scale)
-        |> softcap(cap)
-        |> masks.()
-        |> softmax_last()
-        |> grouped_values(present_v)
+        [q, present_k, present_v, attention_bias]
+        |> widen(fn [q, k, v, bias] ->
+          q
+          |> grouped_scores(k, scale)
+          |> softcap(cap)
+          |> add_mask(bias)
+          |> mask_where(hidden)
+          |> softmax_last()
+          |> grouped_values(v)
+          |> List.wrap()
+        end)
+        |> hd()
       end
       |> from_heads()
 
@@ -187,11 +204,17 @@ defmodule Transmuter.Ops.Transformer do
       if emlx?(q) do
         emlx_attention(q, k, v, scale, masks, [hidden, attention_bias])
       else
-        q
-        |> scores(k, scale)
-        |> masks.()
-        |> softmax_last()
-        |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+        [q, k, v, attention_bias]
+        |> widen(fn [q, k, v, bias] ->
+          q
+          |> scores(k, scale)
+          |> add_mask(bias)
+          |> mask_where(hidden)
+          |> softmax_last()
+          |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+          |> List.wrap()
+        end)
+        |> hd()
       end
       |> from_heads()
 
@@ -340,13 +363,18 @@ defmodule Transmuter.Ops.Transformer do
       masks = if mask, do: &Nx.add(&1, mask), else: & &1
       emlx_attention(q, k, v, scale, masks, [mask])
     else
-      scores = matmul(q, k)
-      scores = if scale == 1, do: scores, else: Nx.multiply(scores, scale)
+      [q, k, v, mask]
+      |> widen(fn [q, k, v, mask] ->
+        scores = matmul(q, k)
+        scores = if scale == 1, do: scores, else: Nx.multiply(scores, scale)
 
-      scores
-      |> add_optional(mask)
-      |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
-      |> matmul(v)
+        scores
+        |> add_optional(mask)
+        |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
+        |> matmul(v)
+        |> List.wrap()
+      end)
+      |> hd()
     end
   end
 
@@ -389,11 +417,16 @@ defmodule Transmuter.Ops.Transformer do
       if emlx?(q) do
         emlx_attention(q, k, v, scale, masks, [hidden, attention_bias])
       else
-        q
-        |> scores(k, scale)
-        |> masks.()
-        |> softmax_last()
-        |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+        [q, k, v, attention_bias]
+        |> widen(fn [q, k, v, bias] ->
+          q
+          |> scores(k, scale)
+          |> then(&masks.(add_mask(&1, bias)))
+          |> softmax_last()
+          |> Nx.dot([3], [0, 1], v, [2], [0, 1])
+          |> List.wrap()
+        end)
+        |> hd()
       end
       |> from_heads()
 
@@ -595,8 +628,16 @@ defmodule Transmuter.Ops.Transformer do
         {1, 1, 1, Nx.axis_size(k, 2)} | for(m <- mask_tensors, m, do: Nx.shape(m))
       ])
 
-    mask = Nx.tensor(0, type: Nx.type(q)) |> Nx.broadcast(shape) |> masks.()
-    EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, mask)
+    type = Nx.type(q)
+    mask = Nx.tensor(0, type: type) |> Nx.broadcast(shape) |> masks.() |> Nx.as_type(type)
+
+    EMLX.Fast.scaled_dot_product_attention(
+      q,
+      Nx.as_type(k, type),
+      Nx.as_type(v, type),
+      scale,
+      mask
+    )
   end
 
   defp mask_where(scores, nil), do: scores
@@ -643,9 +684,12 @@ defmodule Transmuter.Ops.Transformer do
     if emlx?(x) do
       emlx_norm(&EMLX.Fast.rms_norm(&1, &2, eps), x, axes, [w])
     else
-      x32 = Nx.as_type(x, :f32)
-      inv = x32 |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.add(eps) |> Nx.rsqrt()
-      x32 |> Nx.multiply(inv) |> Nx.as_type(Nx.type(x)) |> Nx.multiply(w)
+      [x, w]
+      |> widen(fn [x, w] ->
+        inv = x |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.add(eps) |> Nx.rsqrt()
+        [x |> Nx.multiply(inv) |> Nx.multiply(w)]
+      end)
+      |> hd()
     end
   end
 
@@ -654,10 +698,11 @@ defmodule Transmuter.Ops.Transformer do
       beta = beta || Nx.tensor(0, type: Nx.type(x))
       emlx_norm(&EMLX.Fast.layer_norm(&1, &2, &3, eps), x, [Nx.rank(x) - 1], [gamma, beta])
     else
-      x
-      |> normalize([-1], eps)
-      |> Nx.multiply(gamma)
-      |> add_optional(beta)
+      [x, gamma, beta]
+      |> widen(fn [x, gamma, beta] ->
+        [x |> normalize([-1], eps) |> Nx.multiply(gamma) |> add_optional(beta)]
+      end)
+      |> hd()
     end
   end
 
