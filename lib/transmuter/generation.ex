@@ -22,6 +22,10 @@ defmodule Transmuter.Generation do
 
   The task gives the features of the images to `generate/5` in `:image_features`. They are the features of the image tokens of all rows, in order, as `masked_scatter` in Python transformers uses them. A row starts at the features after those of the rows before it. In the steps of the prompt, the features replace the embeddings of the image tokens, and a cursor of each row counts the image tokens that the row used. Parts of the prompt without image tokens and the steps of new tokens only embed their tokens.
 
+  ## Positions
+
+  Each token of a row has the position of its index in the row. The task can give other positions for the prompt of each row in `:position_ids` of `generate/5`, such as the 3-D positions of M-RoPE in Qwen2-VL. There, the image tokens of a prompt have the positions of their rows and columns in the image. A decoder whose `position_ids` has 3 axes takes 3 positions for each token. The tokens after the prompt continue from the largest position of the prompt: the token at index `i` has the position `i + delta` on all axes. `delta` is the largest position of the prompt, plus 1, minus the length of the prompt, as the rope delta of Python transformers.
+
   A task can add one more processor in the `:processor` key of the context, as `{state, process}`. Before each step, `state` takes the new tokens of a row (the last token first) and gives a tensor. `process` takes the logits and that tensor of one row in the compiled selection, after the suppressed tokens and before the temperature, and gives the new logits.
 
   ## Batches
@@ -250,6 +254,8 @@ defmodule Transmuter.Generation do
 
   `inputs` can also have the key `:image_features`, a tensor of shape `{count, hidden}` with the features of the image tokens of all prompts: the features of the first prompt, in the order of its image tokens, then those of the next prompt. It can have more rows than the prompts have image tokens. It is not an input of the decoder. See the module documentation.
 
+  `inputs` can also have the key `:position_ids`, a list with the positions of each prompt. The positions of a prompt are a list with the positions of each axis of the decoder's `position_ids`, one for each token. An empty list gives the default positions. See the module documentation.
+
   `on_token` is `nil` or a function that receives `%{token: tensor, finished?: tensor}` after each step of a group, with one row for each prompt. `:token` is the new token of the row, or -1 when the row has no new token. `:finished?` is 1 when the row has no more tokens.
 
   Returns the new token ids of each row, without the eos token.
@@ -257,11 +263,18 @@ defmodule Transmuter.Generation do
   def generate(ctx, prompts, seeds, inputs \\ %{}, on_token \\ nil) do
     {features, inputs} = Map.pop(inputs, :image_features)
 
+    {positions, inputs} =
+      Map.pop_lazy(inputs, :position_ids, fn -> Enum.map(prompts, fn _ -> [] end) end)
+
     # The features of each row start after those of the rows before it.
     {cursors, _count} =
       Enum.map_reduce(prompts, 0, &{&2, &2 + Enum.count(&1, fn id -> id == ctx.image_token end)})
 
-    extras = %{features: features, cursors: cursors}
+    extras = %{
+      features: features,
+      cursors: cursors,
+      positions: Enum.map(positions, &{&1, delta(&1)})
+    }
 
     ids =
       for prompts <- groups(ctx, prompts) do
@@ -275,6 +288,11 @@ defmodule Transmuter.Generation do
 
     Enum.zip_with([Enum.map(prompts, fn _ -> [] end) | ids], &Enum.concat/1)
   end
+
+  # The positions after the prompt continue from its largest position. Without given
+  # positions, the delta is 0.
+  defp delta(axes),
+    do: Enum.max(List.flatten(axes), fn -> -1 end) + 1 - length(List.first(axes, []))
 
   # The prompts of each group of rows that share a cache, with empty prompts for the other
   # rows. A buffer keeps the length of each row, so all prompts are one group.
@@ -428,6 +446,7 @@ defmodule Transmuter.Generation do
       inputs: %{},
       features: nil,
       cursors: List.duplicate(0, batch_size),
+      positions: List.duplicate({[], 0}, batch_size),
       lengths: List.duplicate(0, batch_size),
       capacity: capacity,
       logits: nil,
@@ -553,7 +572,7 @@ defmodule Transmuter.Generation do
     values = %{
       "input_ids" => tokens,
       "attention_mask" => masks,
-      "position_ids" => for(past <- state.lengths, do: Enum.to_list(past..(past + n - 1))),
+      "position_ids" => positions(ctx, state, n),
       "num_logits_to_keep" => keep
     }
 
@@ -574,6 +593,24 @@ defmodule Transmuter.Generation do
       end
 
     {inputs, static}
+  end
+
+  # The positions of the tokens at the indices past..past + n - 1 of each row: the given
+  # positions of the prompt, and after them the index plus the delta of the row. A decoder
+  # without position_ids gets 2-D positions, which step_inputs leaves out.
+  defp positions(ctx, state, n) do
+    {_type, dims} = Map.get(ctx.model.input_types, "position_ids", {:s64, [nil, nil]})
+    count = if length(dims) == 3, do: 3, else: 1
+
+    rows =
+      Enum.zip_with(state.lengths, state.positions, fn past, {given, delta} ->
+        for axis <- 0..(count - 1) do
+          prompt = given |> Enum.at(axis, []) |> Enum.slice(past, n)
+          prompt ++ Enum.to_list((past + length(prompt) + delta)..(past + n - 1 + delta)//1)
+        end
+      end)
+
+    if count == 3, do: Enum.zip_with(rows, & &1), else: Enum.map(rows, &hd/1)
   end
 
   # Selects the token of each row from its logits at `index`. The key of a step is the key
