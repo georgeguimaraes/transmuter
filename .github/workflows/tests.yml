@@ -68,13 +68,17 @@ jobs:
             deps
             _build
           key: ${{ runner.os }}-mix-otp${{ matrix.otp }}-elixir${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
-      # The tests download five ONNX models from the Hugging Face Hub.
+      # The tests download ONNX models from the Hugging Face Hub. Every job restores the
+      # newest model cache. Only one job saves it, on main, and only when the set of cached
+      # files changed, because a save uploads the whole cache. Change v2 to start a cache
+      # without the models that the tests no longer use.
       - name: Restore model cache
-        uses: actions/cache@v6
+        id: models
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/transmuter
-          key: ${{ runner.os }}-transmuter-models-${{ hashFiles('test/**/*.exs') }}
-          restore-keys: ${{ runner.os }}-transmuter-models-
+          key: ${{ runner.os }}-transmuter-models-v2-
+          restore-keys: ${{ runner.os }}-transmuter-models-v2-
       - name: Install dependencies
         run: mix deps.get
       - name: Check formatting
@@ -87,3 +91,17 @@ jobs:
         run: mix credo --strict
       - name: Run tests
         run: mix test
+      - name: List the cached models
+        id: model-files
+        if: matrix.otp == '29' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cd ~/.cache/transmuter
+          hash=$(find . -type f ! -name '*.part' | sort | sha256sum | cut -c1-16)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "Model cache: $(du -sh . | cut -f1), file list hash $hash"
+      - name: Save model cache
+        if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/transmuter
+          key: ${{ runner.os }}-transmuter-models-v2-${{ steps.model-files.outputs.hash }}
