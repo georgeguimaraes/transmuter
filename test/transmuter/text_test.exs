@@ -381,7 +381,9 @@ defmodule Transmuter.TextTest do
     texts =
       ["What is the capital of France?", "Hi"]
       |> Enum.map(&%{messages: [%{role: "user", content: &1}]})
-      |> Task.async_stream(&Enum.join(Nx.Serving.batched_run(__MODULE__.Stream, &1)))
+      |> Task.async_stream(&Enum.join(Nx.Serving.batched_run(__MODULE__.Stream, &1)),
+        timeout: 60_000
+      )
       |> Enum.map(fn {:ok, text} -> text end)
 
     assert texts == ["The capital of France is Paris.", "Hello! How can I help you today?"]
