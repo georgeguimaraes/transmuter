@@ -41,7 +41,7 @@ defmodule Transmuter.GraphBreaks do
         random?: Transmuter.random?(model.nodes)
       }
 
-      {call, graph_break} = call(plan, inputs, static_inputs)
+      {call, graph_break} = Transmuter.with_fold_memo(fn -> call(plan, inputs, static_inputs) end)
       {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
     end)
   end
@@ -79,8 +79,11 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
-  defp general(plan, inputs, static_inputs),
-    do: plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
+  defp general(plan, inputs, static_inputs) do
+    Transmuter.with_fold_memo(fn ->
+      plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
+    end)
+  end
 
   defp input_shapes(inputs) do
     Map.new(inputs, fn
@@ -372,12 +375,8 @@ defmodule Transmuter.GraphBreaks do
     statics
     |> Map.drop(Map.keys(plan.model.static))
     |> Enum.sort()
-    |> Enum.map(fn {name, value} -> {name, digest(value)} end)
+    |> Enum.map(fn {name, value} -> {name, Ops.digest(value)} end)
   end
-
-  defp digest(t = %Nx.Tensor{}), do: {Nx.shape(t), Nx.type(t), :erlang.md5(Nx.to_binary(t))}
-  defp digest({:sequence, elements}), do: Enum.map(elements, &digest/1)
-  defp digest(other), do: :erlang.md5(:erlang.term_to_binary(other))
 
   defp to_backend(t = %Nx.Tensor{}, backend), do: Nx.backend_transfer(t, backend)
 

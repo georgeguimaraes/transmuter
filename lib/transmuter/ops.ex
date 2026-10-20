@@ -313,6 +313,11 @@ defmodule Transmuter.Ops do
   def known?(%Nx.Tensor{data: %Nx.Defn.Expr{op: op}}), do: op == :tensor
   def known?(%Nx.Tensor{}), do: true
 
+  @doc false
+  def digest(t = %Nx.Tensor{}), do: {Nx.shape(t), Nx.type(t), :erlang.md5(Nx.to_binary(t))}
+  def digest({:sequence, elements}), do: Enum.map(elements, &digest/1)
+  def digest(other), do: :erlang.md5(:erlang.term_to_binary(other))
+
   @doc """
   Returns whether EMLX computes `tensor`: in a function that EMLX compiles, or eagerly on `EMLX.Backend`.
 

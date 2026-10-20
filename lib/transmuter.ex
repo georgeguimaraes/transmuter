@@ -34,6 +34,7 @@ defmodule Transmuter do
   @fold_max_size @static_int_max_size
 
   @random_key "transmuter.random_key"
+  @fold_memo {__MODULE__, :fold_memo}
 
   @doc """
   Loads an ONNX model.
@@ -315,7 +316,7 @@ defmodule Transmuter do
       |> Map.merge(cast.(inputs))
       |> Map.merge(cast.(static_inputs))
 
-    env = run_nodes(model.nodes, env, ctx)
+    env = with_fold_memo(fn -> run_nodes(model.nodes, env, ctx) end)
 
     model.outputs
     |> Map.new(&{&1, Map.fetch!(env, &1)})
@@ -451,7 +452,27 @@ defmodule Transmuter do
     end)
   end
 
+  # A node with static inputs runs on the host. Nodes with the same operator, attributes and
+  # input values give the same outputs, so each runs once in a call. For example, each layer
+  # of a vision encoder builds the same attention mask from the same shapes.
+  defp fold(node, [], ctx), do: fold_on_host(node, [], ctx)
+
   defp fold(node, inputs, ctx) do
+    memo = Process.get(@fold_memo)
+    key = {ctx.opset, node.op_type, node.domain, node.attribute, Enum.map(inputs, &Ops.digest/1)}
+
+    case memo do
+      %{^key => outputs} ->
+        outputs
+
+      _ ->
+        outputs = fold_on_host(node, inputs, ctx)
+        if memo, do: Process.put(@fold_memo, Map.put(memo, key, outputs))
+        outputs
+    end
+  end
+
+  defp fold_on_host(node, inputs, ctx) do
     Nx.with_default_backend(Nx.BinaryBackend, fn -> Ops.apply(node, inputs, ctx.opset) end)
   end
 
@@ -468,6 +489,21 @@ defmodule Transmuter do
   end
 
   defp unfold(value, _ctx), do: value
+
+  @doc false
+  def with_fold_memo(fun) do
+    if Process.get(@fold_memo) do
+      fun.()
+    else
+      Process.put(@fold_memo, %{})
+
+      try do
+        fun.()
+      after
+        Process.delete(@fold_memo)
+      end
+    end
+  end
 
   defp run_if(node, [condition], env, ctx) do
     branch =
