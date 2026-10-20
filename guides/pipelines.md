@@ -142,7 +142,9 @@ The serving works with any decoder export that has a KV cache. It reads the shap
 
 - Exports with GroupQueryAttention, such as the `onnx-community` exports of Qwen3 and SmolLM2, write the cache in place.
 - Exports that declare `position_ids` keep the cache in a buffer with masked free rows.
-- Merged decoders without `position_ids`, such as `Xenova/gpt2`, grow the cache by one row for each token. They run without compilation, so they are slower.
+- Merged decoders without `position_ids`, such as `Xenova/gpt2`, grow the cache by one row for each token. Each cache length is a new shape, which compiles on its first step and stays cached. So the first request is slower. With `Xenova/gpt2` and 64 new tokens on an Apple silicon GPU, the first request takes 2.9 s and later requests take 0.4 s.
+
+`Transmuter.Generation` describes the three modes of the cache.
 
 The prompt runs in parts with a power-of-two length, and each new token is a part of length 1. So a small number of compiled shapes covers all prompt lengths.
 
