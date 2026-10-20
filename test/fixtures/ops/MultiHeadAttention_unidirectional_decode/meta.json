@@ -1,0 +1,101 @@
+{
+ "repo": "op/MultiHeadAttention_unidirectional_decode",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:MultiHeadAttention": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "q",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    16
+   ]
+  },
+  {
+   "name": "k",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    16
+   ]
+  },
+  {
+   "name": "v",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    16
+   ]
+  },
+  {
+   "name": "pk",
+   "file": "in_3.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    4,
+    8
+   ]
+  },
+  {
+   "name": "pv",
+   "file": "in_4.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    4,
+    8
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1,
+    16
+   ]
+  },
+  {
+   "name": "present_k",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    5,
+    8
+   ]
+  },
+  {
+   "name": "present_v",
+   "file": "out_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    5,
+    8
+   ]
+  }
+ ],
+ "ort_ok": true
+}

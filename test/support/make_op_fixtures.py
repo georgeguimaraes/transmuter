@@ -1385,3 +1385,26 @@ gqa_node = lambda: [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seq
 case("GroupQueryAttention_static_cache_decode", gqa_node(), gqa_static(2, 1, [6, 3]), ms=True, static=("total",))
 # ONNX Runtime takes more than one new token after a past only in a batch of one.
 case("GroupQueryAttention_static_cache_prefill", gqa_node(), gqa_static(1, 3, [5]), ms=True, static=("total",))
+
+# ---------- causal masks with a past ----------
+
+# ONNX Runtime aligns the causal mask to the last query, so the query at row i sees the keys
+# up to P + i. Without a softcap or another mask, EMLX runs this with its causal kernel.
+r = rng_for("causal masks with a past")
+cf = lambda *shape: r.standard_normal(shape).astype(np.float32)
+B, H, S, P, Hd = 2, 2, 2, 3, 8
+case("Attention_causal_past", [node("Attention", ["q", "k", "v", "", "pk", "pv"], ["y", "present_k", "present_v"], is_causal=1)],
+     {"q": cf(B, H, S, Hd), "k": cf(B, H, S, Hd), "v": cf(B, H, S, Hd), "pk": cf(B, H, P, Hd), "pv": cf(B, H, P, Hd)})
+case("MultiHeadAttention_unidirectional_past",
+     [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],
+     {"q": cf(B, S, H * Hd), "k": cf(B, S, H * Hd), "v": cf(B, S, H * Hd), "pk": cf(B, H, P, Hd), "pv": cf(B, H, P, Hd)}, ms=True)
+# A local window hides the keys at window or more positions before the query, as Gemma 3 uses.
+case("GroupQueryAttention_local_window",
+     [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
+           num_heads=4, kv_num_heads=2, local_window_size=3)],
+     {"q": cf(2, 1, 4 * G), "k": cf(2, 1, 2 * G), "v": cf(2, 1, 2 * G), "pk": cf(2, 2, 7, G), "pv": cf(2, 2, 7, G),
+      "seqlens": np.array([7, 4], np.int32), "total": np.array(8, np.int32)}, ms=True, static=("total",))
+# One new token after the past, as in decode, where the causal mask hides no key.
+case("MultiHeadAttention_unidirectional_decode",
+     [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],
+     {"q": cf(B, 1, H * Hd), "k": cf(B, 1, H * Hd), "v": cf(B, 1, H * Hd), "pk": cf(B, H, 4, Hd), "pv": cf(B, H, 4, Hd)}, ms=True)
