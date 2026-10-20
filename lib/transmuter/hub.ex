@@ -111,16 +111,23 @@ defmodule Transmuter.Hub do
       else: []
   end
 
+  # Each download writes its own part file, so processes that download the same file at the
+  # same time do not write into one file. The rename puts a complete file in place at once.
   defp download!(repo, file, target) do
     unless File.exists?(target) do
       File.mkdir_p!(Path.dirname(target))
+      part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
 
-      Req.get!(
-        "https://huggingface.co/#{repo}/resolve/main/#{file}",
-        req_options(into: File.stream!(target <> ".part"), http_errors: :raise)
-      )
+      try do
+        Req.get!(
+          "https://huggingface.co/#{repo}/resolve/main/#{file}",
+          req_options(into: File.stream!(part), http_errors: :raise)
+        )
 
-      File.rename!(target <> ".part", target)
+        File.rename!(part, target)
+      after
+        File.rm(part)
+      end
     end
   end
 
