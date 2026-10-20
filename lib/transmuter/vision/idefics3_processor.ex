@@ -52,7 +52,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
   @doc """
   Turns an image into tiles and gives the text of the image in the prompt.
 
-  Returns `{pixel_values, text}`. `pixel_values` has the shape `{tiles, 3, tile, tile}` and the type `:f32`, on `backend`.
+  Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{tiles, 3, tile, tile}` and type `:f32`, on `backend`.
   """
   def process(processor, image, backend) do
     {:ok, image} = Featurizer.tensor(image)
@@ -80,7 +80,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
       end
 
     pixels = Featurizer.process(processor.featurizer, tiles, backend: backend)
-    {pixels, text(processor, rows, columns)}
+    {%{"pixel_values" => pixels}, text(processor, rows, columns)}
   end
 
   @doc """
@@ -98,11 +98,11 @@ defmodule Transmuter.Vision.Idefics3Processor do
   end
 
   @doc """
-  Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on `pixels` of shape `{batch, tiles, 3, tile, tile}`.
+  Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the `"pixel_values"` of `tensors`, of shape `{batch, tiles, 3, tile, tile}`, and gives the inputs of `Transmuter.Generation.generate/5`.
 
-  The encoder removes the tiles of zeros, as `Idefics3Model.get_image_features` of Python transformers does. So the features are those of the real tiles of all rows, in order. Returns them as a tensor of shape `{tiles * image_seq_len, hidden}`, with rows of zeros after them for the removed tiles.
+  The encoder removes the tiles of zeros, as `Idefics3Model.get_image_features` of Python transformers does. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{tiles * image_seq_len, hidden}`, with rows of zeros after the features for the removed tiles. The prompts take the default positions.
   """
-  def encode(encode, pixels, backend) do
+  def encode(_processor, encode, %{"pixel_values" => pixels}, _prompts, backend) do
     {batch, tiles, _channels, height, width} = Nx.shape(pixels)
 
     # Each tile is a whole image, so the mask has no padding.
@@ -114,7 +114,8 @@ defmodule Transmuter.Vision.Idefics3Processor do
 
     {count, tokens, hidden} = Nx.shape(features)
     padding = (batch * tiles - count) * tokens
-    features |> Nx.reshape({count * tokens, hidden}) |> Nx.pad(0.0, [{0, padding, 0}, {0, 0, 0}])
+    features = Nx.reshape(features, {count * tokens, hidden})
+    %{image_features: Nx.pad(features, 0.0, [{0, padding, 0}, {0, 0, 0}])}
   end
 
   # As _resize_output_size_rescale_to_max_len of Python transformers: the long side gets

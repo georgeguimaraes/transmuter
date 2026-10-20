@@ -14,7 +14,7 @@ defmodule Transmuter.VisionTest do
   ]
 
   alias Transmuter.{ChatTemplate, Featurizer, Tokenizer, Vision}
-  alias Transmuter.Vision.Idefics3Processor
+  alias Transmuter.Vision.{Idefics3Processor, Qwen2VLProcessor}
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @labels ["cats", "dogs", "a remote control", "a couch"]
@@ -157,7 +157,9 @@ defmodule Transmuter.VisionTest do
            877, "a493c96a7687a9a8"},
           {image[0..99], 9, [0.1059, -0.7098, 0.2549, -0.4588], 0.4885, 611, "89410d97ee15e8d2"}
         ] do
-      {pixels, text} = Idefics3Processor.process(processor, image, @opts[:backend])
+      {%{"pixel_values" => pixels}, text} =
+        Idefics3Processor.process(processor, image, @opts[:backend])
+
       pixels = Nx.backend_transfer(pixels, Nx.BinaryBackend)
       assert Nx.shape(pixels) == {tiles, 3, 512, 512}
 
@@ -220,6 +222,90 @@ defmodule Transmuter.VisionTest do
 
     stream = Vision.image_text_to_text(@smolvlm, [stream: true] ++ opts)
     assert Enum.join(Nx.Serving.run(stream, hd(chats))) == hd(expected)
+  end
+
+  @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
+
+  test "the Qwen2-VL processor gives the patches and the prompt of Python transformers" do
+    repo = Transmuter.Repo.load!(@qwen2_vl)
+    processor = Qwen2VLProcessor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+    prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+    # A wide and a tall image. Both have 99 image tokens, so their prompts are equal.
+    for {image, grid, expected} <- [
+          {image, [1, 18, 22], [0.2661, 0.5435, -0.8403, -0.2963]},
+          {Nx.transpose(image, axes: [1, 0, 2]), [1, 22, 18], [0.2661, -0.201, -0.8403, -1.0317]}
+        ] do
+      {tensors, text} = Qwen2VLProcessor.process(processor, image, @opts[:backend])
+      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {396, 1176}
+      assert Nx.to_list(tensors["image_grid_thw"]) == [grid]
+
+      got =
+        for index <- [[0, 0], [1, 100], [-1, 1175], [200, 777]], do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), 0.8945, 1.0e-4
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(
+          tokenizer.native,
+          String.replace(prompt, "<|image_pad|>", text)
+        )
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {126, "5879c4bd9e8deede"}
+    end
+  end
+
+  # The reference is ONNX Runtime on the same files: the fp32 vision encoder, the fp16
+  # embeddings and the q4 decoder, with the 3-D positions of get_rope_index. The 8-bit vision
+  # encoder of the default variants gives another text in Transmuter than in ONNX Runtime. The
+  # model has 2B parameters, so CI leaves this test out.
+  @tag :large_model
+  test "image-text-to-text with Qwen2-VL matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for content <- [
+            [
+              %{type: "image", image: @image},
+              %{type: "text", text: "Can you describe this image?"}
+            ],
+            [
+              %{type: "image", image: tall},
+              %{type: "text", text: "What animals are in the image?"}
+            ],
+            [%{type: "text", text: "What is the capital of France?"}]
+          ],
+          do: %{messages: [%{role: "user", content: content}]}
+
+    expected = [
+      "In the image, there are two cats resting on a pink couch. The cat on the left is a tabby with",
+      "There are two cats in the image.",
+      "The capital of France is Paris."
+    ]
+
+    # The two chats with images have the same number of patches, so they go into one batch.
+    # The first chat also runs alone, with a padding row.
+    opts =
+      [
+        variant: %{vision_encoder: :fp32},
+        strategy: :greedy,
+        max_new_tokens: 24,
+        compile: [batch_size: 2]
+      ] ++ @opts
+
+    serving = Vision.image_text_to_text(@qwen2_vl, opts)
+    results = Nx.Serving.run(serving, chats)
+    assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
+    assert Nx.Serving.run(serving, hd(chats)) == hd(results)
   end
 
   defp assert_predictions(%{predictions: predictions}, expected) do

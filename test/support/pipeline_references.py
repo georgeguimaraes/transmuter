@@ -1,8 +1,8 @@
 """Prints the reference values of test/transmuter/text_test.exs, test/transmuter/vision_test.exs and test/transmuter/audio_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision python -I test/support/pipeline_references.py
 
-Transformers 5 removed the question answering pipeline, so the script uses transformers 4.
+Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The processor of Qwen2-VL loads a video processor, which needs torchvision.
 """
 
 from sentence_transformers import SentenceTransformer
@@ -246,3 +246,74 @@ for name, (images, messages) in chats.items():
         embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0]
         length += 1
     print("smolvlm onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
+# Image-text-to-text with Qwen2-VL. The image processor is the slow one, so the pixel values
+# are those of Transmuter. The reference is ONNX Runtime on the files of the test: the fp32
+# vision encoder, the fp16 embeddings and the q4 decoder. The export of the vision encoder
+# computes the rotary positions of the patches for one image, so each image runs alone. The
+# decoder takes the 3-D positions of M-RoPE from get_rope_index of transformers, and each new
+# token gets its index plus the rope delta of the prompt on all three axes. With the 8-bit
+# vision encoder of the default variants, ONNX Runtime and Transmuter give different texts.
+# The PyTorch model in fp32 needs about 9 GB, so the script does not run it.
+from types import SimpleNamespace
+
+import torch
+from transformers import AutoConfig, GenerationConfig
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel
+
+repo = "onnx-community/Qwen2-VL-2B-Instruct"
+image = Image.open("test/fixtures/cats.png")
+# Transformers 4.57 rejects the size of this preprocessor_config.json, {"min_pixels", "max_pixels"},
+# so the size comes from its min_pixels and max_pixels, which take precedence in Python.
+size = {"shortest_edge": 3136, "longest_edge": 12845056}
+processor = AutoProcessor.from_pretrained(repo, image_processor=AutoImageProcessor.from_pretrained(repo, use_fast=False, size=size))
+config = AutoConfig.from_pretrained(repo)
+
+# The patches, the grid and the prompt of a wide and a tall image: pixel_values at (patch,
+# value), the mean of the absolute values, and the number and a SHA-256 of the int64 input ids.
+chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
+prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
+positions = [(0, 0), (1, 100), (-1, 1175), (200, 777)]
+for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
+    inputs = processor(text=prompt, images=[picture], return_tensors="np")
+    ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
+    print("qwen2-vl", name, values.shape, inputs["image_grid_thw"].tolist(), [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+
+chats = {
+    "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
+    "tall image": ([image.transpose(Image.Transpose.TRANSPOSE)], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What animals are in the image?"}]}]),
+    "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
+}
+
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_fp16.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp())
+session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
+vision, embed, decoder = session("vision_encoder"), session("embed_tokens_fp16"), session("decoder_model_merged_q4")
+names = [o.name for o in decoder.get_outputs()]
+eos = GenerationConfig.from_pretrained(repo).eos_token_id
+rope = SimpleNamespace(config=config)
+
+for name, (images, messages) in chats.items():
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=prompt, images=images or None, return_tensors="np")
+    ids = inputs["input_ids"]
+    embeds = embed.run(None, {"input_ids": ids})[0].astype(np.float32)
+    grid = inputs.get("image_grid_thw")
+    if images:
+        counts = np.cumsum([0] + [int(np.prod(g)) for g in grid])
+        features = [vision.run(None, {"pixel_values": inputs["pixel_values"][counts[i]:counts[i + 1]], "grid_thw": grid[i : i + 1]})[0] for i in range(len(grid))]
+        embeds[ids == config.image_token_id] = np.concatenate(features)
+    position_ids, delta = Qwen2VLModel.get_rope_index(rope, torch.tensor(ids), None if grid is None else torch.tensor(grid), None, torch.ones(ids.shape, dtype=torch.long))
+    position_ids, delta = position_ids.numpy(), int(delta[0, 0])
+    past = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in decoder.get_inputs() if i.name.startswith("past_key_values")}
+    tokens, length = [], ids.shape[1]
+    for _ in range(24):
+        feeds = {"inputs_embeds": embeds, "attention_mask": np.ones((1, length), np.int64), "position_ids": position_ids, **past}
+        outputs = dict(zip(names, decoder.run(None, feeds)))
+        tokens.append(int(outputs["logits"][0, -1].argmax()))
+        if tokens[-1] in eos:
+            break
+        past = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+        embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0].astype(np.float32)
+        position_ids = np.full((3, 1, 1), length + delta, np.int64)
+        length += 1
+    print("qwen2-vl onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))

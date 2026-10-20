@@ -89,8 +89,10 @@ jobs:
         run: mix compile --force --warnings-as-errors
       - name: Run Credo
         run: mix credo --strict
+      # Tests tagged large_model run models with billions of parameters, which are too large
+      # and too slow for a runner. They run locally.
       - name: Run tests
-        run: mix test
+        run: mix test --exclude large_model
       - name: List the cached models
         id: model-files
         if: matrix.otp == '29' && github.event_name == 'push' && github.ref == 'refs/heads/main'
