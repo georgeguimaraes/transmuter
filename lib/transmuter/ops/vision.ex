@@ -152,17 +152,14 @@ defmodule Transmuter.Ops.Vision do
   end
 
   # Max pooling over bins of each ROI; rois are {batch, x1, y1, x2, y2} in input pixels.
+  # ONNX Runtime rounds the scaled corners half away from zero. The pooling reduces the
+  # columns of one bin at a time, then the rows, so the largest value is {R, C, H, W}.
   defp op(node = %{op_type: "MaxRoiPool"}, [x, rois]) do
     [ph, pw] = attr(node, "pooled_shape")
     scale = attr(node, "spatial_scale", 1.0)
     {_n, _c, h, w} = Nx.shape(x)
-
-    coords =
-      rois
-      |> Nx.slice_along_axis(1, 4, axis: 1)
-      |> Nx.multiply(scale)
-      |> Nx.round()
-      |> Nx.as_type(:s32)
+    scaled = rois |> Nx.slice_along_axis(1, 4, axis: 1) |> Nx.multiply(scale)
+    coords = scaled |> Nx.abs() |> Nx.add(0.5) |> Nx.floor() |> Nx.multiply(Nx.sign(scaled))
 
     image =
       Nx.take(
@@ -193,41 +190,48 @@ defmodule Transmuter.Ops.Vision do
         |> Nx.add(start)
         |> Nx.clip(0, size)
 
-      {bin_start, bin_end}
+      positions = Nx.iota({1, 1, size}, type: :f32)
+
+      Nx.logical_and(
+        Nx.greater_equal(positions, Nx.new_axis(bin_start, 2)),
+        Nx.less(positions, Nx.new_axis(bin_end, 2))
+      )
     end
 
-    {hs, he} = bins.(y1, y2, ph, h)
-    {ws, we} = bins.(x1, x2, pw, w)
-    rows = Nx.iota({1, 1, h}, type: :f32)
-    cols = Nx.iota({1, 1, w}, type: :f32)
-
-    in_rows =
-      Nx.logical_and(
-        Nx.greater_equal(rows, Nx.new_axis(hs, 2)),
-        Nx.less(rows, Nx.new_axis(he, 2))
-      )
-
-    in_cols =
-      Nx.logical_and(
-        Nx.greater_equal(cols, Nx.new_axis(ws, 2)),
-        Nx.less(cols, Nx.new_axis(we, 2))
-      )
-
-    # {R, ph, pw, H, W}, broadcast against the image {R, C, 1, 1, H, W}.
-    mask =
-      Nx.logical_and(
-        Nx.reshape(in_rows, {:auto, ph, 1, h, 1}),
-        Nx.reshape(in_cols, {:auto, 1, pw, 1, w})
-      )
-
-    neg = Nx.Constants.min_finite(Nx.type(x))
+    # {R, bins, H} and {R, bins, W}: whether a row or a column is in each bin.
+    {in_rows, in_cols} = {bins.(y1, y2, ph, h), bins.(x1, x2, pw, w)}
     {r, c, _, _} = Nx.shape(image)
-    full = {r, c, ph, pw, h, w}
-    on = Nx.broadcast(Nx.new_axis(mask, 1), full)
-    values = Nx.select(on, Nx.broadcast(image |> Nx.new_axis(2) |> Nx.new_axis(2), full), neg)
-    pooled = Nx.reduce_max(values, axes: [4, 5])
-    empty = mask |> Nx.any(axes: [3, 4]) |> Nx.logical_not() |> Nx.new_axis(1)
-    Nx.select(Nx.broadcast(empty, {r, c, ph, pw}), Nx.tensor(0, type: Nx.type(x)), pooled)
+    neg = Nx.Constants.min_finite(Nx.type(x))
+
+    columns =
+      for j <- 0..(pw - 1) do
+        on = in_cols |> Nx.slice_along_axis(j, 1, axis: 1) |> Nx.reshape({r, 1, 1, w})
+        on |> Nx.broadcast(Nx.shape(image)) |> Nx.select(image, neg) |> Nx.reduce_max(axes: [3])
+      end
+      |> Nx.stack(axis: 3)
+
+    pooled =
+      for i <- 0..(ph - 1) do
+        on = in_rows |> Nx.slice_along_axis(i, 1, axis: 1) |> Nx.reshape({r, 1, h, 1})
+
+        on
+        |> Nx.broadcast(Nx.shape(columns))
+        |> Nx.select(columns, neg)
+        |> Nx.reduce_max(axes: [2])
+      end
+      |> Nx.stack(axis: 2)
+
+    empty =
+      Nx.logical_or(
+        in_rows |> Nx.any(axes: [2]) |> Nx.logical_not() |> Nx.new_axis(2),
+        in_cols |> Nx.any(axes: [2]) |> Nx.logical_not() |> Nx.new_axis(1)
+      )
+
+    Nx.select(
+      Nx.broadcast(Nx.new_axis(empty, 1), {r, c, ph, pw}),
+      Nx.tensor(0, type: Nx.type(x)),
+      pooled
+    )
   end
 
   defp op(node = %{op_type: "DeformConv"}, [x, w, offset | rest]) do

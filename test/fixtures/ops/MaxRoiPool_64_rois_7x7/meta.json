@@ -1,0 +1,48 @@
+{
+ "repo": "op/MaxRoiPool_64_rois_7x7",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "MaxRoiPool": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    32,
+    48,
+    48
+   ]
+  },
+  {
+   "name": "rois",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    32,
+    7,
+    7
+   ]
+  }
+ ],
+ "ort_ok": true
+}

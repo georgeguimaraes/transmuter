@@ -1210,3 +1210,26 @@ case("GridSample_nearest_ties_static", [node("GridSample", ["x", "g"], ["y"], mo
      opset=20, static=("x", "g"))
 case("GridSample_linear_5d", [node("GridSample", ["x", "g"], ["y"], mode="linear", padding_mode="border")],
      {"x": r.standard_normal((1, 2, 3, 4, 5)).astype(np.float32), "g": (r.random((1, 2, 3, 2, 3)) * 2.4 - 1.2).astype(np.float32)}, opset=20)
+
+# ---------- RoI pooling and normalizations ----------
+
+r = rng_for("MaxRoiPool")
+# 64 ROIs of 32 channels on a 48x48 map, at spatial scale 0.5 so odd corners land on ties.
+corners = np.sort(r.integers(0, 96, (64, 2, 2)), axis=1).reshape(64, 4)[:, [0, 2, 1, 3]].astype(np.float32)
+roi_batch = r.integers(0, 2, (64, 1)).astype(np.float32)
+case("MaxRoiPool_64_rois_7x7", [node("MaxRoiPool", ["x", "rois"], ["y"], pooled_shape=[7, 7], spatial_scale=0.5)],
+     {"x": r.standard_normal((2, 32, 48, 48)).astype(np.float32), "rois": np.concatenate([roi_batch, corners], axis=1)}, opset=18)
+r = rng_for("normalizations")
+case("MeanVarianceNormalization_large_mean", [node("MeanVarianceNormalization", ["x"], ["y"])],
+     {"x": (r.standard_normal((2, 3, 4, 4)) + 3000).astype(np.float32)})
+case("MeanVarianceNormalization_axes", [node("MeanVarianceNormalization", ["x"], ["y"], axes=[1, 3])],
+     {"x": r.standard_normal((2, 3, 4, 5)).astype(np.float32)})
+case("InstanceNormalization", [node("InstanceNormalization", ["x", "s", "b"], ["y"], epsilon=1e-3)],
+     {"x": r.standard_normal((2, 3, 5, 4)).astype(np.float32)}, {"s": r.standard_normal(3).astype(np.float32), "b": r.standard_normal(3).astype(np.float32)})
+case("InstanceNormalization_f16", [node("InstanceNormalization", ["x", "s", "b"], ["y"])],
+     {"x": (r.standard_normal((2, 3, 16, 16)) * 4 + 8).astype(np.float16)},
+     {"s": r.standard_normal(3).astype(np.float16), "b": r.standard_normal(3).astype(np.float16)}, extra=HALF)
+case("BatchNormalization", [node("BatchNormalization", ["x", "s", "b", "m", "v"], ["y"], epsilon=1e-3)],
+     {"x": r.standard_normal((2, 3, 5)).astype(np.float32)},
+     {"s": r.standard_normal(3).astype(np.float32), "b": r.standard_normal(3).astype(np.float32),
+      "m": r.standard_normal(3).astype(np.float32), "v": r.random(3).astype(np.float32) + 0.5})

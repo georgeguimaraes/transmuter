@@ -401,14 +401,13 @@ defmodule Transmuter.Ops.NN do
     x |> Nx.abs() |> Nx.pow(p) |> Nx.sum(axes: axes, keep_axes: true) |> Nx.pow(1 / p)
   end
 
+  # The variance is the mean of the squares of the centered values, which does not cancel
+  # out as E[x^2] - E[x]^2 does for a large mean.
   defp op(node = %{op_type: "MeanVarianceNormalization"}, [x]) do
     axes = attr(node, "axes", [0, 2, 3])
-    mean = Nx.mean(x, axes: axes, keep_axes: true)
-
-    variance =
-      x |> Nx.pow(2) |> Nx.mean(axes: axes, keep_axes: true) |> Nx.subtract(Nx.pow(mean, 2))
-
-    Nx.divide(Nx.subtract(x, mean), Nx.add(Nx.sqrt(variance), 1.0e-9))
+    centered = Nx.subtract(x, Nx.mean(x, axes: axes, keep_axes: true))
+    variance = centered |> Nx.multiply(centered) |> Nx.mean(axes: axes, keep_axes: true)
+    Nx.divide(centered, Nx.add(Nx.sqrt(variance), 1.0e-9))
   end
 
   defp op(node = %{op_type: "NegativeLogLikelihoodLoss"}, [x, target | weight]),
