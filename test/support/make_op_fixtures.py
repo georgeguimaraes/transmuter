@@ -1137,3 +1137,31 @@ for name, equation, shapes in [
 ]:
     case(f"Einsum_{name}", [node("Einsum", [f"x{i}" for i in range(len(shapes))], ["y"], equation=equation)],
          {f"x{i}": r.standard_normal(shape).astype(np.float32) for i, shape in enumerate(shapes)})
+
+# ---------- pooling and ConvTranspose padding ----------
+
+r = rng_for("pooling")
+x77 = r.standard_normal((1, 2, 7, 7)).astype(np.float32)
+x66 = r.standard_normal((1, 2, 6, 6)).astype(np.float32)
+pools = [
+    ("MaxPool_auto_pad_same_upper", "MaxPool", x66, dict(kernel_shape=[3, 3], strides=[2, 2], auto_pad="SAME_UPPER")),
+    ("MaxPool_dilations", "MaxPool", x77, dict(kernel_shape=[2, 3], dilations=[2, 1], pads=[1, 0, 0, 1])),
+    ("MaxPool_ceil_mode", "MaxPool", x66, dict(kernel_shape=[3, 3], strides=[2, 2], ceil_mode=1)),
+    ("AveragePool_auto_pad_same_lower", "AveragePool", x66, dict(kernel_shape=[3, 2], strides=[2, 2], auto_pad="SAME_LOWER")),
+    ("AveragePool_auto_pad_same_upper_count_pad", "AveragePool", x66, dict(kernel_shape=[3, 3], strides=[2, 2], auto_pad="SAME_UPPER", count_include_pad=1)),
+    ("AveragePool_ceil_mode_exclude_pad", "AveragePool", x66, dict(kernel_shape=[3, 3], strides=[2, 2], ceil_mode=1)),
+    ("AveragePool_ceil_mode_pads_count_pad", "AveragePool", x66, dict(kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 0, 0], ceil_mode=1, count_include_pad=1)),
+    ("AveragePool_dilations", "AveragePool", x77, dict(kernel_shape=[2, 2], dilations=[2, 3], pads=[1, 1, 1, 1])),
+    ("LpPool_auto_pad_same_upper", "LpPool", x66, dict(kernel_shape=[2, 3], strides=[2, 2], auto_pad="SAME_UPPER", p=2)),
+]
+for name, op, x, attrs in pools:
+    case(name, [node(op, ["x"], ["y"], **attrs)], {"x": x}, opset=19)
+case("MaxPool_indices", [node("MaxPool", ["x"], ["y", "i"], kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])],
+     {"x": r.standard_normal((2, 3, 5, 6)).astype(np.float32)}, opset=12)
+case("MaxPool_indices_storage_order", [node("MaxPool", ["x"], ["y", "i"], kernel_shape=[2, 2], storage_order=1, auto_pad="SAME_UPPER")],
+     {"x": r.standard_normal((1, 2, 5, 4)).astype(np.float32)}, opset=12)
+xt = r.standard_normal((1, 2, 3, 4)).astype(np.float32)
+wt = r.standard_normal((2, 3, 3, 3)).astype(np.float32)
+for name, attrs in [("auto_pad_same_upper", dict(auto_pad="SAME_UPPER")), ("auto_pad_same_lower", dict(auto_pad="SAME_LOWER")),
+                    ("output_shape", dict(output_shape=[6, 9])), ("output_shape_same_upper", dict(output_shape=[6, 8], auto_pad="SAME_UPPER"))]:
+    case(f"ConvTranspose_{name}", [node("ConvTranspose", ["x", "w"], ["y"], strides=[2, 2], **attrs)], {"x": xt}, {"w": wt})

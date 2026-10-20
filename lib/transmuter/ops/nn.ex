@@ -60,7 +60,7 @@ defmodule Transmuter.Ops.NN do
     out =
       Nx.conv(x, w,
         strides: attr(node, "strides", List.duplicate(1, spatial)),
-        padding: conv_padding(node, x, w),
+        padding: spatial_pads(node, spatial_sizes(x), spatial_sizes(w)),
         kernel_dilation: attr(node, "dilations", List.duplicate(1, spatial)),
         feature_group_size: attr(node, "group", 1)
       )
@@ -120,60 +120,62 @@ defmodule Transmuter.Ops.NN do
   defp op(%{op_type: "GlobalMaxPool"}, [x]),
     do: Nx.reduce_max(x, axes: Enum.to_list(2..(Nx.rank(x) - 1)), keep_axes: true)
 
+  # ceil_mode adds the padding that a last, partial window needs. This padding never
+  # counts in the divisor of AveragePool, the explicit padding counts with count_include_pad.
   defp op(node = %{op_type: pool}, [x]) when pool in ["MaxPool", "AveragePool", "LpPool"] do
     kernel = attr(node, "kernel_shape")
     spatial = length(kernel)
     strides = attr(node, "strides", List.duplicate(1, spatial))
-    pads = attr(node, "pads", List.duplicate(0, 2 * spatial))
+    dilations = attr(node, "dilations", List.duplicate(1, spatial))
     sizes = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+    pads = spatial_pads(node, sizes, kernel)
 
     extra =
       if attr(node, "ceil_mode", 0) == 1 do
-        Enum.zip_with(
-          [sizes, kernel, strides, Enum.take(pads, spatial), Enum.drop(pads, spatial)],
-          fn [n, k, st, lo, hi] ->
-            out = ceil((n + lo + hi - k) / st) + 1
-            out = if (out - 1) * st >= n + lo, do: out - 1, else: out
-            max((out - 1) * st + k - (n + lo + hi), 0)
-          end
-        )
+        Enum.zip_with([sizes, kernel, strides, dilations, pads], fn [n, k, st, d, {lo, hi}] ->
+          span = (k - 1) * d + 1
+          out = ceil((n + lo + hi - span) / st) + 1
+          out = if (out - 1) * st >= n + lo, do: out - 1, else: out
+          max((out - 1) * st + span - (n + lo + hi), 0)
+        end)
       else
         List.duplicate(0, spatial)
       end
 
-    padding = [
-      {0, 0},
-      {0, 0}
-      | Enum.zip_with([Enum.take(pads, spatial), Enum.drop(pads, spatial), extra], fn [lo, hi, e] ->
-          {lo, hi + e}
-        end)
-    ]
-
     window = List.to_tuple([1, 1 | kernel])
-    opts = [strides: [1, 1 | strides], padding: padding]
+    window_opts = [strides: [1, 1 | strides], window_dilations: [1, 1 | dilations]]
+    padding = [{0, 0}, {0, 0} | Enum.zip_with(pads, extra, fn {lo, hi}, e -> {lo, hi + e} end)]
+    opts = [padding: padding] ++ window_opts
 
-    cond do
-      pool == "MaxPool" ->
-        Nx.window_max(x, window, opts)
+    case pool do
+      "MaxPool" ->
+        values = Nx.window_max(x, window, opts)
 
-      pool == "LpPool" ->
+        if Enum.at(node.output, 1, "") == "",
+          do: values,
+          else: [values, max_pool_indices(node, x, padding, dilations)]
+
+      "LpPool" ->
         p = attr(node, "p", 2)
         x |> Nx.abs() |> Nx.pow(p) |> Nx.window_sum(window, opts) |> Nx.pow(1 / p)
 
-      true ->
-        sum = Nx.window_sum(x, window, opts)
+      "AveragePool" ->
+        type = Nx.type(x)
+        include = attr(node, "count_include_pad", 0)
 
-        if attr(node, "count_include_pad", 0) == 1 or Enum.all?(pads, &(&1 == 0)),
-          do: Nx.divide(sum, Enum.product(kernel)),
-          else:
-            Nx.divide(
-              sum,
-              Nx.window_sum(
-                Nx.broadcast(Nx.tensor(1.0, type: Nx.type(x)), Nx.shape(x)),
-                window,
-                opts
-              )
-            )
+        counts =
+          Nx.tensor(1, type: type)
+          |> Nx.broadcast(List.to_tuple([1, 1 | sizes]))
+          |> Nx.pad(
+            Nx.tensor(include, type: type),
+            [{0, 0, 0}, {0, 0, 0} | for({lo, hi} <- pads, do: {lo, hi, 0})]
+          )
+          |> Nx.window_sum(
+            window,
+            [padding: [{0, 0}, {0, 0} | for(e <- extra, do: {0, e})]] ++ window_opts
+          )
+
+        Nx.divide(Nx.window_sum(x, window, opts), counts)
     end
   end
 
@@ -464,7 +466,8 @@ defmodule Transmuter.Ops.NN do
     x =
       Nx.pad(x, 0.0, [
         {0, 0, 0},
-        {0, 0, 0} | for({lo, hi} <- conv_padding(node, x, w), do: {lo, hi, 0})
+        {0, 0, 0}
+        | for({lo, hi} <- spatial_pads(node, spatial_sizes(x), spatial_sizes(w)), do: {lo, hi, 0})
       ])
 
     padded = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
@@ -514,11 +517,10 @@ defmodule Transmuter.Ops.NN do
     |> Nx.reshape(List.to_tuple([n, o | out]))
   end
 
-  # {low, high} padding per spatial axis. SAME_UPPER and SAME_LOWER pad so the output
-  # size is ceil(input / stride), with the odd padding at the end or at the start.
-  defp conv_padding(node, x, w) do
-    sizes = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
-    kernel = w |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+  # {low, high} padding per spatial axis of a window of size kernel over sizes, for
+  # convolutions and pooling. SAME_UPPER and SAME_LOWER pad so the output size is
+  # ceil(input / stride), with the odd padding at the end or at the start.
+  defp spatial_pads(node, sizes, kernel) do
     spatial = length(sizes)
     strides = attr(node, "strides", List.duplicate(1, spatial))
     dilations = attr(node, "dilations", List.duplicate(1, spatial))
@@ -542,23 +544,115 @@ defmodule Transmuter.Ops.NN do
     end
   end
 
+  defp spatial_sizes(t), do: t |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+
+  # The flat input position of the first maximum of each window, over the whole input as
+  # MaxPool gives it: row-major, or column-major in each channel with storage_order 1.
+  # Each kernel tap is one strided slice of the padded input.
+  defp max_pool_indices(node, x, padding, dilations) do
+    [n, c | sizes] = Tuple.to_list(Nx.shape(x))
+    kernel = attr(node, "kernel_shape")
+    strides = attr(node, "strides", Enum.map(kernel, fn _ -> 1 end))
+    low = padding |> Enum.drop(2) |> Enum.map(&elem(&1, 0))
+
+    padded =
+      Nx.pad(x, Nx.Constants.min_finite(Nx.type(x)), for({lo, hi} <- padding, do: {lo, hi, 0}))
+
+    padded_sizes = spatial_sizes(padded)
+
+    out =
+      Enum.zip_with([padded_sizes, kernel, strides, dilations], fn [size, k, s, d] ->
+        div(size - (k - 1) * d - 1, s) + 1
+      end)
+
+    taps =
+      kernel
+      |> Enum.map(&Enum.to_list(0..(&1 - 1)))
+      |> Enum.reduce([[]], fn range, taps -> for tap <- taps, i <- range, do: tap ++ [i] end)
+
+    best =
+      taps
+      |> Enum.map(fn tap ->
+        starts = Enum.zip_with(tap, dilations, &(&1 * &2))
+        lengths = Enum.zip_with(out, strides, &((&1 - 1) * &2 + 1))
+        Nx.slice(padded, [0, 0 | starts], [n, c | lengths], strides: [1, 1 | strides])
+      end)
+      |> Nx.stack()
+      |> Nx.argmax(axis: 0)
+
+    shape = List.to_tuple([n, c | out])
+
+    coords =
+      for {{s, d, lo}, axis} <- Enum.with_index(Enum.zip([strides, dilations, low])) do
+        offsets = static_tensor(Enum.map(taps, &Enum.at(&1, axis)), :s64)
+
+        Nx.iota(shape, axis: axis + 2, type: :s64)
+        |> Nx.multiply(s)
+        |> Nx.subtract(lo)
+        |> Nx.add(Nx.multiply(Nx.take(offsets, best), d))
+      end
+
+    # The fastest axis is the last one, or the first one with storage_order 1.
+    axes = Enum.to_list(0..(length(sizes) - 1))
+    fastest_first = if attr(node, "storage_order", 0) == 1, do: axes, else: Enum.reverse(axes)
+
+    {within, _} =
+      Enum.reduce(fastest_first, {0, 1}, fn axis, {flat, place} ->
+        {Nx.add(flat, Nx.multiply(Enum.at(coords, axis), place)), place * Enum.at(sizes, axis)}
+      end)
+
+    Nx.iota(shape, axis: 0, type: :s64)
+    |> Nx.multiply(c)
+    |> Nx.add(Nx.iota(shape, axis: 1, type: :s64))
+    |> Nx.multiply(Enum.product(sizes))
+    |> Nx.add(within)
+  end
+
+  # The full output of a transposed convolution has (in - 1) * stride + output_padding +
+  # (kernel - 1) * dilation + 1 positions per axis. The pads remove positions from it,
+  # explicitly or to reach output_shape, or in * stride with SAME_UPPER and SAME_LOWER.
   defp conv_transpose(node, x, w, b) do
     spatial = Nx.rank(x) - 2
-    kernel = w |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
+    kernel = spatial_sizes(w)
     strides = attr(node, "strides", List.duplicate(1, spatial))
     dilations = attr(node, "dilations", List.duplicate(1, spatial))
-    pads = attr(node, "pads", List.duplicate(0, 2 * spatial))
     output_padding = attr(node, "output_padding", List.duplicate(0, spatial))
+    sizes = spatial_sizes(x)
+    auto_pad = attr(node, "auto_pad", "NOTSET")
+
+    full =
+      Enum.zip_with([sizes, strides, output_padding, kernel, dilations], fn [n, s, adj, k, d] ->
+        (n - 1) * s + adj + (k - 1) * d + 1
+      end)
+
+    targets =
+      cond do
+        shape = attr(node, "output_shape") -> Enum.take(shape, -spatial)
+        auto_pad in ["SAME_UPPER", "SAME_LOWER"] -> Enum.zip_with(sizes, strides, &(&1 * &2))
+        true -> nil
+      end
+
+    pads =
+      cond do
+        targets ->
+          Enum.zip_with(full, targets, fn size, target ->
+            total = max(size - target, 0)
+            small = div(total, 2)
+            if auto_pad == "SAME_UPPER", do: {small, total - small}, else: {total - small, small}
+          end)
+
+        auto_pad == "VALID" ->
+          List.duplicate({0, 0}, spatial)
+
+        true ->
+          pads = attr(node, "pads", List.duplicate(0, 2 * spatial))
+          Enum.zip(Enum.take(pads, spatial), Enum.drop(pads, spatial))
+      end
 
     padding =
-      Enum.zip([
-        kernel,
-        dilations,
-        Enum.take(pads, spatial),
-        Enum.drop(pads, spatial),
-        output_padding
-      ])
-      |> Enum.map(fn {k, d, lo, hi, op} -> {d * (k - 1) - lo, d * (k - 1) - hi + op} end)
+      Enum.zip_with([kernel, dilations, pads, output_padding], fn [k, d, {lo, hi}, adj] ->
+        {d * (k - 1) - lo, d * (k - 1) - hi + adj}
+      end)
 
     # The weight is {in, out / groups, kernel...}. Each group becomes the
     # {out / groups, in / groups, kernel...} kernel of a grouped conv.
