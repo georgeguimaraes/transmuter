@@ -3,10 +3,13 @@ defmodule Transmuter.Ops.Transformer do
   Attention, linear attention, KV cache writes, rotary embedding and normalization. The same op type can be the ONNX standard op (opset 23) or the com.microsoft op from ORT exporters, so the domain decides the input layout.
 
   On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations and the attention core run as fused kernels of `EMLX.Fast`. Attention with a softcap keeps the Nx operations, because the kernel has no softcap.
+
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(q · k * scale + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, the softmax is along the last axis and the mask broadcasts to the scores.
   """
 
   import Transmuter.Ops,
     only: [
+      along_axis: 3,
       attr: 2,
       attr: 3,
       broadcast_shape: 1,
@@ -14,13 +17,14 @@ defmodule Transmuter.Ops.Transformer do
       emlx_norm: 4,
       empty?: 1,
       ints!: 1,
+      matmul: 2,
       normalize: 3,
       normalize_axis: 2,
       shape_of: 1,
       softmax_last: 1
     ]
 
-  @op_types ~w(Attention GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
+  @op_types ~w(Attention AttentionCore GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
                EmbedLayerNormalization TensorScatter LinearAttention)
 
@@ -28,7 +32,10 @@ defmodule Transmuter.Ops.Transformer do
   def op_types, do: @op_types
 
   @doc false
-  def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
+  def apply(node = %{op_type: "AttentionCore"}, inputs, opset),
+    do: [attention_core(node, inputs, opset)]
+
+  def apply(node, inputs, _opset), do: node |> op(inputs) |> List.wrap()
 
   defp op(node = %{op_type: "Attention", domain: "com.microsoft"}, inputs),
     do: packed_attention(node, inputs)
@@ -317,6 +324,36 @@ defmodule Transmuter.Ops.Transformer do
         else: Nx.broadcast(Nx.tensor(0, type: :s32), {b})
 
     [layer_norm(sum, gamma, beta, attr(node, "epsilon", 1.0e-12)), mask_index, sum]
+  end
+
+  # k has the head size before the keys, so the kernel gets its transpose.
+  defp attention_core(node, [q, k, v | mask], opset) do
+    mask = List.first(mask)
+    scale = attr(node, "scale")
+
+    if emlx?(q) and fused_core?(q, k, v, mask, attr(node, "axis")) do
+      k = Nx.transpose(k, axes: [0, 1, 3, 2])
+      masks = if mask, do: &Nx.add(&1, mask), else: & &1
+      emlx_attention(q, k, v, scale, masks, [mask])
+    else
+      scores = matmul(q, k)
+      scores = if scale == 1, do: scores, else: Nx.multiply(scores, scale)
+
+      scores
+      |> add_optional(mask)
+      |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
+      |> matmul(v)
+    end
+  end
+
+  defp fused_core?(q, k, v, mask, axis) do
+    with true <- Enum.all?([q, k, v], &(Nx.rank(&1) == 4 and Nx.type(&1) == Nx.type(q))),
+         {b, heads, s, _head_size} <- Nx.shape(q),
+         true <-
+           Enum.all?([k, v], &(&1 |> Nx.shape() |> Tuple.to_list() |> Enum.take(2) == [b, heads])) do
+      scores = {b, heads, s, Nx.axis_size(k, 3)}
+      axis in [-1, 3] and (mask == nil or broadcast_shape([scores, Nx.shape(mask)]) == scores)
+    end
   end
 
   # com.microsoft Attention from BERT exports: one input projected to Q, K and V.

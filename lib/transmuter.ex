@@ -53,8 +53,13 @@ defmodule Transmuter do
       which calculates half-precision graphs in f32. Half-precision weights are
       converted when the model loads, so they use as much memory as f32 weights.
       `nil` keeps the types of the graph. In native f16, an export that writes a
-      normalization as separate operators can overflow and give zeros. See
+      normalization as separate operators can overflow and give zeros, when
+      `Transmuter.Fusion` does not recognize the normalization. See
       [Backends and performance](guides/backends_and_performance.md).
+
+    * `:fuse` (`t:boolean/0`) - replaces normalizations and attention cores that
+      the graph writes as separate operators with one operator, which runs as a
+      fused kernel on EMLX (see `Transmuter.Fusion`). The default is `true`.
 
     * `:trainable` (`t:boolean/0`) - when `true`, every float initializer is a
       param, so small weights such as a 1-element bias get gradients. The
@@ -113,7 +118,14 @@ defmodule Transmuter do
   defp read!(path, opts) do
     dir = Path.dirname(path)
     model = ModelProto.decode!(File.read!(path))
+
+    opset =
+      Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
+
     graph = inline_external(model.graph, dir)
+
+    graph =
+      if Keyword.get(opts, :fuse, true), do: Transmuter.Fusion.graph(graph, opset), else: graph
 
     trainable = Keyword.get(opts, :trainable, false)
 
@@ -135,8 +147,7 @@ defmodule Transmuter do
       inputs: inputs,
       input_types: Map.new(graph_inputs, &{&1.name, value_type(&1)}),
       outputs: Enum.map(graph.output, & &1.name),
-      opset:
-        Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
+      opset: opset
     }
 
     if backend = opts[:backend], do: %{model | params: move_params(model, backend)}, else: model

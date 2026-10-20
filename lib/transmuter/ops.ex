@@ -26,7 +26,7 @@ defmodule Transmuter.Ops do
               LayerNormalization InstanceNormalization GroupNormalization BatchNormalization
               RMSNormalization SimplifiedLayerNormalization SkipLayerNormalization
               SkipSimplifiedLayerNormalization EmbedLayerNormalization Attention
-              GroupQueryAttention MultiHeadAttention MoE QMoE)
+              GroupQueryAttention MultiHeadAttention AttentionCore MoE QMoE)
 
   @doc false
   def apply(node, inputs, opset) do
@@ -115,7 +115,7 @@ defmodule Transmuter.Ops do
         [along_axis(node, hd(inputs), opset)]
 
       node.op_type in Transformer.op_types() ->
-        Transformer.apply(node, inputs)
+        Transformer.apply(node, inputs, opset)
 
       node.op_type in MoE.op_types() ->
         MoE.apply(node, inputs)
@@ -372,9 +372,12 @@ defmodule Transmuter.Ops do
     end
   end
 
-  # Softmax, LogSoftmax and Hardmax work on one axis from opset 13. Before opset 13
-  # they flatten the input to 2-D at the axis and work on the second dimension.
-  defp along_axis(node, a, opset) do
+  @doc """
+  Computes the `Softmax`, `LogSoftmax` or `Hardmax` of `node` along its axis.
+
+  These operators work on one axis from opset 13. Before opset 13, they flatten the input to 2-D at the axis and work on the second dimension.
+  """
+  def along_axis(node, a, opset) do
     rank = Nx.rank(a)
     axis = attr(node, "axis", if(opset >= 13, do: -1, else: 1))
     axis = if axis < 0, do: axis + rank, else: axis

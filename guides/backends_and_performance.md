@@ -36,7 +36,13 @@ On EMLX, the normalization and attention operators run as the fused kernels of `
 - `RMSNormalization`, `SimplifiedLayerNormalization`, `SkipSimplifiedLayerNormalization`, `LayerNormalization`, `SkipLayerNormalization` and `EmbedLayerNormalization` use one normalization kernel.
 - `Attention`, `GroupQueryAttention`, `MultiHeadAttention` and the `com.microsoft` `Attention` use one attention kernel. Attention with a softcap keeps the Nx operations, because the kernel has no softcap.
 
-The fused kernels change the last bits of the results. On an Apple silicon GPU, the fused normalization makes a decode step of Qwen3-0.6B q4 about 0.6 ms faster, and the fused attention makes it 1.3 ms faster again (12.7 ms to 11.4 ms). The vision encoder of Ministral 3 3B takes 298 ms instead of 364 ms for a 448x448 image. Exports that write the normalization or the attention as separate operators, such as `Pow` and `ReduceMean`, do not change.
+The fused kernels change the last bits of the results. On an Apple silicon GPU, the fused normalization makes a decode step of Qwen3-0.6B q4 about 0.6 ms faster, and the fused attention makes it 1.3 ms faster again (12.7 ms to 11.4 ms). The vision encoder of Ministral 3 3B takes 298 ms instead of 364 ms for a 448x448 image.
+
+Many exports write RMSNorm, LayerNorm and the attention core as separate operators, such as `Pow`, `ReduceMean`, `Sqrt`, `Softmax` and `MatMul`. When the model loads, `Transmuter.Fusion` replaces these subgraphs with `SimplifiedLayerNormalization`, `LayerNormalization` and an attention operator. These operators then also use the fused kernels. A subgraph changes only when the replacement computes the same function. The load option `fuse: false` keeps the graph as it is. On an Apple silicon GPU:
+
+- The decode step of SmolLM2 135M q4 (onnx-community export) takes 7.8 ms instead of 8.6 ms.
+- all-MiniLM-L6-v2 embeds 128 tokens in 2.34 ms instead of 2.57 ms, and a batch of 8 in 9.15 ms instead of 10.0 ms.
+- bert-base-uncased embeds 128 tokens in 10.5 ms instead of 11.5 ms, and a batch of 8 in 58.4 ms instead of 64.2 ms.
 
 ### EXLA
 
@@ -79,11 +85,11 @@ The f32 weights use as much memory as an fp32 export. With `compute_type: nil`, 
 model = Transmuter.load!(source, compute_type: nil)
 ```
 
-In native f16, precision-sensitive operators (sums, normalizations, softmax, attention scores) run in f32 and cast their output back to f16 or bf16. This does not protect a normalization that the export writes as separate operators. Many fp16 decoder exports compute RMSNorm as `Pow`, `ReduceMean`, `Add`, `Sqrt`, `Div` and `Mul`. `Pow` overflows to infinity in f16 for values above 256, and the normalized values become 0. The fp16 export of SmolLM2 135M then gives logits of 0.
+In native f16, precision-sensitive operators (sums, normalizations, softmax, attention scores) run in f32 and cast their output back to f16 or bf16. Many fp16 decoder exports compute RMSNorm as `Pow`, `ReduceMean`, `Add`, `Sqrt`, `Div` and `Mul`. `Pow` overflows to infinity in f16 for values above 256, and the normalized values become 0. `Transmuter.Fusion` replaces this subgraph with `SimplifiedLayerNormalization`, which runs in f32. A normalization that it does not recognize still overflows. With `fuse: false`, the fp16 export of SmolLM2 135M gives logits of 0.
 
 Native f16 can also drift in a deep graph, because each intermediate value is stored in f16. The fp16 vision encoder of Qwen2-VL 2B has 32 blocks. In native f16, its output differs from the f32 result by 60%. In f32, it matches ONNX Runtime within 2e-5.
 
-Use native f16 only after you compare its output with the default f32 run. On an Apple silicon GPU, the fp16 export of SmolLM2 135M generates 60.5 tokens per second in f32 and 66.2 in native f16.
+Use native f16 only after you compare its output with the default f32 run. On an Apple silicon GPU, the fp16 export of SmolLM2 135M gives the same 128 greedy tokens in f32 and in native f16. A decode step takes 10.4 ms in f32 and 9.1 to 10.0 ms in native f16, and the peak memory is 692 MB in f32 and 463 MB in native f16.
 
 ## Memory management with EMLX
 

@@ -281,8 +281,8 @@ defmodule Transmuter.TextTest do
   end
 
   test "a half-precision export runs in f32 by default" do
-    # The fp16 export writes RMSNorm as Pow, ReduceMean, Add and Sqrt. In native f16, Pow
-    # overflows and all logits are 0.
+    # The fp16 export writes RMSNorm as Pow, ReduceMean, Add and Sqrt. Transmuter.Fusion
+    # replaces them with SimplifiedLayerNormalization, so native f16 gives this text too.
     serving =
       Transmuter.Text.generation(
         {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"},

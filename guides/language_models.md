@@ -134,7 +134,7 @@ Performance comparison on Apple silicon GPU, one forward pass of 8 tokens:
 
 ## Half-precision exports
 
-Half-precision exports (`model_fp16.onnx`) run in f32 by default, as in ONNX Runtime on the CPU. Many fp16 decoder exports write RMSNorm as separate operators (`Pow`, `ReduceMean`, `Add`, `Sqrt`). In native f16, `Pow` overflows for values above 256, and the model gives logits of 0. Use `compute_type: nil` for native f16 only after you compare its output with an f32 run:
+Half-precision exports (`model_fp16.onnx`) run in f32 by default, as in ONNX Runtime on the CPU. Many fp16 decoder exports write RMSNorm as separate operators (`Pow`, `ReduceMean`, `Add`, `Sqrt`). In native f16, `Pow` overflows for values above 256. When the model loads, `Transmuter.Fusion` replaces the subgraphs that it recognizes with one normalization operator, which runs in f32. Use `compute_type: nil` for native f16 only after you compare its output with an f32 run:
 
 ```elixir
 model = Transmuter.load!({:hf, repo, "onnx/model_fp16.onnx"}, compute_type: nil)
