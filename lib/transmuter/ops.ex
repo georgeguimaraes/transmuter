@@ -441,6 +441,19 @@ defmodule Transmuter.Ops do
     Nx.multiply(centered, Nx.rsqrt(Nx.add(var, eps)))
   end
 
+  @doc """
+  Rounds half to even, as ONNX does, on every backend.
+
+  Backends round ties differently: MLX to even, `Nx.BinaryBackend` away from zero. A tie becomes twice its rounded half, which is never a tie, so the rounding mode of the backend does not matter. Infinities and NaN pass through, because `Nx.BinaryBackend` cannot round them.
+  """
+  def round_half_even(t) do
+    finite = t |> Nx.is_infinity() |> Nx.logical_or(Nx.is_nan(t)) |> Nx.logical_not()
+    safe = Nx.select(finite, t, 0)
+    tie = Nx.equal(Nx.subtract(safe, Nx.floor(safe)), 0.5)
+    rounded = Nx.select(tie, Nx.multiply(Nx.round(Nx.divide(safe, 2)), 2), Nx.round(safe))
+    Nx.select(finite, rounded, t)
+  end
+
   @doc false
   def softmax_last(a) do
     max = Nx.reduce_max(a, axes: [-1], keep_axes: true)

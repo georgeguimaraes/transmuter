@@ -1016,3 +1016,32 @@ case("QMoE_8bit_silu_k1",
      # ONNX Runtime's 8-bit QMoE kernel is an approximation: it differs from the exact
      # dequantized result by 0.11 (1.3% of the largest output), which Transmuter matches.
      atol=0.15)
+
+# ---------- elementwise edge values ----------
+
+# A "half" fixture runs f16 in f16, as a model loaded without :compute_type.
+HALF = {"half": True}
+r = rng_for("elementwise edge values")
+edges = np.array([0.5, 2.0, 0.0, -0.0, -3.7, np.nan, np.inf, -np.inf, 1e-30, 256.0], np.float32)
+case("Cast_float_to_bool", [node("Cast", ["x"], ["y"], to=TensorProto.BOOL)], {"x": edges})
+case("Cast_int_to_bool", [node("Cast", ["x"], ["y"], to=TensorProto.BOOL)], {"x": np.array([0, 1, 2, -1, 256, -256], np.int32)})
+# ONNX rounds half to even. Static inputs run on Nx.BinaryBackend, the others on EMLX.
+ties = np.array([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 0.49999997, 2.4, -2.6, 4194304.5, np.inf, -np.inf, np.nan], np.float32)
+case("Round_half_to_even", [node("Round", ["x"], ["y"])], {"x": ties})
+case("Round_half_to_even_static", [node("Round", ["x"], ["y"])], {"x": ties}, static=("x",))
+case("Round_half_to_even_f16", [node("Round", ["x"], ["y"])], {"x": ties[:10].astype(np.float16)}, extra=HALF)
+for name, attrs in [("negative", {"detect_positive": 0}), ("positive", {"detect_negative": 0})]:
+    case(f"IsInf_detect_{name}_only", [node("IsInf", ["x"], ["y"], **attrs)], {"x": edges})
+case("Softplus_large", [node("Softplus", ["x"], ["y"])], {"x": np.array([-1000, -100, -20, -1, 0, 1, 20, 88, 89, 100, 1000], np.float32)})
+case("Softplus_large_f16", [node("Softplus", ["x"], ["y"])], {"x": np.array([-20, -1, 0, 1, 10, 11, 12, 15, 100], np.float16)}, extra=HALF)
+case("Clip_min_max_inputs", [node("Clip", ["x", "lo", "hi"], ["y"])], {"x": r.standard_normal((3, 5)).astype(np.float32)},
+     {"lo": np.array(-0.5, np.float32), "hi": np.array(0.7, np.float32)})
+case("Clip_int_min_only", [node("Clip", ["x", "lo"], ["y"])], {"x": r.integers(-9, 9, (3, 5)).astype(np.int32)}, {"lo": np.array(-2, np.int32)})
+case("Mod_int", [node("Mod", ["a", "b"], ["y"])], {"a": np.array([-7, -4, 5, 7, 0, 9], np.int32), "b": np.array([3, 3, -3, -3, 4, 4], np.int32)})
+case("Mod_fmod_float", [node("Mod", ["a", "b"], ["y"], fmod=1)],
+     {"a": np.array([-7.5, -4, 5.25, 7, 0, 9], np.float32), "b": np.array([3, 3, -3, -3, 4, 2.5], np.float32)})
+case("Mod_fmod_int", [node("Mod", ["a", "b"], ["y"], fmod=1)], {"a": np.array([-6, -7, 6, 7, -9, 0], np.int32), "b": np.array([3, 3, -3, -3, 4, -5], np.int32)})
+case("Where_broadcast", [node("Where", ["c", "x", "y"], ["z"])],
+     {"c": r.random((2, 1, 4)) > 0.5, "x": r.standard_normal((3, 1)).astype(np.float32), "y": r.standard_normal((2, 3, 4)).astype(np.float32)})
+case("Gelu", [node("Gelu", ["x"], ["y"])], {"x": r.standard_normal((3, 6)).astype(np.float32) * 3}, opset=20)
+case("Gelu_tanh", [node("Gelu", ["x"], ["y"], approximate="tanh")], {"x": r.standard_normal((3, 6)).astype(np.float32) * 3}, opset=20)

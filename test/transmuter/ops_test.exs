@@ -22,8 +22,15 @@ defmodule Transmuter.OpsTest do
   defp assert_matches_reference(dir) do
     meta = dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
 
+    # A "half" fixture runs f16 and bf16 in their own type, as a model loaded without
+    # :compute_type. The others run them in f32.
+    compute_type = if meta["half"], do: nil, else: :f32
+
     model =
-      Transmuter.load!(Path.join(dir, meta["onnx_path"]), backend: @backend, compute_type: :f32)
+      Transmuter.load!(Path.join(dir, meta["onnx_path"]),
+        backend: @backend,
+        compute_type: compute_type
+      )
 
     # Strings, sequences and empty optionals cannot be compiled inputs, so they are static.
     {static, inputs} =

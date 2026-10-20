@@ -30,7 +30,14 @@ defmodule Transmuter.Ops.Shape do
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
   defp op(%{op_type: "Cast"}, [empty = {:empty, _shape}]), do: empty
-  defp op(node = %{op_type: "Cast"}, [a]), do: Nx.as_type(a, dtype(attr(node, "to")))
+  # A cast to BOOL (9) is true for every value that is not zero.
+  defp op(node = %{op_type: "Cast"}, [a]) do
+    case attr(node, "to") do
+      9 -> Nx.not_equal(a, 0)
+      to -> Nx.as_type(a, dtype(to))
+    end
+  end
+
   defp op(node = %{op_type: "BitCast"}, [a]), do: Nx.bitcast(a, dtype(attr(node, "to")))
 
   defp op(node = %{op_type: "Constant"}, []) do

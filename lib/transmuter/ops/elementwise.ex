@@ -3,7 +3,7 @@ defmodule Transmuter.Ops.Elementwise do
   Elementwise operators: arithmetic, comparisons, logic, bitwise, trigonometry and activations.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1, round_half_even: 1]
 
   @op_types ~w(Add Sub Mul Div Pow Sqrt Erf Tanh Abs Exp Sigmoid Mod Equal Less LessOrEqual
                Greater GreaterOrEqual Not And Or Xor Neg Sin Cos Atan Log Floor Ceil Round Sign
@@ -38,8 +38,10 @@ defmodule Transmuter.Ops.Elementwise do
   defp op(%{op_type: "Exp"}, [a]), do: Nx.exp(a)
   defp op(%{op_type: "Sigmoid"}, [a]), do: Nx.sigmoid(a)
 
+  # Backends disagree on the sign of a remainder, so the remainder of the absolute values
+  # takes the sign of a, as fmod does. Mod without fmod moves it to the sign of b.
   defp op(node = %{op_type: "Mod"}, [a, b]) do
-    r = Nx.remainder(a, b)
+    r = Nx.multiply(Nx.sign(a), Nx.remainder(Nx.abs(a), Nx.abs(b)))
 
     if attr(node, "fmod", 0) == 1,
       do: r,
@@ -67,17 +69,26 @@ defmodule Transmuter.Ops.Elementwise do
   defp op(%{op_type: "Log"}, [a]), do: Nx.log(a)
   defp op(%{op_type: "Floor"}, [a]), do: Nx.floor(a)
   defp op(%{op_type: "Ceil"}, [a]), do: Nx.ceil(a)
-  defp op(%{op_type: "Round"}, [a]), do: Nx.round(a)
+  defp op(%{op_type: "Round"}, [a]), do: round_half_even(a)
   defp op(%{op_type: "Sign"}, [a]), do: Nx.sign(a)
   defp op(%{op_type: "Reciprocal"}, [a]), do: Nx.divide(1, a)
   defp op(%{op_type: "IsNaN"}, [a]), do: Nx.is_nan(a)
-  defp op(%{op_type: "IsInf"}, [a]), do: Nx.is_infinity(a)
+
+  defp op(node = %{op_type: "IsInf"}, [a]) do
+    detect =
+      Nx.select(Nx.less(a, 0), attr(node, "detect_negative", 1), attr(node, "detect_positive", 1))
+
+    Nx.logical_and(Nx.is_infinity(a), detect)
+  end
+
   defp op(%{op_type: "Relu"}, [a]), do: Nx.max(a, 0)
 
   defp op(node = %{op_type: "LeakyRelu"}, [a]),
     do: Nx.select(Nx.less(a, 0), Nx.multiply(a, attr(node, "alpha", 0.01)), a)
 
-  defp op(%{op_type: "Softplus"}, [a]), do: Nx.log1p(Nx.exp(a))
+  # log(1 + exp(a)) = max(a, 0) + log(1 + exp(-|a|)), and exp(-|a|) cannot overflow.
+  defp op(%{op_type: "Softplus"}, [a]),
+    do: Nx.add(Nx.max(a, 0), Nx.log1p(Nx.exp(Nx.negate(Nx.abs(a)))))
 
   defp op(node = %{op_type: "HardSigmoid"}, [a]),
     do:

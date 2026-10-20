@@ -1,0 +1,56 @@
+{
+ "repo": "op/Where_broadcast",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Where": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "c",
+   "file": "in_0.bin",
+   "dtype": "u8",
+   "shape": [
+    2,
+    1,
+    4
+   ]
+  },
+  {
+   "name": "x",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    1
+   ]
+  },
+  {
+   "name": "y",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    4
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "z",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    3,
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

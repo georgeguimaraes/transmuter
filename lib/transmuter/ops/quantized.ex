@@ -3,7 +3,7 @@ defmodule Transmuter.Ops.Quantized do
   Quantized weights are dequantized to floats inside the graph. On EMLX, the `MatMulNBits` weights that `Transmuter.EMLX` keeps packed are not dequantized. Packed sub-byte values hold the lowest bits first, so element 2i of a 4-bit tensor is the low nibble of byte i.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, matmul: 2, round_half_even: 1]
 
   alias Transmuter.Ops.NN
 
@@ -366,12 +366,6 @@ defmodule Transmuter.Ops.Quantized do
             1 |> List.duplicate(Nx.rank(t)) |> List.replace_at(axis, :auto) |> List.to_tuple()
           )
         )
-  end
-
-  defp round_half_even(t) do
-    rounded = Nx.round(t)
-    tie = Nx.equal(Nx.abs(Nx.subtract(t, Nx.floor(t))), 0.5)
-    Nx.select(tie, Nx.multiply(Nx.round(Nx.divide(t, 2)), 2), rounded)
   end
 
   defp saturate(t, type) do
