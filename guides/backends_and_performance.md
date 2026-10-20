@@ -91,6 +91,12 @@ Native f16 can also drift in a deep graph, because each intermediate value is st
 
 For a deep half-precision graph, compare the native output with a `compute_type: :f32` run. On an Apple silicon GPU, the fp16 export of SmolLM2 135M gives the same 128 greedy tokens in f32 and in native f16. A decode step takes 10.3 ms in f32 and 9.1 ms in native f16, and the peak memory is 692 MB in f32 and 463 MB in native f16.
 
+## Dynamic 8-bit quantization
+
+The q8 exports (`model_quantized.onnx`) quantize the activations when the model runs, with `DynamicQuantizeLinear`. This operator takes one scale and one zero point from the minimum and the maximum of the whole tensor. In a batch, the tensor holds every row, so the padding rows and the other inputs change the scale of each input. An input in a batch can then give results that are different from its results alone.
+
+Transmuter computes these operators as ONNX Runtime does, so a batch gives the results of ONNX Runtime on the same batch. When the results of an input must not depend on the batch, use a batch size of 1, or a q4 or fp32 variant.
+
 ## Memory management with EMLX
 
 EMLX maintains two caches of its own that grow with new shapes.
