@@ -131,8 +131,7 @@ defmodule Transmuter.Generation do
     end
   end
 
-  # Whether the values of `name` depend on the values of `target`. The output of Shape and
-  # Size depends only on the shape of its input.
+  # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do
     producers = for node <- model.nodes, output <- node.output, into: %{}, do: {output, node}
     walk([name], target, producers, MapSet.new())
@@ -147,11 +146,16 @@ defmodule Transmuter.Generation do
       name == target ->
         true
 
-      name in seen or node == nil or node.op_type in ["Shape", "Size"] ->
+      name in seen or node == nil ->
         walk(rest, target, producers, seen)
 
       true ->
-        walk(node.input ++ rest, target, producers, MapSet.put(seen, name))
+        walk(
+          Transmuter.value_dependencies(node) ++ rest,
+          target,
+          producers,
+          MapSet.put(seen, name)
+        )
     end
   end
 

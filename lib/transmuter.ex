@@ -784,6 +784,12 @@ defmodule Transmuter do
     node.input ++ outer
   end
 
+  @doc false
+  # The names whose values decide the outputs of `node`. The outputs of Shape and Size
+  # depend only on the shape of their input.
+  def value_dependencies(%{op_type: op_type}) when op_type in ["Shape", "Size"], do: []
+  def value_dependencies(node), do: dependencies(node)
+
   defp outer_reads(graph) do
     local = Enum.map(graph.initializer, & &1.name) ++ Enum.map(graph.input, & &1.name)
     produced = Enum.flat_map(graph.node, & &1.output)

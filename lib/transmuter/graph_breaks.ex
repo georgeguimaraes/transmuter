@@ -268,7 +268,10 @@ defmodule Transmuter.GraphBreaks do
     outputs = Map.take(env, node.output)
 
     static? =
-      Enum.all?(Transmuter.dependencies(node), &(&1 == "" or MapSet.member?(state.static, &1)))
+      Enum.all?(
+        Transmuter.value_dependencies(node),
+        &(&1 == "" or MapSet.member?(state.static, &1))
+      )
 
     outputs =
       if static?,
