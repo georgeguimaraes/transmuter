@@ -223,13 +223,11 @@ defmodule Transmuter.Generation do
       |> Enum.reduce(%{state | inputs: inputs}, &step(ctx, &2, &1))
 
     {rows, _n, vocab} = Nx.shape(state.logits)
-    none = Nx.broadcast(Nx.tensor(0, type: :u8), {vocab})
-    suppressed = mark(none, Enum.map(ctx.suppress, &[&1]))
+    suppressed = mark(none({vocab}), Enum.map(ctx.suppress, &[&1]))
 
     # The tokens that the repetition penalty applies to: the prompt and the new tokens.
-    seen =
-      Nx.broadcast(none, {rows, vocab})
-      |> mark(for {prompt, i} <- Enum.with_index(prompts), id <- prompt, do: [i, id])
+    prompt_ids = for {prompt, i} <- Enum.with_index(prompts), id <- prompt, do: [i, id]
+    seen = mark(none({rows, vocab}), prompt_ids)
 
     %{
       state: state,
@@ -297,12 +295,20 @@ defmodule Transmuter.Generation do
   defp advance(ctx, group),
     do: %{group | state: step(ctx, group.state, Enum.map(group.new, &List.wrap/1))}
 
+  # The masks of tokens are on the host, because a mark there is faster than a call to the
+  # device. They are made from binaries, because Nx.broadcast on Nx.BinaryBackend goes
+  # through a list of the elements, which is slow for a large vocabulary.
+  defp none(shape), do: shape |> Tuple.product() |> bytes(0) |> Nx.reshape(shape)
+
   defp mark(tensor, []), do: tensor
 
   defp mark(tensor, indices) do
-    ones = Nx.broadcast(Nx.tensor(1, type: :u8), {length(indices)})
-    Nx.indexed_put(tensor, Nx.tensor(indices), ones)
+    indices = Nx.tensor(indices, backend: Nx.BinaryBackend)
+    Nx.indexed_put(tensor, indices, bytes(Nx.axis_size(indices, 0), 1))
   end
+
+  defp bytes(count, value),
+    do: Nx.from_binary(:binary.copy(<<value>>, count), :u8, backend: Nx.BinaryBackend)
 
   defp split_from_end(prompt, sizes) do
     {parts, []} =

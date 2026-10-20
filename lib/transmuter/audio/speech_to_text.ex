@@ -92,14 +92,18 @@ defmodule Transmuter.Audio.SpeechToText do
       end
     end
 
+    # Nx.slice and Nx.pad on Nx.BinaryBackend go through a list of the samples, so the
+    # windows are cut from the binary. Zero bits are the zero of each type.
     preprocess = fn audio ->
       seed = opts[:seed] || :rand.uniform(2 ** 32)
+      type = {_kind, bits} = Nx.type(audio)
+      samples = Nx.to_binary(audio)
 
       for {start, stride = {size, _left, _right}} <- windows(Nx.size(audio), settings) do
-        padding = featurizer.n_samples - size
-
-        audio = audio |> Nx.slice([start], [size]) |> Nx.pad(0.0, [{0, padding, 0}])
-        %{prompt: prompt, seed: seed, tensors: %{"audio" => audio}, stride: stride}
+        {skip, take, padding} = {start * bits, size * bits, (featurizer.n_samples - size) * bits}
+        <<_::bitstring-size(^skip), window::bitstring-size(^take), _::bitstring>> = samples
+        window = Nx.from_binary(<<window::bitstring, 0::size(padding)>>, type)
+        %{prompt: prompt, seed: seed, tensors: %{"audio" => window}, stride: stride}
       end
     end
 
