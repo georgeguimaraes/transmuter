@@ -190,22 +190,29 @@ defmodule Transmuter.GraphBreaks do
     classify(entry)
   end
 
-  # The first segment compiles at once, as a model without breaks always did. A later
-  # segment is traced first, and a short one runs eagerly without compiling.
-  defp compile_segment(plan, fun, args, 0, ref) do
-    compiled = compile(plan, fun, args)
-    {stop, out_names, produced} = Process.get(ref)
-    %{compiled: compiled, stop: stop, out_names: out_names, produced: produced}
-  end
-
+  # The compiler traces the segment before it builds a program. A short segment after a
+  # break runs eagerly, so its trace stops the compiler. The first segment always compiles,
+  # as a model without breaks always did. The compiled function keeps the trace function,
+  # so it holds the number of nodes and not the plan.
   defp compile_segment(plan, fun, args, pos, ref) do
-    Nx.Defn.debug_expr(fun).(args)
-    {stop, out_names, produced} = Process.get(ref)
-    stop_index = if stop == :end, do: tuple_size(plan.nodes), else: stop
+    count = tuple_size(plan.nodes)
+
+    bounded = fn args ->
+      outputs = fun.(args)
+      {stop, _out_names, _produced} = Process.get(ref)
+      stop_index = if stop == :end, do: count, else: stop
+      if pos > 0 and stop_index - pos < @min_compiled_nodes, do: throw({ref, :eager})
+      outputs
+    end
 
     compiled =
-      if stop_index - pos >= @min_compiled_nodes, do: compile(plan, fun, args)
+      try do
+        compile(plan, bounded, args)
+      catch
+        {^ref, :eager} -> nil
+      end
 
+    {stop, out_names, produced} = Process.get(ref)
     %{compiled: compiled, stop: stop, out_names: out_names, produced: produced}
   end
 

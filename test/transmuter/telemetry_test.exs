@@ -51,6 +51,25 @@ defmodule Transmuter.TelemetryTest do
     refute_received {[:transmuter, :cache, :miss], _metadata}
   end
 
+  # The segment after the Range has 2 nodes, fewer than the 20 that compile.
+  test "a short segment after a break runs eagerly" do
+    model = load_fixture("Break_Range_computed_limit")
+    input = %{"x" => Nx.tensor([1.0, 1, 1, 0.5, 0.25, 0.25], backend: @backend)}
+    compiled = Transmuter.compile(model, input, @compiler)
+    assert_received {[:transmuter, :segment, :compile, :stop], %{position: 0, stop: break}}
+    after_break = break + 1
+
+    for _call <- 1..2 do
+      %{"y" => y} = compiled.(input)
+      assert Nx.shape(y) == {4}
+    end
+
+    assert_received {[:transmuter, :segment, :compile, :stop],
+                     %{position: ^after_break, stop: :end, compiled: false}}
+
+    assert_received {[:transmuter, :cache, :hit], %{position: ^after_break}}
+  end
+
   test "a new shape at a full position evicts the least recently used segment" do
     model = load_fixture("Break_Range_long_tail")
     input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}
