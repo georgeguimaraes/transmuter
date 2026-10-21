@@ -90,9 +90,11 @@ jobs:
       - name: Run Credo
         run: mix credo --strict
       # Tests tagged large_model are too large or too slow for a runner, for example models
-      # with billions of parameters. They run locally.
+      # with billions of parameters. They run locally. EMLX runs all CPU work of the BEAM on
+      # one worker thread, so concurrent tests wait for each other and a small test can time
+      # out behind a large one. One test at a time is also faster on the runner.
       - name: Run tests
-        run: mix test --exclude large_model
+        run: mix test --exclude large_model --max-cases 1
       - name: List the cached models
         id: model-files
         if: matrix.otp == '29' && github.event_name == 'push' && github.ref == 'refs/heads/main'
