@@ -345,7 +345,8 @@ defmodule Transmuter.GraphBreaks do
   defp promote?(_value), do: false
 
   defp to_host({:sequence, elements}), do: {:sequence, Enum.map(elements, &to_host/1)}
-  defp to_host(t), do: Nx.backend_copy(t, Nx.BinaryBackend)
+  defp to_host(t = %Nx.Tensor{}), do: Nx.backend_copy(t, Nx.BinaryBackend)
+  defp to_host(value), do: value
 
   defp outputs(state, plan) do
     plan.model.outputs
