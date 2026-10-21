@@ -669,3 +669,25 @@ defmodule TransmuterTest do
            "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
   end
 end
+
+defmodule TransmuterTest.EXLACacheTest do
+  # The cache of EXLA is global, so other tests must not compile at the same time.
+  use ExUnit.Case, async: false
+
+  @moduletag :exla
+
+  test "EXLA keeps no compiled segment after the process that compiled it exits" do
+    backend = Transmuter.TestBackend.backend()
+
+    model =
+      Transmuter.load!(Path.expand("fixtures/ops/Cosh/model.onnx", __DIR__), backend: backend)
+
+    input = %{"x" => Nx.iota({3, 5}, type: :f32, backend: backend)}
+    before = :ets.info(EXLA.Defn.LockedCache, :size)
+
+    Task.async(fn -> Transmuter.compile(model, input, Transmuter.TestBackend.compiler_opts()) end)
+    |> Task.await()
+
+    assert :ets.info(EXLA.Defn.LockedCache, :size) == before
+  end
+end

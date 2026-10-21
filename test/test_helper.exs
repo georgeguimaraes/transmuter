@@ -42,4 +42,4 @@ if Transmuter.TestBackend.compiler() == EMLX do
   Nx.Defn.jit(&Nx.add(&1, 1), Transmuter.TestBackend.compiler_opts()).(Nx.tensor(1.0))
 end
 
-ExUnit.start()
+ExUnit.start(exclude: if(Transmuter.TestBackend.compiler() == EXLA, do: [], else: [:exla]))

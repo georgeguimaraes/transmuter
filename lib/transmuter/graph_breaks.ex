@@ -20,6 +20,11 @@ defmodule Transmuter.GraphBreaks do
     compiler = opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
     metadata = %{source: model[:source], compiler: compiler}
 
+    # EXLA keeps each compiled function in a global cache that never evicts. The segments
+    # are already cached here, with eviction and erasure when the owner exits, so EXLA must
+    # not keep a second copy. Other compilers, such as EMLX, reject the :cache option.
+    opts = if compiler == EXLA, do: Keyword.put_new(opts, :cache, false), else: opts
+
     :telemetry.span([:transmuter, :compile], metadata, fn ->
       nodes = List.to_tuple(model.nodes)
       last_use = last_use(model)
