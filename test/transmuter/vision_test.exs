@@ -5,6 +5,7 @@ defmodule Transmuter.VisionTest do
   # The first run downloads the models.
   @moduletag :hub
   @moduletag timeout: 900_000
+  @moduletag ci_partition: 2
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
