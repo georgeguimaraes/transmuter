@@ -202,10 +202,7 @@ defmodule Transmuter.Ops.Vision do
       length = Nx.max(Nx.add(Nx.subtract(stop, start), 1), 1) |> Nx.as_type(:f32)
       i = Nx.iota({1, bins_count}, type: :f32)
 
-      # XLA turns a division by a constant into a multiplication by the reciprocal, which
-      # can be one ulp off. Then an edge moves by one pixel when i * length / bins_count is
-      # an integer. XLA cannot fold this divisor, so the division stays correctly rounded.
-      bin_size = Nx.divide(length, length |> Nx.multiply(0) |> Nx.add(bins_count))
+      bin_size = f32_quotient(length, bins_count)
 
       bin_start =
         i
@@ -598,5 +595,38 @@ defmodule Transmuter.Ops.Vision do
 
   defp flat_index(coords, dims) do
     coords |> Enum.zip(dims) |> Enum.reduce(0, fn {i, d}, acc -> acc * d + i end)
+  end
+
+  # The correctly rounded f32 quotient of an integer number of pixels by n, as ONNX Runtime
+  # computes the bin size of MaxRoiPool. A compiled f32 division can be one ulp off: XLA
+  # divides by the reciprocal, and the CUDA division is approximate. Then a bin edge moves by
+  # one pixel. The integer operations here are exact on every backend. f32 holds the integers
+  # below 2^24.
+  defp f32_quotient(pixels, n) do
+    l = pixels |> Nx.min(2 ** 24 - 1) |> Nx.as_type(:s64)
+
+    # e with 2^e <= l / n < 2^(e + 1). n * 2^-bits < 1 <= l, so e is at least -bits.
+    bits = n |> Integer.digits(2) |> length()
+    scaled = Nx.left_shift(l, bits)
+
+    # The limits pass 2^32, so they are s64 tensors. An integer literal would be an s32 constant.
+    e =
+      Enum.reduce((1 - bits)..23//1, Nx.tensor(-bits, type: :s64), fn j, e ->
+        limit = Nx.tensor(n * 2 ** (j + bits), type: :s64)
+        Nx.add(e, scaled |> Nx.greater_equal(limit) |> Nx.as_type(:s64))
+      end)
+
+    # The quotient of l * 2^s by n has 24 bits. It rounds half to even, as IEEE division.
+    s = Nx.subtract(23, e)
+    numerator = Nx.left_shift(l, s)
+    {q, r} = {Nx.quotient(numerator, n), Nx.remainder(numerator, n)}
+    twice = Nx.multiply(r, 2)
+    odd = Nx.equal(Nx.remainder(q, 2), 1)
+    up = Nx.logical_or(Nx.greater(twice, n), Nx.logical_and(Nx.equal(twice, n), odd))
+    q = Nx.add(q, Nx.as_type(up, :s64))
+
+    # 2^-s from its f32 exponent bits. q <= 2^24, so both factors and the product are exact.
+    pow2 = Nx.subtract(127, s) |> Nx.as_type(:s32) |> Nx.left_shift(23) |> Nx.bitcast(:f32)
+    Nx.multiply(Nx.as_type(q, :f32), pow2)
   end
 end
