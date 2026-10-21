@@ -6,11 +6,8 @@ defmodule Transmuter.OpsTest do
   # evaluator. test/support/make_op_fixtures.py writes them, so these tests need no Python.
   @fixtures Path.expand("../fixtures/ops", __DIR__)
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
-  @backend {EMLX.Backend, device: @device}
-  @compiler [compiler: EMLX, device: @device]
+  @backend Transmuter.TestBackend.backend()
+  @compiler Transmuter.TestBackend.compiler_opts()
 
   for dir <- @fixtures |> Path.join("*") |> Path.wildcard() |> Enum.sort() do
     @dir dir

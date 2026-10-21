@@ -5,12 +5,9 @@ defmodule Transmuter.TextTest do
   # see test/support/pipeline_references.py. The first run downloads the models.
   @moduletag timeout: 900_000
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
   @opts [
-    backend: {EMLX.Backend, device: @device},
-    defn_options: [compiler: EMLX, device: @device]
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
   alias Transmuter.Tokenizer
@@ -438,12 +435,9 @@ defmodule Transmuter.TextServingTest do
 
   @moduletag timeout: 900_000
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
   @opts [
-    backend: {EMLX.Backend, device: @device},
-    defn_options: [compiler: EMLX, device: @device]
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
   test "a started serving compiles each length once and batches inputs of any length" do

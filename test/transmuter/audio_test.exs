@@ -7,13 +7,10 @@ defmodule Transmuter.AudioTest do
   # hf-internal-testing/librispeech_asr_dummy, 5.86 s at 16 kHz.
   @moduletag timeout: 900_000
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
-  @backend {EMLX.Backend, device: @device}
+  @backend Transmuter.TestBackend.backend()
   @opts [
     backend: @backend,
-    defn_options: [compiler: EMLX, device: @device],
+    defn_options: Transmuter.TestBackend.compiler_opts(),
     strategy: :greedy
   ]
 

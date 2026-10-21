@@ -5,14 +5,8 @@ defmodule TransmuterTest do
   # see test/support/model_references.py. The first run downloads the models.
   @moduletag timeout: 900_000
 
-  # Metal on macOS; the CPU device elsewhere, such as Linux CI. The EMLX compiler
-  # takes the device too, because it defaults to the GPU.
-  # TRANSMUTER_TEST_DEVICE=cpu runs the CI configuration on a Mac.
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
-  @backend {EMLX.Backend, device: @device}
-  @compiler [compiler: EMLX, device: @device]
+  @backend Transmuter.TestBackend.backend()
+  @compiler Transmuter.TestBackend.compiler_opts()
 
   test "runs a BERT encoder" do
     model = load("Xenova/all-MiniLM-L6-v2", "onnx/model.onnx")
@@ -326,22 +320,25 @@ defmodule TransmuterTest do
     @moduledoc false
     @behaviour Nx.Defn.Compiler
 
-    defdelegate __jit__(key, vars, fun, args, opts), to: EMLX
-    defdelegate __partitions_options__(opts), to: EMLX
-    defdelegate __to_backend__(opts), to: EMLX
+    @compiler Transmuter.TestBackend.compiler()
+
+    def __jit__(key, vars, fun, args, opts), do: @compiler.__jit__(key, vars, fun, args, opts)
+    def __partitions_options__(opts), do: @compiler.__partitions_options__(opts)
+    def __to_backend__(opts), do: @compiler.__to_backend__(opts)
 
     def __compile__(key, vars, fun, opts) do
       send(self(), :compiled)
-      EMLX.__compile__(key, vars, fun, opts)
+      @compiler.__compile__(key, vars, fun, opts)
     end
   end
+
+  @counting_compiler Keyword.put(@compiler, :compiler, CountingCompiler)
 
   test "a compiled function takes inputs of other shapes" do
     model = load_fixture("Cosh")
     input = &%{"x" => Nx.iota(&1, type: :f32, backend: @backend) |> Nx.divide(10)}
 
-    compiled =
-      Transmuter.compile(model, input.({3, 5}), compiler: CountingCompiler, device: @device)
+    compiled = Transmuter.compile(model, input.({3, 5}), @counting_compiler)
 
     assert flush_compiles(0) == 1
 
@@ -356,7 +353,7 @@ defmodule TransmuterTest do
   test "keeps the most recently used segments after a break" do
     model = load_fixture("Break_Range_long_tail")
     input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}
-    compiled = Transmuter.compile(model, input.(1), compiler: CountingCompiler, device: @device)
+    compiled = Transmuter.compile(model, input.(1), @counting_compiler)
 
     compiles = fn firsts ->
       Enum.each(firsts, &compiled.(input.(&1)))
@@ -373,12 +370,7 @@ defmodule TransmuterTest do
     model = load_fixture("Break_Range_long_tail")
     input = &%{"x" => Nx.tensor([&1, 1, 1, 1, 1, 1], type: :f32, backend: @backend)}
 
-    compiled =
-      Transmuter.compile(model, input.(1),
-        compiler: CountingCompiler,
-        device: @device,
-        cache_size: 2
-      )
+    compiled = Transmuter.compile(model, input.(1), [cache_size: 2] ++ @counting_compiler)
 
     compiles = fn firsts ->
       Enum.each(firsts, &compiled.(input.(&1)))
@@ -553,7 +545,8 @@ defmodule TransmuterTest do
     }
 
     model = Transmuter.load!(write_model(graph), backend: @backend, compute_type: :f32)
-    assert %Nx.Tensor{type: {:f, 32}, data: %EMLX.Backend{}} = model.params["w"]
+    assert %Nx.Tensor{type: {:f, 32}, data: %backend{}} = model.params["w"]
+    assert backend == elem(@backend, 0)
 
     x = Nx.tensor([[1.0, 2.0, 3.0, 4.0]], type: :f16, backend: @backend)
     %{"y" => y} = Transmuter.run(model, model.params, %{"x" => x})
@@ -609,7 +602,8 @@ defmodule TransmuterTest do
     model = Transmuter.load!(write_model(graph), backend: @backend)
     x = Nx.iota({3, 3}, type: :f32, backend: @backend)
     %{"y" => y} = Transmuter.run(model, model.params, %{"x" => x})
-    assert %Nx.Tensor{data: %EMLX.Backend{}} = y
+    assert %Nx.Tensor{data: %backend{}} = y
+    assert backend == elem(@backend, 0)
     assert_all_close(y, Nx.eye(3))
   end
 

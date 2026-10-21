@@ -13,10 +13,6 @@ defmodule Transmuter.FusionTest do
 
   @moduletag :tmp_dir
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
-
   @x Nx.iota({2, 3, 8}, type: :f32) |> Nx.multiply(37.0) |> Nx.remainder(19.0) |> Nx.subtract(9.0)
 
   defp rms_norm(divide, opts \\ []) do
@@ -238,17 +234,17 @@ defmodule Transmuter.FusionTest do
   defp ops(path), do: Enum.map(Transmuter.load!(path).nodes, & &1.op_type)
 
   # The fused model gives the outputs of the graph without the rewrite, on Nx.BinaryBackend
-  # and compiled with EMLX, which runs the fused kernels.
+  # and compiled with the test backend. On EMLX, the compiled model runs the fused kernels.
   defp assert_same_outputs(path, inputs) do
     model = Transmuter.load!(path, fuse: false)
     expected = Transmuter.run(model, model.params, inputs)
     fused = Transmuter.load!(path)
     assert_close(Transmuter.run(fused, fused.params, inputs), expected)
 
-    backend = {EMLX.Backend, device: @device}
+    backend = Transmuter.TestBackend.backend()
     fused = Transmuter.load!(path, backend: backend)
     inputs = Map.new(inputs, fn {k, t} -> {k, Nx.backend_transfer(t, backend)} end)
-    run = Transmuter.compile(fused, inputs, compiler: EMLX, device: @device)
+    run = Transmuter.compile(fused, inputs, Transmuter.TestBackend.compiler_opts())
     assert_close(run.(inputs), expected)
   end
 

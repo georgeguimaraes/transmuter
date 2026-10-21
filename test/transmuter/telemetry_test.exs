@@ -1,11 +1,8 @@
 defmodule Transmuter.TelemetryTest do
   use ExUnit.Case, async: true
 
-  @device (System.get_env("TRANSMUTER_TEST_DEVICE") ||
-             if(match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"))
-          |> String.to_existing_atom()
-  @backend {EMLX.Backend, device: @device}
-  @compiler [compiler: EMLX, device: @device]
+  @backend Transmuter.TestBackend.backend()
+  @compiler Transmuter.TestBackend.compiler_opts()
 
   @events [
     [:transmuter, :compile, :stop],
@@ -35,7 +32,8 @@ defmodule Transmuter.TelemetryTest do
 
     assert_received {[:transmuter, :cache, :miss], %{position: 0}}
     assert_received {[:transmuter, :segment, :compile, :stop], %{position: 0, stop: break}}
-    assert_received {[:transmuter, :compile, :stop], %{graph_break: true, compiler: EMLX}}
+    compiler = @compiler[:compiler]
+    assert_received {[:transmuter, :compile, :stop], %{graph_break: true, compiler: ^compiler}}
     after_break = break + 1
 
     compiled.(input)
