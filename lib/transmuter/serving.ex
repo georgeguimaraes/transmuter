@@ -96,43 +96,87 @@ defmodule Transmuter.Serving do
           Enum.map(windows, &{sequence, &1})
         end)
 
-      {tensors, key, rows}
+      {[{tensors, key}], rows}
     end
 
     shapes = %{batch_size: batch_size, templates: templates, inputs: %{}}
     new(model, opts, shapes, preprocess, fun, postprocess, validate)
   end
 
+  # The compiled model of a serving whose image size depends on the image keeps this many
+  # image sizes.
+  @image_sizes 64
+
+  # The serving compiles the size of a 640x480 image when it starts, a common size of photos
+  # and of the COCO images. It compiles the other sizes on their first call.
+  @nominal_size {480, 640}
+
   @doc """
   Returns an `Nx.Serving` that runs `model` on images.
 
-  The featurizer turns the images into `"pixel_values"` on the `:backend` of `opts`. The featurizer must give one image size, so the serving compiles one shape. `inputs` are other inputs of the model that are the same for all images, such as the text of the labels in zero-shot classification. Their first axis is not the batch.
+  The featurizer turns the images into `"pixel_values"` on the `:backend` of `opts`. When the model has a `"pixel_mask"` input, each image also gets a mask of ones. The mask has the shape that the model declares, such as 64x64 in the DETR exports of Xenova, or else the size of the image. The images of a batch have one size, so no pixel is padding. `inputs` are other inputs of the model that are the same for all images, such as the text of the labels in zero-shot classification. Their first axis is not the batch.
 
-  `fun` and `postprocess` are as in `text/7`. An image is one row, so `postprocess` takes a list of one row and a list of one image tensor.
+  When the featurizer gives one image size, the serving compiles that shape, and the images go into batches of the `:batch_size` of `:compile`. When the size depends on the image, such as with the `shortest_edge` and `longest_edge` of DETR, the batch size must be 1. Each image is then a batch, and the compiled model compiles each new image size on its first call. It keeps up to #{@image_sizes} sizes.
+
+  `fun` and `postprocess` are as in `text/7`. The tensors of `fun` must have the same shape for all image sizes. An image is one row, so `postprocess` takes a list of one row and a list of one image tensor.
   """
   def image(model, featurizer, opts, fun, postprocess, inputs \\ %{}) do
     compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
-    batch_size = compile[:batch_size]
-    {height, width} = image_size!(featurizer)
-    key = {:image_size, {height, width}}
-    templates = %{key => %{"pixel_values" => zeros({batch_size, 3, height, width}, :f32)}}
+    size = Featurizer.size(featurizer)
+    batch_size = image_batch_size!(size, compile[:batch_size])
+    key = {:image_size, size}
+    {height, width} = size || Featurizer.image_size(featurizer, @nominal_size)
+    template = image_inputs(model, zeros({batch_size, 3, height, width}, :f32))
     backend = opts[:backend] || Nx.default_backend()
 
     preprocess = fn images ->
-      pixels =
-        featurizer
-        |> Featurizer.process(images, backend: backend)
-        |> Nx.backend_transfer(Nx.BinaryBackend)
+      groups =
+        for group <- if(size, do: [images], else: Enum.map(images, &[&1])) do
+          pixels =
+            featurizer
+            |> Featurizer.process(group, backend: backend)
+            |> Nx.backend_transfer(Nx.BinaryBackend)
 
-      {%{"pixel_values" => pixels}, key, Enum.map(images, &[&1])}
+          {image_inputs(model, pixels), key}
+        end
+
+      {groups, Enum.map(images, &[&1])}
     end
 
     validate = fn input ->
       with {:ok, image} <- Featurizer.tensor(input), do: {:ok, [image]}
     end
 
-    shapes = %{batch_size: batch_size, templates: templates, inputs: inputs}
+    shapes = %{
+      batch_size: batch_size,
+      templates: %{key => template},
+      inputs: inputs,
+      cache_size: @image_sizes
+    }
+
     new(model, opts, shapes, preprocess, fun, postprocess, validate)
+  end
+
+  defp image_batch_size!(nil, batch_size) when batch_size != 1,
+    do:
+      raise(
+        ArgumentError,
+        "the featurizer gives images of different sizes, so each image is a batch of its own. " <>
+          "Use batch_size: 1, or set a size with height and width in preprocessor_config.json"
+      )
+
+  defp image_batch_size!(_size, batch_size), do: batch_size
+
+  defp image_inputs(model, pixels) do
+    if "pixel_mask" in model.inputs do
+      {type, [_batch, mask_height, mask_width]} = model.input_types["pixel_mask"]
+      {batch, _channels, height, width} = Nx.shape(pixels)
+      one = Nx.tensor(1, type: type, backend: Nx.BinaryBackend)
+      mask = Nx.broadcast(one, {batch, mask_height || height, mask_width || width})
+      %{"pixel_values" => pixels, "pixel_mask" => mask}
+    else
+      %{"pixel_values" => pixels}
+    end
   end
 
   @doc """
@@ -145,18 +189,21 @@ defmodule Transmuter.Serving do
               "Set a size with height and width, or a crop size, in preprocessor_config.json"
   end
 
-  # `shapes` has the batch size, the input templates of each batch key, and the inputs
-  # that are the same for all batches. `validate` gives the sequences of each input.
-  # `preprocess` takes the sequences of all inputs and gives the tensors, the batch key, and
-  # for each sequence the list of its rows.
+  # `shapes` has the batch size, the input templates of each batch key, the inputs that are
+  # the same for all batches, and optionally the `:cache_size` of the compiled models.
+  # `validate` gives the sequences of each input. `preprocess` takes the sequences of all
+  # inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each
+  # sequence the list of its rows. The rows of the batches are those of the sequences, in order.
   defp new(model, opts, shapes, preprocess, fun, postprocess, validate) do
     %{batch_size: batch_size, templates: templates} = shapes
     fixed = Map.take(shapes.inputs, model.inputs)
+    compile_options = shapes |> Map.take([:cache_size]) |> Map.to_list()
 
     Nx.Serving.new(
       __MODULE__,
       fn defn_options ->
         {keys, defn_options} = Keyword.pop!(defn_options, :batch_keys)
+        defn_options = compile_options ++ defn_options
 
         runs =
           Map.new(keys, fn key ->
@@ -181,11 +228,17 @@ defmodule Transmuter.Serving do
     |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
-      {tensors, key, rows} = preprocess.(Enum.concat(inputs))
-      tensors = model_inputs!(model, tensors, fixed)
-      batch = [tensors] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
+      {groups, rows} = preprocess.(Enum.concat(inputs))
+
+      batches =
+        for {tensors, key} <- groups do
+          [model_inputs!(model, tensors, fixed)] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
+        end
+
+      # Nx.Serving splits one batch that is larger than the batch size, but not a list.
+      batches = with [batch] <- batches, do: batch
       items = rows |> split_like(inputs) |> Enum.map(&Enum.concat/1)
-      {batch, {multi?, items}}
+      {batches, {multi?, items}}
     end)
     |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, items} ->
       results =
