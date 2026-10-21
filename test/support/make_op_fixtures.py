@@ -1428,3 +1428,17 @@ case("GroupQueryAttention_local_window",
 case("MultiHeadAttention_unidirectional_decode",
      [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],
      {"q": cf(B, 1, H * Hd), "k": cf(B, 1, H * Hd), "v": cf(B, 1, H * Hd), "pk": cf(B, H, 4, Hd), "pv": cf(B, H, 4, Hd)}, ms=True)
+
+# ---------- patch embeddings ----------
+
+# Windows that do not overlap and have no padding, as the patch embedding of a vision transformer.
+# The input sizes are not multiples of the kernel, so the last pixels of each axis are left out.
+r = rng_for("patch embeddings")
+case("Conv_patches_2d", [node("Conv", ["x", "w", "b"], ["y"], kernel_shape=[4, 4], strides=[4, 4])],
+     {"x": r.standard_normal((2, 3, 18, 13)).astype(np.float32)},
+     {"w": r.standard_normal((5, 3, 4, 4)).astype(np.float32), "b": r.standard_normal(5).astype(np.float32)})
+case("Conv_patches_3d", [node("Conv", ["x", "w"], ["y"], strides=[2, 3, 3], pads=[0, 0, 0, 0, 0, 0])],
+     {"x": r.standard_normal((6, 3, 2, 3, 3)).astype(np.float32)}, {"w": r.standard_normal((4, 3, 2, 3, 3)).astype(np.float32)})
+case("ConvInteger_patches", [node("ConvInteger", ["x", "w", "xz", "wz"], ["y"], strides=[16, 16])],
+     {"x": r.integers(0, 256, (1, 3, 32, 48)).astype(np.uint8)},
+     {"w": r.integers(0, 256, (4, 3, 16, 16)).astype(np.uint8), "xz": np.array(128, np.uint8), "wz": np.array(7, np.uint8)})

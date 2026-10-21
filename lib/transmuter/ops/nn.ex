@@ -61,12 +61,16 @@ defmodule Transmuter.Ops.NN do
     spatial = Nx.rank(x) - 2
 
     out =
-      Nx.conv(x, w,
-        strides: attr(node, "strides", List.duplicate(1, spatial)),
-        padding: spatial_pads(node, spatial_sizes(x), spatial_sizes(w)),
-        kernel_dilation: attr(node, "dilations", List.duplicate(1, spatial)),
-        feature_group_size: attr(node, "group", 1)
-      )
+      if patches?(node, x, w) do
+        patch_conv(x, w, &Nx.dot(&1, [2], &2, [1]))
+      else
+        Nx.conv(x, w,
+          strides: attr(node, "strides", List.duplicate(1, spatial)),
+          padding: spatial_pads(node, spatial_sizes(x), spatial_sizes(w)),
+          kernel_dilation: attr(node, "dilations", List.duplicate(1, spatial)),
+          feature_group_size: attr(node, "group", 1)
+        )
+      end
 
     case b do
       [b] when b != nil ->
@@ -457,9 +461,54 @@ defmodule Transmuter.Ops.NN do
   @doc """
   Computes a convolution of zero-shifted integers, with x and w as f32, to s32.
 
-  It is one exact integer product (see `integer_product/5`) per kernel tap. A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels, and is off by up to 15 on sums of about 1.6e6.
+  It is one exact integer product (see `integer_product/5`) per kernel tap, or one for all patches when the windows do not overlap. A backend convolution can be inexact: MLX uses Winograd on the GPU for 3x3 kernels, and is off by up to 15 on sums of about 1.6e6.
   """
   def integer_conv(node, x, w) do
+    if patches?(node, x, w),
+      do: patch_conv(x, w, &integer_product(&1, 2, &2, 1, fn a, b -> Nx.dot(a, [2], b, [1]) end)),
+      else: tap_conv(node, x, w)
+  end
+
+  # A convolution whose windows do not overlap and cover the input without padding, as
+  # the patch embedding of a vision transformer, multiplies each patch by the kernel.
+  defp patches?(node, x, w) do
+    kernel = spatial_sizes(w)
+    spatial = length(kernel)
+
+    attr(node, "strides") == kernel and attr(node, "group", 1) == 1 and
+      attr(node, "dilations", List.duplicate(1, spatial)) == List.duplicate(1, spatial) and
+      spatial_pads(node, spatial_sizes(x), kernel) == List.duplicate({0, 0}, spatial)
+  end
+
+  # The patches of x become rows {n, patches, c * kernel}, and product.(rows, w) multiplies
+  # them by w {o, c * kernel} to {n, patches, o}. Each axis drops the part of the input
+  # that a whole patch does not cover.
+  defp patch_conv(x, w, product) do
+    [n, c | sizes] = Tuple.to_list(Nx.shape(x))
+    [o, _c | kernel] = Tuple.to_list(Nx.shape(w))
+    spatial = length(kernel)
+    out = Enum.zip_with(sizes, kernel, &div/2)
+    split = Enum.flat_map(Enum.zip(out, kernel), &Tuple.to_list/1)
+
+    rows =
+      x
+      |> Nx.slice(List.duplicate(0, spatial + 2), [n, c | Enum.zip_with(out, kernel, &(&1 * &2))])
+      |> Nx.reshape(List.to_tuple([n, c | split]))
+      |> Nx.transpose(
+        axes:
+          [0] ++
+            Enum.map(0..(spatial - 1), &(2 + 2 * &1)) ++
+            [1] ++ Enum.map(0..(spatial - 1), &(3 + 2 * &1))
+      )
+      |> Nx.reshape({n, Enum.product(out), c * Enum.product(kernel)})
+
+    rows
+    |> product.(Nx.reshape(w, {o, :auto}))
+    |> Nx.transpose(axes: [0, 2, 1])
+    |> Nx.reshape(List.to_tuple([n, o | out]))
+  end
+
+  defp tap_conv(node, x, w) do
     [n, c | _] = Tuple.to_list(Nx.shape(x))
     [o, group_c | kernel] = Tuple.to_list(Nx.shape(w))
     spatial = length(kernel)
