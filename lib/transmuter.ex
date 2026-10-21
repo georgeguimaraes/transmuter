@@ -79,7 +79,7 @@ defmodule Transmuter do
       logit. Use it to compare a model with a reference that has no noise. The
       default is `true`.
 
-    * `:outputs` (a list of `t:String.t/0`, or a function) - the graph outputs to keep. The model then gives only these outputs, and the loader removes the nodes and the initializers that no kept output reads. An `If` node keeps only the outputs that a later node or the graph reads, and its two branches keep the same outputs. `Loop` and `Scan` keep all outputs of their bodies. A function gets the names of the graph outputs and returns the names to keep. A name that is not a graph output raises an `ArgumentError`. The default is `nil`, which keeps all outputs.
+    * `:outputs` (a list of `t:String.t/0`, or a function) - the graph outputs to keep. The model then gives only these outputs, and the loader removes the nodes and the initializers that no kept output reads. An `If` node keeps only the outputs that a later node or the graph reads, and its two branches keep the same outputs. `Loop` and `Scan` keep all outputs of their bodies. A function gets the names of the graph outputs and returns the names to keep. A name that is not a graph output raises an `ArgumentError`. The servings that generate text, classify or embed give the outputs that they read. The default is `nil`, which keeps all outputs.
 
   Returns a map with:
 

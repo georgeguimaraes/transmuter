@@ -44,7 +44,8 @@ defmodule Transmuter.Vision.ImageTextToText do
     model_opts = Keyword.take(opts, [:backend, :compute_type])
     vision = Repo.load_component!(repo, "vision_encoder", :q4, model_opts)
     embed = Repo.load_component!(repo, "embed_tokens", :q8, model_opts)
-    decoder = Repo.load_component!(repo, "decoder_model_merged", :q4, model_opts)
+    decoder_opts = [outputs: &Generation.outputs/1] ++ model_opts
+    decoder = Repo.load_component!(repo, "decoder_model_merged", :q4, decoder_opts)
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     {module, processor} = processor!(repo)
     backend = opts[:backend] || Nx.default_backend()

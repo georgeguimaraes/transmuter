@@ -14,7 +14,10 @@ defmodule Transmuter.Text.TextEmbedding do
   @doc false
   def text_embedding(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [:output_pool, :embedding_processor])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+
+    {repo, model, tokenizer} =
+      Serving.load!(source, [outputs: ["last_hidden_state"]] ++ opts, :fp32)
+
     opts = Keyword.merge(sentence_transformers(repo, opts), opts)
     pool = opts[:output_pool]
     processor = opts[:embedding_processor]

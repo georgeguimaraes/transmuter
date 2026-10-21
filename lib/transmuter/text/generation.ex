@@ -32,7 +32,11 @@ defmodule Transmuter.Text.Generation do
       ])
 
     Keyword.validate!(opts[:compile], [:batch_size])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :q4, ["model", "decoder_model_merged"])
+
+    load_opts = [outputs: &Generation.outputs/1] ++ opts
+    components = ["model", "decoder_model_merged"]
+    {repo, model, tokenizer} = Serving.load!(source, load_opts, :q4, components)
+
     ctx = Generation.context(repo, model, opts)
     bos = ctx.bos
 

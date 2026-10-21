@@ -8,7 +8,7 @@ defmodule Transmuter.Text.TextClassification do
   @doc false
   def text_classification(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [:scores_function, top_k: 5])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+    {repo, model, tokenizer} = Serving.load!(source, [outputs: ["logits"]] ++ opts, :fp32)
 
     scores_function =
       Keyword.get_lazy(opts, :scores_function, fn -> Serving.scores_function(repo) end)

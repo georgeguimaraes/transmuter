@@ -78,6 +78,12 @@ defmodule Transmuter.Generation do
   end
 
   @doc """
+  Returns the outputs of a decoder that generation reads: `logits` and the present cache. `names` are the names of the graph outputs. Give this function to the `:outputs` option of `Transmuter.load!/2`, so the decoder computes no other outputs, such as the attention probabilities of the Whisper exports of Xenova.
+  """
+  def outputs(names),
+    do: Enum.filter(names, &(&1 == "logits" or String.starts_with?(&1, "present.")))
+
+  @doc """
   Returns the `:max_new_tokens` of a decoder whose `max_length` counts its prompt, such as the decoder of an encoder-decoder model. The value comes from `opts`, from `max_new_tokens` of `generation_config.json`, or from `max_length` minus `prompt_length`. As in Python transformers, `max_length` is `20` when the configuration does not give it.
   """
   def max_new_tokens(repo, opts, prompt_length) do

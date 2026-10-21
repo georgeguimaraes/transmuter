@@ -22,7 +22,10 @@ defmodule Transmuter.Text.QuestionAnswering do
   @doc false
   def question_answering(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [max_answer_length: 15])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+
+    {repo, model, tokenizer} =
+      Serving.load!(source, [outputs: ~w(start_logits end_logits)] ++ opts, :fp32)
+
     cls = tokenizer.special_tokens[:cls]
     cls_id = cls && Tokenizer.token_to_id(tokenizer, cls)
 

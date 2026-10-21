@@ -45,7 +45,7 @@ defmodule Transmuter.Serving do
   end
 
   @doc """
-  Loads the repository of `source` and its model. The model is the first of `components` that the repository has, in the default variant `variant` of the task.
+  Loads the repository of `source` and its model. The model is the first of `components` that the repository has, in the default variant `variant` of the task. The `:outputs` in `opts` go to `Transmuter.load!/2`, so the model gives only the outputs that the task reads.
   """
   def load_model!(source, opts, variant, components \\ ["model"]) do
     repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
@@ -57,7 +57,7 @@ defmodule Transmuter.Serving do
           repo,
           component,
           variant,
-          Keyword.take(opts, [:backend, :compute_type])
+          Keyword.take(opts, [:backend, :compute_type, :outputs])
         )
 
     {repo, model}
@@ -339,13 +339,15 @@ defmodule Transmuter.Serving do
   end
 
   @doc """
-  Loads the repository of `source`, its encoder (`encoder_model`) and its merged decoder (`decoder_model_merged`). The default variant is fp32.
+  Loads the repository of `source`, its encoder (`encoder_model`) and its merged decoder (`decoder_model_merged`). The default variant is fp32. The encoder gives only `last_hidden_state`, and the decoder gives only the outputs of `Transmuter.Generation.outputs/1`.
   """
   def load_encoder_decoder!(source, opts) do
     repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
     model_opts = Keyword.take(opts, [:backend, :compute_type])
-    encoder = Repo.load_component!(repo, "encoder_model", :fp32, model_opts)
-    decoder = Repo.load_component!(repo, "decoder_model_merged", :fp32, model_opts)
+    encoder_opts = [outputs: ["last_hidden_state"]] ++ model_opts
+    encoder = Repo.load_component!(repo, "encoder_model", :fp32, encoder_opts)
+    decoder_opts = [outputs: &Generation.outputs/1] ++ model_opts
+    decoder = Repo.load_component!(repo, "decoder_model_merged", :fp32, decoder_opts)
     {repo, encoder, decoder}
   end
 

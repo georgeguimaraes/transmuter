@@ -10,12 +10,9 @@ defmodule Transmuter.Vision.ImageEmbedding do
   @doc false
   def image_embedding(source, opts) do
     opts = Keyword.validate!(opts, Serving.image_options() ++ [:embedding_processor])
-    {repo, model} = Serving.load_model!(source, opts, :fp32, ["vision_model", "model"])
-
-    output =
-      Enum.find(@outputs, &(&1 in model.outputs)) ||
-        raise ArgumentError,
-              "the model has none of the outputs #{inspect(@outputs)}, outputs: #{inspect(model.outputs)}"
+    load_opts = [outputs: &[output!(&1)]] ++ opts
+    {repo, model} = Serving.load_model!(source, load_opts, :fp32, ["vision_model", "model"])
+    output = output!(model.outputs)
 
     Serving.image(
       model,
@@ -26,6 +23,12 @@ defmodule Transmuter.Vision.ImageEmbedding do
       end,
       fn [%{embedding: embedding}], _images -> %{embedding: embedding} end
     )
+  end
+
+  defp output!(outputs) do
+    Enum.find(@outputs, &(&1 in outputs)) ||
+      raise ArgumentError,
+            "the model has none of the outputs #{inspect(@outputs)}, outputs: #{inspect(outputs)}"
   end
 
   # Exports without pooler_output, such as DINOv2, give the pooled output as the first

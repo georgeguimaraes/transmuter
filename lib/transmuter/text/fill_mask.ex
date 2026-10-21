@@ -10,7 +10,7 @@ defmodule Transmuter.Text.FillMask do
   @doc false
   def fill_mask(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [top_k: 5])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+    {repo, model, tokenizer} = Serving.load!(source, [outputs: ["logits"]] ++ opts, :fp32)
 
     mask =
       tokenizer.special_tokens[:mask] || raise ArgumentError, "the tokenizer has no mask token"

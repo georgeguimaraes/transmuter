@@ -16,7 +16,7 @@ defmodule Transmuter.Text.TokenClassification do
   @doc false
   def token_classification(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [:aggregation, ignored_labels: ["O"]])
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+    {repo, model, tokenizer} = Serving.load!(source, [outputs: ["logits"]] ++ opts, :fp32)
     aggregation = opts[:aggregation]
 
     unless aggregation in @aggregations do

@@ -20,7 +20,7 @@ defmodule Transmuter.Text.ZeroShotClassification do
       raise ArgumentError, "expected a list of label strings, got: #{inspect(labels)}"
     end
 
-    {repo, model, tokenizer} = Serving.load!(source, opts, :fp32)
+    {repo, model, tokenizer} = Serving.load!(source, [outputs: ["logits"]] ++ opts, :fp32)
     hypotheses = Enum.map(labels, opts[:hypothesis_template])
     entailment = entailment!(repo)
 

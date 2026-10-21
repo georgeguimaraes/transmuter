@@ -8,7 +8,7 @@ defmodule Transmuter.Vision.ImageClassification do
   @doc false
   def image_classification(source, opts) do
     opts = Keyword.validate!(opts, Serving.image_options() ++ [:scores_function, top_k: 5])
-    {repo, model} = Serving.load_model!(source, opts, :fp32)
+    {repo, model} = Serving.load_model!(source, [outputs: ["logits"]] ++ opts, :fp32)
 
     scores_function =
       Keyword.get_lazy(opts, :scores_function, fn -> Serving.scores_function(repo) end)
