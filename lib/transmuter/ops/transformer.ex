@@ -298,7 +298,9 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   # k has the head size before the keys. 4-D heads with the softmax over the keys take the
-  # shared attention core with the transpose of k. Other shapes keep the MatMul broadcasting.
+  # shared attention core with the transpose of k. Exports such as Whisper and TrOCR put the
+  # heads in the batch, {B * N, S, d}, which are the heads of a batch of one. Other shapes
+  # keep the MatMul broadcasting.
   # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
   # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
   defp attention_core(node, [q, k, v | optional], opset) do
@@ -312,38 +314,40 @@ defmodule Transmuter.Ops.Transformer do
         _other -> {scale, divisor}
       end
 
-    # Exports such as Whisper and TrOCR put the heads in the batch, {B * N, S, d}. These are
-    # the heads of a batch of one.
+    batched? = Enum.all?([q, k, v], &(Nx.rank(&1) == 3))
+    [q4, k4, v4] = if batched?, do: Enum.map([q, k, v], &Nx.new_axis(&1, 0)), else: [q, k, v]
     last? = attr(node, "axis") in [-1, Nx.rank(q) - 1]
-    heads = if Enum.all?([q, k, v], &(Nx.rank(&1) == 3)), do: &Nx.new_axis(&1, 0), else: & &1
-    {q4, k4, v4} = {heads.(q), heads.(k), heads.(v)}
 
     if divisor == nil and last? and fused_core?(q4, k4, v4, [mask, keep]) do
       hidden = keep && Nx.equal(keep, 0)
       opts = %{scale: scale, softcap: 0.0, bias: mask, hidden: hidden, causal: false}
       out = attend(q4, Nx.transpose(k4, axes: [0, 1, 3, 2]), v4, opts)
-      if Nx.rank(q) == 3, do: Nx.squeeze(out, axes: [0]), else: out
+      if batched?, do: Nx.squeeze(out, axes: [0]), else: out
     else
-      [q, k, v, mask, divisor]
-      |> widen(fn [q, k, v, mask, divisor] ->
-        scores = matmul(q, k)
-
-        scores =
-          cond do
-            divisor != nil -> Nx.divide(scores, divisor)
-            scale == 1 -> scores
-            true -> Nx.multiply(scores, scale)
-          end
-
-        scores
-        |> where_kept(keep, attr(node, "fill"))
-        |> add_optional(mask)
-        |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
-        |> matmul(v)
-        |> List.wrap()
-      end)
-      |> hd()
+      plain_core(node, [q, k, v, mask, keep, divisor], scale, opset)
     end
+  end
+
+  defp plain_core(node, [q, k, v, mask, keep, divisor], scale, opset) do
+    [q, k, v, mask, divisor]
+    |> widen(fn [q, k, v, mask, divisor] ->
+      scores = matmul(q, k)
+
+      scores =
+        cond do
+          divisor != nil -> Nx.divide(scores, divisor)
+          scale == 1 -> scores
+          true -> Nx.multiply(scores, scale)
+        end
+
+      scores
+      |> where_kept(keep, attr(node, "fill"))
+      |> add_optional(mask)
+      |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
+      |> matmul(v)
+      |> List.wrap()
+    end)
+    |> hd()
   end
 
   defp where_kept(scores, nil, _fill), do: scores
