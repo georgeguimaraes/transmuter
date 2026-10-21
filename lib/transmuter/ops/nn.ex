@@ -846,23 +846,92 @@ defmodule Transmuter.Ops.NN do
   # An output position outside the input with tf_crop_and_resize has no taps and gets the
   # extrapolation value. As in ONNX Runtime, an axis with scale 1 stays as it is, unless
   # its roi crops it.
-  defp resize_axis(x, node, axis, {in_size, out_size, scale, region}) do
+  defp resize_axis(x, node, axis, sizes = {in_size, out_size, scale, _region}) do
     ctm = attr(node, "coordinate_transformation_mode", "half_pixel")
 
-    if scale == 1 and ctm != "tf_crop_and_resize" do
-      x
-    else
-      taps =
-        for i <- 0..(out_size - 1) do
-          xo = resize_source(ctm, i, {in_size, out_size, scale, region})
+    cond do
+      scale == 1 and ctm != "tf_crop_and_resize" ->
+        x
 
-          if ctm == "tf_crop_and_resize" and (xo < 0 or xo > in_size - 1),
-            do: [],
-            else: resize_taps(node, xo, in_size, scale)
-        end
+      periodic?(node, ctm, sizes) ->
+        periodic_taps(x, node, axis, ctm, sizes)
 
-      weighted_taps(x, axis, taps, attr(node, "extrapolation_value", 0.0))
+      true ->
+        taps =
+          for i <- 0..(out_size - 1) do
+            xo = resize_source(ctm, i, sizes)
+
+            if ctm == "tf_crop_and_resize" and (xo < 0 or xo > in_size - 1),
+              do: [],
+              else: resize_taps(node, xo, in_size, scale)
+          end
+
+        weighted_taps(x, axis, taps, attr(node, "extrapolation_value", 0.0))
     end
+  end
+
+  # An upscale by an integer s with a source coordinate of i / s plus a constant reads the
+  # same taps, shifted by j, for every output i = j * s + p of phase p. A tap outside the
+  # input reads the border, as the edge-padded input gives it. Only the antialias and
+  # exclude_outside modes weight the border taps in another way.
+  defp periodic?(node, ctm, {in_size, out_size, scale, _region}) do
+    ctm in ~w(asymmetric half_pixel pytorch_half_pixel tf_half_pixel_for_nn half_pixel_symmetric) and
+      scale > 1 and scale == round(scale) and out_size == in_size * round(scale) and
+      attr(node, "exclude_outside", 0) == 0 and attr(node, "antialias", 0) == 0
+  end
+
+  # The taps of each phase, as offsets from j, come from an output far enough from the
+  # borders that no tap moves. The edge-padded input shifted by each offset, times the
+  # weights of the phases, gives the s outputs of each input position.
+  defp periodic_taps(x, node, axis, ctm, sizes = {in_size, _out_size, scale, _region}) do
+    s = round(scale)
+    j0 = 4
+
+    phases =
+      for p <- 0..(s - 1) do
+        xo = resize_source(ctm, j0 * s + p, sizes)
+        for {j, w} <- resize_taps(node, xo, 2 * j0 + 8, scale), do: {j - j0, w}
+      end
+
+    offsets = phases |> List.flatten() |> Enum.map(&elem(&1, 0))
+    {lo, hi} = Enum.min_max(offsets)
+    {before, after_} = {max(-lo, 0), max(hi, 0)}
+    shape = Nx.shape(x)
+
+    edge = fn count, index ->
+      if count > 0,
+        do: [
+          x
+          |> Nx.slice_along_axis(index, 1, axis: axis)
+          |> Nx.broadcast(put_elem(shape, axis, count))
+        ],
+        else: []
+    end
+
+    padded = Nx.concatenate(edge.(before, 0) ++ [x] ++ edge.(after_, in_size - 1), axis: axis)
+    phase_axis = List.duplicate(1, Nx.rank(x) + 1) |> List.replace_at(axis + 1, s)
+
+    for offset <- lo..hi do
+      weights =
+        for taps <- phases,
+            do:
+              taps
+              |> Enum.filter(&(elem(&1, 0) == offset))
+              |> Enum.map(&elem(&1, 1))
+              |> Enum.sum()
+
+      padded
+      |> Nx.slice_along_axis(offset + before, in_size, axis: axis)
+      |> Nx.new_axis(axis + 1)
+      |> Nx.multiply(
+        weights
+        |> static_tensor(:f32)
+        |> Nx.reshape(List.to_tuple(phase_axis))
+        |> Nx.as_type(Nx.type(x))
+      )
+    end
+    |> Enum.reduce(&Nx.add/2)
+    |> Nx.reshape(put_elem(shape, axis, in_size * s))
   end
 
   defp weighted_taps(x, axis, taps, outside_value) do

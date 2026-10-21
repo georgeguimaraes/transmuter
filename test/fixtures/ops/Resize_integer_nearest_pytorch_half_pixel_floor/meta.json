@@ -1,0 +1,39 @@
+{
+ "repo": "op/Resize_integer_nearest_pytorch_half_pixel_floor",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Resize": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2,
+    4,
+    5
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    2,
+    16,
+    15
+   ]
+  }
+ ],
+ "ort_ok": true
+}

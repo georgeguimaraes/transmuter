@@ -1450,6 +1450,22 @@ case("MatMulNBits_b4_bs256_packed", [node("MatMulNBits", ["A", "B", "scales", "z
      {"B": pack(q, 4).reshape(N, K // bs, bs // 2), "scales": (r.random(N * K // bs) * 0.1 + 0.01).astype(np.float32),
       "zp": pack(r.integers(0, 16, (N, K // bs)), 4).reshape(-1)}, ms=True)
 
+# ---------- Resize by an integer scale ----------
+
+# Each output phase reads the same taps of the input, shifted, and the taps outside read the border.
+# Asymmetric nearest with round_prefer_ceil has ties at half of the scale.
+r = rng_for("Resize by an integer scale")
+x45i = r.standard_normal((1, 2, 4, 5)).astype(np.float32)
+for name, attrs, scales, opset in [
+    ("linear_half_pixel", dict(mode="linear"), (1, 1, 3, 2), 13),
+    ("cubic_asymmetric", dict(mode="cubic", coordinate_transformation_mode="asymmetric"), (1, 1, 2, 4), 13),
+    ("nearest_pytorch_half_pixel_floor", dict(mode="nearest", coordinate_transformation_mode="pytorch_half_pixel", nearest_mode="floor"), (1, 1, 4, 3), 13),
+    ("linear_tf_half_pixel_for_nn", dict(mode="linear", coordinate_transformation_mode="tf_half_pixel_for_nn"), (1, 1, 2, 2), 13),
+    ("cubic_half_pixel_symmetric", dict(mode="cubic", coordinate_transformation_mode="half_pixel_symmetric"), (1, 1, 3, 3), 19),
+    ("nearest_asymmetric_round_prefer_ceil", dict(mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="round_prefer_ceil"), (1, 1, 2, 4), 13),
+]:
+    case(f"Resize_integer_{name}", [node("Resize", ["x", "", "scales"], ["y"], **attrs)], {"x": x45i}, {"scales": np.array(scales, np.float32)}, opset=opset)
+
 # ---------- MoE decode ----------
 
 # One token selects 2 of 8 experts, fewer than the experts, so only the weights of these 2 are read.
