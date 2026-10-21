@@ -105,6 +105,24 @@ defmodule Transmuter.TelemetryTest do
                      %{position: 0, shapes: [{"x", {{2, 7}, _type}}]}}
   end
 
+  # The Loop body reads the sizes as an outer sequence. They become static at the break of
+  # the Loop, so the bounds of both Slices fold, and the Slices do not break.
+  test "a break makes the small outer values of its subgraphs static" do
+    model = load_fixture("Break_Loop_outer_sequence")
+    sizes = Nx.tensor([2, 3, 1], backend: @backend)
+    x = Nx.tensor([1.0, 2, 3, 4, 5, 6], backend: @backend)
+
+    %{"y" => y} =
+      Transmuter.compile(model, %{"sizes" => sizes, "x" => x}, @compiler).(%{
+        "sizes" => sizes,
+        "x" => x
+      })
+
+    assert Nx.to_flat_list(y) == [3.0, 4.0, 5.0, 6.0]
+    assert_received {[:transmuter, :break, :stop], %{op_type: "Loop"}}
+    refute_received {[:transmuter, :break, :stop], _metadata}
+  end
+
   # The fixture folds two values of 6400 elements from the shape of x, and NonZero reads one
   # of them. They leave the host, but the graph has no break, and an eager run gives the same
   # values on the backend of the model.

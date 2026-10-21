@@ -822,6 +822,24 @@ case("Break_Range_long_tail",
      [node("Identity", ["t12"], ["y"])],
      {"x": pos_f32(6)}, {"zero": np.array(0, np.int64), "one": np.array(1, np.int64),
                          "scale": np.array(0.9, np.float32), "shift": np.array(0.25, np.float32)})
+# The Loop body reads the sizes as an outer sequence and expands them, so the Loop breaks, as the
+# Loop of the Qwen2-VL vision encoder does. The bounds of both Slices come from its output.
+sizes_body = helper.make_graph(
+    [node("SequenceAt", ["sizes_seq", "i"], ["size"]), node("Unsqueeze", ["size", "axes"], ["size_1"]),
+     node("Expand", ["one_f", "size_1"], ["ones"]), node("ReduceSum", ["ones"], ["count_f"], keepdims=0),
+     node("Cast", ["count_f"], ["count"], to=INT64), node("Identity", ["cond_in"], ["cond_out"])],
+    "sizes_body",
+    [helper.make_tensor_value_info("i", INT64, []), helper.make_tensor_value_info("cond_in", TensorProto.BOOL, [])],
+    [helper.make_tensor_value_info("cond_out", TensorProto.BOOL, []), helper.make_tensor_value_info("count", INT64, [])])
+case("Break_Loop_outer_sequence",
+     [node("SplitToSequence", ["sizes"], ["sizes_seq"], axis=0, keepdims=0), node("Shape", ["sizes"], ["sizes_shape"]),
+      node("Gather", ["sizes_shape", "zero"], ["trips"]), node("Loop", ["trips", "", ], ["counts"], body=sizes_body),
+      node("CumSum", ["counts", "zero"], ["ends"]), node("Gather", ["ends", "first"], ["e0"]),
+      node("Gather", ["ends", "second"], ["e1"]), node("Gather", ["ends", "third"], ["e2"]),
+      node("Slice", ["x", "e0", "e1"], ["a"]), node("Slice", ["x", "e1", "e2"], ["b"]), node("Concat", ["a", "b"], ["y"], axis=0)],
+     {"sizes": np.array([2, 3, 1], np.int64), "x": pos_f32(6)},
+     {"zero": np.array(0, np.int64), "axes": np.array([0], np.int64), "one_f": np.array(1.0, np.float32),
+      "first": np.array([0], np.int64), "second": np.array([1], np.int64), "third": np.array([2], np.int64)})
 
 # ---------- long recurrences and loops ----------
 

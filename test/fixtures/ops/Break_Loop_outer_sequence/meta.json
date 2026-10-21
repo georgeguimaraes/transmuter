@@ -1,0 +1,47 @@
+{
+ "repo": "op/Break_Loop_outer_sequence",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "SplitToSequence": 1,
+  "Shape": 1,
+  "Gather": 4,
+  "Loop": 1,
+  "CumSum": 1,
+  "Slice": 2,
+  "Concat": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "sizes",
+   "file": "in_0.bin",
+   "dtype": "s64",
+   "shape": [
+    3
+   ]
+  },
+  {
+   "name": "x",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    6
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "y",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  }
+ ],
+ "ort_ok": true
+}

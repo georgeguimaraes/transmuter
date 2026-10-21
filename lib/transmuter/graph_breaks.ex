@@ -2,7 +2,7 @@ defmodule Transmuter.GraphBreaks do
   @moduledoc """
   Compiles a model whose graph needs values that are only known when it runs, such as the limit of a Range or the boxes of a NonMaxSuppression.
 
-  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. Small inputs of the break node (integer shapes, float scales) become static, so later segments fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
+  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. The small values that the break node reads (integer shapes, float scales) become static, also the outer values that its subgraphs read, so later segments fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
 
   Static values are those of the model, the static inputs, promoted values and values folded from them. Everything else enters a segment as an argument.
   """
@@ -287,8 +287,9 @@ defmodule Transmuter.GraphBreaks do
     end)
   end
 
-  # The break node runs eagerly. Its small inputs become static first, so later
-  # segments can fold the shapes they decide.
+  # The break node runs eagerly. The small values that it reads become static first, so
+  # later segments can fold the shapes they decide. A Loop body, for example, reads the
+  # sizes of the images of a Qwen2-VL encoder as an outer value.
   defp run_break(plan, state, index) do
     node = elem(plan.nodes, index)
     metadata = %{source: plan.source, position: index, node: node.name, op_type: node.op_type}
@@ -300,11 +301,11 @@ defmodule Transmuter.GraphBreaks do
 
   defp run_break_node(plan, state, node) do
     state =
-      Enum.reduce(node.input, state, fn name, state ->
+      Enum.reduce(Transmuter.dependencies(node), state, fn name, state ->
         value = Map.get(state.env, name)
 
         if promote?(value) and not static?(plan, state, name) do
-          value = Nx.backend_copy(value, Nx.BinaryBackend)
+          value = to_host(value)
           merge(state, %{values: %{name => value}, static: %{name => Ops.digest(value)}})
         else
           state
@@ -338,7 +339,13 @@ defmodule Transmuter.GraphBreaks do
     if Nx.Type.integer?(Nx.type(t)), do: Nx.size(t) <= 4096, else: Nx.size(t) <= 16
   end
 
+  defp promote?({:sequence, elements}),
+    do: Enum.all?(elements, &(promote?(&1) or Ops.static?(&1)))
+
   defp promote?(_value), do: false
+
+  defp to_host({:sequence, elements}), do: {:sequence, Enum.map(elements, &to_host/1)}
+  defp to_host(t), do: Nx.backend_copy(t, Nx.BinaryBackend)
 
   defp outputs(state, plan) do
     plan.model.outputs
