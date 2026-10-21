@@ -1466,6 +1466,17 @@ for name, attrs, scales, opset in [
 ]:
     case(f"Resize_integer_{name}", [node("Resize", ["x", "", "scales"], ["y"], **attrs)], {"x": x45i}, {"scales": np.array(scales, np.float32)}, opset=opset)
 
+# ---------- TopK of one value ----------
+
+# Rows with equal largest or smallest values take the lower index, as a stable sort does.
+r = rng_for("TopK of one value")
+ties = np.array([[3.0, 7.0, 7.0, 1.0, 7.0], [2.0, 2.0, 5.0, -4.0, -4.0], [0.5, 0.5, 0.5, 0.5, 0.5]], np.float32)
+k1 = np.array([1], np.int64)
+case("TopK_k1_ties", [node("TopK", ["x", "k"], ["values", "indices"])], {"x": ties}, {"k": k1})
+case("TopK_k1_smallest_ties_axis_0", [node("TopK", ["x", "k"], ["values", "indices"], axis=0, largest=0)], {"x": ties.T.copy()}, {"k": k1})
+case("TopK_k1_int32", [node("TopK", ["x", "k"], ["values", "indices"])],
+     {"x": r.integers(-3, 3, (4, 6)).astype(np.int32)}, {"k": k1})
+
 # ---------- MoE decode ----------
 
 # One token selects 2 of 8 experts, fewer than the experts, so only the weights of these 2 are read.

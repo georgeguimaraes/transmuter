@@ -70,26 +70,36 @@ defmodule Transmuter.Ops.Reduction do
     axis = attr(node, "axis", -1)
     axis = if axis < 0, do: axis + rank, else: axis
 
-    # EMLX sorts in descending order by negating, which wraps integers. A bitwise not
-    # reverses the order of every integer type without wrapping.
-    {keys, direction} =
-      cond do
-        attr(node, "largest", 1) == 0 -> {x, :asc}
-        Nx.Type.integer?(Nx.type(x)) -> {Nx.bitwise_not(x), :asc}
-        true -> {x, :desc}
-      end
+    largest? = attr(node, "largest", 1) == 1
 
-    if k == 0 do
-      empty = {:empty, x |> Nx.shape() |> put_elem(axis, 0)}
-      [empty, empty]
-    else
-      # A stable sort keeps the lower index first among equal values, as ORT does.
-      idx =
-        keys
-        |> Nx.argsort(axis: axis, direction: direction, stable: true)
-        |> Nx.slice_along_axis(0, k, axis: axis)
+    cond do
+      k == 0 ->
+        empty = {:empty, x |> Nx.shape() |> put_elem(axis, 0)}
+        [empty, empty]
 
-      [Nx.take_along_axis(x, idx, axis: axis), Nx.as_type(idx, :s64)]
+      # One value is an arg reduction, which keeps the lower index among equal values.
+      k == 1 ->
+        reduce = if largest?, do: &Nx.argmax/2, else: &Nx.argmin/2
+        idx = reduce.(x, axis: axis, keep_axis: true, tie_break: :low)
+        [Nx.take_along_axis(x, idx, axis: axis), Nx.as_type(idx, :s64)]
+
+      true ->
+        # EMLX sorts in descending order by negating, which wraps integers. A bitwise not
+        # reverses the order of every integer type without wrapping.
+        {keys, direction} =
+          cond do
+            not largest? -> {x, :asc}
+            Nx.Type.integer?(Nx.type(x)) -> {Nx.bitwise_not(x), :asc}
+            true -> {x, :desc}
+          end
+
+        # A stable sort keeps the lower index first among equal values, as ORT does.
+        idx =
+          keys
+          |> Nx.argsort(axis: axis, direction: direction, stable: true)
+          |> Nx.slice_along_axis(0, k, axis: axis)
+
+        [Nx.take_along_axis(x, idx, axis: axis), Nx.as_type(idx, :s64)]
     end
   end
 
