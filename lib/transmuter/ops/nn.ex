@@ -86,7 +86,7 @@ defmodule Transmuter.Ops.NN do
     shape = List.to_tuple([1, :auto | List.duplicate(1, length(axes))])
 
     x
-    |> normalize(axes, attr(node, "epsilon", 1.0e-5))
+    |> normalize_trailing(axes, attr(node, "epsilon", 1.0e-5))
     |> Nx.multiply(Nx.reshape(scale, shape))
     |> Nx.add(Nx.reshape(bias, shape))
   end
@@ -207,7 +207,7 @@ defmodule Transmuter.Ops.NN do
     shape = Nx.shape(x)
     {n, c} = {elem(shape, 0), elem(shape, 1)}
     grouped = Nx.reshape(x, {n, groups, :auto})
-    normed = normalize(grouped, [2], attr(node, "epsilon", 1.0e-5))
+    normed = normalize_trailing(grouped, [2], attr(node, "epsilon", 1.0e-5))
 
     {scale, bias} =
       if Nx.size(scale) == c,
@@ -455,6 +455,16 @@ defmodule Transmuter.Ops.NN do
       "none" -> loss
       "sum" -> Nx.sum(loss)
       "mean" -> Nx.divide(Nx.sum(loss), Nx.sum(weights))
+    end
+  end
+
+  # Normalizes x over its trailing axes, without a weight. EMLX does it in one kernel.
+  defp normalize_trailing(x, axes, eps) do
+    if emlx?(x) do
+      [one, zero] = Enum.map([1, 0], &Nx.tensor(&1, type: Nx.type(x)))
+      emlx_norm(&EMLX.Fast.layer_norm(&1, &2, &3, eps), x, axes, [one, zero])
+    else
+      normalize(x, axes, eps)
     end
   end
 
