@@ -12,7 +12,8 @@ permissions:
 jobs:
   # EXLA on the CPU is a real Linux deployment, so these jobs run all tests. mix test gives
   # the sorted test files to the partitions in turn. With 3 partitions, the text, audio and
-  # vision tests, which take most of the time, run in different jobs.
+  # vision tests, which take most of the time, run in different jobs. The slowest tests and
+  # modules in the log show how to keep the partitions balanced.
   exla:
     name: Tests / exla (${{ matrix.partition }}/3)
     runs-on: ubuntu-latest
@@ -103,7 +104,7 @@ jobs:
         env:
           TRANSMUTER_TEST_BACKEND: exla
           MIX_TEST_PARTITION: ${{ matrix.partition }}
-        run: mix test --exclude large_model --max-cases 2 --partitions 3
+        run: mix test --exclude large_model --max-cases 2 --partitions 3 --slowest 10 --slowest-modules 6
       - name: List the cached models
         id: model-files
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
