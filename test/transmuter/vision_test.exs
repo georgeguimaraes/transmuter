@@ -125,9 +125,9 @@ defmodule Transmuter.VisionTest do
 
   @handwriting_long StbImage.read_file!(Path.expand("../fixtures/handwriting_long.png", __DIR__))
 
-  # The rows of a batch stop at different steps: the first at the end token, the second at
-  # the limit of 20 new tokens of generate in transformers, before "trees" gets its period.
-  # Both rows are clear text, so the rounding of a batch does not change a token.
+  # The rows of a batch stop at the end token at different steps, and the second row has more
+  # than the 20 new tokens of generate in transformers. Both rows are clear text, so the
+  # rounding of a batch does not change a token.
   test "a batch of images gives the text of each image alone, and a stream joins to it" do
     opts = [variant: :q8] ++ @opts
     single = Vision.image_to_text(@trocr, opts)
@@ -135,7 +135,7 @@ defmodule Transmuter.VisionTest do
 
     assert Enum.map(alone, fn %{results: [%{text: text}]} -> text end) == [
              "Meet me at the station at noon .",
-             "We walked along the river and talked about the garden until the sun went down behind the hills and trees"
+             "We walked along the river and talked about the garden until the sun went down behind the hills and trees ."
            ]
 
     batched = Vision.image_to_text(@trocr, [compile: [batch_size: 2]] ++ opts)

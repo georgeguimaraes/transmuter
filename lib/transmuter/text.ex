@@ -210,7 +210,9 @@ defmodule Transmuter.Text do
 
     * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits. `:batch_size` is the number of inputs that generate together, as in `generation/2`. Inputs of the same sequence length go into one batch.
 
-    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`.
+    * `:max_new_tokens` - the maximum number of new tokens. The default is that of the `text2text-generation` pipeline of transformers (see `Transmuter.Generation.max_new_tokens/3`): 256 for T5, and `max_length` minus 1 for the start token when the configuration gives a `max_length` other than 20, such as 511 for Marian.
+
+    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

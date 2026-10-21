@@ -31,6 +31,7 @@ defmodule Transmuter.Text.TextToText do
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
     given = ~w(encoder_hidden_states encoder_attention_mask)
+    opts = Keyword.put(opts, :max_new_tokens, Generation.max_new_tokens(repo, opts, 1))
     ctx = Generation.context(repo, decoder, opts, given)
 
     compile =
