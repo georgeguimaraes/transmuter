@@ -5,7 +5,7 @@ defmodule Transmuter.VisionTest do
   # The first run downloads the models.
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 2
+  @moduletag ci_partition: 6
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -388,9 +388,9 @@ defmodule Transmuter.VisionTest do
   end
 end
 
-# --only ci_partition:2 in CI also includes the tests of VisionTest with a :large_model tag,
-# because an included tag wins over an excluded one. So these tests are in a module without
-# a :ci_partition tag, and CI leaves them out.
+# --only ci_partition:6 in CI would also include :large_model tests of VisionTest, because an
+# included tag wins over an excluded one. So these tests are in a module without a
+# :ci_partition tag, and CI leaves them out.
 defmodule Transmuter.VisionLargeModelTest do
   use ExUnit.Case, async: true
 

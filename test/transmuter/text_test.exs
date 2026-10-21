@@ -474,14 +474,14 @@ defmodule Transmuter.TextServingTest do
   end
 end
 
-# The batch test is the slowest text test, so with --max-cases 2 it runs next to the other
-# text tests in its CI partition.
+# The batch test takes about as long as all other text tests together on EXLA in CI, so it
+# is a module of its own, in its own CI partition.
 defmodule Transmuter.TextBatchTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 4
+  @moduletag ci_partition: 5
 
   @opts [
     backend: Transmuter.TestBackend.backend(),

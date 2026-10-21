@@ -13,11 +13,13 @@ jobs:
   # EXLA on the CPU is a real Linux deployment, so these jobs run all tests. The slowest
   # test modules have a :ci_partition tag, and each tagged partition runs in its own job.
   # Partition 1 runs all tests without the tag. The tests of one module run one at a time,
-  # so a slow test goes in a module of its own. --only also includes the :large_model tests
+  # so a slow test goes in a module of its own. Two slow modules in one job take longer than
+  # in two jobs, because each XLA computation already uses all CPUs of the runner, so each
+  # slow module has its own partition. --only also includes the :large_model tests
   # of a tagged module, so a tagged module has none (Transmuter.CIPartitionTest checks
   # this). The slowest tests and modules in the log show how to keep the partitions balanced.
   exla:
-    name: Tests / exla (${{ matrix.partition }}/4)
+    name: Tests / exla (${{ matrix.partition }}/6)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,6 +29,8 @@ jobs:
           - { partition: 2, select: "--only ci_partition:2" }
           - { partition: 3, select: "--only ci_partition:3" }
           - { partition: 4, select: "--only ci_partition:4" }
+          - { partition: 5, select: "--only ci_partition:5" }
+          - { partition: 6, select: "--only ci_partition:6" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # mix test starts the emlx application in this job too, and EMLX on Linux needs
