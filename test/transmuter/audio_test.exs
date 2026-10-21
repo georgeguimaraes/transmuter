@@ -157,10 +157,9 @@ defmodule Transmuter.AudioTest do
   # allows 2e-4.
   @speaker Nx.from_binary(File.read!("test/fixtures/speaker_embeddings.f32"), :f32)
   @speech_opts Keyword.delete(@opts, :strategy)
-  @voices [
-    {"Xenova/mms-tts-eng", "Hello, my dog is cute.", "test/fixtures/mms_tts_eng.f32", []},
-    {"Xenova/speecht5_tts", "Hi.", "test/fixtures/speecht5_hi.f32", [speaker_embedding: @speaker]}
-  ]
+  @vits {"Xenova/mms-tts-eng", "Hello, my dog is cute.", "test/fixtures/mms_tts_eng.f32", []}
+  @speecht5 {"Xenova/speecht5_tts", "Hi.", "test/fixtures/speecht5_hi.f32",
+             [speaker_embedding: @speaker]}
 
   # The tokenizer.json of mms-tts-eng has a model without a type, and the one of speecht5_tts
   # has a Precompiled normalizer without a charsmap.
@@ -188,34 +187,42 @@ defmodule Transmuter.AudioTest do
     end
   end
 
-  test "text-to-speech without noise matches transformers" do
-    for {repo, text, path, opts} <- @voices do
-      serving =
-        Transmuter.Audio.text_to_speech({:hf, repo}, [noise: false] ++ opts ++ @speech_opts)
+  test "VITS without noise matches transformers, and the seed decides its audio" do
+    assert_reference_audio(@vits)
+    assert_seeded_audio(@vits)
+  end
 
-      expected = Nx.from_binary(File.read!(path), :f32)
-      assert %{audio: audio, sampling_rate: 16_000} = Nx.Serving.run(serving, text)
-      assert Nx.shape(audio) == Nx.shape(expected), repo
-      difference = audio |> Nx.subtract(expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
-      assert difference < 2.0e-4, "#{repo}: the audio differs by #{difference}"
-    end
+  # The SpeechT5 files are 642 MB, so CI leaves this test out.
+  @tag :large_model
+  test "SpeechT5 without noise matches transformers, and the seed decides its audio" do
+    assert_reference_audio(@speecht5)
+    assert_seeded_audio(@speecht5)
+  end
+
+  defp assert_reference_audio({repo, text, path, opts}) do
+    serving =
+      Transmuter.Audio.text_to_speech({:hf, repo}, [noise: false] ++ opts ++ @speech_opts)
+
+    expected = Nx.from_binary(File.read!(path), :f32)
+    assert %{audio: audio, sampling_rate: 16_000} = Nx.Serving.run(serving, text)
+    assert Nx.shape(audio) == Nx.shape(expected), repo
+    difference = audio |> Nx.subtract(expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+    assert difference < 2.0e-4, "#{repo}: the audio differs by #{difference}"
   end
 
   # The noise of VITS and the dropout of SpeechT5 come from the seed, so there is no
   # reference. The audio of a seed is the same alone and in a list, and its length is near
   # the length without noise.
-  test "the seed of a text decides its audio" do
-    for {repo, text, path, opts} <- @voices do
-      serving = Transmuter.Audio.text_to_speech({:hf, repo}, opts ++ @speech_opts)
-      inputs = [%{text: text, seed: 1}, %{text: text, seed: 2}]
-      results = [one, two] = Nx.Serving.run(serving, inputs)
+  defp assert_seeded_audio({repo, text, path, opts}) do
+    serving = Transmuter.Audio.text_to_speech({:hf, repo}, opts ++ @speech_opts)
+    inputs = [%{text: text, seed: 1}, %{text: text, seed: 2}]
+    results = [one, two] = Nx.Serving.run(serving, inputs)
 
-      assert results == Enum.map(inputs, &Nx.Serving.run(serving, &1))
-      refute one.audio == two.audio
+    assert results == Enum.map(inputs, &Nx.Serving.run(serving, &1))
+    refute one.audio == two.audio
 
-      length = div(File.stat!(path).size, 4)
-      assert Nx.size(one.audio) in div(length, 2)..(length * 2), repo
-    end
+    length = div(File.stat!(path).size, 4)
+    assert Nx.size(one.audio) in div(length, 2)..(length * 2), repo
   end
 
   defp assert_all_close(tensor, expected) do
