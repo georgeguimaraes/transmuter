@@ -33,7 +33,7 @@ defmodule Transmuter.GraphBreaks do
         source: model[:source],
         nodes: nodes,
         last_use: last_use,
-        graph: :erlang.term_to_binary({nodes, last_use, model.opset, model[:compute_type]}),
+        key: make_ref(),
         opts: opts,
         backend: Nx.Defn.to_backend(opts),
         table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
@@ -41,7 +41,11 @@ defmodule Transmuter.GraphBreaks do
         random?: Transmuter.random?(model.nodes)
       }
 
-      {call, graph_break} = Transmuter.with_fold_memo(fn -> call(plan, inputs, static_inputs) end)
+      {call, graph_break} =
+        with_graph(plan, fn ->
+          Transmuter.with_fold_memo(fn -> call(plan, inputs, static_inputs) end)
+        end)
+
       {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
     end)
   end
@@ -63,13 +67,9 @@ defmodule Transmuter.GraphBreaks do
         shapes = input_shapes(inputs)
 
         fast = fn inputs ->
-          if input_shapes(inputs) == shapes do
-            state = initial(plan, inputs, static_inputs)
-            {args, _statics} = live(plan, state, 0)
-            state |> merge(run_compiled(entry, args)) |> outputs(plan)
-          else
-            general(plan, inputs, static_inputs)
-          end
+          if input_shapes(inputs) == shapes,
+            do: whole(plan, entry, inputs, static_inputs),
+            else: general(plan, inputs, static_inputs)
         end
 
         {fast, false}
@@ -79,10 +79,38 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
+  # EMLX traces again in a call whose quantized params it has not compiled.
+  defp whole(plan, entry, inputs, static_inputs) do
+    state = initial(plan, inputs, static_inputs)
+    {args, _statics} = live(plan, state, 0)
+    with_graph(plan, fn -> state |> merge(run_compiled(entry, args)) |> outputs(plan) end)
+  end
+
   defp general(plan, inputs, static_inputs) do
-    Transmuter.with_fold_memo(fn ->
-      plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
+    with_graph(plan, fn ->
+      Transmuter.with_fold_memo(fn ->
+        plan |> run(initial(plan, inputs, static_inputs), 0) |> outputs(plan)
+      end)
     end)
+  end
+
+  # The traces of a call read the plan of the call. The compiled function of a segment keeps
+  # its trace function, and each cached segment has a copy of it, so the trace function
+  # holds only the key of the plan.
+  defp with_graph(plan, fun) do
+    key = {__MODULE__, plan.key}
+
+    if Process.get(key) do
+      fun.()
+    else
+      Process.put(key, plan)
+
+      try do
+        fun.()
+      after
+        Process.delete(key)
+      end
+    end
   end
 
   defp input_shapes(inputs) do
@@ -151,8 +179,8 @@ defmodule Transmuter.GraphBreaks do
     entry =
       :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
         ref = make_ref()
-        graph = plan.graph
-        fun = fn args -> trace(graph, statics, args, pos, ref) end
+        key = plan.key
+        fun = fn args -> trace(key, statics, args, pos, ref) end
         entry = compile_segment(plan, fun, args, pos, ref)
         Process.delete(ref)
         {entry, Map.merge(metadata, %{stop: entry.stop, compiled: entry.compiled != nil})}
@@ -191,12 +219,9 @@ defmodule Transmuter.GraphBreaks do
   defp classify(entry), do: {:break, entry}
 
   # The traced body of a segment. It records where it stopped, which traced values it
-  # returns and which static values it folded, so the caller can resume after it. The
-  # compiled function keeps this closure, and each cached segment has a copy of the
-  # function. So the closure holds the graph as one binary, which all copies share.
-  defp trace(graph, statics, args, pos, ref) do
-    {nodes, last_use, opset, compute_type} = :erlang.binary_to_term(graph)
-    plan = %{nodes: nodes, last_use: last_use, model: %{opset: opset, compute_type: compute_type}}
+  # returns and which static values it folded, so the caller can resume after it.
+  defp trace(key, statics, args, pos, ref) do
+    %{} = plan = Process.get({__MODULE__, key})
     env = Map.merge(statics, decode(args))
     ctx = context(plan, env)
     {env, stop} = run_until_break(plan, env, ctx, pos)
