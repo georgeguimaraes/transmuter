@@ -446,6 +446,43 @@ defmodule TransmuterTest do
     assert_all_close(y, Nx.dot(Nx.tensor([[1.0, 2.0, 3.0, 4.0]]), Nx.as_type(weight, :f32)))
   end
 
+  # A large value that a traced function folds from static values is known, but the device
+  # builds it. A long Loop that carries it runs as a while loop and does not unroll.
+  test "a long Loop over a large folded value runs as a while loop" do
+    int64 = &%TensorProto{name: &1, data_type: 7, dims: &2, raw_data: <<&3::64-signed-native>>}
+
+    body = %GraphProto{
+      name: "body",
+      input: [value("i", [], 7), value("cond_in", [], 9), value("acc", [8192])],
+      output: [value("cond_out", [], 9), value("acc_out", [8192])],
+      node: [
+        node("Identity", ["cond_in"], ["cond_out"]),
+        node("Mul", ["acc", "acc"], ["square"]),
+        node("Add", ["square", "acc"], ["acc_out"])
+      ]
+    }
+
+    graph = %GraphProto{
+      input: [value("x", [4])],
+      output: [value("y")],
+      initializer: [int64.("size", [1], 8192), int64.("trips", [], 64)],
+      node: [
+        node("ConstantOfShape", ["size"], ["zeros"]),
+        node("Loop", ["trips", "", "zeros"], ["acc"],
+          attribute: [%AttributeProto{name: "body", type: :GRAPH, g: body}]
+        ),
+        node("ReduceSum", ["acc"], ["total"], attribute: [int_attribute("keepdims", 0)]),
+        node("Add", ["x", "total"], ["y"])
+      ]
+    }
+
+    model = Transmuter.load!(write_model(graph), backend: @backend)
+    x = Nx.iota({4}, type: :f32, backend: @backend)
+    expr = Nx.Defn.debug_expr(&Transmuter.run(model, &1, &2)).(model.params, %{"x" => x})
+    assert inspect(expr, limit: :infinity) =~ "while"
+    assert_all_close(Transmuter.compile(model, %{"x" => x}, @compiler).(%{"x" => x})["y"], x)
+  end
+
   # EyeLike builds its output from Nx.iota and reads only the shape of its input.
   test "an eager run builds the constants of an operator on the backend of the model" do
     graph = %GraphProto{

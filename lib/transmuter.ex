@@ -689,7 +689,8 @@ defmodule Transmuter do
   # unrolled graph can get too deep to compile. The step returns the next carried
   # values and its outputs, and the outputs of all steps are stacked on a new first
   # axis. Returns nil when the loop is short, is not traced, or needs a static i, for
-  # example to decide a shape. Then the caller unrolls. A while body cannot read outer
+  # example to decide a shape. A traced value that the host knows, such as a large folded
+  # value, is still part of the traced function. Then the caller unrolls. A while body cannot read outer
   # values, so the traced values that the step reads from env go in the loop state:
   # the outer reads of the body and the names in inputs.
   defp while_loop(body, count, carried, env, step, inputs \\ []) do
@@ -701,7 +702,7 @@ defmodule Transmuter do
     values = carried ++ Map.values(captured)
 
     if count > @max_unrolled_steps and Enum.all?(values, &is_struct(&1, Nx.Tensor)) and
-         not Enum.all?(values, &Ops.known?/1) and not random?(body.node) do
+         Enum.any?(values, &match?(%Nx.Tensor{data: %Expr{}}, &1)) and not random?(body.node) do
       {probe, outputs} = step.(Ops.static_tensor(0, :s64), carried, env)
 
       if Enum.map(probe, &Nx.to_template/1) != Enum.map(carried, &Nx.to_template/1),
