@@ -133,16 +133,20 @@ for repo in ["openai/clip-vit-base-patch32", "google/siglip-base-patch16-224"]:
     print(repo, [(p["label"], round(p["score"], 6)) for p in classify(image, candidate_labels=labels)])
 
 # Image-to-text: generate of the original PyTorch models of the Xenova exports, greedy, as
-# Transmuter.Vision.image_to_text/2. The configurations have no max_length, so the text has
-# at most 20 tokens with the start token, the default of GenerationConfig.
+# Transmuter.Vision.image_to_text/2. The configurations have no max_length, so generate
+# gives at most 20 new tokens after the start token (max_length 20 of GenerationConfig plus
+# the start token). The image-to-text pipeline gives 256 new tokens for these models.
 # test/fixtures/handwriting.png and handwriting_long.png are lines of text that Pillow drew
-# with the Caveat font (SIL Open Font License 1.1, github.com/google/fonts).
+# with the Caveat font (SIL Open Font License 1.1, github.com/google/fonts) at size 56.
+# handwriting_long.png has the text "We walked along the river and talked about the garden
+# until the sun went down behind the hills and trees.", so generate stops at the limit of
+# 20 new tokens, before "trees" gets its period and the end token.
 from transformers import VisionEncoderDecoderModel
 
 for repo, path in [("nlpconnect/vit-gpt2-image-captioning", "test/fixtures/cats.png"), ("microsoft/trocr-small-handwritten", "test/fixtures/handwriting.png"), ("microsoft/trocr-small-handwritten", "test/fixtures/handwriting_long.png")]:
     pixel_values = processor(repo)(Image.open(path), return_tensors="pt").pixel_values
     output = VisionEncoderDecoderModel.from_pretrained(repo).generate(pixel_values, do_sample=False, num_beams=1)
-    print(repo, repr(AutoTokenizer.from_pretrained(repo).batch_decode(output, skip_special_tokens=True)[0]))
+    print(repo, path, output.shape[1] - 1, "new tokens", repr(AutoTokenizer.from_pretrained(repo).batch_decode(output, skip_special_tokens=True)[0]))
 
 # Text-to-text: greedy, as Transmuter.Text.text_to_text/2 with strategy: :greedy.
 from transformers import AutoModelForSeq2SeqLM

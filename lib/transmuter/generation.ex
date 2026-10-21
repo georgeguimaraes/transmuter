@@ -42,6 +42,9 @@ defmodule Transmuter.Generation do
   # Buffers have a capacity of a power of two, from this size.
   @min_capacity 256
 
+  # max_length of GenerationConfig in Python transformers.
+  @default_max_length 20
+
   @doc """
   Returns the context of generation for `model`: the cache mode and the settings from `generation_config.json` and `opts`. `given` are the names of other inputs that the caller gives to `generate/5`, such as the outputs of an encoder.
 
@@ -84,11 +87,22 @@ defmodule Transmuter.Generation do
     do: Enum.filter(names, &(&1 == "logits" or String.starts_with?(&1, "present.")))
 
   @doc """
-  Returns the `:max_new_tokens` of a decoder whose `max_length` counts its prompt, such as the decoder of an encoder-decoder model. The value comes from `opts`, from `max_new_tokens` of `generation_config.json`, or from `max_length` minus `prompt_length`. As in Python transformers, `max_length` is `20` when the configuration does not give it.
+  Returns the `:max_new_tokens` of a decoder whose `max_length` counts its prompt, such as the decoder of an encoder-decoder model. The rule is that of `generate` in Python transformers 4:
+
+    1. `:max_new_tokens` of `opts`, else `max_new_tokens` of `generation_config.json`.
+    2. When `max_length` is not in the configuration or is `20`, the default of `GenerationConfig`, `generate` adds the prompt length to it. So the value is 20 new tokens.
+    3. Else `max_length` minus `prompt_length`, such as 448 minus the prompt for Whisper.
+
+  The pipelines of transformers give 256 new tokens in case 2 (`max_new_tokens` of their default configuration).
   """
   def max_new_tokens(repo, opts, prompt_length) do
     gen = repo.generation_config
-    opts[:max_new_tokens] || gen["max_new_tokens"] || (gen["max_length"] || 20) - prompt_length
+
+    cond do
+      max_new_tokens = opts[:max_new_tokens] || gen["max_new_tokens"] -> max_new_tokens
+      gen["max_length"] in [nil, @default_max_length] -> @default_max_length
+      true -> gen["max_length"] - prompt_length
+    end
   end
 
   # The tokens that each step suppresses: suppress_tokens and the bad words of one token.

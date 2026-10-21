@@ -136,7 +136,7 @@ defmodule Transmuter.Vision do
 
   ## Options
 
-    * `:max_new_tokens` - the maximum number of new tokens. The default is `max_new_tokens` of `generation_config.json`, or else `max_length` minus 1 for the start token. When the configuration has no `max_length`, the value is 20, as in Python transformers. So the default for ViT-GPT2 and TrOCR is 19 new tokens.
+    * `:max_new_tokens` - the maximum number of new tokens. The default is that of `generate` in Python transformers (see `Transmuter.Generation.max_new_tokens/3`): `max_new_tokens` of `generation_config.json`, else `max_length` minus 1 for the start token. When `max_length` is not in the configuration or is 20, the default is 20 new tokens. So the default for ViT-GPT2 and TrOCR is 20 new tokens. The `image-to-text` pipeline of transformers gives 256 new tokens for these models.
 
     * `:compile` - `:batch_size`, the number of images that generate together. The default is `1`.
 
