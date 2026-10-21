@@ -12,18 +12,20 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    name: OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}}
+    name: OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}} / ${{matrix.backend}}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { elixir: "1.20", otp: "29" }
-          - { elixir: "1.19", otp: "28" }
-          - { elixir: "1.18", otp: "27" }
+          - { elixir: "1.20", otp: "29", backend: emlx }
+          - { elixir: "1.19", otp: "28", backend: emlx }
+          - { elixir: "1.18", otp: "27", backend: emlx }
+          - { elixir: "1.20", otp: "29", backend: exla }
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # EMLX runs MLX on the CPU on Linux and needs OpenBLAS. apt-get can block on
+      # EMLX runs MLX on the CPU on Linux and needs OpenBLAS. The exla job needs it too,
+      # because mix test starts the emlx application in every job. apt-get can block on
       # the dpkg lock without a timeout, so each call is bounded and retried once.
       - name: Install OpenBLAS (for emlx)
         timeout-minutes: 6
@@ -61,12 +63,14 @@ jobs:
         with:
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
+      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
             _build
+            ~/.cache/xla
           key: ${{ runner.os }}-mix-otp${{ matrix.otp }}-elixir${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
       # The tests download ONNX models from the Hugging Face Hub. Every job restores the
       # newest model cache. Only one job saves it, on main, and only when the set of cached
@@ -94,10 +98,12 @@ jobs:
       # one worker thread, so concurrent tests wait for each other and a small test can time
       # out behind a large one. One test at a time is also faster on the runner.
       - name: Run tests
+        env:
+          TRANSMUTER_TEST_BACKEND: ${{ matrix.backend }}
         run: mix test --exclude large_model --max-cases 1
       - name: List the cached models
         id: model-files
-        if: matrix.otp == '29' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: matrix.otp == '29' && matrix.backend == 'emlx' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           cd ~/.cache/transmuter
           hash=$(find . -type f ! -name '*.part' | sort | sha256sum | cut -c1-16)
