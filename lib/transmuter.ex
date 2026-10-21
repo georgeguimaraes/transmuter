@@ -188,6 +188,8 @@ defmodule Transmuter do
     %{graph | initializer: Enum.map(graph.initializer, &Ops.read_external(&1, dir))}
   end
 
+  defp where(node), do: "#{node.op_type} #{node.name}"
+
   @doc """
   Compiles the model for the shapes and types of `inputs`.
 
@@ -397,11 +399,7 @@ defmodule Transmuter do
   @doc false
   def run_nodes(nodes, env, ctx) do
     Enum.reduce(nodes, env, fn node, env ->
-      inputs =
-        Enum.map(node.input, fn
-          "" -> nil
-          name -> Map.fetch!(env, name)
-        end)
+      inputs = Enum.map(node.input, &input!(env, &1, node))
 
       outputs =
         try do
@@ -431,7 +429,7 @@ defmodule Transmuter do
         rescue
           e in Transmuter.UnknownValueError ->
             reraise %{e | node: e.node || node.name, op_type: e.op_type || node.op_type},
-                    __STACKTRACE__
+                    without_arguments(__STACKTRACE__)
 
           e ->
             shapes =
@@ -445,10 +443,30 @@ defmodule Transmuter do
             message =
               "#{node.op_type} #{node.name} with inputs #{inspect(shapes)}: #{Exception.message(e)}"
 
-            reraise RuntimeError, message, __STACKTRACE__
+            reraise RuntimeError, message, without_arguments(__STACKTRACE__)
         end
 
       Map.merge(env, Map.new(Enum.zip(node.output, outputs)))
+    end)
+  end
+
+  defp input!(_env, "", _node), do: nil
+
+  defp input!(env, name, node) do
+    case env do
+      %{^name => value} -> value
+      %{} -> raise ArgumentError, "#{where(node)} reads #{name}, which no node computes before it"
+    end
+  end
+
+  # The top frame of some errors, such as a function clause error, keeps the arguments of
+  # the call. In a traced function they are expressions, which share their arguments. An
+  # error that leaves a process copies its reason without that sharing, which can take
+  # minutes for a large graph, so the frames keep only the arity.
+  defp without_arguments(stacktrace) do
+    Enum.map(stacktrace, fn
+      {module, fun, args, location} when is_list(args) -> {module, fun, length(args), location}
+      entry -> entry
     end)
   end
 

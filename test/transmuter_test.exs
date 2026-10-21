@@ -360,6 +360,78 @@ defmodule TransmuterTest do
     end
   end
 
+  alias Transmuter.Onnx.{
+    AttributeProto,
+    GraphProto,
+    ModelProto,
+    NodeProto,
+    OperatorSetIdProto,
+    TensorShapeProto,
+    TypeProto,
+    ValueInfoProto
+  }
+
+  # Each Add reads its input twice, so the expression of x16 is a graph with 16 levels and
+  # 2^16 paths. An error that kept it would copy all paths when it leaves the process.
+  test "an error in a traced node keeps no traced values" do
+    adds = for i <- 0..15, do: node("Add", ["x#{i}", "x#{i}"], ["x#{i + 1}"])
+
+    graph = %GraphProto{
+      input: [value("x0", [4])],
+      output: [value("y")],
+      node: adds ++ [node("Cast", ["x16", "x16"], ["y"], attribute: [int_attribute("to", 1)])]
+    }
+
+    model = Transmuter.load!(write_model(graph), backend: @backend)
+    inputs = %{"x0" => Nx.iota({4}, type: :f32, backend: @backend)}
+
+    {error, stacktrace} =
+      try do
+        Transmuter.compile(model, inputs, @compiler)
+      rescue
+        e -> {e, __STACKTRACE__}
+      end
+
+    assert %RuntimeError{message: "Cast " <> _} = error
+    assert :erts_debug.flat_size({error, stacktrace}) < 10_000
+  end
+
+  defp node(op_type, input, output, opts \\ []) do
+    struct!(
+      %NodeProto{op_type: op_type, name: String.downcase(op_type), input: input, output: output},
+      opts
+    )
+  end
+
+  defp int_attribute(name, value), do: %AttributeProto{name: name, type: :INT, i: value}
+
+  defp value(name, dims \\ nil, elem_type \\ 1) do
+    shape =
+      dims &&
+        %TensorShapeProto{
+          dim: Enum.map(dims, &%TensorShapeProto.Dimension{value: {:dim_value, &1}})
+        }
+
+    type = %TypeProto{
+      value: {:tensor_type, %TypeProto.Tensor{elem_type: elem_type, shape: shape}}
+    }
+
+    %ValueInfoProto{name: name, type: type}
+  end
+
+  defp write_model(graph) do
+    model = %ModelProto{
+      ir_version: 10,
+      opset_import: [%OperatorSetIdProto{domain: "", version: 17}],
+      graph: %{graph | name: "g"}
+    }
+
+    path = Path.join(System.tmp_dir!(), "transmuter_#{System.unique_integer([:positive])}.onnx")
+    {iodata, _size} = Protox.encode!(model)
+    File.write!(path, iodata)
+    path
+  end
+
   defp load(repo, file, opts \\ []) do
     Transmuter.load!({:hf, repo, file}, [backend: @backend] ++ opts)
   end
