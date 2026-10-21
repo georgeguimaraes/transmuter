@@ -263,6 +263,33 @@ defmodule TransmuterTest do
     assert different?(a, b)
   end
 
+  test "a model without noise gives fixed values" do
+    f32 = &Nx.tensor(&1, type: :f32, backend: @backend)
+
+    for {name, inputs, expected} <- [
+          {"RandomNormal_mean_scale", %{}, &Nx.broadcast(2.0, &1)},
+          {"RandomNormalLike", %{"x" => f32.([[0.5, 2.0]])}, fn _ -> [[-1.0, -1.0]] end},
+          {"RandomUniform_low_high", %{}, &Nx.broadcast(4.0, &1)},
+          {"RandomUniformLike_dtype", %{"x" => Nx.tensor([[3, 7]], type: :s32)},
+           fn _ -> [[1.0, 1.0]] end},
+          {"Bernoulli", %{"p" => f32.([0.0, 0.3, 1.0])}, fn _ -> [0.0, 1.0, 1.0] end},
+          {"Multinomial", %{"x" => f32.([[0.1, 2.0, -1.0]])}, &Nx.broadcast(1, &1)}
+        ] do
+      path = Path.expand("fixtures/ops/#{name}/model.onnx", __DIR__)
+      model = Transmuter.load!(path, backend: @backend, noise: false)
+      inputs = Map.new(inputs, fn {k, t} -> {k, Nx.backend_transfer(t, @backend)} end)
+
+      for y <- [
+            Transmuter.run(model, model.params, inputs)["y"],
+            Transmuter.compile(model, inputs, @compiler).(inputs)["y"]
+          ] do
+        y = Nx.backend_copy(y, Nx.BinaryBackend)
+        expected = Nx.tensor(expected.(Nx.shape(y)), type: Nx.type(y))
+        assert y == expected, "#{name} gave #{inspect(y)}"
+      end
+    end
+  end
+
   defp load_fixture(name) do
     Transmuter.load!(Path.expand("fixtures/ops/#{name}/model.onnx", __DIR__), backend: @backend)
   end

@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Random do
   @moduledoc """
-  Random operators on Nx.Random. Each run has one key, and each node folds a hash of its first output name into it, so nodes draw independent streams. A node with a seed draws the same values on every run. Values cannot match ONNX Runtime, whose generator differs.
+  Random operators on Nx.Random. Each run has one key, and each node folds a hash of its first output name into it, so nodes draw independent streams. A node with a seed draws the same values on every run. Values cannot match ONNX Runtime, whose generator differs. A model without noise has no key, and each node gives a fixed value (see the `:noise` option of `Transmuter.load!/2`).
   """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, dtype: 1]
@@ -11,6 +11,8 @@ defmodule Transmuter.Ops.Random do
   def op_types, do: @op_types
 
   @doc false
+  def apply(node, inputs, nil), do: [fixed(node, inputs)]
+
   def apply(node, inputs, key) do
     key =
       case attr(node, "seed") do
@@ -22,13 +24,13 @@ defmodule Transmuter.Ops.Random do
   end
 
   defp op(node = %{op_type: "RandomNormal"}, [], key),
-    do: normal(node, key, List.to_tuple(attr(node, "shape")), dtype(attr(node, "dtype", 1)))
+    do: normal(node, key, shape(node), dtype(attr(node, "dtype", 1)))
 
   defp op(node = %{op_type: "RandomNormalLike"}, [x], key),
     do: normal(node, key, Nx.shape(x), like_type(node, x))
 
   defp op(node = %{op_type: "RandomUniform"}, [], key),
-    do: uniform(node, key, List.to_tuple(attr(node, "shape")), dtype(attr(node, "dtype", 1)))
+    do: uniform(node, key, shape(node), dtype(attr(node, "dtype", 1)))
 
   defp op(node = %{op_type: "RandomUniformLike"}, [x], key),
     do: uniform(node, key, Nx.shape(x), like_type(node, x))
@@ -54,6 +56,34 @@ defmodule Transmuter.Ops.Random do
     |> Nx.argmax(axis: 2)
     |> Nx.as_type(dtype(attr(node, "dtype", 6)))
   end
+
+  # The values of a model without noise, see the :noise option of Transmuter.load!/2.
+  defp fixed(node = %{op_type: "RandomNormal"}, []),
+    do: fill(attr(node, "mean", 0.0), shape(node), dtype(attr(node, "dtype", 1)))
+
+  defp fixed(node = %{op_type: "RandomNormalLike"}, [x]),
+    do: fill(attr(node, "mean", 0.0), Nx.shape(x), like_type(node, x))
+
+  defp fixed(node = %{op_type: "RandomUniform"}, []),
+    do: fill(attr(node, "high", 1.0), shape(node), dtype(attr(node, "dtype", 1)))
+
+  defp fixed(node = %{op_type: "RandomUniformLike"}, [x]),
+    do: fill(attr(node, "high", 1.0), Nx.shape(x), like_type(node, x))
+
+  defp fixed(node = %{op_type: "Bernoulli"}, [p]),
+    do: p |> Nx.greater(0) |> Nx.as_type(like_type(node, p))
+
+  defp fixed(node = %{op_type: "Multinomial"}, [x]) do
+    {batch, _classes} = Nx.shape(x)
+
+    x
+    |> Nx.argmax(axis: 1, keep_axis: true)
+    |> Nx.broadcast({batch, attr(node, "sample_size", 1)})
+    |> Nx.as_type(dtype(attr(node, "dtype", 6)))
+  end
+
+  defp shape(node), do: List.to_tuple(attr(node, "shape"))
+  defp fill(value, shape, type), do: Nx.broadcast(Nx.tensor(value, type: type), shape)
 
   defp normal(node, key, shape, type) do
     mean = attr(node, "mean", 0.0)

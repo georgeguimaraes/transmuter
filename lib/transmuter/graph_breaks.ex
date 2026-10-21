@@ -40,7 +40,7 @@ defmodule Transmuter.GraphBreaks do
         backend: Nx.Defn.to_backend(opts),
         table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
         scope: Shared.scope(),
-        random?: Transmuter.random?(model.nodes)
+        random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
       }
 
       {call, graph_break} =

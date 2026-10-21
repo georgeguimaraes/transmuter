@@ -70,6 +70,15 @@ defmodule Transmuter do
       default is `false`, which folds float initializers with up to 16 elements
       as constants.
 
+    * `:noise` (`t:boolean/0`) - when `false`, the random operators give fixed
+      values, so each run gives the same outputs. RandomNormal and
+      RandomNormalLike give their mean. RandomUniform and RandomUniformLike give
+      their upper bound, so a dropout that keeps the values where the draw is
+      greater than the ratio keeps all values. Bernoulli gives 1 where the
+      probability is more than 0. Multinomial gives the class with the largest
+      logit. Use it to compare a model with a reference that has no noise. The
+      default is `true`.
+
   Returns a map with:
 
     * `:params` - the weights, on the `:backend` when it is given
@@ -77,6 +86,7 @@ defmodule Transmuter do
     * `:inputs` - the names of the graph inputs
     * `:outputs` - the names of the graph outputs
     * `:source` - the source, which `Transmuter.Telemetry` events give as metadata
+    * `:noise` - the `:noise` option. Put `false` in a loaded model to give fixed values in place of random draws
 
   ## Examples
 
@@ -151,6 +161,7 @@ defmodule Transmuter do
       params: Map.new(params),
       backend: opts[:backend],
       compute_type: compute_type,
+      noise: Keyword.get(opts, :noise, true),
       inputs: inputs,
       input_types: Map.new(graph_inputs, &{&1.name, value_type(&1)}),
       outputs: Enum.map(graph.output, & &1.name),
@@ -295,7 +306,7 @@ defmodule Transmuter do
   Random operators draw from the `Nx.Random` key in the `"#{@random_key}"` input.
   Without it, each call makes a new key. A function that you compile yourself makes
   the key when it is traced, so it gives the same values on every call unless you
-  pass the key.
+  pass the key. A model with `noise: false` (see `load!/2`) gives fixed values.
 
   ## Examples
 
@@ -328,7 +339,9 @@ defmodule Transmuter do
   end
 
   defp run_graph(model, params, inputs, static_inputs) do
-    {key, inputs} = Map.pop_lazy(inputs, @random_key, &random_key/0)
+    # Without noise, the random operators get no key and give fixed values.
+    {key, inputs} = Map.pop(inputs, @random_key)
+    key = if Map.get(model, :noise, true), do: key || random_key()
 
     ctx = %{
       opset: model.opset,
