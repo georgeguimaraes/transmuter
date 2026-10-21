@@ -371,6 +371,29 @@ defmodule TransmuterTest do
     ValueInfoProto
   }
 
+  # ONNX Runtime rejects this graph too: "Subgraph output (y) is an outer scope value".
+  # The merged fp16 decoders of some Xenova exports have such If branches.
+  test "a subgraph output that no node of the subgraph computes fails at load" do
+    branch = %GraphProto{name: "then", node: [node("Neg", ["x"], ["z"])], output: [value("y")]}
+
+    graph = %GraphProto{
+      input: [value("x", [4]), value("flag", [1], 9)],
+      output: [value("y")],
+      node: [
+        node("If", ["flag"], ["y"],
+          attribute: [
+            %AttributeProto{name: "then_branch", type: :GRAPH, g: branch},
+            %AttributeProto{name: "else_branch", type: :GRAPH, g: branch}
+          ]
+        )
+      ]
+    }
+
+    assert_raise ArgumentError, ~r/then_branch of If if gives the outputs y, which no node/, fn ->
+      graph |> write_model() |> Transmuter.load!()
+    end
+  end
+
   # Each Add reads its input twice, so the expression of x16 is a graph with 16 levels and
   # 2^16 paths. An error that kept it would copy all paths when it leaves the process.
   test "an error in a traced node keeps no traced values" do

@@ -93,7 +93,7 @@ defmodule Transmuter.Vision do
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.
 
-  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the `VisionEncoderDecoderModel` exports of Xenova, such as `Xenova/vit-gpt2-image-captioning` and `Xenova/trocr-small-handwritten`. The default variant is fp32. The encoder reads `pixel_values` from `Transmuter.Featurizer`. The decoder starts from `decoder_start_token_id` and reads the output of the encoder in each step.
+  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the `VisionEncoderDecoderModel` exports of Xenova, such as `Xenova/vit-gpt2-image-captioning` and `Xenova/trocr-small-handwritten`. The default variant is fp32. The fp16 decoder of `Xenova/vit-gpt2-image-captioning` is broken: its `If` branches give outputs that no node of the branch computes. ONNX Runtime also rejects it, and `Transmuter.load!/2` raises an `ArgumentError`. Use the fp32 or q8 files of that repository. The encoder reads `pixel_values` from `Transmuter.Featurizer`. The decoder starts from `decoder_start_token_id` and reads the output of the encoder in each step.
 
       serving = Transmuter.Vision.image_to_text({:hf, "Xenova/vit-gpt2-image-captioning"})
       Nx.Serving.run(serving, image)

@@ -128,6 +128,7 @@ defmodule Transmuter do
       Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
 
     graph = inline_external(model.graph, dir)
+    check_outputs!(graph, "the graph")
 
     graph =
       if Keyword.get(opts, :fuse, true), do: Transmuter.Fusion.graph(graph, opset), else: graph
@@ -172,8 +173,9 @@ defmodule Transmuter do
               a
               | t: a.t && Ops.read_external(a.t, dir),
                 tensors: Enum.map(a.tensors, &Ops.read_external(&1, dir)),
-                g: a.g && inline_subgraph(a.g, dir),
-                graphs: Enum.map(a.graphs, &inline_subgraph(&1, dir))
+                g: a.g && inline_subgraph(a.g, dir, "the #{a.name} of #{where(node)}"),
+                graphs:
+                  Enum.map(a.graphs, &inline_subgraph(&1, dir, "the #{a.name} of #{where(node)}"))
             }
           end)
 
@@ -183,9 +185,29 @@ defmodule Transmuter do
     %{graph | node: node}
   end
 
-  defp inline_subgraph(graph, dir) do
+  defp inline_subgraph(graph, dir, where) do
     graph = inline_external(graph, dir)
+    check_outputs!(graph, where)
     %{graph | initializer: Enum.map(graph.initializer, &Ops.read_external(&1, dir))}
+  end
+
+  # Each output of a graph is a value of the graph: an input, an initializer or the output
+  # of one of its nodes. ONNX Runtime also rejects a subgraph whose output is an outer
+  # value, such as the merged fp16 decoders whose If branches name the graph outputs.
+  defp check_outputs!(graph, where) do
+    local =
+      Enum.map(graph.input, & &1.name) ++
+        Enum.map(graph.initializer, & &1.name) ++ Enum.flat_map(graph.node, & &1.output)
+
+    case Enum.map(graph.output, & &1.name) -- local do
+      [] ->
+        :ok
+
+      missing ->
+        raise ArgumentError,
+              "#{where} gives the outputs #{Enum.join(missing, ", ")}, which no node of it computes. " <>
+                "ONNX Runtime also rejects this model"
+    end
   end
 
   defp where(node), do: "#{node.op_type} #{node.name}"
