@@ -15,7 +15,7 @@ defmodule Transmuter.Vision do
 
   All tasks take these options:
 
-    * `:compile` - `:batch_size`. The default is `1`. The serving compiles the model for one image size, from `preprocessor_config.json`.
+    * `:compile` - `:batch_size`. The default is `1`. The serving compiles the model for the image size of `preprocessor_config.json`. When the size depends on the image, such as with `shortest_edge` and no crop, the batch size must be 1. The serving then runs each image alone, and the model compiles each new image size on its first call.
 
     * `:defn_options` - options of `Transmuter.compile/3`, such as `compiler: EMLX`.
 
@@ -87,6 +87,39 @@ defmodule Transmuter.Vision do
   """
   defdelegate zero_shot_image_classification(source, labels, opts \\ []),
     to: Transmuter.Vision.ZeroShotImageClassification
+
+  @doc """
+  Builds a serving that finds objects in images, with a DETR, YOLOS, RT-DETR or RF-DETR model.
+
+  The input is an image or a list of images. The result is `%{detections: [%{label: label, score: score, box: box}]}`. A box is `%{xmin: x, ymin: y, xmax: x, ymax: y}`, in pixels of the input image. The coordinates are floats. They can be a little outside the image, as in Python transformers. The pipeline of Python transformers truncates them to integers.
+
+      serving = Transmuter.Vision.object_detection({:hf, "Xenova/detr-resnet-50"})
+      Nx.Serving.run(serving, image)
+      #=> %{detections: [%{label: "remote", score: 0.997, box: %{xmin: 19.9, ymin: 35.1, xmax: 87.3, ymax: 59.2}}, ...]}
+
+  The labels come from `id2label` in `config.json`. The scores and the boxes are those of `post_process_object_detection` of Python transformers, and `model_type` in `config.json` selects the method:
+
+    * `"detr"` and `"yolos"` - each query gives the class with the highest softmax score. The last class is "no object", and the softmax does not give it. The detections are in the order of the queries.
+
+    * `"rt_detr"`, `"rt_detr_v2"` and `"rf_detr"` - each pair of a query and a class gets a sigmoid score. The `:top_k` pairs with the highest scores are the detections, from the highest score.
+
+  DETR and YOLOS resize the short side of the image to `shortest_edge` and keep the aspect ratio, so the size of the pixel values depends on the image. Then each image is a batch of its own, and the model compiles each new size on its first call. YOLOS also rounds each side down to a multiple of 16, as in Python transformers. The DETR exports of Xenova take a pixel mask of 64x64. The serving gives a mask of ones, because the images of a batch are not padded.
+
+  The RF-DETR exports of onnx-community, such as `onnx-community/rfdetr_nano-ONNX`, set `do_normalize` to `false` in `preprocessor_config.json`, but their graphs do not normalize the pixels. The serving normalizes the pixels of RF-DETR with `image_mean` and `image_std`, as the RF-DETR models of Python transformers do.
+
+  The default variant is fp32, which gives the scores of the PyTorch models. The q8 files quantize the activations when the model runs, so their scores can be different in each runtime. See [Backends and performance](guides/backends_and_performance.md).
+
+  ## Options
+
+    * `:threshold` - the minimum score of a detection. A detection has a higher score than the threshold. The default is `0.5`, as in Python transformers.
+
+    * `:top_k` - the number of pairs of a query and a class that RT-DETR and RF-DETR keep before the threshold. The default is the number of queries, as in Python transformers. DETR and YOLOS do not use this option.
+
+    * `:compile` - `:batch_size`. The default is `1`. When the size of the images depends on the image, as with DETR and YOLOS, the batch size must be `1`.
+
+  See the module documentation for the other options.
+  """
+  defdelegate object_detection(source, opts \\ []), to: Transmuter.Vision.ObjectDetection
 
   @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.

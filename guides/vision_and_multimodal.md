@@ -157,7 +157,9 @@ depth = run.(%{"pixel_values" => pixel_values})["predicted_depth"]
 
 ## Object detection with RF-DETR
 
-[RF-DETR](https://huggingface.co/onnx-community/rfdetr_nano-ONNX) is a real-time object detector. Its export takes a `pixel_values` tensor of shape `{batch, 3, 544, 544}` and returns 300 proposals per image:
+[RF-DETR](https://huggingface.co/onnx-community/rfdetr_nano-ONNX) is a real-time object detector. `Transmuter.Vision.object_detection/2` runs it as a serving, with the image processor and the scores and boxes of Python transformers. See the [Pipelines guide](pipelines.md).
+
+Its export takes a `pixel_values` tensor of shape `{batch, 3, height, width}` and returns 300 proposals per image. The image processor resizes to 384x384. The graph does not normalize the pixels, so normalize them with the ImageNet mean and std, although `preprocessor_config.json` sets `do_normalize` to `false`:
 
 ```elixir
 model = Transmuter.load!(
@@ -165,7 +167,6 @@ model = Transmuter.load!(
   backend: EMLX.Backend
 )
 
-# Input must be {batch, 3, 544, 544}: the Swin window requires an even patch count.
 run = Transmuter.compile(model, %{"pixel_values" => pixel_values}, compiler: EMLX)
 outputs = run.(%{"pixel_values" => pixel_values})
 pred_boxes = outputs["pred_boxes"]  # {batch, 300, 4}, normalized cx/cy/w/h

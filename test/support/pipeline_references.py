@@ -1,8 +1,8 @@
 """Prints the reference values of test/transmuter/text_test.exs, test/transmuter/vision_test.exs and test/transmuter/audio_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision --with timm python -I test/support/pipeline_references.py
 
-Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The processor of Qwen2-VL loads a video processor, which needs torchvision.
+Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The processor of Qwen2-VL loads a video processor, which needs torchvision. DETR needs timm.
 """
 
 from sentence_transformers import SentenceTransformer
@@ -317,6 +317,24 @@ for name, (images, messages) in chats.items():
         position_ids = np.full((3, 1, 1), length + delta, np.int64)
         length += 1
     print("qwen2-vl onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
+# Object detection: the slow image processor, the PyTorch model and
+# post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
+# truncates the boxes to integers, so the script prints the boxes before that. DETR uses
+# the ResNet-50 of timm. The reference of RF-DETR is in test/support/rf_detr_reference.py,
+# because only transformers 5 has RF-DETR.
+from transformers import AutoModelForObjectDetection
+
+image = Image.open("test/fixtures/cats.png")
+for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
+    processor = AutoImageProcessor.from_pretrained(repo, use_fast=False)
+    model = AutoModelForObjectDetection.from_pretrained(repo)
+    for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
+        inputs = processor(picture, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        result = processor.post_process_object_detection(outputs, threshold=0.5, target_sizes=[(picture.height, picture.width)])[0]
+        print(repo, name, tuple(inputs["pixel_values"].shape), [(model.config.id2label[int(label)], round(float(score), 6), [round(float(x), 4) for x in box]) for score, label, box in zip(result["scores"], result["labels"], result["boxes"])])
 
 # The resized sizes of DETR and YOLOS. A long side over longest_edge gives the short side
 # longest_edge times the aspect ratio, rounded half to even: 1333 * 400 / 800 is 666.5.

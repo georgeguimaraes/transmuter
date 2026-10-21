@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR) and `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL). `Transmuter.Audio.speech_to_text/2` runs Whisper. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL) and `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR). `Transmuter.Audio.speech_to_text/2` runs Whisper. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 

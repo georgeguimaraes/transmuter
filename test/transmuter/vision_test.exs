@@ -330,6 +330,127 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The references of DETR and YOLOS are the PyTorch models with
+  # post_process_object_detection of transformers 4, see test/support/pipeline_references.py.
+  # The reference of RF-DETR is the PyTorch model of transformers 5, see
+  # test/support/rf_detr_reference.py. DETR and YOLOS give the detections in the order of the
+  # queries, and RF-DETR from the highest score.
+  test "object detection matches post_process_object_detection of transformers" do
+    for {repo, wide, tall} <- [
+          {"Xenova/detr-resnet-50",
+           [
+             {"remote", 0.997378, [19.8952, 35.1192, 87.331, 59.1798]},
+             {"remote", 0.995471, [166.5936, 35.2691, 184.6295, 94.831]},
+             {"couch", 0.995002, [-0.0737, -0.0021, 319.921, 239.9825]},
+             {"cat", 0.996962, [6.5825, 25.1499, 156.9784, 236.0207]},
+             {"cat", 0.997858, [172.6578, 12.0069, 320.4138, 184.9281]}
+           ],
+           [
+             {"remote", 0.981368, [39.0159, 165.7224, 97.1045, 185.2333]},
+             {"remote", 0.996639, [35.4754, 19.0578, 58.4294, 88.7652]},
+             {"cat", 0.997509, [8.6708, 172.2435, 185.811, 320.2794]},
+             {"cat", 0.994645, [26.4559, 5.6095, 237.1201, 156.2772]},
+             {"couch", 0.993239, [-0.0561, 0.1082, 239.9409, 320.1053]}
+           ]},
+          {"Xenova/yolos-tiny",
+           [
+             {"remote", 0.847386, [24.1551, 36.6842, 89.2268, 59.8285]},
+             {"remote", 0.945534, [168.4989, 39.3963, 185.3595, 96.2932]},
+             {"cat", 0.974007, [6.1349, 26.4885, 155.0585, 235.7913]},
+             {"bed", 0.679433, [0.0896, 0.0021, 320.0895, 239.8154]},
+             {"remote", 0.990069, [20.9094, 36.1831, 87.784, 59.9306]},
+             {"cat", 0.886771, [167.2931, 0.238, 319.4196, 184.5449]}
+           ],
+           [
+             {"cat", 0.985624, [29.0007, 4.5455, 236.0907, 156.2661]},
+             {"bed", 0.97155, [0.1085, 0.1047, 239.9882, 319.8357]},
+             {"remote", 0.998535, [35.7993, 20.1866, 59.2976, 92.7396]},
+             {"remote", 0.989537, [37.5054, 168.2169, 96.157, 186.4062]},
+             {"cat", 0.996023, [12.7713, 172.1163, 185.2852, 319.4268]}
+           ]},
+          {"onnx-community/rfdetr_nano-ONNX",
+           [
+             {"cat", 0.962052, [7.2289, 27.1561, 158.3699, 236.7962]},
+             {"cat", 0.948672, [173.543, 12.8385, 319.5366, 186.8357]},
+             {"remote", 0.910824, [167.0068, 38.483, 185.5564, 93.4559]},
+             {"remote", 0.881908, [19.8815, 36.7721, 87.671, 59.1429]},
+             {"couch", 0.659234, [-0.2202, -0.1711, 320.8276, 239.657]}
+           ],
+           [
+             {"cat", 0.948363, [12.6889, 172.1027, 185.9526, 319.9852]},
+             {"cat", 0.944986, [27.1592, 7.6413, 236.8518, 160.4658]},
+             {"remote", 0.874704, [36.6841, 19.3162, 58.9057, 88.8499]},
+             {"remote", 0.662767, [38.3403, 167.271, 94.4649, 185.7012]}
+           ]}
+        ] do
+      serving = Vision.object_detection({:hf, repo}, @opts)
+      tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+      # A tensor and a StbImage give the same result.
+      [image, tensor, tall_result] =
+        Nx.Serving.run(serving, [@image, StbImage.to_nx(@image), tall_image])
+
+      assert image == tensor
+      assert_detections(repo, image, wide)
+      assert_detections(repo, tall_result, tall)
+    end
+  end
+
+  # The serving compiles the size of a 640x480 image when it starts, which is also the size of
+  # the wide image. The tall image compiles on its first call, and its second call finds it.
+  test "object detection compiles each image size once" do
+    serving = Vision.object_detection({:hf, "Xenova/yolos-tiny"}, @opts)
+    name = :"detection_#{System.unique_integer([:positive])}"
+    start_supervised!({Nx.Serving, serving: serving, name: name})
+
+    test_pid = self()
+    handler = "detection-#{inspect(test_pid)}"
+
+    :telemetry.attach(handler, [:transmuter, :cache, :miss], &__MODULE__.forward_miss/4, test_pid)
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+    images = [@image, tall, @image, tall]
+    results = Nx.Serving.batched_run(name, images)
+    misses = receive_misses()
+    :telemetry.detach(handler)
+
+    assert Enum.uniq(misses) == misses
+
+    pixels =
+      for {0, shapes} <- misses, {"pixel_values", {shape, _type}} <- shapes, do: shape
+
+    assert pixels == [{1, 3, 672, 512}]
+    assert results == Nx.Serving.run(serving, images)
+  end
+
+  def forward_miss(_event, _measurements, metadata, pid) do
+    if match?({:hf, "Xenova/yolos-tiny", _file}, metadata.source),
+      do: send(pid, {:miss, metadata.position, metadata.shapes})
+  end
+
+  defp receive_misses do
+    receive do
+      {:miss, position, shapes} -> [{position, shapes} | receive_misses()]
+    after
+      0 -> []
+    end
+  end
+
+  # Box coordinates can be near 0, so their tolerance is 1e-3 of the side of the image, 0.32
+  # pixels. Scores have a tolerance of 1e-3 relative.
+  defp assert_detections(repo, %{detections: detections}, expected) do
+    assert Enum.map(detections, & &1.label) == Enum.map(expected, &elem(&1, 0)), repo
+
+    for {detection, {_label, score, box}} <- Enum.zip(detections, expected) do
+      assert_in_delta detection.score, score, 1.0e-3 * score, repo
+      %{xmin: xmin, ymin: ymin, xmax: xmax, ymax: ymax} = detection.box
+
+      for {g, e} <- Enum.zip([xmin, ymin, xmax, ymax], box),
+          do: assert_in_delta(g, e, 0.32, "#{repo}: #{inspect(detection)}")
+    end
+  end
+
   defp assert_predictions(%{predictions: predictions}, expected) do
     assert Enum.map(predictions, & &1.label) == Enum.map(expected, &elem(&1, 0))
 

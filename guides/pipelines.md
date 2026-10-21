@@ -243,8 +243,9 @@ image = StbImage.read_file!("cats.jpg")
 | `zero_shot_image_classification/3` | image | `%{predictions: [%{label: label, score: score}]}` |
 | `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
 | `image_text_to_text/2` | `%{messages: messages}` with image parts | `%{results: [%{text: text, token_summary: summary}]}` |
+| `object_detection/2` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of `generate` in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of `generate` in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels.
 
 ### Image preprocessing
 
@@ -252,7 +253,7 @@ Each function also takes a list of images and then gives a list of results. The 
 
 The resize gives the same pixels as Pillow, for all `resample` filters of Pillow. With the hamming filter, a small number of pixels can differ by 1. The scores of a model change when the pixels change, so this match is important. The serving resizes on the `:backend` of the task, because the resize is slow on `Nx.BinaryBackend`.
 
-The serving compiles the model for one image size, which comes from `size` or `crop_size` in `preprocessor_config.json`. The serving raises an error when the size depends on the image, for example with `shortest_edge` and no crop.
+The serving compiles the model for one image size, which comes from `size` or `crop_size` in `preprocessor_config.json`. When the size depends on the image, for example with `shortest_edge` and no crop, the serving runs each image alone, and the model compiles each new image size on its first call. Then the batch size must be 1. `image_to_text/2` raises an error for these sizes.
 
 ### Image classification
 
@@ -295,6 +296,20 @@ Nx.Serving.run(serving, image)
 ```
 
 The serving runs encoder-decoder exports of `VisionEncoderDecoderModel`, such as ViT-GPT2 for captions and TrOCR for handwritten text. The encoder reads the image once, and the decoder generates the text. The settings come from `generation_config.json`, so ViT-GPT2 and TrOCR use greedy selection. When the configuration has no `max_length`, the text has at most 20 tokens with the start token, as in Python transformers. Use `:max_new_tokens` to change this limit. The serving takes the options of generation, such as `:compile`, `:stream` and `:strategy`.
+
+### Object detection
+
+```elixir
+serving = Transmuter.Vision.object_detection({:hf, "Xenova/detr-resnet-50"})
+Nx.Serving.run(serving, image)
+#=> %{detections: [%{label: "remote", score: 0.997, box: %{xmin: 19.9, ymin: 35.1, xmax: 87.3, ymax: 59.2}}, ...]}
+```
+
+The serving runs DETR, YOLOS, RT-DETR and RF-DETR exports, such as `Xenova/detr-resnet-50`, `Xenova/yolos-tiny` and `onnx-community/rfdetr_nano-ONNX`. The boxes are floats in pixels of the input image. The pipeline of Python transformers truncates them to integers. The serving keeps the detections with a score higher than `threshold`. The default threshold is 0.5, as in Python transformers.
+
+`model_type` in `config.json` selects the scores. DETR and YOLOS take the softmax over the classes, without the last class, which is "no object". Each query gives one detection, in the order of the queries. RT-DETR and RF-DETR take a sigmoid of each pair of a query and a class, and keep the `:top_k` pairs with the highest scores. The default `:top_k` is the number of queries.
+
+DETR and YOLOS resize the short side to `shortest_edge`, so each image has its own size. The serving runs each image alone, and the model compiles each new image size on its first call. Use `batch_size: 1` with these models. RF-DETR resizes each image to 384x384, so its images go into batches.
 
 ### Image-text-to-text
 
