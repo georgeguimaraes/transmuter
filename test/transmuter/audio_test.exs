@@ -150,6 +150,32 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  # The tokenizer.json of mms-tts-eng has a model without a type, and the one of speecht5_tts
+  # has a Precompiled normalizer without a charsmap.
+  test "the tokenizers of the speech exports give the ids of transformers" do
+    text = "Hello World! It's 3 o'clock, café? ÀB_x–y"
+
+    for {repo, expected} <- [
+          {"Xenova/mms-tts-eng",
+           [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0, 19, 0, 9, 0, 22, 0, 25, 0, 21, 0, 5, 0, 19, 0, 18] ++
+             [0, 33, 0, 1, 0, 8, 0, 19, 0, 11, 0, 19, 0, 22, 0, 1, 0, 12, 0, 21, 0, 22, 0, 12, 0] ++
+             [0, 0, 19, 0, 12, 0, 26, 0, 20, 0, 19, 0, 24, 0, 30, 0, 31, 0, 10, 0, 3, 0]},
+          {"Xenova/speecht5_tts",
+           [4, 35, 5, 15, 15, 8, 4, 38, 8, 13, 15, 14, 44, 4, 30, 6, 31, 12, 4, 3, 4, 8, 31, 17] ++
+             [15, 8, 17, 28, 23, 4, 17, 7, 19, 73, 41, 4, 3, 40, 3, 37, 3, 22, 2]}
+        ] do
+      tokenizer = Transmuter.Tokenizer.load!({:hf, repo})
+      {%{"input_ids" => ids}, _encodings} = Transmuter.Tokenizer.encode(tokenizer, [text])
+      assert Nx.to_flat_list(ids) == expected, repo
+    end
+
+    tokenizer = Transmuter.Tokenizer.load!({:hf, "Xenova/mms-tts-eng"})
+
+    assert_raise ArgumentError, ~r/gives no tokens/, fn ->
+      Transmuter.Tokenizer.encode(tokenizer, ["🙂"])
+    end
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 

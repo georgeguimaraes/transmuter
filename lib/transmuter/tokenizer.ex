@@ -62,7 +62,20 @@ defmodule Transmuter.Tokenizer do
           |> Tokenizer.from_buffer()
 
         :error ->
-          Tokenizer.from_file(path)
+          json = File.read!(path)
+
+          # The tokenizers library panics on a null charsmap, so these files do not go to it.
+          with false <- Regex.match?(~r/"precompiled_charsmap"\s*:\s*null/, json),
+               {:ok, native} <- Tokenizer.from_buffer(json) do
+            {:ok, native}
+          else
+            _unreadable ->
+              json
+              |> JSON.decode!()
+              |> readable(repo)
+              |> JSON.encode!()
+              |> Tokenizer.from_buffer()
+          end
       end
 
     # Exports often save a fixed padding in tokenizer.json, and encode/3 pads on its own.
@@ -136,6 +149,30 @@ defmodule Transmuter.Tokenizer do
       "precompiled_charsmap" => Base.encode64(charsmap)
     })
   end
+
+  # Some tokenizer.json files of transformers.js exports are not readable by the tokenizers
+  # library. A model without a type, such as the characters of VITS, is a vocabulary of whole
+  # tokens with the unknown token of the tokenizer in transformers.js, and the library needs
+  # the type and the unknown token. A Precompiled normalizer without a charsmap, such as in
+  # SpeechT5, changes no character in Python, and the library panics on it.
+  defp readable(json, repo) do
+    json
+    |> Map.update!("model", &typed_model(&1, repo))
+    |> Map.update("normalizer", nil, &charsmap/1)
+  end
+
+  defp typed_model(model = %{"vocab" => vocab}, repo)
+       when is_map(vocab) and not is_map_key(model, "type"),
+       do:
+         Map.merge(
+           %{"type" => "WordLevel", "unk_token" => Repo.special_token(repo, "unk")},
+           model
+         )
+
+  defp typed_model(model, _repo), do: model
+
+  defp charsmap(%{"type" => "Precompiled", "precompiled_charsmap" => nil}), do: nil
+  defp charsmap(normalizer), do: normalizer
 
   # The fields of a protobuf message as {number, value}. A value is an integer (varint) or the
   # bytes of the field.
@@ -215,6 +252,12 @@ defmodule Transmuter.Tokenizer do
     rows = Enum.concat(windows)
     longest = rows |> Enum.map(&Encoding.n_tokens/1) |> Enum.max()
     length = pad_length(tokenizer.length, longest)
+
+    # Nx has no tensors of length 0.
+    if length == 0 do
+      raise ArgumentError,
+            "the tokenizer gives no tokens for #{inspect(inputs)}, such as for a text without characters that the vocabulary has"
+    end
 
     rows =
       if Enum.all?(rows, &(Encoding.n_tokens(&1) == length)),
