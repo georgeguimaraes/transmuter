@@ -202,9 +202,14 @@ defmodule Transmuter.Ops.Vision do
       length = Nx.max(Nx.add(Nx.subtract(stop, start), 1), 1) |> Nx.as_type(:f32)
       i = Nx.iota({1, bins_count}, type: :f32)
 
+      # XLA turns a division by a constant into a multiplication by the reciprocal, which
+      # can be one ulp off. Then an edge moves by one pixel when i * length / bins_count is
+      # an integer. XLA cannot fold this divisor, so the division stays correctly rounded.
+      bin_size = Nx.divide(length, length |> Nx.multiply(0) |> Nx.add(bins_count))
+
       bin_start =
         i
-        |> Nx.multiply(Nx.divide(length, bins_count))
+        |> Nx.multiply(bin_size)
         |> Nx.floor()
         |> Nx.add(start)
         |> Nx.clip(0, size)
@@ -212,7 +217,7 @@ defmodule Transmuter.Ops.Vision do
       bin_end =
         i
         |> Nx.add(1)
-        |> Nx.multiply(Nx.divide(length, bins_count))
+        |> Nx.multiply(bin_size)
         |> Nx.ceil()
         |> Nx.add(start)
         |> Nx.clip(0, size)
