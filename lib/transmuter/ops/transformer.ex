@@ -6,7 +6,7 @@ defmodule Transmuter.Ops.Transformer do
 
   All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel.
 
-  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep and divisor. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores and the host can read the divisor.
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor and the two shapes of a `Reshape` pair of the probabilities. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities.
   """
 
   import Transmuter.Ops,
@@ -308,7 +308,7 @@ defmodule Transmuter.Ops.Transformer do
   # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
   # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
   defp attention_core(node, [q, k, v | optional], opset) do
-    [mask, keep, divisor] = optional(optional, 3)
+    [mask, keep, divisor, split, merge] = optional(optional, 5)
     scale = attr(node, "scale")
 
     {scale, divisor} =
@@ -322,17 +322,48 @@ defmodule Transmuter.Ops.Transformer do
     [q4, k4, v4] = if batched?, do: Enum.map([q, k, v], &Nx.new_axis(&1, 0)), else: [q, k, v]
     last? = attr(node, "axis") in [-1, Nx.rank(q) - 1]
 
-    if divisor == nil and last? and fused_core?(q4, k4, v4, [mask, keep]) do
+    if divisor == nil and last? and fused_core?(q4, k4, v4, [mask, keep]) and
+         same_shape?(scores_shape(q, k), [split, merge]) do
       hidden = keep && Nx.equal(keep, 0)
       opts = %{scale: scale, softcap: 0.0, bias: mask, hidden: hidden, causal: false}
       out = attend(q4, Nx.transpose(k4, axes: [0, 1, 3, 2]), v4, opts)
       if batched?, do: Nx.squeeze(out, axes: [0]), else: out
     else
-      plain_core(node, [q, k, v, mask, keep, divisor], scale, opset)
+      plain_core(node, [q, k, v, mask, keep, divisor, split, merge], scale, opset)
     end
   end
 
-  defp plain_core(node, [q, k, v, mask, keep, divisor], scale, opset) do
+  # The scores q · k of a core whose q and k have the same batch axes.
+  defp scores_shape(q, k), do: put_elem(Nx.shape(q), Nx.rank(q) - 1, Nx.axis_size(k, -1))
+
+  # Whether the reshapes with these ONNX shapes give back a value of this shape.
+  defp same_shape?(shape, shapes) do
+    shapes = Enum.reject(shapes, &is_nil/1)
+
+    with true <- Enum.all?(shapes, &known?/1) do
+      steps = Enum.scan(shapes, shape, &reshaped(&2, &1))
+
+      Enum.all?(steps, &(Tuple.product(&1) == Tuple.product(shape))) and
+        List.last(steps, shape) == shape
+    end
+  end
+
+  # The shape of an ONNX Reshape of a value of `shape`: 0 copies the axis and -1 takes the
+  # rest of the size.
+  defp reshaped(shape, target) do
+    dims =
+      target
+      |> Transmuter.Ops.values!()
+      |> Enum.with_index(fn
+        0, i -> elem(shape, i)
+        d, _i -> d
+      end)
+
+    rest = div(Tuple.product(shape), dims |> Enum.reject(&(&1 == -1)) |> Enum.product())
+    dims |> Enum.map(&if(&1 == -1, do: rest, else: &1)) |> List.to_tuple()
+  end
+
+  defp plain_core(node, [q, k, v, mask, keep, divisor, split, merge], scale, opset) do
     [q, k, v, mask, divisor]
     |> widen(fn [q, k, v, mask, divisor] ->
       scores = matmul(q, k)
@@ -348,11 +379,16 @@ defmodule Transmuter.Ops.Transformer do
       |> where_kept(keep, attr(node, "fill"))
       |> add_optional(mask)
       |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
+      |> reshape_optional(split)
+      |> reshape_optional(merge)
       |> matmul(v)
       |> List.wrap()
     end)
     |> hd()
   end
+
+  defp reshape_optional(x, nil), do: x
+  defp reshape_optional(x, shape), do: Nx.reshape(x, reshaped(Nx.shape(x), shape))
 
   defp where_kept(scores, nil, _fill), do: scores
 

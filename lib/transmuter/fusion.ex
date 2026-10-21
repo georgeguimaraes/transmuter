@@ -6,7 +6,7 @@ defmodule Transmuter.Fusion do
 
     * `Pow(x, 2)`, `ReduceMean`, `Add(eps)`, `Sqrt`, then `x / sqrt`, `x * (1 / sqrt)` or `x * Reciprocal(sqrt)`, then `Mul(weight)` becomes `SimplifiedLayerNormalization`.
     * `ReduceMean`, `Sub`, the RMSNorm of the difference, then `Mul(gamma)` and `Add(beta)` becomes `LayerNormalization`.
-    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, an optional `Cast` to a float type, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, `Softmax`, an optional `Cast` to a float type and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way.
+    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, an optional `Cast` to a float type, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, `Softmax`, an optional `Cast` to a float type, an optional pair of `Reshape` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way.
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
@@ -19,7 +19,7 @@ defmodule Transmuter.Fusion do
     * The weight, gamma and beta are constants of at most one axis, so they broadcast only along the last axis.
     * No value inside the subgraph has a consumer outside it, also not a graph output or a subgraph.
 
-  Without shapes at load time, `AttentionCore` checks the shapes when it runs and uses the fused kernel only for 4-D heads, or 3-D heads in the batch as in Whisper and TrOCR exports, with a softmax over the last axis.
+  Without shapes at load time, `AttentionCore` checks the shapes when it runs and uses the fused kernel only for 4-D heads, or 3-D heads in the batch as in Whisper and TrOCR exports, with a softmax over the last axis. A `Reshape` pair of the probabilities, as in the Whisper exports of Xenova, must give back the shape of the probabilities. Else the core runs as the operators of the graph.
   """
 
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
@@ -191,8 +191,11 @@ defmodule Transmuter.Fusion do
 
   # The probabilities are Softmax(scores + mask), optionally through a Cast to a float type,
   # and the mask is optional. The inputs of AttentionCore are q, k, v, the mask, the keys to
-  # keep and the divisor of the scores, with "" for a missing one.
+  # keep, the divisor of the scores and the shapes of a Reshape pair of the probabilities,
+  # with "" for a missing one.
   defp attention(ctx, matmul = %{input: [probs, v]}) do
+    {probs, split, merge, reshaped} = reshape_pair(ctx, probs)
+
     with {softmax, cast} <- through_cast(ctx, probs, "Softmax"),
          {logits, mask, masked} <- masked(ctx, hd(softmax.input)),
          {qk = %{input: [q, k]}, scores} <- scores(ctx, logits) do
@@ -202,7 +205,7 @@ defmodule Transmuter.Fusion do
         op_type: "AttentionCore",
         domain: "transmuter",
         name: matmul.name,
-        input: [q, k, v, mask, scores.keep, scores.divisor],
+        input: [q, k, v, mask, scores.keep, scores.divisor, split, merge],
         output: matmul.output,
         attribute: [
           %AttributeProto{name: "scale", type: :FLOAT, f: scores.scale},
@@ -211,9 +214,23 @@ defmodule Transmuter.Fusion do
         ]
       }
 
-      {node, [matmul, softmax | cast ++ masked ++ scores.nodes ++ [qk]]}
+      {node, [matmul, softmax | reshaped ++ cast ++ masked ++ scores.nodes ++ [qk]]}
     else
       _ -> nil
+    end
+  end
+
+  # Some exports, such as the Whisper exports of Xenova, reshape the probabilities to 4-D
+  # heads and back to the 3-D layout before the second MatMul. Without shapes, the pair is
+  # not known to give back the same shape, so AttentionCore checks it when the graph runs.
+  # Returns the input of the pair, its two shapes and its nodes.
+  defp reshape_pair(ctx, name) do
+    with merge = %{input: [split_out, merge_shape]} <- op(ctx, name, "Reshape"),
+         split = %{input: [x, split_shape]} <- op(ctx, split_out, "Reshape"),
+         true <- Enum.all?([merge, split], &(Ops.attr(&1, "allowzero", 0) == 0)) do
+      {x, split_shape, merge_shape, [merge, split]}
+    else
+      _ -> {name, "", "", []}
     end
   end
 

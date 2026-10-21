@@ -127,6 +127,36 @@ defmodule Transmuter.FusionTest do
     assert_same_outputs(model, %{"q" => q, "k" => k, "v" => v, "mask" => mask})
   end
 
+  # The Whisper exports of Xenova reshape the probabilities to 4-D heads and back. A pair
+  # that gives back the shape of the probabilities runs in the kernel. A pair that gives
+  # another shape runs as the operators of the graph.
+  test "a Reshape pair after the softmax runs in AttentionCore", %{tmp_dir: dir} do
+    nodes = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 2, 1]),
+      node("MatMul", ["q", "kt"], ["scores"]),
+      node("Softmax", ["scores"], ["probs"], axis: 2),
+      node("Reshape", ["probs", "split"], ["heads"]),
+      node("Reshape", ["heads", "merge"], ["merged"]),
+      node("MatMul", ["merged", "v"], ["y"])
+    ]
+
+    key = Nx.Random.key(2)
+    {q, key} = Nx.Random.normal(key, shape: {6, 3, 64})
+    {k, key} = Nx.Random.normal(key, shape: {6, 4, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {6, 4, 64})
+    s64 = &Nx.tensor(&1, type: :s64)
+
+    for {split, merge, v} <- [
+          {[2, 3, 3, 4], [6, -1, 4], v},
+          {[6, 12], [6, 4, 3], v[[.., 0..2]]}
+        ] do
+      constants = %{"split" => s64.(split), "merge" => s64.(merge)}
+      model = write(dir, nodes, constants, ["q", "k", "v"], ["y"], 13)
+      assert ops(model) == ["Transpose", "AttentionCore"]
+      assert_same_outputs(model, %{"q" => q, "k" => k, "v" => v})
+    end
+  end
+
   test "a subgraph that computes another function stays", %{tmp_dir: dir} do
     variants = [
       rms_norm(one_over_sqrt(), exponent: "three"),
