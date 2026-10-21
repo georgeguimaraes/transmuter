@@ -296,7 +296,12 @@ defmodule Transmuter.Ops do
   def values!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
 
   @doc false
-  def scalar!(t), do: t |> values!() |> hd()
+  def scalar!(t) do
+    case values!(t) do
+      [value] -> value
+      values -> raise ArgumentError, "expected one value, got #{length(values)} values"
+    end
+  end
 
   @doc false
   def values_or_attr(node, input, name, default \\ nil)
