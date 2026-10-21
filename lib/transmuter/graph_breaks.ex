@@ -33,6 +33,8 @@ defmodule Transmuter.GraphBreaks do
         source: model[:source],
         nodes: nodes,
         last_use: last_use,
+        defined: defined(model),
+        constant: constant(model),
         key: make_ref(),
         opts: opts,
         backend: Nx.Defn.to_backend(opts),
@@ -82,8 +84,8 @@ defmodule Transmuter.GraphBreaks do
   # EMLX traces again in a call whose quantized params it has not compiled.
   defp whole(plan, entry, inputs, static_inputs) do
     state = initial(plan, inputs, static_inputs)
-    {args, _statics} = live(plan, state, 0)
-    with_graph(plan, fn -> state |> merge(run_compiled(entry, args)) |> outputs(plan) end)
+    {args, _static_key, _statics} = live(plan, state, 0)
+    with_graph(plan, fn -> state |> merge(run_compiled(entry, encode(args))) |> outputs(plan) end)
   end
 
   defp general(plan, inputs, static_inputs) do
@@ -120,7 +122,8 @@ defmodule Transmuter.GraphBreaks do
     end)
   end
 
-  # The values of one call: names, the set of static names and the random key.
+  # The values of one call: names, and the digest of each static value that is not a
+  # value of the model. A value gets its digest once, when it becomes static.
   defp initial(plan, inputs, static_inputs) do
     model = plan.model
     cast = &Map.new(&1, fn {k, t} -> {k, Transmuter.upcast(t, model[:compute_type])} end)
@@ -136,8 +139,13 @@ defmodule Transmuter.GraphBreaks do
       |> Map.merge(cast.(inputs))
       |> Map.merge(cast.(static_inputs))
 
-    %{env: env, static: MapSet.new(Map.keys(model.static) ++ Map.keys(static_inputs))}
+    %{env: env, static: digests(cast.(static_inputs))}
   end
+
+  defp digests(values), do: Map.new(values, fn {name, value} -> {name, Ops.digest(value)} end)
+
+  defp static?(plan, state, name),
+    do: Map.has_key?(state.static, name) or Map.has_key?(plan.model.static, name)
 
   defp run(plan, state, pos) when pos >= tuple_size(plan.nodes), do: state
 
@@ -159,10 +167,11 @@ defmodule Transmuter.GraphBreaks do
   # Finds or builds the compiled segment that starts at pos for these values, and gives
   # its arguments.
   defp segment(plan, state, pos) do
-    {args, statics} = live(plan, state, pos)
-    shapes = templates(args)
-    key = {pos, shapes, static_key(plan, statics)}
+    {args, static_key, statics} = live(plan, state, pos)
+    shapes = Enum.map(args, fn {name, value} -> {name, template(value)} end)
+    key = {pos, shapes, static_key}
     metadata = %{source: plan.source, position: pos, shapes: shapes}
+    args = encode(args)
 
     case lookup(plan, key) do
       {:ok, entry} ->
@@ -171,7 +180,7 @@ defmodule Transmuter.GraphBreaks do
 
       :miss ->
         :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
-        {build(plan, key, statics, args, metadata), args}
+        {build(plan, key, statics.(), args, metadata), args}
     end
   end
 
@@ -213,7 +222,14 @@ defmodule Transmuter.GraphBreaks do
       end
 
     {stop, out_names, produced} = Process.get(ref)
-    %{compiled: compiled, stop: stop, out_names: out_names, produced: produced}
+
+    %{
+      compiled: compiled,
+      stop: stop,
+      out_names: out_names,
+      produced: produced,
+      digests: digests(produced)
+    }
   end
 
   # The compiled function keeps its example arguments, so it gets templates. With the
@@ -256,9 +272,9 @@ defmodule Transmuter.GraphBreaks do
     end)
   end
 
-  defp run_compiled(%{compiled: compiled, out_names: names, produced: produced}, args) do
+  defp run_compiled(entry = %{compiled: compiled, out_names: names, produced: produced}, args) do
     outputs = compiled.(args) |> decode()
-    %{values: Map.merge(produced, Map.take(outputs, names)), static: Map.keys(produced)}
+    %{values: Map.merge(produced, Map.take(outputs, names)), static: entry.digests}
   end
 
   # Runs nodes from pos up to stop (or to the end) one by one on concrete values.
@@ -287,12 +303,12 @@ defmodule Transmuter.GraphBreaks do
       Enum.reduce(node.input, state, fn name, state ->
         value = Map.get(state.env, name)
 
-        if promote?(value) and not MapSet.member?(state.static, name),
-          do: %{
-            env: Map.put(state.env, name, Nx.backend_copy(value, Nx.BinaryBackend)),
-            static: MapSet.put(state.static, name)
-          },
-          else: state
+        if promote?(value) and not static?(plan, state, name) do
+          value = Nx.backend_copy(value, Nx.BinaryBackend)
+          merge(state, %{values: %{name => value}, static: %{name => Ops.digest(value)}})
+        else
+          state
+        end
       end)
 
     run_node(plan, state, node, context(plan, state.env))
@@ -305,17 +321,17 @@ defmodule Transmuter.GraphBreaks do
     static? =
       Enum.all?(
         Transmuter.value_dependencies(node),
-        &(&1 == "" or MapSet.member?(state.static, &1))
+        &(&1 == "" or static?(plan, state, &1))
       )
 
     # A node with static inputs leaves a large output on the backend, which is not static.
     {static, other} = Map.split_with(outputs, fn {_k, v} -> static? and Ops.static?(v) end)
     other = Map.new(other, fn {k, v} -> {k, to_backend(v, plan.backend)} end)
-    merge(state, %{values: Map.merge(static, other), static: Map.keys(static)})
+    merge(state, %{values: Map.merge(static, other), static: digests(static)})
   end
 
   defp merge(state, %{values: values, static: static}) do
-    %{env: Map.merge(state.env, values), static: MapSet.union(state.static, MapSet.new(static))}
+    %{env: Map.merge(state.env, values), static: Map.merge(state.static, static)}
   end
 
   defp promote?(t = %Nx.Tensor{data: %data{}}) when data != Nx.BinaryBackend do
@@ -332,24 +348,61 @@ defmodule Transmuter.GraphBreaks do
     |> Transmuter.host_outputs(Compiler)
   end
 
-  # Zero-size values, strings and empty optionals hold no device data, so they are
-  # captured like static values whatever their origin.
-  defp argument?(state, name, value),
-    do: not MapSet.member?(state.static, name) and device_value?(value)
-
   defp device_value?(%Nx.Tensor{}), do: true
   defp device_value?({:sequence, elements}), do: Enum.all?(elements, &device_value?/1)
   defp device_value?(_value), do: false
 
-  # The values that nodes at pos or later read: the arguments of a segment and the static
-  # values that it captures.
+  # The values that nodes at pos or later read: the arguments of a segment, the key of the
+  # static values that can change between calls, and a function that gives the static
+  # values that the segment captures. Zero-size values, strings and empty optionals hold no
+  # device data, so they are captured like static values whatever their origin.
   defp live(plan, state, pos) do
-    {args, statics} =
-      state.env
-      |> Enum.filter(fn {name, _value} -> Map.get(plan.last_use, name, -1) >= pos end)
-      |> Enum.split_with(fn {name, value} -> argument?(state, name, value) end)
+    {names, constants} = live_names(plan, state, pos)
 
-    {encode(args), Map.new(statics)}
+    {args, statics, key} =
+      Enum.reduce(names, {[], [], []}, fn name, acc = {args, statics, key} ->
+        case state.env do
+          %{^name => value} ->
+            cond do
+              digest = state.static[name] ->
+                {args, [{name, value} | statics], [{name, digest} | key]}
+
+              device_value?(value) ->
+                {[{name, value} | args], statics, key}
+
+              true ->
+                {args, [{name, value} | statics], [{name, Ops.digest(value)} | key]}
+            end
+
+          %{} ->
+            acc
+        end
+      end)
+
+    {args, key, fn -> Map.merge(Map.take(state.env, constants), Map.new(statics)) end}
+  end
+
+  # The names of the values that a call has before pos and that nodes at pos or later read,
+  # in an order that is the same for each call. The static values with a name of
+  # plan.constant are the same in every call, so a call reads them only to build a
+  # segment. Each position computes the names once.
+  defp live_names(plan, state, pos) do
+    key = {:live, pos}
+
+    with nil <- Shared.get(plan.scope, key) do
+      names =
+        Enum.split_with(
+          for(
+            {name, index} <- plan.defined,
+            index < pos and Map.get(plan.last_use, name, -1) >= pos,
+            do: name
+          ),
+          &(not (Map.has_key?(plan.constant, &1) and static?(plan, state, &1)))
+        )
+
+      Shared.put(plan.scope, key, names)
+      names
+    end
   end
 
   defp context(plan, env) do
@@ -374,6 +427,35 @@ defmodule Transmuter.GraphBreaks do
     Enum.reduce([Transmuter.random_input() | model.outputs], reads, &Map.put(&2, &1, :infinity))
   end
 
+  # The names whose values are the same in every call: the static values of the model and
+  # the outputs of nodes that read only such values and draw no random values.
+  defp constant(model) do
+    Enum.reduce(model.nodes, Map.new(model.static, fn {name, _} -> {name, true} end), fn node,
+                                                                                         constant ->
+      if not Transmuter.random?([node]) and
+           Enum.all?(Transmuter.dependencies(node), &(&1 == "" or Map.has_key?(constant, &1))),
+         do: Enum.reduce(node.output, constant, &Map.put(&2, &1, true)),
+         else: constant
+    end)
+  end
+
+  # Each name with the index of the node that computes it, or -1 for a value that a call
+  # starts with.
+  defp defined(model) do
+    initial = Map.keys(model.static) ++ Map.keys(model.params) ++ model.inputs
+
+    Enum.uniq_by(
+      Enum.map([Transmuter.random_input() | initial], &{&1, -1}) ++
+        for(
+          {node, i} <- Enum.with_index(model.nodes),
+          name <- node.output,
+          name != "",
+          do: {name, i}
+        ),
+      &elem(&1, 0)
+    )
+  end
+
   # A sequence of tensors crosses a segment boundary as a tuple.
   defp encode(values) do
     Map.new(values, fn
@@ -393,22 +475,8 @@ defmodule Transmuter.GraphBreaks do
   defp traced?({:sequence, elements}), do: Enum.any?(elements, &traced?/1)
   defp traced?(_value), do: false
 
-  defp templates(args) do
-    args
-    |> Enum.map(fn {name, value} -> {name, template(value)} end)
-    |> Enum.sort()
-  end
-
   defp template(t = %Nx.Tensor{}), do: {Nx.shape(t), Nx.type(t)}
-  defp template(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> Enum.map(&template/1)
-
-  # Values of the static inputs that are not part of the model, which every call shares.
-  defp static_key(plan, statics) do
-    statics
-    |> Map.drop(Map.keys(plan.model.static))
-    |> Enum.sort()
-    |> Enum.map(fn {name, value} -> {name, Ops.digest(value)} end)
-  end
+  defp template({:sequence, elements}), do: Enum.map(elements, &template/1)
 
   defp to_backend(t = %Nx.Tensor{}, backend), do: Nx.backend_transfer(t, backend)
 
