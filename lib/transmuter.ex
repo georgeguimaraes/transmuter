@@ -243,7 +243,9 @@ defmodule Transmuter do
   All other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX` or
   `compiler: EXLA`.
 
-  Each call of a model with random operators draws new values.
+  Each call of a model with random operators draws new values. A call that gives an
+  `Nx.Random` key in the `Transmuter.random_input/0` input draws from that key, so the
+  same key gives the same values.
 
   ## Examples
 

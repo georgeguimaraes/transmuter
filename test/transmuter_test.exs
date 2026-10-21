@@ -237,6 +237,18 @@ defmodule TransmuterTest do
     assert different?(eager.(), eager.())
   end
 
+  test "draws the same values from the same key" do
+    model = load_fixture("RandomNormal_mean_scale")
+    compiled = Transmuter.compile(model, %{}, @compiler)
+    key = &%{Transmuter.random_input() => Nx.backend_transfer(Nx.Random.key(&1), @backend)}
+    first = compiled.(key.(1))["y"]
+
+    refute different?(first, compiled.(key.(1))["y"])
+    assert different?(first, compiled.(key.(2))["y"])
+    eager = Transmuter.run(model, model.params, key.(1))["y"]
+    assert_all_close(first, Nx.backend_copy(eager, Nx.BinaryBackend))
+  end
+
   test "draws the same values on each call from a seed" do
     model = load_fixture("RandomNormal_seed")
     compiled = Transmuter.compile(model, %{}, @compiler)

@@ -115,8 +115,11 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
+  # The random key is not a part of the shapes, so a call with a key takes the fast path.
   defp input_shapes(inputs) do
-    Map.new(inputs, fn
+    inputs
+    |> Map.delete(Transmuter.random_input())
+    |> Map.new(fn
       {name, t = %Nx.Tensor{}} -> {name, {Nx.shape(t), Nx.type(t)}}
       other -> other
     end)
@@ -128,10 +131,11 @@ defmodule Transmuter.GraphBreaks do
     model = plan.model
     cast = &Map.new(&1, fn {k, t} -> {k, Transmuter.upcast(t, model[:compute_type])} end)
 
+    # A call can give its own key, so that it draws the same values again.
     inputs =
       if plan.random?,
-        do: Map.put(inputs, Transmuter.random_input(), Transmuter.random_key()),
-        else: inputs
+        do: Map.put_new_lazy(inputs, Transmuter.random_input(), &Transmuter.random_key/0),
+        else: Map.delete(inputs, Transmuter.random_input())
 
     env =
       model.static
