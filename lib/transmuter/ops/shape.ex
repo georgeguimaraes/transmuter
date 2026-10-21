@@ -54,6 +54,7 @@ defmodule Transmuter.Ops.Shape do
       [%{name: "value_floats", floats: fs}] -> static_tensor(fs, :f32)
       [%{name: "value_string", s: s}] -> {:strings, {}, [s]}
       [%{name: "value_strings", strings: values}] -> {:strings, {length(values)}, values}
+      [%{name: name}] -> raise ArgumentError, "Constant #{name} is not supported"
     end
   end
 
@@ -267,6 +268,9 @@ defmodule Transmuter.Ops.Shape do
 
       "CRD" ->
         a |> Nx.reshape({n, div(c, b * b), b, b, h, w}) |> Nx.transpose(axes: [0, 1, 4, 2, 5, 3])
+
+      mode ->
+        raise ArgumentError, "DepthToSpace mode #{inspect(mode)} is unknown"
     end
     |> Nx.reshape({n, div(c, b * b), h * b, w * b})
   end

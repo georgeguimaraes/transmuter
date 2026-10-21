@@ -626,4 +626,6 @@ defmodule Transmuter.Ops do
     raise ArgumentError,
           "Transmuter loads FP8 tensors as f16, but it cannot compute FP8 values (ONNX type #{dt})"
   end
+
+  def dtype(dt), do: raise(ArgumentError, "ONNX type #{dt} has no Nx type")
 end

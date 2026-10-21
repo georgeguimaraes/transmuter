@@ -4,7 +4,15 @@ defmodule Transmuter.Ops.Signal do
   """
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, normalize_axis: 2, optional: 2, scalar!: 1, static_tensor: 2]
+    only: [
+      attr: 2,
+      attr: 3,
+      dtype: 1,
+      normalize_axis: 2,
+      optional: 2,
+      scalar!: 1,
+      static_tensor: 2
+    ]
 
   alias Nx.Defn.Expr
 
@@ -106,7 +114,7 @@ defmodule Transmuter.Ops.Signal do
 
     values
     |> static_tensor(:f64)
-    |> Nx.as_type(Transmuter.Ops.dtype(attr(node, "output_datatype", 1)))
+    |> Nx.as_type(dtype(attr(node, "output_datatype", 1)))
   end
 
   # Triangular mel filters, {dft_length / 2 + 1, num_mel_bins}, as the ONNX reference builds them.
@@ -145,10 +153,9 @@ defmodule Transmuter.Ops.Signal do
 
     rows
     |> static_tensor(:f64)
-    |> Nx.as_type(Transmuter.Ops.dtype(attr(node, "output_datatype", 1)))
+    |> Nx.as_type(dtype(attr(node, "output_datatype", 1)))
   end
 
-  # STFT of signal {B, L, 1 or 2}. Output {B, frames, bins, 2}.
   defp op(node = %{op_type: "STFT"}, [signal, frame_step | rest]) do
     [window, frame_length] = optional(rest, 2)
     step = scalar!(frame_step)
@@ -388,7 +395,6 @@ defmodule Transmuter.Ops.Signal do
   defp activation("Elu", alpha, _),
     do: &Nx.select(Nx.less(&1, 0), Nx.multiply(alpha, Nx.subtract(Nx.exp(&1), 1)), &1)
 
-  # Real and imaginary parts {..., n} along axis times n x bins DFT matrices.
   # Frame f holds samples f * step .. f * step + size - 1 of a {B, L, C} signal. The
   # signal splits into chunks of gcd(size, step) samples, and a frame is size / gcd
   # consecutive chunks, so strided slices of the chunks build all frames.
@@ -411,6 +417,7 @@ defmodule Transmuter.Ops.Signal do
     |> Nx.concatenate(axis: 2)
   end
 
+  # Real and imaginary parts {..., n} along axis times n x bins DFT matrices.
   defp dft(x, axis, n, bins, inverse?) do
     rank = Nx.rank(x)
     {re, im} = components(x)

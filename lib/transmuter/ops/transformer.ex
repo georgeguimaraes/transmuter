@@ -373,7 +373,12 @@ defmodule Transmuter.Ops.Transformer do
 
   # com.microsoft Attention from BERT exports: one input projected to Q, K and V.
   defp packed_attention(node, [x, weights, bias | rest]) do
-    [mask, nil, attention_bias] = optional(rest, 3)
+    [mask, past, attention_bias] = optional(rest, 3)
+
+    if past do
+      raise ArgumentError, "Attention (com.microsoft) with the past input is not supported"
+    end
+
     heads = attr(node, "num_heads")
     {b, s, _} = Nx.shape(x)
     qkv = x |> Nx.dot([2], weights, [0]) |> add_optional(bias)
@@ -403,7 +408,6 @@ defmodule Transmuter.Ops.Transformer do
     [out]
   end
 
-  # true where a key is hidden. A 1-D mask holds key lengths, 2-D and 3-D masks hold 1 to keep.
   # Hidden keys from a mask of key lengths {B}, of keys {B, T}, or of queries and keys
   # {B, S, T}. A zero in the mask hides a key.
   defp padding_mask(nil, _b, _t), do: nil

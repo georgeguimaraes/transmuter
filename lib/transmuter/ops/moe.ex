@@ -17,15 +17,16 @@ defmodule Transmuter.Ops.MoE do
   @doc false
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
-  # com.microsoft MoE: float expert weights, full-softmax routing.
   defp op(node = %{op_type: "MoE"}, [input, router_probs | rest]) do
     [fc1_w, fc1_bias, fc2_w, fc2_bias, fc3_w, fc3_bias] = optional(rest, 6)
-    {k, normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
-
-    # Full softmax over all experts, then top-k selection.
     probs = router_probs |> Nx.as_type(:f32) |> softmax_last()
-    {top_vals, top_idx} = topk(probs, k)
-    weights = if normalize == 1, do: local_normalize(top_vals), else: top_vals
+    {top_vals, top_idx} = topk(probs, attr(node, "k"))
+
+    weights =
+      if attr(node, "normalize_routing_weights", 0) == 1,
+        do: local_normalize(top_vals),
+        else: top_vals
+
     route = route(weights, top_idx, Nx.axis_size(fc1_w, 0))
     w = &(&1 && select(&1, route))
 
@@ -36,23 +37,16 @@ defmodule Transmuter.Ops.MoE do
     ])
   end
 
-  # com.microsoft QMoE: block-wise quantized expert weights, local-softmax routing.
+  # The weights of a token add up to 1 after the softmax over its k values, so
+  # normalize_routing_weights changes nothing.
   defp op(node = %{op_type: "QMoE"}, [input, router_probs | rest]) do
     [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = optional(rest, 12)
     [fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp] = opt
-
-    {k, _normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
     bits = attr(node, "expert_weight_bits", 4)
     block_size = attr(node, "block_size", 0)
     type = Nx.type(input)
-
-    # Local softmax: top-k selection then softmax over those k values, so the weights of a
-    # token already add up to 1 and normalize_routing_weights changes nothing.
-    {top_vals, top_idx} = topk(Nx.as_type(router_probs, :f32), k)
-    max_v = Nx.reduce_max(top_vals, axes: [1], keep_axes: true)
-    exp_v = Nx.exp(Nx.subtract(top_vals, max_v))
-    weights = Nx.divide(exp_v, Nx.sum(exp_v, axes: [1], keep_axes: true))
-    route = route(weights, top_idx, Nx.axis_size(fc1_w, 0))
+    {top_vals, top_idx} = topk(Nx.as_type(router_probs, :f32), attr(node, "k"))
+    route = route(softmax_last(top_vals), top_idx, Nx.axis_size(fc1_w, 0))
     pick = &(&1 && select(&1, route))
 
     w = fn w, s, z ->
@@ -68,20 +62,28 @@ defmodule Transmuter.Ops.MoE do
 
   # The expert MLPs of the routed rows, added with the routing weights of each token.
   defp experts(node, input, route, [{fc1_w, fc1_bias}, {fc2_w, fc2_bias}, {fc3_w, fc3_bias}]) do
-    {_k, _normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
+    activation = %{
+      type: attr(node, "activation_type", "relu"),
+      fusion: attr(node, "swiglu_fusion", 0),
+      alpha: attr(node, "activation_alpha", 1.0),
+      beta: attr(node, "activation_beta", 0.0),
+      limit: attr(node, "swiglu_limit", 0.0)
+    }
+
     type = Nx.type(input)
-    {t, input_2d} = flatten_input(input)
-    h = Nx.axis_size(input_2d, 1)
-    rows = input_2d |> Nx.as_type(type) |> Nx.broadcast(route.rows.(t, h), axes: route.axes)
-    rows = Nx.reshape(rows, {:auto, h})
+    h = Nx.axis_size(input, -1)
+    input_2d = Nx.reshape(input, {:auto, h})
+    t = Nx.axis_size(input_2d, 0)
+    rows = input_2d |> Nx.broadcast(route.rows.(t, h), axes: route.axes) |> Nx.reshape({:auto, h})
     h1 = rows |> expert_dot(fc1_w, route) |> add_bias(fc1_bias, route.experts)
 
+    # With swiglu_fusion 0, fc1 gives the gate and fc3 the linear values.
     activated =
-      if act == "swiglu" and fusion == 0 and fc3_w do
+      if activation.type == "swiglu" and activation.fusion == 0 and fc3_w do
         h3 = rows |> expert_dot(fc3_w, route) |> add_bias(fc3_bias, route.experts)
-        swiglu_gate(h1, h3, alpha, beta, limit)
+        swiglu_gate(h1, h3, activation)
       else
-        activate(h1, act, fusion, alpha, beta, limit)
+        activate(h1, activation)
       end
 
     out = activated |> expert_dot(fc2_w, route) |> add_bias(fc2_bias, route.experts)
@@ -152,34 +154,7 @@ defmodule Transmuter.Ops.MoE do
 
   defp expert_dot(rows, w, _route), do: Nx.dot(rows, [1], [0], w, [2], [0])
 
-  # --- helpers ---
-
-  defp moe_attrs(node) do
-    k = attr(node, "k")
-    normalize = attr(node, "normalize_routing_weights", 0)
-    act = attr(node, "activation_type", "relu")
-    fusion = attr(node, "swiglu_fusion", 0)
-    # FLOAT attributes (type 1 in proto); default to 1.0 / 0.0.
-    alpha = attr(node, "activation_alpha", 1.0)
-    beta = attr(node, "activation_beta", 0.0)
-    limit = nonzero_float(attr(node, "swiglu_limit", 0.0))
-    {k, normalize, act, fusion, alpha, beta, limit}
-  end
-
-  # Returns {T, input_2d}: token count and a 2D view.
-  defp flatten_input(input) do
-    case Nx.rank(input) do
-      2 ->
-        {t, _h} = Nx.shape(input)
-        {t, input}
-
-      3 ->
-        {b, s, h} = Nx.shape(input)
-        {b * s, Nx.reshape(input, {b * s, h})}
-    end
-  end
-
-  # Top-k along axis 1, stable sort (lower index wins on ties, as ORT does).
+  # A stable sort keeps the lower index first among equal values, as ONNX Runtime does.
   defp topk(probs, k) do
     idx =
       probs
@@ -189,7 +164,6 @@ defmodule Transmuter.Ops.MoE do
     {Nx.take_along_axis(probs, idx, axis: 1), idx}
   end
 
-  # Normalizes each row by its sum (used when normalize_routing_weights=1 for MoE).
   defp local_normalize(weights) do
     sum = Nx.sum(weights, axes: [1], keep_axes: true)
     safe = Nx.select(Nx.equal(sum, 0), 1, sum)
@@ -199,41 +173,38 @@ defmodule Transmuter.Ops.MoE do
   defp add_bias(h, nil, _flat_idx), do: h
   defp add_bias(h, bias, flat_idx), do: Nx.add(h, Nx.take(bias, flat_idx))
 
-  defp activate(h, "relu", _, _alpha, _beta, _limit), do: Nx.max(h, 0)
-  defp activate(h, "gelu", _, _alpha, _beta, _limit), do: gelu(h)
-  defp activate(h, "silu", _, _alpha, _beta, _limit), do: Nx.multiply(h, Nx.sigmoid(h))
-  defp activate(h, "identity", _, _alpha, _beta, _limit), do: h
-  defp activate(h, "swiglu", 1, alpha, beta, limit), do: swiglu_interleaved(h, alpha, beta, limit)
-  defp activate(h, "swiglu", 2, alpha, beta, limit), do: swiglu_concat(h, alpha, beta, limit)
-  # fusion=0 without a separate fc3: treat fc1 as producing interleaved g and l.
-  defp activate(h, "swiglu", _, alpha, beta, limit), do: swiglu_interleaved(h, alpha, beta, limit)
+  defp activate(h, %{type: "relu"}), do: Nx.max(h, 0)
+  defp activate(h, %{type: "gelu"}), do: gelu(h)
+  defp activate(h, %{type: "silu"}), do: Nx.multiply(h, Nx.sigmoid(h))
+  defp activate(h, %{type: "identity"}), do: h
 
-  # SwiGLU from two separate GEMMs (fusion=0): h1 is the gate, h3 is the linear branch.
-  defp swiglu_gate(g, l, alpha, beta, limit) do
-    g = if limit, do: Nx.min(g, limit), else: g
-    l = if limit, do: Nx.clip(l, Nx.negate(limit), limit), else: l
-    Nx.multiply(Nx.multiply(g, Nx.sigmoid(Nx.multiply(alpha, g))), Nx.add(l, beta))
-  end
-
-  # SwiGLU interleaved layout (swiglu_fusion=1): [g0, l0, g1, l1, ...].
-  defp swiglu_interleaved(h, alpha, beta, limit) do
-    {t_k, two_i} = Nx.shape(h)
-    inter = div(two_i, 2)
-    pairs = Nx.reshape(h, {t_k, inter, 2})
-    g = pairs |> Nx.slice_along_axis(0, 1, axis: 2) |> Nx.squeeze(axes: [2])
-    l = pairs |> Nx.slice_along_axis(1, 1, axis: 2) |> Nx.squeeze(axes: [2])
-    swiglu_gate(g, l, alpha, beta, limit)
-  end
-
-  # SwiGLU concatenated layout (swiglu_fusion=2): first half g, second half l.
-  defp swiglu_concat(h, alpha, beta, limit) do
+  # swiglu_fusion 2 puts the gates in the first half and the linear values in the second.
+  defp activate(h, activation = %{type: "swiglu", fusion: 2}) do
     inter = div(Nx.axis_size(h, 1), 2)
     g = Nx.slice_along_axis(h, 0, inter, axis: 1)
     l = Nx.slice_along_axis(h, inter, inter, axis: 1)
-    swiglu_gate(g, l, alpha, beta, limit)
+    swiglu_gate(g, l, activation)
   end
 
-  # Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))).
+  # swiglu_fusion 1, and 0 without fc3, interleave the gates and the linear values.
+  defp activate(h, activation = %{type: "swiglu"}) do
+    {rows, size} = Nx.shape(h)
+    pairs = Nx.reshape(h, {rows, div(size, 2), 2})
+    g = pairs |> Nx.slice_along_axis(0, 1, axis: 2) |> Nx.squeeze(axes: [2])
+    l = pairs |> Nx.slice_along_axis(1, 1, axis: 2) |> Nx.squeeze(axes: [2])
+    swiglu_gate(g, l, activation)
+  end
+
+  # A swiglu_limit of 0 is no limit.
+  defp swiglu_gate(g, l, %{alpha: alpha, beta: beta, limit: limit}) do
+    {g, l} =
+      if limit == 0,
+        do: {g, l},
+        else: {Nx.min(g, limit), Nx.clip(l, Nx.negate(limit), limit)}
+
+    Nx.multiply(Nx.multiply(g, Nx.sigmoid(Nx.multiply(alpha, g))), Nx.add(l, beta))
+  end
+
   defp gelu(h) do
     inv_sqrt2 = 1.0 / :math.sqrt(2)
     Nx.multiply(h, Nx.multiply(0.5, Nx.add(1, Nx.erf(Nx.multiply(h, inv_sqrt2)))))
@@ -280,7 +251,4 @@ defmodule Transmuter.Ops.MoE do
       end
     end
   end
-
-  defp nonzero_float(v) when v == 0 or v == 0.0, do: nil
-  defp nonzero_float(v), do: v
 end

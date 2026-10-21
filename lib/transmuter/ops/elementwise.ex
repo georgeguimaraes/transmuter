@@ -131,9 +131,7 @@ defmodule Transmuter.Ops.Elementwise do
     do: Nx.multiply(x, Nx.sigmoid(Nx.multiply(x, attr(node, "alpha", 1.702))))
 
   defp op(%{op_type: "PRelu"}, [x, slope]),
-    do:
-      Nx.select(Nx.less(x, 0), Nx.multiply(x, slope), x)
-      |> Nx.broadcast(broadcast_shape([Nx.shape(x), Nx.shape(slope)]))
+    do: Nx.select(Nx.less(x, 0), Nx.multiply(x, slope), x)
 
   defp op(%{op_type: "Mish"}, [x]), do: Nx.multiply(x, Nx.tanh(Nx.log1p(Nx.exp(x))))
   defp op(%{op_type: "Softsign"}, [x]), do: Nx.divide(x, Nx.add(1, Nx.abs(x)))

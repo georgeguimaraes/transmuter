@@ -20,6 +20,8 @@ defmodule Transmuter.Ops.NN do
       widen: 2
     ]
 
+  alias Transmuter.Onnx.AttributeProto
+
   @op_types ~w(Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
                Resize GridSample Dropout LRN GlobalLpPool MeanVarianceNormalization MaxPool
@@ -263,9 +265,9 @@ defmodule Transmuter.Ops.NN do
       node
       | op_type: "Resize",
         attribute: [
-          %{name: "mode", type: :STRING, s: mode},
-          %{name: "coordinate_transformation_mode", type: :STRING, s: "asymmetric"},
-          %{name: "nearest_mode", type: :STRING, s: "floor"}
+          %AttributeProto{name: "mode", type: :STRING, s: mode},
+          %AttributeProto{name: "coordinate_transformation_mode", type: :STRING, s: "asymmetric"},
+          %AttributeProto{name: "nearest_mode", type: :STRING, s: "floor"}
         ]
     }
 
@@ -1015,6 +1017,7 @@ defmodule Transmuter.Ops.NN do
       "round_prefer_ceil" -> if half?, do: ceil(xo), else: round(xo)
       "floor" -> floor(xo)
       "ceil" -> ceil(xo)
+      mode -> raise ArgumentError, "Resize nearest_mode #{inspect(mode)} is unknown"
     end
   end
 
