@@ -380,6 +380,13 @@ defmodule Transmuter.Ops do
   def normalize_axis(axis, rank) when axis < 0, do: axis + rank
   def normalize_axis(axis, _rank), do: axis
 
+  @doc """
+  Reshapes `t` to rank `rank`, with its values along `axis` and size 1 on the other axes.
+  """
+  def on_axis(t, rank, axis),
+    do:
+      Nx.reshape(t, 1 |> List.duplicate(rank) |> List.replace_at(axis, :auto) |> List.to_tuple())
+
   @doc false
   def optional(inputs, count), do: Enum.take(inputs ++ List.duplicate(nil, count), count)
 

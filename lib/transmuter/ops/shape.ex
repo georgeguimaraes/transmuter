@@ -12,6 +12,7 @@ defmodule Transmuter.Ops.Shape do
       empty?: 1,
       known!: 2,
       normalize_axis: 2,
+      on_axis: 3,
       scalar!: 1,
       shape_of: 1,
       split_along: 3,
@@ -467,14 +468,7 @@ defmodule Transmuter.Ops.Shape do
     shape = Nx.shape(x)
     t = Nx.iota(shape, axis: time_axis, type: :s64)
 
-    lens_shape =
-      shape
-      |> Tuple.to_list()
-      |> Enum.map(fn _ -> 1 end)
-      |> List.replace_at(batch_axis, :auto)
-      |> List.to_tuple()
-
-    lens = lens |> Nx.as_type(:s64) |> Nx.reshape(lens_shape)
+    lens = lens |> Nx.as_type(:s64) |> on_axis(tuple_size(shape), batch_axis)
     index = Nx.select(Nx.less(t, lens), Nx.subtract(Nx.subtract(lens, 1), t), t)
     Nx.take_along_axis(x, index, axis: time_axis)
   end

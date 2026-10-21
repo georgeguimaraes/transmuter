@@ -4,12 +4,21 @@ defmodule Transmuter.Ops.Quantized do
   """
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, matmul: 2, normalize_axis: 2, optional: 2, round_half_even: 1]
+    only: [
+      attr: 2,
+      attr: 3,
+      matmul: 2,
+      normalize_axis: 2,
+      on_axis: 3,
+      optional: 2,
+      round_half_even: 1
+    ]
 
   alias Transmuter.Ops.NN
 
   @op_types ~w(MatMulNBits GatherBlockQuantized DequantizeLinear QuantizeLinear
-               DynamicQuantizeLinear MatMulInteger QLinearMatMul QLinearConv QLinearAdd QLinearMul)
+               DynamicQuantizeLinear MatMulInteger ConvInteger QLinearMatMul QLinearConv QLinearAdd
+               QLinearMul)
 
   @doc false
   def op_types, do: @op_types
@@ -117,6 +126,13 @@ defmodule Transmuter.Ops.Quantized do
     a = a |> Nx.as_type(:f32) |> subtract_zero(a_zero, Nx.rank(a) - 2)
     b = b |> Nx.as_type(:f32) |> subtract_zero(b_zero, Nx.rank(b) - 1)
     integer_matmul(a, b)
+  end
+
+  defp op(node = %{op_type: "ConvInteger"}, [x, w | zero_points]) do
+    [x_zero, w_zero] = optional(zero_points, 2)
+    x = x |> Nx.as_type(:f32) |> subtract_zero(x_zero, 1)
+    w = w |> Nx.as_type(:f32) |> subtract_zero(w_zero, 0)
+    NN.integer_conv(node, x, w)
   end
 
   # Integer matmul on zero-shifted values, then requantized: y = round(acc * a_scale * b_scale / y_scale) + y_zero.
@@ -284,14 +300,7 @@ defmodule Transmuter.Ops.Quantized do
   # A scalar, or a 1-D tensor laid along one axis of a rank-r result, as f32.
   defp per_axis(t, rank, axis) do
     t = Nx.as_type(t, :f32)
-
-    if Nx.size(t) == 1,
-      do: Nx.reshape(t, {}),
-      else:
-        Nx.reshape(
-          t,
-          1 |> List.duplicate(rank) |> List.replace_at(axis, :auto) |> List.to_tuple()
-        )
+    if Nx.size(t) == 1, do: Nx.reshape(t, {}), else: on_axis(t, rank, axis)
   end
 
   # Unpacks bits-wide unsigned values from the last axis of a u8 tensor.
@@ -366,29 +375,13 @@ defmodule Transmuter.Ops.Quantized do
         |> Nx.slice_along_axis(0, dim, axis: axis)
 
       true ->
-        Nx.reshape(
-          param,
-          1 |> List.duplicate(rank) |> List.replace_at(axis, :auto) |> List.to_tuple()
-        )
+        on_axis(param, rank, axis)
     end
   end
 
   defp subtract_zero(t, nil, _axis), do: t
 
-  defp subtract_zero(t, zero, axis) do
-    zero = Nx.as_type(zero, :f32)
-
-    if Nx.size(zero) == 1,
-      do: Nx.subtract(t, Nx.reshape(zero, {})),
-      else:
-        Nx.subtract(
-          t,
-          Nx.reshape(
-            zero,
-            1 |> List.duplicate(Nx.rank(t)) |> List.replace_at(axis, :auto) |> List.to_tuple()
-          )
-        )
-  end
+  defp subtract_zero(t, zero, axis), do: Nx.subtract(t, per_axis(zero, Nx.rank(t), axis))
 
   defp saturate(t, type) do
     {low, high} =

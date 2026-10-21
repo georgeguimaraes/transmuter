@@ -24,6 +24,7 @@ defmodule Transmuter.Ops.Transformer do
       matmul: 2,
       normalize: 3,
       normalize_axis: 2,
+      on_axis: 3,
       optional: 2,
       scalar!: 1,
       shape_of: 1,
@@ -179,7 +180,7 @@ defmodule Transmuter.Ops.Transformer do
     start =
       (List.first(write_indices) || Nx.broadcast(Nx.tensor(0, type: :s64), {batch}))
       |> Nx.as_type(:s64)
-      |> Nx.reshape(List.to_tuple([batch | List.duplicate(1, rank - 1)]))
+      |> on_axis(rank, 0)
 
     positions = Nx.add(Nx.iota(shape, axis: axis, type: :s64), start)
 

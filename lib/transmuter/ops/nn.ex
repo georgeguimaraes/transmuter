@@ -12,6 +12,7 @@ defmodule Transmuter.Ops.NN do
       empty?: 1,
       normalize: 3,
       normalize_axis: 2,
+      on_axis: 3,
       optional: 2,
       round_half_even: 1,
       static_tensor: 2,
@@ -19,7 +20,7 @@ defmodule Transmuter.Ops.NN do
       widen: 2
     ]
 
-  @op_types ~w(ConvInteger Conv InstanceNormalization BatchNormalization LayerNormalization
+  @op_types ~w(Conv InstanceNormalization BatchNormalization LayerNormalization
                GlobalAveragePool GlobalMaxPool ConvTranspose LpNormalization GroupNormalization
                Resize GridSample Dropout LRN GlobalLpPool MeanVarianceNormalization MaxPool
                AveragePool LpPool Upsample MaxUnpool CausalConvWithState NegativeLogLikelihoodLoss
@@ -31,70 +32,35 @@ defmodule Transmuter.Ops.NN do
   @doc false
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
-  defp op(node = %{op_type: "ConvInteger"}, [x, w | zero_points]) do
-    [x_zero, w_zero] = optional(zero_points, 2)
-    x = Nx.as_type(x, :f32)
-    x = if x_zero, do: Nx.subtract(x, Nx.reshape(Nx.as_type(x_zero, :f32), {})), else: x
-    w = Nx.as_type(w, :f32)
-
-    w =
-      cond do
-        w_zero == nil ->
-          w
-
-        Nx.size(w_zero) == 1 ->
-          Nx.subtract(w, Nx.reshape(Nx.as_type(w_zero, :f32), {}))
-
-        true ->
-          Nx.subtract(
-            w,
-            Nx.reshape(
-              Nx.as_type(w_zero, :f32),
-              List.to_tuple([:auto | List.duplicate(1, Nx.rank(w) - 1)])
-            )
-          )
-      end
-
-    integer_conv(node, x, w)
-  end
-
   defp op(node = %{op_type: "Conv"}, [x, w | b]) do
-    spatial = Nx.rank(x) - 2
-
     out =
       if patches?(node, x, w) do
         patch_conv(x, w, &Nx.dot(&1, [2], &2, [1]))
       else
+        {strides, dilations, pads} = window(node, spatial_sizes(x), spatial_sizes(w))
+
         Nx.conv(x, w,
-          strides: attr(node, "strides", List.duplicate(1, spatial)),
-          padding: spatial_pads(node, spatial_sizes(x), spatial_sizes(w)),
-          kernel_dilation: attr(node, "dilations", List.duplicate(1, spatial)),
+          strides: strides,
+          padding: pads,
+          kernel_dilation: dilations,
           feature_group_size: attr(node, "group", 1)
         )
       end
 
-    case b do
-      [b] when b != nil ->
-        Nx.add(out, Nx.reshape(b, List.to_tuple([1, :auto] ++ List.duplicate(1, spatial))))
-
-      _ ->
-        out
-    end
+    add_channel_bias(out, List.first(b))
   end
 
   defp op(node = %{op_type: "InstanceNormalization"}, [x, scale, bias]) do
-    axes = Enum.to_list(2..(Nx.rank(x) - 1))
-    shape = List.to_tuple([1, :auto | List.duplicate(1, length(axes))])
+    channel = &on_axis(&1, Nx.rank(x), 1)
 
     x
-    |> normalize_trailing(axes, attr(node, "epsilon", 1.0e-5))
-    |> Nx.multiply(Nx.reshape(scale, shape))
-    |> Nx.add(Nx.reshape(bias, shape))
+    |> normalize_trailing(Enum.to_list(2..(Nx.rank(x) - 1)), attr(node, "epsilon", 1.0e-5))
+    |> Nx.multiply(channel.(scale))
+    |> Nx.add(channel.(bias))
   end
 
   defp op(node = %{op_type: "BatchNormalization"}, [x, scale, bias, mean, var]) do
-    shape = List.to_tuple([1, :auto | List.duplicate(1, Nx.rank(x) - 2)])
-    r = &Nx.reshape(&1, shape)
+    r = &on_axis(&1, Nx.rank(x), 1)
 
     x
     |> Nx.subtract(r.(mean))
@@ -131,11 +97,8 @@ defmodule Transmuter.Ops.NN do
   # counts in the divisor of AveragePool, the explicit padding counts with count_include_pad.
   defp op(node = %{op_type: pool}, [x]) when pool in ["MaxPool", "AveragePool", "LpPool"] do
     kernel = attr(node, "kernel_shape")
-    spatial = length(kernel)
-    strides = attr(node, "strides", List.duplicate(1, spatial))
-    dilations = attr(node, "dilations", List.duplicate(1, spatial))
-    sizes = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
-    pads = spatial_pads(node, sizes, kernel)
+    sizes = spatial_sizes(x)
+    {strides, dilations, pads} = window(node, sizes, kernel)
 
     extra =
       if attr(node, "ceil_mode", 0) == 1 do
@@ -146,7 +109,7 @@ defmodule Transmuter.Ops.NN do
           max((out - 1) * st + span - (n + lo + hi), 0)
         end)
       else
-        List.duplicate(0, spatial)
+        List.duplicate(0, length(kernel))
       end
 
     window = List.to_tuple([1, 1 | kernel])
@@ -160,7 +123,7 @@ defmodule Transmuter.Ops.NN do
 
         if Enum.at(node.output, 1, "") == "",
           do: values,
-          else: [values, max_pool_indices(node, x, padding, dilations)]
+          else: [values, max_pool_indices(node, x, padding, strides, dilations)]
 
       "LpPool" ->
         p = attr(node, "p", 2)
@@ -214,12 +177,10 @@ defmodule Transmuter.Ops.NN do
         do: {scale, bias},
         else: {repeat_groups(scale, c), repeat_groups(bias, c)}
 
-    channel = List.to_tuple([1, c | List.duplicate(1, tuple_size(shape) - 2)])
-
     normed
     |> Nx.reshape(shape)
-    |> Nx.multiply(Nx.reshape(scale, channel))
-    |> Nx.add(Nx.reshape(bias, channel))
+    |> Nx.multiply(on_axis(scale, tuple_size(shape), 1))
+    |> Nx.add(on_axis(bias, tuple_size(shape), 1))
   end
 
   # Resize one axis at a time. Each output element reads a few input elements, so the
@@ -314,10 +275,8 @@ defmodule Transmuter.Ops.NN do
   # The indices are flat over the whole output, as MaxPool gives them.
   defp op(node = %{op_type: "MaxUnpool"}, [x, indices | output_shape]) do
     kernel = attr(node, "kernel_shape")
-    spatial = length(kernel)
-    strides = attr(node, "strides", List.duplicate(1, spatial))
-    pads = attr(node, "pads", List.duplicate(0, 2 * spatial))
     [n, c | sizes] = Tuple.to_list(Nx.shape(x))
+    {strides, _dilations, pads} = window(node, sizes, kernel)
 
     shape =
       if s = List.first(output_shape),
@@ -325,10 +284,9 @@ defmodule Transmuter.Ops.NN do
         else: [
           n,
           c
-          | Enum.zip_with(
-              [sizes, kernel, strides, Enum.take(pads, spatial), Enum.drop(pads, spatial)],
-              fn [size, k, st, lo, hi] -> (size - 1) * st - lo - hi + k end
-            )
+          | Enum.zip_with([sizes, kernel, strides, pads], fn [size, k, st, {lo, hi}] ->
+              (size - 1) * st - lo - hi + k
+            end)
         ]
 
     Nx.tensor(0, type: Nx.type(x))
@@ -483,11 +441,10 @@ defmodule Transmuter.Ops.NN do
   # the patch embedding of a vision transformer, multiplies each patch by the kernel.
   defp patches?(node, x, w) do
     kernel = spatial_sizes(w)
-    spatial = length(kernel)
+    {_strides, dilations, pads} = window(node, spatial_sizes(x), kernel)
 
     attr(node, "strides") == kernel and attr(node, "group", 1) == 1 and
-      attr(node, "dilations", List.duplicate(1, spatial)) == List.duplicate(1, spatial) and
-      spatial_pads(node, spatial_sizes(x), kernel) == List.duplicate({0, 0}, spatial)
+      Enum.all?(dilations, &(&1 == 1)) and Enum.all?(pads, &(&1 == {0, 0}))
   end
 
   # The patches of x become rows {n, patches, c * kernel}, and product.(rows, w) multiplies
@@ -522,16 +479,9 @@ defmodule Transmuter.Ops.NN do
     [n, c | _] = Tuple.to_list(Nx.shape(x))
     [o, group_c | kernel] = Tuple.to_list(Nx.shape(w))
     spatial = length(kernel)
-    strides = attr(node, "strides", List.duplicate(1, spatial))
-    dilations = attr(node, "dilations", List.duplicate(1, spatial))
+    {strides, dilations, pads} = window(node, spatial_sizes(x), kernel)
     groups = div(c, group_c)
-
-    x =
-      Nx.pad(x, 0.0, [
-        {0, 0, 0},
-        {0, 0, 0}
-        | for({lo, hi} <- spatial_pads(node, spatial_sizes(x), spatial_sizes(w)), do: {lo, hi, 0})
-      ])
+    x = Nx.pad(x, 0.0, [{0, 0, 0}, {0, 0, 0} | for({lo, hi} <- pads, do: {lo, hi, 0})])
 
     padded = x |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
 
@@ -600,31 +550,34 @@ defmodule Transmuter.Ops.NN do
     |> Enum.reduce(&Nx.add/2)
   end
 
-  # {low, high} padding per spatial axis of a window of size kernel over sizes, for
-  # convolutions and pooling. SAME_UPPER and SAME_LOWER pad so the output size is
-  # ceil(input / stride), with the odd padding at the end or at the start.
-  defp spatial_pads(node, sizes, kernel) do
+  # The strides, dilations and {low, high} padding per spatial axis of a window of size
+  # kernel over sizes, for convolutions and pooling. SAME_UPPER and SAME_LOWER pad so the
+  # output size is ceil(input / stride), with the odd padding at the end or at the start.
+  defp window(node, sizes, kernel) do
     spatial = length(sizes)
     strides = attr(node, "strides", List.duplicate(1, spatial))
     dilations = attr(node, "dilations", List.duplicate(1, spatial))
 
-    case {attr(node, "auto_pad", "NOTSET"), attr(node, "pads")} do
-      {"NOTSET", nil} ->
-        List.duplicate({0, 0}, spatial)
+    pads =
+      case {attr(node, "auto_pad", "NOTSET"), attr(node, "pads")} do
+        {"NOTSET", nil} ->
+          List.duplicate({0, 0}, spatial)
 
-      {"NOTSET", pads} ->
-        Enum.zip(Enum.take(pads, spatial), Enum.drop(pads, spatial))
+        {"NOTSET", pads} ->
+          Enum.zip(Enum.take(pads, spatial), Enum.drop(pads, spatial))
 
-      {"VALID", _} ->
-        List.duplicate({0, 0}, spatial)
+        {"VALID", _} ->
+          List.duplicate({0, 0}, spatial)
 
-      {same, _} ->
-        Enum.zip_with([sizes, kernel, strides, dilations], fn [size, k, s, d] ->
-          total = max((div(size + s - 1, s) - 1) * s + (k - 1) * d + 1 - size, 0)
-          small = div(total, 2)
-          if same == "SAME_UPPER", do: {small, total - small}, else: {total - small, small}
-        end)
-    end
+        {same, _} ->
+          Enum.zip_with([sizes, kernel, strides, dilations], fn [size, k, s, d] ->
+            total = max((div(size + s - 1, s) - 1) * s + (k - 1) * d + 1 - size, 0)
+            small = div(total, 2)
+            if same == "SAME_UPPER", do: {small, total - small}, else: {total - small, small}
+          end)
+      end
+
+    {strides, dilations, pads}
   end
 
   defp spatial_sizes(t), do: t |> Nx.shape() |> Tuple.to_list() |> Enum.drop(2)
@@ -632,10 +585,9 @@ defmodule Transmuter.Ops.NN do
   # The flat input position of the first maximum of each window, over the whole input as
   # MaxPool gives it: row-major, or column-major in each channel with storage_order 1.
   # Each kernel tap is one strided slice of the padded input.
-  defp max_pool_indices(node, x, padding, dilations) do
+  defp max_pool_indices(node, x, padding, strides, dilations) do
     [n, c | sizes] = Tuple.to_list(Nx.shape(x))
     kernel = attr(node, "kernel_shape")
-    strides = attr(node, "strides", Enum.map(kernel, fn _ -> 1 end))
     low = padding |> Enum.drop(2) |> Enum.map(&elem(&1, 0))
 
     padded =
@@ -763,9 +715,7 @@ defmodule Transmuter.Ops.NN do
 
   defp add_channel_bias(out, nil), do: out
 
-  defp add_channel_bias(out, b),
-    do:
-      Nx.add(out, Nx.reshape(b, List.to_tuple([1, :auto] ++ List.duplicate(1, Nx.rank(out) - 2))))
+  defp add_channel_bias(out, b), do: Nx.add(out, on_axis(b, Nx.rank(out), 1))
 
   # {coordinate, size, bounds} for each spatial axis, in input pixels. Nearest rounds the
   # coordinates. A coordinate out of bounds moves to the border or reflects into the bounds.
@@ -919,7 +869,6 @@ defmodule Transmuter.Ops.NN do
     end
 
     padded = Nx.concatenate(edge.(before, 0) ++ [x] ++ edge.(after_, in_size - 1), axis: axis)
-    phase_axis = List.duplicate(1, Nx.rank(x) + 1) |> List.replace_at(axis + 1, s)
 
     for offset <- lo..hi do
       weights =
@@ -936,7 +885,7 @@ defmodule Transmuter.Ops.NN do
       |> Nx.multiply(
         weights
         |> static_tensor(:f32)
-        |> Nx.reshape(List.to_tuple(phase_axis))
+        |> on_axis(Nx.rank(x) + 1, axis + 1)
         |> Nx.as_type(Nx.type(x))
       )
     end
@@ -951,12 +900,7 @@ defmodule Transmuter.Ops.NN do
     taps = Enum.map(taps, &(&1 ++ List.duplicate({0, 0.0}, width - length(&1))))
     indices = taps |> Enum.map(fn row -> Enum.map(row, &elem(&1, 0)) end) |> static_tensor(:s64)
     weights = taps |> Enum.map(fn row -> Enum.map(row, &elem(&1, 1)) end) |> static_tensor(:f32)
-    ones = x |> Nx.shape() |> Tuple.to_list() |> Enum.map(fn _ -> 1 end)
-
-    along_axis =
-      &(&1
-        |> Nx.reshape(List.to_tuple(List.replace_at(ones, axis, out_size)))
-        |> Nx.as_type(Nx.type(x)))
+    per_output = &(&1 |> on_axis(Nx.rank(x), axis) |> Nx.as_type(Nx.type(x)))
 
     sum =
       for k <- 0..(width - 1) do
@@ -964,12 +908,12 @@ defmodule Transmuter.Ops.NN do
         |> Nx.take(indices |> Nx.slice_along_axis(k, 1, axis: 1) |> Nx.reshape({out_size}),
           axis: axis
         )
-        |> Nx.multiply(weights |> Nx.slice_along_axis(k, 1, axis: 1) |> along_axis.())
+        |> Nx.multiply(weights |> Nx.slice_along_axis(k, 1, axis: 1) |> per_output.())
       end
       |> Enum.reduce(&Nx.add/2)
 
     if Enum.any?(outside, &(&1 == 1)),
-      do: Nx.add(sum, Nx.multiply(along_axis.(static_tensor(outside, :f32)), outside_value)),
+      do: Nx.add(sum, Nx.multiply(per_output.(static_tensor(outside, :f32)), outside_value)),
       else: sum
   end
 
