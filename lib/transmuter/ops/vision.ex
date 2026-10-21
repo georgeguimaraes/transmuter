@@ -139,17 +139,33 @@ defmodule Transmuter.Ops.Vision do
         do: rois |> known!("the RoiAlign ROIs with sampling_ratio 0") |> Nx.to_list()
 
     count = Nx.axis_size(rois, 0)
+    {n, c, h, w} = Nx.shape(x)
+    pixels = x |> Nx.transpose(axes: [0, 2, 3, 1]) |> Nx.reshape({n * h * w, c})
+    opts = {{out_h, out_w}, scale, half_pixel?, max?, {h, w}}
 
-    for r <- 0..(count - 1) do
-      roi = Nx.slice_along_axis(rois, r, 1, axis: 0) |> Nx.reshape({4})
+    # The ROIs with the same sampling grid run together, and the output keeps their order.
+    groups =
+      0..(count - 1)
+      |> Enum.group_by(
+        &sampling_grid(known && Enum.at(known, &1), {out_h, out_w}, ratio, scale, half_pixel?)
+      )
+      |> Enum.sort()
 
-      image =
-        Nx.take(x, Nx.slice_along_axis(batch_indices, r, 1, axis: 0) |> Nx.reshape({}), axis: 0)
+    case groups do
+      [{grid, _all}] ->
+        roi_align(pixels, rois, batch_indices, grid, opts)
 
-      grid = sampling_grid(known && Enum.at(known, r), {out_h, out_w}, ratio, scale, half_pixel?)
-      roi_align_one(image, roi, {out_h, out_w}, grid, scale, half_pixel?, max?)
+      groups ->
+        order = groups |> Enum.flat_map(&elem(&1, 1)) |> Enum.with_index() |> Enum.sort()
+
+        groups
+        |> Enum.map(fn {grid, members} ->
+          ids = static_tensor(members, :s64)
+          roi_align(pixels, Nx.take(rois, ids), Nx.take(batch_indices, ids), grid, opts)
+        end)
+        |> Nx.concatenate()
+        |> Nx.take(static_tensor(Enum.map(order, &elem(&1, 1)), :s64))
     end
-    |> Nx.stack()
   end
 
   # Max pooling over bins of each ROI; rois are {batch, x1, y1, x2, y2} in input pixels.
@@ -415,60 +431,42 @@ defmodule Transmuter.Ops.Vision do
     {max(ceil(roi_h / out_h), 1), max(ceil(roi_w / out_w), 1)}
   end
 
-  defp roi_align_one(image, roi, {out_h, out_w}, {grid_h, grid_w}, scale, half_pixel?, max?) do
-    {_c, h, w} = Nx.shape(image)
+  # The ROIs {R, 4} of the images that batch_indices name, on the pixels {N * H * W, C} of
+  # x. Each output bin averages (or takes the largest of) grid_h * grid_w bilinear samples.
+  defp roi_align(pixels, rois, batch_indices, {grid_h, grid_w}, opts) do
+    {{out_h, out_w}, scale, half_pixel?, max?, {h, w}} = opts
+    r = Nx.axis_size(rois, 0)
     offset = if half_pixel?, do: 0.5, else: 0.0
-    roi = roi |> Nx.multiply(scale) |> Nx.subtract(offset)
-
-    [x1, y1, x2, y2] =
-      for i <- 0..3, do: roi |> Nx.slice_along_axis(i, 1, axis: 0) |> Nx.reshape({})
-
+    rois = rois |> Nx.multiply(scale) |> Nx.subtract(offset)
+    [x1, y1, x2, y2] = for i <- 0..3, do: rois |> Nx.slice_along_axis(i, 1, axis: 1)
     min_size = if half_pixel?, do: 0.0, else: 1.0
-    roi_w = Nx.max(Nx.subtract(x2, x1), min_size)
-    roi_h = Nx.max(Nx.subtract(y2, y1), min_size)
-    bin_h = Nx.divide(roi_h, out_h)
-    bin_w = Nx.divide(roi_w, out_w)
+    bin_h = y2 |> Nx.subtract(y1) |> Nx.max(min_size) |> Nx.divide(out_h) |> Nx.reshape({r, 1, 1})
+    bin_w = x2 |> Nx.subtract(x1) |> Nx.max(min_size) |> Nx.divide(out_w) |> Nx.reshape({r, 1, 1})
 
-    # Sample positions {out_h, grid_h} and {out_w, grid_w}.
-    ys =
-      Nx.iota({out_h, 1})
-      |> Nx.multiply(bin_h)
-      |> Nx.add(y1)
-      |> Nx.add(Nx.multiply(Nx.add(Nx.iota({1, grid_h}), 0.5), Nx.divide(bin_h, grid_h)))
-
-    xs =
-      Nx.iota({out_w, 1})
-      |> Nx.multiply(bin_w)
-      |> Nx.add(x1)
-      |> Nx.add(Nx.multiply(Nx.add(Nx.iota({1, grid_w}), 0.5), Nx.divide(bin_w, grid_w)))
-
-    {y_lo, y_hi, wy, y_ok} = roi_axis_taps(ys, h)
-    {x_lo, x_hi, wx, x_ok} = roi_axis_taps(xs, w)
-
-    flat = Nx.reshape(image, {:auto, h * w})
-
-    at = fn yi, xi ->
-      Nx.take(
-        flat,
-        Nx.add(
-          Nx.multiply(Nx.reshape(yi, {out_h, grid_h, 1, 1}), w),
-          Nx.reshape(xi, {1, 1, out_w, grid_w})
-        ),
-        axis: 1
-      )
+    # Sample positions {R, out, grid} along each axis.
+    samples = fn start, bin, out, grid ->
+      Nx.iota({1, out, 1})
+      |> Nx.multiply(bin)
+      |> Nx.add(Nx.reshape(start, {r, 1, 1}))
+      |> Nx.add(Nx.multiply(Nx.add(Nx.iota({1, 1, grid}), 0.5), Nx.divide(bin, grid)))
     end
 
-    wy = Nx.reshape(wy, {1, out_h, grid_h, 1, 1})
-    wx = Nx.reshape(wx, {1, 1, 1, out_w, grid_w})
+    {y_lo, y_hi, wy, y_ok} = roi_axis_taps(samples.(y1, bin_h, out_h, grid_h), h)
+    {x_lo, x_hi, wx, x_ok} = roi_axis_taps(samples.(x1, bin_w, out_w, grid_w), w)
+    rows = &Nx.reshape(&1, {r, out_h, grid_h, 1, 1})
+    columns = &Nx.reshape(&1, {r, 1, 1, out_w, grid_w})
+    image = batch_indices |> Nx.as_type(:s32) |> Nx.multiply(h * w) |> Nx.reshape({r, 1, 1, 1, 1})
 
-    {channels, _, _} = Nx.shape(image)
+    # {R, out_h, grid_h, out_w, grid_w, C}
+    at = fn yi, xi ->
+      index = image |> Nx.add(Nx.multiply(rows.(yi), w)) |> Nx.add(columns.(xi))
+      Nx.take(pixels, index, axis: 0)
+    end
 
-    ok =
-      Nx.logical_and(
-        Nx.reshape(y_ok, {1, out_h, grid_h, 1, 1}),
-        Nx.reshape(x_ok, {1, 1, 1, out_w, grid_w})
-      )
-      |> Nx.broadcast({channels, out_h, grid_h, out_w, grid_w})
+    [wy, wx, y_ok, x_ok] =
+      Enum.map([rows.(wy), columns.(wx), rows.(y_ok), columns.(x_ok)], &Nx.new_axis(&1, -1))
+
+    ok = Nx.logical_and(y_ok, x_ok)
 
     corners = [
       Nx.multiply(at.(y_lo, x_lo), Nx.multiply(Nx.subtract(1, wy), Nx.subtract(1, wx))),
@@ -477,21 +475,26 @@ defmodule Transmuter.Ops.Vision do
       Nx.multiply(at.(y_hi, x_hi), Nx.multiply(wy, wx))
     ]
 
-    zero = Nx.tensor(0, type: Nx.type(image))
+    zero = Nx.tensor(0, type: Nx.type(pixels))
+    shape = put_elem(Nx.shape(hd(corners)), 5, Nx.axis_size(pixels, 1))
+    ok = Nx.broadcast(ok, shape)
 
-    if max? do
-      # ONNX Runtime takes the largest weighted corner, which is the bilinear value for one sample per bin.
-      corners
-      |> Enum.map(&Nx.select(ok, &1, zero))
-      |> Enum.reduce(&Nx.max/2)
-      |> Nx.reduce_max(axes: [2, 4])
-    else
-      corners
-      |> Enum.reduce(&Nx.add/2)
-      |> then(&Nx.select(ok, &1, zero))
-      |> Nx.sum(axes: [2, 4])
-      |> Nx.divide(grid_h * grid_w)
-    end
+    pooled =
+      if max? do
+        # ONNX Runtime takes the largest weighted corner, which is the bilinear value for one sample per bin.
+        corners
+        |> Enum.map(&Nx.select(ok, &1, zero))
+        |> Enum.reduce(&Nx.max/2)
+        |> Nx.reduce_max(axes: [2, 4])
+      else
+        corners
+        |> Enum.reduce(&Nx.add/2)
+        |> then(&Nx.select(ok, &1, zero))
+        |> Nx.sum(axes: [2, 4])
+        |> Nx.divide(grid_h * grid_w)
+      end
+
+    Nx.transpose(pooled, axes: [0, 3, 1, 2])
   end
 
   # Low and high neighbors, the high weight, and validity of each sample position along one axis.
