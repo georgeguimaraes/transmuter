@@ -121,16 +121,65 @@ defmodule Transmuter.FusionTest do
     model = write(dir, nodes, @rms_constants, ["x"], ["y", "sqrt"])
     assert ops(model) == Enum.map(nodes, & &1.op_type)
 
-    # A scale that is not a constant stays outside of AttentionCore.
+    # A Where whose fill gives the hidden keys some weight stays.
     nodes = [
       node("MatMul", ["q", "k"], ["qk"]),
-      node("Div", ["qk", "scale"], ["scores"]),
+      node("Where", ["keep", "qk", "fill"], ["scores"]),
       node("Softmax", ["scores"], ["probs"], axis: -1),
       node("MatMul", ["probs", "v"], ["y"])
     ]
 
-    model = write(dir, nodes, %{}, ["q", "k", "v", "scale"], ["y"])
+    model = write(dir, nodes, %{"fill" => Nx.tensor(-1.0)}, ["q", "k", "v", "keep"], ["y"])
     assert ops(model) == Enum.map(nodes, & &1.op_type)
+  end
+
+  # GPT-2 exports compute the divisor of the scores from the head size, cast the scores to
+  # f32, hide the later keys with a Where and add the padding mask. A divisor that is a graph
+  # input is not known in the compiled function, so AttentionCore divides with Nx there.
+  test "the attention core of GPT-2 becomes AttentionCore", %{tmp_dir: dir} do
+    divisor = [
+      node("Shape", ["q"], ["q_shape"]),
+      node("Gather", ["q_shape", "three"], ["head_size"]),
+      node("Cast", ["head_size"], ["head_size_f"], to: 1),
+      node("Pow", ["head_size_f", "half"], ["sqrt_d"])
+    ]
+
+    core = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Div", ["qk", "sqrt_d"], ["scaled"]),
+      node("Cast", ["scaled"], ["scores"], to: 1),
+      node("Where", ["keep", "scores", "fill"], ["kept"]),
+      node("Add", ["kept", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: -1),
+      node("Cast", ["probs"], ["probs_f"], to: 1),
+      node("MatMul", ["probs_f", "v"], ["y"])
+    ]
+
+    constants = %{
+      "three" => Nx.tensor(3, type: :s64),
+      "half" => Nx.tensor(0.5),
+      "fill" => Nx.Constants.min_finite(:f32)
+    }
+
+    key = Nx.Random.key(1)
+    {q, key} = Nx.Random.normal(key, shape: {2, 4, 3, 64})
+    {k, key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+
+    keep =
+      Nx.less_equal(Nx.iota({1, 1, 3, 5}, axis: 3), Nx.add(Nx.iota({1, 1, 3, 5}, axis: 2), 2))
+
+    mask = Nx.tensor([[0, 0, 0, -1.0e9, -1.0e9], [0, 0, 0, 0, 0]]) |> Nx.reshape({2, 1, 1, 5})
+    inputs = %{"q" => q, "k" => k, "v" => v, "keep" => keep, "mask" => mask}
+
+    model = write(dir, divisor ++ core, constants, ["q", "k", "v", "keep", "mask"], ["y"])
+    assert Enum.sort(ops(model)) == ~w(AttentionCore Cast Gather Pow Shape Transpose)
+    assert_same_outputs(model, inputs)
+
+    model = write(dir, core, constants, ["q", "k", "v", "keep", "mask", "sqrt_d"], ["y"])
+    assert ops(model) == ["Transpose", "AttentionCore"]
+    assert_same_outputs(model, Map.put(inputs, "sqrt_d", Nx.tensor(8.0)))
   end
 
   defp ops(path), do: Enum.map(Transmuter.load!(path).nodes, & &1.op_type)

@@ -6,13 +6,14 @@ defmodule Transmuter.Fusion do
 
     * `Pow(x, 2)`, `ReduceMean`, `Add(eps)`, `Sqrt`, then `x / sqrt`, `x * (1 / sqrt)` or `x * Reciprocal(sqrt)`, then `Mul(weight)` becomes `SimplifiedLayerNormalization`.
     * `ReduceMean`, `Sub`, the RMSNorm of the difference, then `Mul(gamma)` and `Add(beta)` becomes `LayerNormalization`.
-    * `MatMul(q, k)`, an optional `Mul` or `Div` by a constant scale, an optional `Add(mask)`, `Softmax` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`).
+    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, an optional `Cast` to a float type, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, `Softmax`, an optional `Cast` to a float type and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way.
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
   A subgraph matches only when the replacement computes the same function:
 
-    * The exponent is 2, the numerator of `1 / sqrt` is 1, and eps and the scale are constants with one value.
+    * The exponent is 2, the numerator of `1 / sqrt` is 1, and eps and a `Mul` scale are constants with one value. A `Div` by a value that is not a constant becomes the divisor input of `AttentionCore`, which reads it when the graph runs.
+    * The fill of the `Where` is a constant of at most -1.0e4, so the hidden keys get no weight.
     * Eps is an f32, f16 or bf16 value. It has the type of x, so x is not f64.
     * `ReduceMean` reduces the axis -1 and keeps it.
     * The weight, gamma and beta are constants of at most one axis, so they broadcast only along the last axis.
@@ -23,6 +24,9 @@ defmodule Transmuter.Fusion do
 
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
   alias Transmuter.Ops
+
+  # The ONNX types FLOAT, FLOAT16 and BFLOAT16.
+  @float_types [1, 10, 16]
 
   @doc """
   Rewrites the matching subgraphs of `graph` and of its subgraphs.
@@ -185,28 +189,29 @@ defmodule Transmuter.Fusion do
     end
   end
 
-  # The scores before the softmax are MatMul(q, k), optionally scaled by a constant, plus
-  # an optional mask.
+  # The probabilities are Softmax(scores + mask), optionally through a Cast to a float type,
+  # and the mask is optional. The inputs of AttentionCore are q, k, v, the mask, the keys to
+  # keep and the divisor of the scores, with "" for a missing one.
   defp attention(ctx, matmul = %{input: [probs, v]}) do
-    with softmax = %{} <- op(ctx, probs, "Softmax"),
-         {scores, mask, masked} <- masked(ctx, hd(softmax.input)),
-         {product, scale, scaled} <- scaled(ctx, scores),
-         qk = %{input: [q, k]} <- op(ctx, product, "MatMul") do
+    with {softmax, cast} <- through_cast(ctx, probs, "Softmax"),
+         {logits, mask, masked} <- masked(ctx, hd(softmax.input)),
+         {qk = %{input: [q, k]}, scores} <- scores(ctx, logits) do
       default_axis = if ctx.opset >= 13, do: -1, else: 1
 
       node = %NodeProto{
         op_type: "AttentionCore",
         domain: "transmuter",
         name: matmul.name,
-        input: [q, k, v | mask],
+        input: [q, k, v, mask, scores.keep, scores.divisor],
         output: matmul.output,
         attribute: [
-          %AttributeProto{name: "scale", type: :FLOAT, f: scale},
-          %AttributeProto{name: "axis", type: :INT, i: Ops.attr(softmax, "axis", default_axis)}
+          %AttributeProto{name: "scale", type: :FLOAT, f: scores.scale},
+          %AttributeProto{name: "axis", type: :INT, i: Ops.attr(softmax, "axis", default_axis)},
+          %AttributeProto{name: "fill", type: :FLOAT, f: scores.fill}
         ]
       }
 
-      {node, [matmul, softmax | masked ++ scaled ++ [qk]]}
+      {node, [matmul, softmax | cast ++ masked ++ scores.nodes ++ [qk]]}
     else
       _ -> nil
     end
@@ -214,30 +219,74 @@ defmodule Transmuter.Fusion do
 
   defp masked(ctx, z) do
     with add = %{} <- op(ctx, z, "Add"),
-         [scores, mask] <- Enum.find(orders(add.input), &product?(ctx, hd(&1))) do
-      {scores, [mask], [add]}
+         [logits, mask] <- Enum.find(orders(add.input), &scores(ctx, hd(&1))) do
+      {logits, mask, [add]}
     else
-      _ -> {z, [], []}
+      _ -> {z, "", []}
     end
   end
 
-  defp product?(ctx, scores) do
-    {product, _scale, _nodes} = scaled(ctx, scores)
-    op(ctx, product, "MatMul") != nil
+  # The scores are MatMul(q, k), an optional scale, an optional Cast to a float type, and an
+  # optional Where that keeps the scores of some keys and gives the others a fill of at most
+  # -1.0e4, which gives them no weight. Returns the MatMul and the parts of the scores.
+  defp scores(ctx, name) do
+    {name, keep, fill, kept} = kept(ctx, name)
+    {name, cast} = through_cast(ctx, name)
+    {product, scale, divisor, scaled} = scaled(ctx, name)
+
+    if qk = op(ctx, product, "MatMul") do
+      {qk,
+       %{
+         scale: scale,
+         divisor: divisor,
+         keep: keep,
+         fill: fill,
+         nodes: kept ++ cast ++ scaled
+       }}
+    end
   end
 
+  defp kept(ctx, name) do
+    with where = %{input: [keep, scores, fill]} <- op(ctx, name, "Where"),
+         value when is_float(value) and value <= -1.0e4 <- float_scalar(ctx, fill) do
+      {scores, keep, value, [where]}
+    else
+      _ -> {name, "", 0.0, []}
+    end
+  end
+
+  # The node of op_type that computes name, directly or through a Cast to a float type.
+  defp through_cast(ctx, name, op_type) do
+    {inner, cast} = through_cast(ctx, name)
+    if node = op(ctx, inner, op_type), do: {node, cast}
+  end
+
+  defp through_cast(ctx, name) do
+    case op(ctx, name, "Cast") do
+      cast = %{input: [inner]} ->
+        if Ops.attr(cast, "to") in @float_types, do: {inner, [cast]}, else: {name, []}
+
+      nil ->
+        {name, []}
+    end
+  end
+
+  # A Div by a value that is not a constant keeps the value as the divisor.
   defp scaled(ctx, scores) do
     with nil <- op(ctx, scores, "Div"),
          nil <- op(ctx, scores, "Mul") do
-      {scores, 1.0, []}
+      {scores, 1.0, "", []}
     else
       node = %{op_type: "Div", input: [product, divisor]} ->
-        c = float_scalar(ctx, divisor)
-        if c && c != 0, do: {product, 1 / c, [node]}, else: {scores, 1.0, []}
+        case float_scalar(ctx, divisor) do
+          nil -> {product, 1.0, divisor, [node]}
+          c when c != 0 -> {product, 1 / c, "", [node]}
+          _zero -> {scores, 1.0, "", []}
+        end
 
       node = %{op_type: "Mul"} ->
-        Enum.find_value(orders(node.input), {scores, 1.0, []}, fn [product, factor] ->
-          if c = float_scalar(ctx, factor), do: {product, c, [node]}
+        Enum.find_value(orders(node.input), {scores, 1.0, "", []}, fn [product, factor] ->
+          if c = float_scalar(ctx, factor), do: {product, c, "", [node]}
         end)
     end
   end
@@ -285,7 +334,7 @@ defmodule Transmuter.Fusion do
   # The value of an f32, f16 or bf16 constant with one element.
   defp epsilon(ctx, name) do
     case ctx.constants[name] do
-      %{data_type: type} when type in [1, 10, 16] -> scalar(ctx, name)
+      %{data_type: type} when type in @float_types -> scalar(ctx, name)
       _ -> nil
     end
   end

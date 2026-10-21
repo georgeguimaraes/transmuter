@@ -6,7 +6,7 @@ defmodule Transmuter.Ops.Transformer do
 
   All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel.
 
-  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(q · k * scale + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, the softmax is along the last axis and the mask broadcasts to the scores.
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep and divisor. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, the softmax is along the last axis, the masks broadcast to the scores and the host can read the divisor.
   """
 
   import Transmuter.Ops,
@@ -19,6 +19,8 @@ defmodule Transmuter.Ops.Transformer do
       emlx_norm: 4,
       empty?: 1,
       ints!: 1,
+      known!: 2,
+      known?: 1,
       matmul: 2,
       normalize: 3,
       normalize_axis: 2,
@@ -297,20 +299,37 @@ defmodule Transmuter.Ops.Transformer do
 
   # k has the head size before the keys. 4-D heads with the softmax over the keys take the
   # shared attention core with the transpose of k. Other shapes keep the MatMul broadcasting.
-  defp attention_core(node, [q, k, v | mask], opset) do
-    mask = List.first(mask)
+  # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
+  # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
+  defp attention_core(node, [q, k, v | optional], opset) do
+    [mask, keep, divisor] = pad(optional, 3)
     scale = attr(node, "scale")
 
-    if fused_core?(q, k, v, mask, attr(node, "axis")) do
-      opts = %{scale: scale, softcap: 0.0, bias: mask, hidden: nil, causal: false}
+    {scale, divisor} =
+      case divisor && known?(divisor) && Nx.size(divisor) == 1 &&
+             divisor |> known!("the divisor") |> Nx.reshape({}) |> Nx.to_number() do
+        d when is_number(d) and d != 0 -> {scale / d, nil}
+        _other -> {scale, divisor}
+      end
+
+    if divisor == nil and fused_core?(q, k, v, [mask, keep], attr(node, "axis")) do
+      hidden = keep && Nx.equal(keep, 0)
+      opts = %{scale: scale, softcap: 0.0, bias: mask, hidden: hidden, causal: false}
       attend(q, Nx.transpose(k, axes: [0, 1, 3, 2]), v, opts)
     else
-      [q, k, v, mask]
-      |> widen(fn [q, k, v, mask] ->
+      [q, k, v, mask, divisor]
+      |> widen(fn [q, k, v, mask, divisor] ->
         scores = matmul(q, k)
-        scores = if scale == 1, do: scores, else: Nx.multiply(scores, scale)
+
+        scores =
+          cond do
+            divisor != nil -> Nx.divide(scores, divisor)
+            scale == 1 -> scores
+            true -> Nx.multiply(scores, scale)
+          end
 
         scores
+        |> where_kept(keep, attr(node, "fill"))
         |> add_optional(mask)
         |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
         |> matmul(v)
@@ -320,13 +339,22 @@ defmodule Transmuter.Ops.Transformer do
     end
   end
 
-  defp fused_core?(q, k, v, mask, axis) do
+  defp where_kept(scores, nil, _fill), do: scores
+
+  defp where_kept(scores, keep, fill) do
+    shape = broadcast_shape([Nx.shape(scores), Nx.shape(keep)])
+    Nx.select(Nx.broadcast(keep, shape), Nx.broadcast(scores, shape), fill)
+  end
+
+  defp fused_core?(q, k, v, masks, axis) do
     with true <- Enum.all?([q, k, v], &(Nx.rank(&1) == 4 and Nx.type(&1) == Nx.type(q))),
          {b, heads, s, _head_size} <- Nx.shape(q),
          true <-
            Enum.all?([k, v], &(&1 |> Nx.shape() |> Tuple.to_list() |> Enum.take(2) == [b, heads])) do
       scores = {b, heads, s, Nx.axis_size(k, 3)}
-      axis in [-1, 3] and (mask == nil or broadcast_shape([scores, Nx.shape(mask)]) == scores)
+
+      axis in [-1, 3] and
+        Enum.all?(masks, &(&1 == nil or broadcast_shape([scores, Nx.shape(&1)]) == scores))
     end
   end
 
