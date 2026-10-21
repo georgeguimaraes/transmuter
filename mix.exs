@@ -111,6 +111,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.Idefics3Processor,
           Transmuter.Vision.Qwen2VLProcessor,
           Transmuter.Audio.SpeechToText,
+          Transmuter.Audio.TextToSpeech,
           Transmuter.Fusion,
           Transmuter.GraphBreaks,
           Transmuter.Shared,

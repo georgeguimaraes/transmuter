@@ -4,6 +4,8 @@ defmodule Transmuter.Serving do
 
   `text/7` and `image/6` build the servings that run the model once. The client side turns the inputs into tensors and gives each batch a key: the sequence length for text, and the image size for images. The serving compiles the model once for each key in its init function. Init runs in the serving process, so the cache of compiled graph segments lives as long as the serving. Each batch is padded to the batch size, so the model only runs the compiled shapes.
 
+  `each/2` builds the servings that run each input as a batch of its own, such as text-to-speech, whose outputs have a shape that depends on the input.
+
   `generation/4` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop. With `stream: true`, the loop sends each new token to the client through the `:token` hook of `Nx.Serving.streaming/2`, and the client decodes the text.
   """
 
@@ -248,6 +250,53 @@ defmodule Transmuter.Serving do
         )
         |> split_like(items)
         |> Enum.zip_with(items, postprocess)
+
+      if multi?, do: results, else: hd(results)
+    end)
+  end
+
+  @doc """
+  Returns an `Nx.Serving` that runs each input as a batch of one row, for outputs whose shapes depend on the input, such as the audio of text-to-speech. The serving streams the outputs of each batch to the client, so the outputs of the inputs of a list can have different shapes.
+
+  `task` is a map:
+
+    * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
+
+    * `:preprocess` takes a valid input and returns a map of `Nx.BinaryBackend` tensors without a batch axis.
+
+    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of one input, with a batch axis of size 1, and returns a map of tensors with a batch axis of size 1.
+
+    * `:postprocess` takes the map of tensors of one input, without the batch axis, and returns the result.
+
+  The serving reads `:defn_options` of `opts`.
+  """
+  def each(task, opts) do
+    %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess} = task
+
+    Nx.Serving.new(
+      __MODULE__,
+      fn defn_options ->
+        run = init.(Keyword.delete(defn_options, :batch_keys))
+
+        fn batch ->
+          Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+          |> run.()
+          |> Nx.backend_transfer(Nx.BinaryBackend)
+        end
+      end,
+      opts[:defn_options]
+    )
+    |> Nx.Serving.batch_size(1)
+    |> Nx.Serving.streaming()
+    |> Nx.Serving.client_preprocessing(fn input ->
+      {inputs, multi?} = validate!(input, validate)
+      {Enum.map(inputs, &Nx.Batch.stack([preprocess.(&1)])), multi?}
+    end)
+    |> Nx.Serving.client_postprocessing(fn stream, multi? ->
+      results =
+        Enum.map(stream, fn {:batch, outputs, _metadata} ->
+          outputs |> Map.new(fn {name, t} -> {name, t[0]} end) |> postprocess.()
+        end)
 
       if multi?, do: results, else: hd(results)
     end)

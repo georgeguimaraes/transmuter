@@ -1,10 +1,14 @@
 defmodule Transmuter.Audio do
   @moduledoc """
-  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer and the configuration) and returns an `Nx.Serving` that takes audio and gives results in the shapes of Bumblebee.
+  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer and the configuration) and returns an `Nx.Serving`. `speech_to_text/2` takes audio and gives text in the shape of Bumblebee. `text_to_speech/2` takes text and gives audio in the shape of Python transformers.
 
       serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"})
       Nx.Serving.run(serving, audio)
       #=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, ...", ...}]}
+
+      serving = Transmuter.Audio.text_to_speech({:hf, "Xenova/mms-tts-eng"})
+      Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+      #=> %{audio: #Nx.Tensor<f32[31744]>, sampling_rate: 16000}
 
   The tasks need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
 
@@ -45,4 +49,39 @@ defmodule Transmuter.Audio do
   The serving does not stream the text, because it merges the windows of long audio only at the end.
   """
   defdelegate speech_to_text(source, opts \\ []), to: Transmuter.Audio.SpeechToText
+
+  @doc """
+  Builds a serving that turns text into speech with VITS (MMS-TTS) or SpeechT5.
+
+  The input is a string, or a map with the text in `:text`, and optionally `:seed` and `:speaker_embedding`. The input can also be a list of them. The result is `%{audio: audio, sampling_rate: rate}`, as the `text-to-speech` pipeline of Python transformers. `audio` is an f32 tensor of PCM samples `{samples}`, and `rate` is the sampling rate in Hz.
+
+  The model type in `config.json` selects the steps:
+
+    * VITS, such as `Xenova/mms-tts-eng`, makes the audio in one pass of `onnx/model.onnx`. The tokenizer reads characters, and puts the pad token between them, as `VitsTokenizer` of transformers.
+
+    * SpeechT5, such as `Xenova/speecht5_tts`, needs a speaker embedding of 512 values, such as an x-vector of the CMU ARCTIC speakers. The encoder (`encoder_model`) runs once. The decoder (`decoder_model_merged`) then makes the spectrogram in steps of two frames. It stops when the sum of the two stop probabilities of a step is 0.5 or more, or after 10 steps for each token, as `generate_speech` of transformers with its defaults. The postnet and the vocoder (`decoder_postnet_and_vocoder`) turn the spectrogram into audio.
+
+  Kokoro reads phonemes, not text, so `text_to_speech/2` does not run it. See the [Speech and audio guide](guides/speech_and_audio.md) for Kokoro with tensors.
+
+  Both models are random. VITS adds noise to the durations and to the sounds, and the decoder of SpeechT5 applies dropout in each step, also in Python. The seed of an input decides this noise, so a seed gives the same audio each time. An input without a seed gets a random seed.
+
+  The default variant is fp32. The serving runs each text alone, because the length of the audio depends on the text. The compiled models keep the shapes of 64 text lengths and audio lengths. The decoder of SpeechT5 compiles a shape for each step on its first run, and keeps 1024 steps.
+
+      serving =
+        Transmuter.Audio.text_to_speech({:hf, "Xenova/speecht5_tts"},
+          speaker_embedding: Nx.from_binary(File.read!("speaker.f32"), :f32)
+        )
+
+      Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+      #=> %{audio: #Nx.Tensor<f32[25088]>, sampling_rate: 16000}
+
+  ## Options
+
+    * `:seed` - the seed of the inputs without a seed. The default is a random seed for each input.
+
+    * `:speaker_embedding` - the speaker embedding of the inputs without one, a tensor `{512}` for SpeechT5. VITS takes no speaker embedding.
+
+    * `:noise` - `false` removes the noise, so the audio does not depend on the seed. The random operators of the model then give fixed values (see the `:noise` option of `Transmuter.load!/2`). VITS then gives the audio of transformers with `noise_scale` and `noise_scale_duration` at 0. In SpeechT5, the dropout keeps all values. The audio without noise is less natural, and SpeechT5 can then continue to its maximum length. Use it to compare with a reference. The default is `true`.
+  """
+  defdelegate text_to_speech(source, opts \\ []), to: Transmuter.Audio.TextToSpeech
 end

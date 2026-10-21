@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL) and `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR). `Transmuter.Audio.speech_to_text/2` runs Whisper. Their results have the shapes of Bumblebee, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL) and `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR). `Transmuter.Audio` gives `speech_to_text` (Whisper) and `text_to_speech` (VITS and SpeechT5). Their results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 
@@ -81,6 +81,8 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 `bench/kokoro_tts.exs` runs [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) from its ONNX export and writes a WAV file. All operators of the export run in Transmuter. The example also shows how to round audio lengths to 200 ms buckets to limit recompilation.
 
 Kokoro reads phonemes, not text. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance. See the [Speech and Audio guide](guides/speech_and_audio.md) for more models and patterns.
+
+`Transmuter.Audio.text_to_speech/2` speaks text with VITS (MMS-TTS) and SpeechT5. It does not run Kokoro, because Kokoro needs phonemes.
 
 The example also fixes one node of the export. The export computes the STFT phase with the `atan2` of `torch.onnx`, which gives -π for `atan2(0, x)` when x is negative. `torch.atan2` gives π, and the model was trained with π. Transmuter computes an exact STFT, so the imaginary part is 0 at DC and Nyquist, and the wrong phase in every frame adds a tone at 4.8 kHz. ONNX Runtime hides the error, because its STFT has small rounding errors at these bins. The example changes the `Greater` test of the `atan2` to `GreaterOrEqual`, as in `torch.atan2`.
 
@@ -164,7 +166,8 @@ These models also ran from input to final result, and the result agrees with ONN
 |---|---|
 | [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) | Speech for inputs of up to 505 phonemes. With the `atan2` fix of the example, the spectrum matches PyTorch |
 | [Grounding DINO tiny](https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX) | The same detections on a COCO image, with scores within 0.0001 |
-| [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5 |
+| [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5. Without noise, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
+| [SpeechT5](https://huggingface.co/Xenova/speecht5_tts) | With a decoder dropout that keeps all values, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |
 | [Moonshine base](https://huggingface.co/onnx-community/moonshine-base-ONNX) | The same tokens for 2 s, 6 s and 15 s of speech |
 | [Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export) | The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter |

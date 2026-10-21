@@ -74,9 +74,79 @@ Each new audio length compiles a new graph segment. To limit the number of compi
 | 20.2 s | 13.9 s | 10.6 s | 0.84 s |
 | 26.6 s | 25.8 s | 11.4 s | 1.11 s |
 
-## MMS-TTS
+## Text-to-speech with VITS and SpeechT5
 
-[MMS-TTS](https://huggingface.co/Xenova/mms-tts-eng) is a text-to-speech model from Meta. It generates audio from phoneme input. The tested version gives the same audio length and a waveform within 6e-5 of ONNX Runtime (when given the same random seed).
+`Transmuter.Audio.text_to_speech/2` speaks text with two model types. It gives `%{audio: audio, sampling_rate: rate}`, as the `text-to-speech` pipeline of Python transformers. `audio` is an f32 tensor of PCM samples.
+
+```elixir
+serving =
+  Transmuter.Audio.text_to_speech({:hf, "Xenova/mms-tts-eng"},
+    backend: EMLX.Backend,
+    defn_options: [compiler: EMLX]
+  )
+
+%{audio: audio, sampling_rate: 16000} = Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+File.write!("speech.f32", Nx.to_binary(audio))
+# ffmpeg -f f32le -ar 16000 -ac 1 -i speech.f32 speech.wav
+```
+
+### VITS
+
+[MMS-TTS](https://huggingface.co/Xenova/mms-tts-eng) is a family of VITS models from Meta, one for each language. The model makes the audio in one pass. The tokenizer reads characters and puts the pad token between them, as `VitsTokenizer` of Python transformers. It lowercases the text and removes the characters that the vocabulary does not have.
+
+The export adds random noise to the durations of the characters and to the sounds, with the `noise_scale_duration` (0.8) and `noise_scale` (0.667) of the configuration. The seed of a request decides the noise, so the length of the audio also depends on the seed.
+
+### SpeechT5
+
+[SpeechT5](https://huggingface.co/Xenova/speecht5_tts) needs a speaker embedding: an x-vector of 512 values, such as the x-vectors of the CMU ARCTIC speakers that the examples of transformers use. Give it in the `:speaker_embedding` option or in the input:
+
+```elixir
+speaker = Nx.from_binary(File.read!("speaker.f32"), :f32)
+
+serving =
+  Transmuter.Audio.text_to_speech({:hf, "Xenova/speecht5_tts"},
+    speaker_embedding: speaker,
+    backend: EMLX.Backend,
+    defn_options: [compiler: EMLX]
+  )
+
+Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+#=> %{audio: #Nx.Tensor<f32[25088]>, sampling_rate: 16000}
+```
+
+The serving does the steps of `generate_speech` in Python transformers:
+
+1. The encoder runs once on the characters of the text.
+2. The decoder makes the spectrogram in steps. Each step gives 2 frames of 80 mel values, and the next step takes the frames so far and the KV cache.
+3. The loop stops when the sum of the two stop probabilities of a step is 0.5 or more, or after 10 steps for each token of the text (`maxlenratio` 20 divided by the `reduction_factor` 2).
+4. The postnet and the HiFi-GAN vocoder (`decoder_postnet_and_vocoder.onnx`) turn the frames into audio. This file is the same as `onnx/model.onnx` of `Xenova/speecht5_hifigan`.
+
+The prenet of the decoder applies dropout with a ratio of 0.5 in each step, also in eval mode in Python. So the audio of SpeechT5 also depends on the seed. Each step draws from its own key, which comes from the seed and the number of the step.
+
+### Noise and references
+
+With `noise: false`, the random operators give fixed values (see the `:noise` option of `Transmuter.load!/2`). VITS then gives the audio of Python transformers with `noise_scale` and `noise_scale_duration` at 0. In SpeechT5, the dropout keeps all values. The tests compare this audio with PyTorch, and `test/support/pipeline_references.py` makes the references:
+
+| Model | Text | Length | Largest difference |
+|---|---|---|---|
+| `Xenova/mms-tts-eng` | "Hello, my dog is cute." | 33,024 samples, the same as PyTorch | 8.5e-5 |
+| `Xenova/speecht5_tts` | "Hi." | 9,728 samples (19 steps), the same as PyTorch | 8.4e-5 |
+
+ONNX Runtime on the fp32 SpeechT5 export, with the same dropout, gives 19 steps and differs from PyTorch by 1.1e-4. The quantized SpeechT5 files do not give the audio of ONNX Runtime on the same files. With the 8-bit files, the decoder stops after 19 steps in Transmuter and after 21 steps in ONNX Runtime. With the 4-bit files, the samples differ by up to 5e-3. Use the fp32 files, the default.
+
+### Speed
+
+On an Apple M-series GPU, `Xenova/mms-tts-eng` makes 2 s of speech in 0.23 s. `Xenova/speecht5_tts` makes 1.6 s of speech in 3.3 s: each of its 49 decoder steps takes about 68 ms. The decoder computes its positions from the length of its inputs, so each step has a new shape. Each shape compiles on its first run, and the compiled decoder keeps 1024 shapes.
+
+The serving runs each text alone, because the length of the audio depends on the text. A list of texts runs one text after the other.
+
+### Kokoro
+
+`text_to_speech/2` does not run Kokoro, because Kokoro reads phonemes. See [Kokoro text-to-speech](#kokoro-text-to-speech) for Kokoro with tensors.
+
+### MMS-TTS with tensors
+
+The model takes `input_ids` and `attention_mask`. The tokenizer of the repository gives them. Give an `Nx.Random` key in the `Transmuter.random_input/0` input to get the same audio again.
 
 ```elixir
 model = Transmuter.load!(
@@ -84,16 +154,20 @@ model = Transmuter.load!(
   backend: EMLX.Backend
 )
 
-# Inputs: "input_ids" (encoded phonemes, shape {1, n}) and "attention_mask" (shape {1, n}).
+tokenizer = Transmuter.Tokenizer.load!({:hf, "Xenova/mms-tts-eng"})
+{tokens, _encodings} = Transmuter.Tokenizer.encode(tokenizer, ["Hello, my dog is cute."])
+
 inputs = %{
-  "input_ids" => input_ids,
-  "attention_mask" => attention_mask
+  "input_ids" => tokens["input_ids"],
+  "attention_mask" => tokens["attention_mask"],
+  Transmuter.random_input() => Nx.Random.key(42)
 }
 
 run = Transmuter.compile(model, inputs, compiler: EMLX)
-output = run.(inputs)
-waveform = output["waveform"]
+waveform = run.(inputs)["waveform"]
 ```
+
+With the random values of ONNX Runtime, the model gives the same audio length and a waveform within 6e-5 of ONNX Runtime.
 
 ## Whisper speech recognition
 

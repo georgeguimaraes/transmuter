@@ -54,8 +54,9 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
 | `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
+| `Transmuter.Audio.text_to_speech/2` | text, or `%{text: text, seed: seed}` | `%{audio: tensor, sampling_rate: rate}` |
 
-Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task.
+Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Bumblebee has no text-to-speech, so `text_to_speech/2` gives the shape of the pipeline of Python transformers. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task. The audio of text-to-speech depends on a random seed, so the tests compare the audio without noise.
 
 ### Embeddings
 
@@ -227,6 +228,30 @@ Nx.Serving.run(serving, audio)
 ```
 
 See [Speech and audio](speech_and_audio.md) for the details.
+
+### Speech synthesis
+
+```elixir
+serving = Transmuter.Audio.text_to_speech({:hf, "Xenova/mms-tts-eng"})
+Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+#=> %{audio: #Nx.Tensor<f32[31744]>, sampling_rate: 16000}
+```
+
+`Transmuter.Audio.text_to_speech/2` turns text into PCM samples. Write them to a file with `File.write!("speech.f32", Nx.to_binary(audio))`, and convert the file with `ffmpeg -f f32le -ar 16000 -ac 1 -i speech.f32 speech.wav`. The serving runs two model types:
+
+- VITS, such as the MMS-TTS models of Meta (`Xenova/mms-tts-eng`), makes the audio in one pass.
+- SpeechT5 (`Xenova/speecht5_tts`) makes a spectrogram step by step and turns it into audio with a vocoder. It needs a speaker embedding of 512 values in the `:speaker_embedding` option or in the input.
+
+```elixir
+speaker = Nx.from_binary(File.read!("speaker.f32"), :f32)
+serving = Transmuter.Audio.text_to_speech({:hf, "Xenova/speecht5_tts"}, speaker_embedding: speaker)
+Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
+#=> %{audio: #Nx.Tensor<f32[25088]>, sampling_rate: 16000}
+```
+
+Both models are random, also in Python. The seed of an input decides the audio, and an input without a seed gets a random seed. With `noise: false`, the random operators give fixed values. VITS then gives the audio of Python transformers with `noise_scale` and `noise_scale_duration` at 0, and the decoder of SpeechT5 keeps all values in its dropout. The tests compare this audio with PyTorch: the length is the same, and the samples are within 1e-4.
+
+The serving runs each text alone, because the length of the audio depends on the text. Kokoro reads phonemes, not text, so the serving does not run it. See [Speech and audio](speech_and_audio.md) for the details.
 
 ## Images
 

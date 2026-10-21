@@ -1,6 +1,6 @@
 """Prints the reference values of test/transmuter/text_test.exs, test/transmuter/vision_test.exs and test/transmuter/audio_test.exs, from the pipelines of Python transformers and sentence-transformers.
 
-Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision --with timm python -I test/support/pipeline_references.py
+Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with onnx --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision --with timm python -I test/support/pipeline_references.py
 
 Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The processor of Qwen2-VL loads a video processor, which needs torchvision. DETR needs timm.
 """
@@ -341,3 +341,80 @@ for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
 for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
     processor = AutoImageProcessor.from_pretrained(repo, use_fast=False)
     print(repo, "sizes", [tuple(processor(Image.new("RGB", (width, height)), return_tensors="np")["pixel_values"].shape[2:]) for height, width in [(240, 320), (100, 1000), (1000, 100), (400, 800), (800, 600)]])
+
+# Text-to-speech without noise, as Transmuter.Audio.text_to_speech/2 with noise: false. VITS
+# runs with noise_scale and noise_scale_duration at 0. The decoder prenet of SpeechT5 applies
+# dropout also in eval, so here the dropout keeps all values, as the export does when its
+# RandomUniformLike operators give their upper bound. With this dropout, SpeechT5 reads "Hi."
+# in 19 steps, before maxlen (25 steps). The script writes the audio to
+# test/fixtures/mms_tts_eng.f32 and test/fixtures/speecht5_hi.f32. The speaker embedding in
+# test/fixtures/speaker_embeddings.f32 is speaker_embeddings.bin of the transformers.js docs
+# (huggingface.co/datasets/Xenova/transformers.js-docs).
+import onnx
+from onnx import helper, numpy_helper
+from transformers import SpeechT5ForTextToSpeech, SpeechT5HifiGan, SpeechT5Processor, VitsModel
+from transformers.models.speecht5 import modeling_speecht5
+
+text = "Hello, my dog is cute."
+tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
+print("vits ids", tokenizer("Hello World! It's 3 o'clock, café? ÀB_x–y").input_ids)
+model = VitsModel.from_pretrained("facebook/mms-tts-eng")
+model.noise_scale = model.noise_scale_duration = 0.0
+with torch.no_grad():
+    waveform = model(**tokenizer(text, return_tensors="pt")).waveform[0].numpy()
+waveform.astype("<f4").tofile("test/fixtures/mms_tts_eng.f32")
+print("vits", model.config.sampling_rate, len(waveform), float(np.abs(waveform).mean()))
+
+modeling_speecht5.SpeechT5SpeechDecoderPrenet._consistent_dropout = lambda self, x, p: x / (1 - p)
+processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
+model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
+vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
+speaker = np.fromfile("test/fixtures/speaker_embeddings.f32", "<f4")[None]
+print("speecht5 ids", processor(text="Hello World! It's 3 o'clock, café? ÀB_x–y")["input_ids"])
+ids = processor(text="Hi.", return_tensors="pt")["input_ids"]
+with torch.no_grad():
+    speech = model.generate_speech(ids, torch.tensor(speaker), vocoder=vocoder).numpy()
+speech.astype("<f4").tofile("test/fixtures/speecht5_hi.f32")
+print("speecht5", vocoder.config.sampling_rate, len(speech), float(np.abs(speech).mean()))
+
+
+# ONNX Runtime on the fp32 export of SpeechT5, with the dropout that keeps all values and the
+# stop rule of Python, gives the same length and a waveform within about 1e-4 of PyTorch.
+def keep_all(graph):
+    nodes = []
+    for node in graph.node:
+        for attribute in node.attribute:
+            if attribute.type == onnx.AttributeProto.GRAPH:
+                keep_all(attribute.g)
+        if node.op_type == "RandomUniformLike":
+            name = node.output[0]
+            one = numpy_helper.from_array(np.array(1.0, np.float32))
+            nodes += [helper.make_node("Shape", [node.input[0]], [name + "_shape"]), helper.make_node("Constant", [], [name + "_one"], value=one), helper.make_node("Expand", [name + "_one", name + "_shape"], [name])]
+        else:
+            nodes.append(node)
+    del graph.node[:]
+    graph.node.extend(nodes)
+
+
+def keep_all_session(path):
+    graph = onnx.load(path)
+    keep_all(graph.graph)
+    return ort.InferenceSession(graph.SerializeToString(), providers=["CPUExecutionProvider"])
+
+
+directory = snapshot_download("Xenova/speecht5_tts", allow_patterns=["onnx/encoder_model.onnx", "onnx/decoder_model_merged.onnx", "onnx/decoder_postnet_and_vocoder.onnx"], local_dir=tempfile.mkdtemp())
+encoder, decoder, vocoder = (keep_all_session(f"{directory}/onnx/{name}.onnx") for name in ["encoder_model", "decoder_model_merged", "decoder_postnet_and_vocoder"])
+hidden, mask = encoder.run(None, {"input_ids": ids.numpy()})
+names = [o.name for o in decoder.get_outputs()]
+past = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in decoder.get_inputs() if i.name.startswith("past_key_values")}
+sequence, spectrum = np.zeros((1, 1, 80), np.float32), []
+for step in range(1, hidden.shape[1] * 20 // 2 + 1):
+    feeds = {"output_sequence": sequence, "encoder_hidden_states": hidden, "encoder_attention_mask": mask, "speaker_embeddings": speaker, "use_cache_branch": np.array([step > 1]), **past}
+    outputs = dict(zip(names, decoder.run(None, feeds)))
+    spectrum.append(outputs["spectrum"])
+    if outputs["prob"].sum() >= 0.5:
+        break
+    sequence = outputs["output_sequence_out"]
+    past.update({k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present") and v.shape[2] > 0})
+waveform = vocoder.run(None, {"spectrogram": np.concatenate(spectrum)})[0].reshape(-1)
+print("speecht5 onnxruntime", len(spectrum), len(waveform), float(np.abs(waveform - speech).max()) if len(waveform) == len(speech) else None)

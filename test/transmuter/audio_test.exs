@@ -150,6 +150,18 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  # The audio of transformers without noise: VITS with noise_scale and noise_scale_duration at
+  # 0, and SpeechT5 with a prenet dropout that keeps all values. See
+  # test/support/pipeline_references.py. Transmuter is within 8.5e-5 of PyTorch on the GPU and
+  # the CPU of a Mac. ONNX Runtime on the SpeechT5 export is 1.1e-4 from PyTorch, so the test
+  # allows 2e-4.
+  @speaker Nx.from_binary(File.read!("test/fixtures/speaker_embeddings.f32"), :f32)
+  @speech_opts Keyword.delete(@opts, :strategy)
+  @voices [
+    {"Xenova/mms-tts-eng", "Hello, my dog is cute.", "test/fixtures/mms_tts_eng.f32", []},
+    {"Xenova/speecht5_tts", "Hi.", "test/fixtures/speecht5_hi.f32", [speaker_embedding: @speaker]}
+  ]
+
   # The tokenizer.json of mms-tts-eng has a model without a type, and the one of speecht5_tts
   # has a Precompiled normalizer without a charsmap.
   test "the tokenizers of the speech exports give the ids of transformers" do
@@ -173,6 +185,36 @@ defmodule Transmuter.AudioTest do
 
     assert_raise ArgumentError, ~r/gives no tokens/, fn ->
       Transmuter.Tokenizer.encode(tokenizer, ["🙂"])
+    end
+  end
+
+  test "text-to-speech without noise matches transformers" do
+    for {repo, text, path, opts} <- @voices do
+      serving =
+        Transmuter.Audio.text_to_speech({:hf, repo}, [noise: false] ++ opts ++ @speech_opts)
+
+      expected = Nx.from_binary(File.read!(path), :f32)
+      assert %{audio: audio, sampling_rate: 16_000} = Nx.Serving.run(serving, text)
+      assert Nx.shape(audio) == Nx.shape(expected), repo
+      difference = audio |> Nx.subtract(expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+      assert difference < 2.0e-4, "#{repo}: the audio differs by #{difference}"
+    end
+  end
+
+  # The noise of VITS and the dropout of SpeechT5 come from the seed, so there is no
+  # reference. The audio of a seed is the same alone and in a list, and its length is near
+  # the length without noise.
+  test "the seed of a text decides its audio" do
+    for {repo, text, path, opts} <- @voices do
+      serving = Transmuter.Audio.text_to_speech({:hf, repo}, opts ++ @speech_opts)
+      inputs = [%{text: text, seed: 1}, %{text: text, seed: 2}]
+      results = [one, two] = Nx.Serving.run(serving, inputs)
+
+      assert results == Enum.map(inputs, &Nx.Serving.run(serving, &1))
+      refute one.audio == two.audio
+
+      length = div(File.stat!(path).size, 4)
+      assert Nx.size(one.audio) in div(length, 2)..(length * 2), repo
     end
   end
 
