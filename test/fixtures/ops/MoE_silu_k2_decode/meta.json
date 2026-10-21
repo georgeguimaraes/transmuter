@@ -1,0 +1,46 @@
+{
+ "repo": "op/MoE_silu_k2_decode",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "com.microsoft:MoE": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "input",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    1,
+    32
+   ]
+  },
+  {
+   "name": "router",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    8
+   ]
+  }
+ ],
+ "outputs": [
+  {
+   "name": "output",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    1,
+    32
+   ]
+  }
+ ],
+ "ort_ok": true
+}

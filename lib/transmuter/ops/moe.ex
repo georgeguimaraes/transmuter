@@ -18,37 +18,20 @@ defmodule Transmuter.Ops.MoE do
   # com.microsoft MoE: float expert weights, full-softmax routing.
   defp op(node = %{op_type: "MoE"}, [input, router_probs | rest]) do
     [fc1_w, fc1_bias, fc2_w, fc2_bias, fc3_w, fc3_bias] = pad(rest, 6)
-
-    {k, normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
-    type = Nx.type(input)
-    {t, input_2d} = flatten_input(input)
+    {k, normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
 
     # Full softmax over all experts, then top-k selection.
     probs = router_probs |> Nx.as_type(:f32) |> softmax_last()
     {top_vals, top_idx} = topk(probs, k)
     weights = if normalize == 1, do: local_normalize(top_vals), else: top_vals
-    flat_idx = Nx.reshape(top_idx, {:auto})
-    input_tk = replicate_rows(input_2d, t, k) |> Nx.as_type(type)
+    route = route(weights, top_idx, Nx.axis_size(fc1_w, 0))
+    w = &(&1 && select(&1, route))
 
-    h1 = gemm_batched(input_tk, Nx.take(fc1_w, flat_idx))
-    h1 = add_bias(h1, fc1_bias, flat_idx)
-
-    fc3_tk = fc3_w && Nx.take(fc3_w, flat_idx)
-
-    activated =
-      compute_activation(
-        h1,
-        input_tk,
-        flat_idx,
-        act,
-        fusion,
-        {alpha, beta, limit},
-        fc3_tk,
-        fc3_bias
-      )
-
-    out_tk = gemm_batched(activated, Nx.take(fc2_w, flat_idx)) |> add_bias(fc2_bias, flat_idx)
-    combine(Nx.as_type(out_tk, type), Nx.as_type(weights, type), t, k, input)
+    experts(node, input, route, [
+      {w.(fc1_w), fc1_bias},
+      {w.(fc2_w), fc2_bias},
+      {w.(fc3_w), fc3_bias}
+    ])
   end
 
   # com.microsoft QMoE: block-wise quantized expert weights, local-softmax routing.
@@ -56,55 +39,116 @@ defmodule Transmuter.Ops.MoE do
     [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = pad(rest, 12)
     [fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp] = opt
 
-    {k, normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
+    {k, _normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
     bits = attr(node, "expert_weight_bits", 4)
     block_size = attr(node, "block_size", 0)
     type = Nx.type(input)
-    {t, input_2d} = flatten_input(input)
 
-    # Local softmax: top-k selection then softmax over those k values.
+    # Local softmax: top-k selection then softmax over those k values, so the weights of a
+    # token already add up to 1 and normalize_routing_weights changes nothing.
     {top_vals, top_idx} = topk(Nx.as_type(router_probs, :f32), k)
     max_v = Nx.reduce_max(top_vals, axes: [1], keep_axes: true)
     exp_v = Nx.exp(Nx.subtract(top_vals, max_v))
-    # normalize_routing_weights is a no-op after local softmax (sum is already 1).
-    _ = normalize
     weights = Nx.divide(exp_v, Nx.sum(exp_v, axes: [1], keep_axes: true))
-    flat_idx = Nx.reshape(top_idx, {:auto})
-    input_tk = replicate_rows(input_2d, t, k) |> Nx.as_type(type)
+    route = route(weights, top_idx, Nx.axis_size(fc1_w, 0))
+    pick = &(&1 && select(&1, route))
 
-    take_dq = fn w, s, z ->
-      dequant(
-        Nx.take(w, flat_idx),
-        s && Nx.take(s, flat_idx),
-        z && Nx.take(z, flat_idx),
-        bits,
-        block_size,
-        type
-      )
+    w = fn w, s, z ->
+      w && dequant(pick.(w), pick.(s), pick.(z), bits, block_size, type)
     end
 
-    h1 = gemm_batched(input_tk, take_dq.(fc1_w, fc1_scales, fc1_zp))
-    h1 = add_bias(h1, fc1_bias, flat_idx)
+    experts(node, input, route, [
+      {w.(fc1_w, fc1_scales, fc1_zp), fc1_bias},
+      {w.(fc2_w, fc2_scales, fc2_zp), fc2_bias},
+      {w.(fc3_w, fc3_scales, fc3_zp), fc3_bias}
+    ])
+  end
 
-    fc3_dq = fc3_w && take_dq.(fc3_w, fc3_scales, fc3_zp)
+  # The expert MLPs of the routed rows, added with the routing weights of each token.
+  defp experts(node, input, route, [{fc1_w, fc1_bias}, {fc2_w, fc2_bias}, {fc3_w, fc3_bias}]) do
+    {_k, _normalize, act, fusion, alpha, beta, limit} = moe_attrs(node)
+    type = Nx.type(input)
+    {t, input_2d} = flatten_input(input)
+    h = Nx.axis_size(input_2d, 1)
+    rows = input_2d |> Nx.as_type(type) |> Nx.broadcast(route.rows.(t, h), axes: route.axes)
+    rows = Nx.reshape(rows, {:auto, h})
+    h1 = rows |> expert_dot(fc1_w, route) |> add_bias(fc1_bias, route.experts)
 
     activated =
-      compute_activation(
-        h1,
-        input_tk,
-        flat_idx,
-        act,
-        fusion,
-        {alpha, beta, limit},
-        fc3_dq,
-        fc3_bias
-      )
+      if act == "swiglu" and fusion == 0 and fc3_w do
+        h3 = rows |> expert_dot(fc3_w, route) |> add_bias(fc3_bias, route.experts)
+        swiglu_gate(h1, h3, alpha, beta, limit)
+      else
+        activate(h1, act, fusion, alpha, beta, limit)
+      end
 
-    out_tk =
-      gemm_batched(activated, take_dq.(fc2_w, fc2_scales, fc2_zp)) |> add_bias(fc2_bias, flat_idx)
+    out = activated |> expert_dot(fc2_w, route) |> add_bias(fc2_bias, route.experts)
+    weights = route.weights |> Nx.reshape({:auto, 1}) |> Nx.as_type(type)
 
-    combine(Nx.as_type(out_tk, type), Nx.as_type(weights, type), t, k, input)
+    # A row with weight 0 adds nothing, also when its expert gives an infinity.
+    result =
+      weights
+      |> Nx.equal(0)
+      |> Nx.broadcast(Nx.shape(out))
+      |> Nx.select(0, Nx.multiply(Nx.as_type(out, type), weights))
+      |> Nx.reshape(route.rows.(t, h))
+      |> Nx.sum(axes: [route.slot_axis])
+
+    Nx.reshape(result, Nx.shape(input))
   end
+
+  # Each token runs its k experts, so the rows are T * k, token by token, and the weights of
+  # their experts are gathered. When T * k is at least the number of experts, every expert
+  # runs on every token instead, with weight 0 for the tokens that do not select it. The
+  # rows are then E * T, expert by expert, and a batched product reads each weight once.
+  defp route(weights, top_idx, experts) do
+    {t, k} = Nx.shape(top_idx)
+
+    if t * k >= experts do
+      dense =
+        top_idx
+        |> Nx.new_axis(1)
+        |> Nx.equal(Nx.iota({1, experts, 1}))
+        |> Nx.multiply(Nx.new_axis(weights, 1))
+        |> Nx.sum(axes: [2])
+        |> Nx.transpose()
+
+      %{
+        dense?: true,
+        rows: &{experts, &1, &2},
+        axes: [1, 2],
+        slot_axis: 0,
+        experts: Nx.iota({experts, t}, axis: 0) |> Nx.reshape({:auto}),
+        weights: dense
+      }
+    else
+      %{
+        dense?: false,
+        rows: &{&1, k, &2},
+        axes: [0, 2],
+        slot_axis: 1,
+        experts: Nx.reshape(top_idx, {:auto}),
+        weights: weights
+      }
+    end
+  end
+
+  defp select(w, %{dense?: true}), do: w
+  defp select(w, %{experts: ids}), do: Nx.take(w, ids)
+
+  # rows {R, K} times the weight {N, K} of the expert of each row: w is {E, N, K} for all
+  # experts with E * T rows, or {R, N, K} with the weight of each row.
+  defp expert_dot(rows, w, %{dense?: true}) do
+    {r, size} = Nx.shape(rows)
+    experts = Nx.axis_size(w, 0)
+
+    rows
+    |> Nx.reshape({experts, div(r, experts), size})
+    |> Nx.dot([2], [0], w, [2], [0])
+    |> Nx.reshape({r, :auto})
+  end
+
+  defp expert_dot(rows, w, _route), do: Nx.dot(rows, [1], [0], w, [2], [0])
 
   # --- helpers ---
 
@@ -150,40 +194,8 @@ defmodule Transmuter.Ops.MoE do
     Nx.divide(weights, safe)
   end
 
-  # Replicates each token k times: {T, H} → {T*k, H}.
-  defp replicate_rows(x, t, k) do
-    h = Nx.axis_size(x, 1)
-    x |> Nx.new_axis(1) |> Nx.broadcast({t, k, h}) |> Nx.reshape({t * k, h})
-  end
-
-  # Batched GEMM: a {M, K} × b {M, N, K}^T → {M, N}.
-  # Each expert in the batch has its own weight matrix.
-  defp gemm_batched(a, b) do
-    Nx.dot(a, [1], [0], b, [2], [0])
-  end
-
   defp add_bias(h, nil, _flat_idx), do: h
   defp add_bias(h, bias, flat_idx), do: Nx.add(h, Nx.take(bias, flat_idx))
-
-  # Routes through the activation: handles fused and unfused SwiGLU.
-  defp compute_activation(
-         h1,
-         input_tk,
-         flat_idx,
-         act,
-         fusion,
-         {alpha, beta, limit},
-         fc3_w,
-         fc3_bias
-       ) do
-    if act == "swiglu" and fusion == 0 and fc3_w do
-      h3 = gemm_batched(input_tk, fc3_w)
-      h3 = add_bias(h3, fc3_bias, flat_idx)
-      swiglu_gate(h1, h3, alpha, beta, limit)
-    else
-      activate(h1, act, fusion, alpha, beta, limit)
-    end
-  end
 
   defp activate(h, "relu", _, _alpha, _beta, _limit), do: Nx.max(h, 0)
   defp activate(h, "gelu", _, _alpha, _beta, _limit), do: gelu(h)
@@ -280,24 +292,6 @@ defmodule Transmuter.Ops.MoE do
       else
         q_sub
       end
-    end
-  end
-
-  # Combines expert outputs: weighted sum over the k slot dimension.
-  # out_tk: {T*k, H}, weights: {T, k} → output same shape as input.
-  defp combine(out_tk, weights, t, k, input) do
-    h = Nx.axis_size(out_tk, 1)
-    flat_w = Nx.reshape(weights, {t * k, 1})
-
-    result =
-      out_tk
-      |> Nx.multiply(flat_w)
-      |> Nx.reshape({t, k, h})
-      |> Nx.sum(axes: [1])
-
-    case Nx.rank(input) do
-      2 -> result
-      3 -> Nx.reshape(result, Nx.shape(input))
     end
   end
 

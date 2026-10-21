@@ -1438,6 +1438,24 @@ case("MultiHeadAttention_unidirectional_decode",
      [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],
      {"q": cf(B, 1, H * Hd), "k": cf(B, 1, H * Hd), "v": cf(B, 1, H * Hd), "pk": cf(B, H, 4, Hd), "pv": cf(B, H, 4, Hd)}, ms=True)
 
+# ---------- MoE decode ----------
+
+# One token selects 2 of 8 experts, fewer than the experts, so only the weights of these 2 are read.
+# The other MoE cases have at least as many token slots as experts, and every expert runs on every token.
+r = rng_for("MoE decode")
+E, Hd, Id = 8, 32, 16
+case("MoE_silu_k2_decode",
+     [node("MoE", ["input", "router", "fc1", "b1", "fc2", "b2"], ["output"], domain=MS, k=2, activation_type="silu")],
+     {"input": r.standard_normal((1, 1, Hd)).astype(np.float32), "router": r.standard_normal((1, E)).astype(np.float32)},
+     {"fc1": (r.standard_normal((E, Id, Hd)) * 0.3).astype(np.float32), "b1": r.standard_normal((E, Id)).astype(np.float32),
+      "fc2": (r.standard_normal((E, Hd, Id)) * 0.3).astype(np.float32), "b2": r.standard_normal((E, Hd)).astype(np.float32)}, ms=True)
+case("QMoE_4bit_silu_k2_decode",
+     [node("QMoE", ["input", "router", "fc1", "fc1s", "", "fc2", "fc2s"], ["output"], domain=MS,
+           k=2, activation_type="silu", expert_weight_bits=4, block_size=16)],
+     {"input": r.standard_normal((1, Hd)).astype(np.float32), "router": r.standard_normal((1, E)).astype(np.float32)},
+     {"fc1": pack_weights(r.integers(0, 16, (E, Id, Hd)), 4), "fc1s": (np.abs(r.standard_normal((E, Id, Hd // 16))) * 0.05 + 0.01).astype(np.float32),
+      "fc2": pack_weights(r.integers(0, 16, (E, Hd, Id)), 4), "fc2s": (np.abs(r.standard_normal((E, Hd, Id // 16))) * 0.05 + 0.01).astype(np.float32)}, ms=True)
+
 # ---------- patch embeddings ----------
 
 # Windows that do not overlap and have no padding, as the patch embedding of a vision transformer.
