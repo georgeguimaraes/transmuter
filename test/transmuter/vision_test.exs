@@ -193,6 +193,9 @@ defmodule Transmuter.VisionTest do
 
   # The reference is ONNX Runtime on the same files: the q4 vision encoder and decoder and
   # the 8-bit embeddings. The batch has rows of 13, 13 and 22 tiles and a row without images.
+  # On the Linux runner, MLX runs the 4-bit matmuls on one CPU thread, and the test runs for
+  # more than 80 minutes, so CI leaves this test out.
+  @tag :large_model
   test "image-text-to-text matches ONNX Runtime alone, in a batch and in a stream" do
     tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
     crop = StbImage.to_nx(@image)[0..99]
