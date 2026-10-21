@@ -79,6 +79,8 @@ defmodule Transmuter do
       logit. Use it to compare a model with a reference that has no noise. The
       default is `true`.
 
+    * `:outputs` (a list of `t:String.t/0`, or a function) - the graph outputs to keep. The model then gives only these outputs, and the loader removes the nodes and the initializers that no kept output reads. An `If` node keeps only the outputs that a later node or the graph reads, and its two branches keep the same outputs. `Loop` and `Scan` keep all outputs of their bodies. A function gets the names of the graph outputs and returns the names to keep. A name that is not a graph output raises an `ArgumentError`. The default is `nil`, which keeps all outputs.
+
   Returns a map with:
 
     * `:params` - the weights, on the `:backend` when it is given
@@ -116,6 +118,13 @@ defmodule Transmuter do
         compute_type: :f32
       )
 
+  Keep only the outputs that a generation loop reads. The Whisper exports of Xenova also give the attention probabilities of each layer:
+
+      model = Transmuter.load!(
+        {:hf, "Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx"},
+        outputs: &Enum.filter(&1, fn name -> name == "logits" or name =~ ~r/^present\./ end)
+      )
+
   Load a local file:
 
       model = Transmuter.load!("/path/to/model.onnx")
@@ -140,6 +149,10 @@ defmodule Transmuter do
     graph = inline_external(model.graph, dir)
     check_outputs!(graph, "the graph")
 
+    known = Enum.map(graph.input, & &1.name) ++ Enum.map(graph.initializer, & &1.name)
+    graph = %{graph | node: toposort(graph.node, known)}
+    graph = if outputs = opts[:outputs], do: prune(graph, outputs), else: graph
+
     graph =
       if Keyword.get(opts, :fuse, true), do: Transmuter.Fusion.graph(graph, opset), else: graph
 
@@ -156,7 +169,7 @@ defmodule Transmuter do
     compute_type = Keyword.get(opts, :compute_type)
 
     model = %{
-      nodes: toposort(graph.node, inputs ++ initializers),
+      nodes: graph.node,
       static: Map.new(static, fn {k, t} -> {k, upcast(t, compute_type)} end),
       params: Map.new(params),
       backend: opts[:backend],
@@ -225,6 +238,76 @@ defmodule Transmuter do
   end
 
   defp where(node), do: "#{node.op_type} #{node.name}"
+
+  # Keeps the graph outputs that `outputs` names. The initializers that the graph then does
+  # not read are also graph inputs in exports before IR version 4, so they leave both lists.
+  defp prune(graph, outputs) do
+    names = Enum.map(graph.output, & &1.name)
+    kept = if is_function(outputs, 1), do: outputs.(names), else: outputs
+
+    case kept -- names do
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError,
+              "the graph has no outputs #{Enum.join(unknown, ", ")}, outputs: #{inspect(names)}"
+    end
+
+    pruned = live(%{graph | output: Enum.filter(graph.output, &(&1.name in kept))})
+
+    removed =
+      MapSet.difference(
+        MapSet.new(graph.initializer, & &1.name),
+        MapSet.new(pruned.initializer, & &1.name)
+      )
+
+    %{pruned | input: Enum.reject(graph.input, &MapSet.member?(removed, &1.name))}
+  end
+
+  # Removes the nodes and the initializers that no output of the graph reads, from the last
+  # node to the first. Nodes are in the order of their dependencies. An If node keeps only its
+  # outputs that a later node or the graph reads, and both branches keep the same outputs.
+  # Loop and Scan keep all outputs of their bodies, because each step reads its state.
+  defp live(graph) do
+    {nodes, reads} =
+      graph.node
+      |> Enum.reverse()
+      |> Enum.reduce({[], MapSet.new(graph.output, & &1.name)}, fn node, {nodes, reads} ->
+        if Enum.any?(node.output, &read?(reads, &1)) do
+          node = live_subgraphs(node, reads)
+          {[node | nodes], Enum.into(dependencies(node), reads)}
+        else
+          {nodes, reads}
+        end
+      end)
+
+    %{graph | node: nodes, initializer: Enum.filter(graph.initializer, &read?(reads, &1.name))}
+  end
+
+  defp read?(reads, name), do: name != "" and MapSet.member?(reads, name)
+
+  defp live_subgraphs(node = %{op_type: "If"}, reads) do
+    kept = for {name, i} <- Enum.with_index(node.output), read?(reads, name), do: i
+    take = fn list -> Enum.map(kept, &Enum.at(list, &1)) end
+
+    attribute =
+      Enum.map(node.attribute, fn
+        a = %{g: g} when g != nil -> %{a | g: live(%{g | output: take.(g.output)})}
+        a -> a
+      end)
+
+    %{node | output: take.(node.output), attribute: attribute}
+  end
+
+  defp live_subgraphs(node, _reads) do
+    attribute =
+      Enum.map(node.attribute, fn a ->
+        %{a | g: a.g && live(a.g), graphs: Enum.map(a.graphs, &live/1)}
+      end)
+
+    %{node | attribute: attribute}
+  end
 
   @doc """
   Compiles the model for the shapes and types of `inputs`.

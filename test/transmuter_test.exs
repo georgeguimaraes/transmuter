@@ -434,6 +434,82 @@ defmodule TransmuterTest do
     end
   end
 
+  # w is also a graph input, as in exports before IR version 4.
+  test "the outputs option removes the outputs and the nodes that no kept output reads" do
+    w = %TensorProto{name: "w", dims: [4], data_type: 1, float_data: [1.0, 2.0, 3.0, 4.0]}
+
+    path =
+      write_model(%GraphProto{
+        input: [value("x", [4]), value("w", [4])],
+        initializer: [w],
+        output: [value("y"), value("z")],
+        node: [
+          node("Neg", ["x"], ["y"]),
+          node("Exp", ["x"], ["t"]),
+          node("Mul", ["t", "w"], ["z"]),
+          node("Abs", ["x"], ["unread"])
+        ]
+      })
+
+    model = Transmuter.load!(path)
+    assert {model.inputs, model.outputs, length(model.nodes)} == {["x"], ["y", "z"], 4}
+
+    for outputs <- [["y"], &Enum.take(&1, 1)] do
+      model = Transmuter.load!(path, outputs: outputs)
+      assert {model.inputs, model.outputs} == {["x"], ["y"]}
+      assert Enum.map(model.nodes, & &1.op_type) == ["Neg"]
+      refute Map.has_key?(model.params, "w") or Map.has_key?(model.static, "w")
+
+      x = Nx.tensor([1.0, -2.0, 3.0, -4.0])
+      assert Transmuter.run(model, model.params, %{"x" => x}) == %{"y" => Nx.negate(x)}
+    end
+
+    assert_raise ArgumentError, ~r/the graph has no outputs v, outputs: \["y", "z"\]/, fn ->
+      Transmuter.load!(path, outputs: ["y", "v"])
+    end
+  end
+
+  test "the outputs option removes the If outputs that no node reads from both branches" do
+    branch = fn first, second ->
+      %GraphProto{
+        name: first,
+        node: [node(first, ["x"], ["#{first}_out"]), node(second, ["x"], ["#{second}_out"])],
+        output: [value("#{first}_out"), value("#{second}_out")]
+      }
+    end
+
+    graph = %GraphProto{
+      input: [value("x", [4]), value("flag", [1], 9)],
+      output: [value("p"), value("q")],
+      node: [
+        node("If", ["flag"], ["p", "q"],
+          attribute: [
+            %AttributeProto{name: "then_branch", type: :GRAPH, g: branch.("Neg", "Exp")},
+            %AttributeProto{name: "else_branch", type: :GRAPH, g: branch.("Abs", "Sqrt")}
+          ]
+        )
+      ]
+    }
+
+    model = graph |> write_model() |> Transmuter.load!(outputs: ["p"])
+    assert [%{op_type: "If", output: ["p"], attribute: branches}] = model.nodes
+
+    for %{g: g} <- branches do
+      assert {length(g.node), length(g.output)} == {1, 1}
+      assert hd(g.output).name == hd(hd(g.node).output)
+    end
+
+    x = Nx.tensor([1.0, -2.0, 3.0, -4.0])
+
+    for {flag, expected} <- [{1, Nx.negate(x)}, {0, Nx.abs(x)}] do
+      flag = Nx.tensor([flag], type: :u8)
+
+      assert Transmuter.run(model, model.params, %{"x" => x}, %{"flag" => flag}) == %{
+               "p" => expected
+             }
+    end
+  end
+
   # Each Add reads its input twice, so the expression of x16 is a graph with 16 levels and
   # 2^16 paths. An error that kept it would copy all paths when it leaves the process.
   test "an error in a traced node keeps no traced values" do
