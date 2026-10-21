@@ -464,18 +464,33 @@ defmodule Transmuter.GraphBreaks do
     )
   end
 
-  # A sequence of tensors crosses a segment boundary as a tuple.
+  # A sequence crosses a segment boundary as a tuple of its tensors. Its other elements,
+  # such as zero-size values, hold no data, so the key keeps them with their positions.
   defp encode(values) do
     Map.new(values, fn
-      {name, {:sequence, elements}} -> {{:sequence, name}, List.to_tuple(elements)}
-      other -> other
+      {name, {:sequence, elements}} ->
+        {tensors, others} =
+          elements |> Enum.with_index() |> Enum.split_with(&is_struct(elem(&1, 0), Nx.Tensor))
+
+        {{:sequence, name, others}, tensors |> Enum.map(&elem(&1, 0)) |> List.to_tuple()}
+
+      other ->
+        other
     end)
   end
 
   defp decode(values) do
     Map.new(values, fn
-      {{:sequence, name}, elements} -> {name, {:sequence, Tuple.to_list(elements)}}
-      other -> other
+      {{:sequence, name, others}, tensors} ->
+        elements =
+          Enum.reduce(others, Tuple.to_list(tensors), fn {value, i}, elements ->
+            List.insert_at(elements, i, value)
+          end)
+
+        {name, {:sequence, elements}}
+
+      other ->
+        other
     end)
   end
 

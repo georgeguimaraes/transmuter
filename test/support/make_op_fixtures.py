@@ -840,6 +840,15 @@ case("Break_Loop_outer_sequence",
      {"sizes": np.array([2, 3, 1], np.int64), "x": pos_f32(6)},
      {"zero": np.array(0, np.int64), "axes": np.array([0], np.int64), "one_f": np.array(1.0, np.float32),
       "first": np.array([0], np.int64), "second": np.array([1], np.int64), "third": np.array([2], np.int64)})
+# The outer sequence also holds a zero-size tensor, which the Loop does not read. The break copies
+# the small tensors of the sequence to the host and keeps the zero-size value.
+case("Break_Loop_outer_sequence_empty_element",
+     [node("SplitToSequence", ["sizes"], ["split"], axis=0, keepdims=0), node("SequenceInsert", ["split", "empty"], ["sizes_seq"]),
+      node("Shape", ["sizes"], ["sizes_shape"]), node("Gather", ["sizes_shape", "zero"], ["trips"]),
+      node("Loop", ["trips", "", ], ["counts"], body=sizes_body), node("ReduceSum", ["counts"], ["y"], keepdims=0)],
+     {"sizes": np.array([2, 3, 1], np.int64)},
+     {"zero": np.array(0, np.int64), "axes": np.array([0], np.int64), "one_f": np.array(1.0, np.float32),
+      "empty": np.zeros(0, np.int64)})
 
 # ---------- long recurrences and loops ----------
 
