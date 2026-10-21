@@ -180,7 +180,7 @@ defmodule Transmuter.Audio.TextToSpeech do
         end)
 
       # An eager fold_in is many small calls to the device.
-      fold_in = Nx.Defn.jit(&Nx.Random.fold_in/2, defn_options)
+      fold_in = Nx.Defn.jit(&Transmuter.Random.fold_in/2, defn_options)
 
       fn %{"input_ids" => ids, "speaker_embeddings" => embedding, "seed" => seed} ->
         %{"encoder_outputs" => hidden, "encoder_attention_mask" => mask} =

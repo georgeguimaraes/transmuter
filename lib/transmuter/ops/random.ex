@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Random do
   @moduledoc """
-  Random operators on Nx.Random. Each run has one key, and each node folds a hash of its first output name into it, so nodes draw independent streams. A node with a seed draws the same values on every run. Values cannot match ONNX Runtime, whose generator differs. A model without noise has no key, and each node gives a fixed value (see the `:noise` option of `Transmuter.load!/2`).
+  Random operators on `Transmuter.Random`, which gives the values of `Nx.Random`. Each run has one key, and each node folds a hash of its first output name into it, so nodes draw independent streams. A node with a seed draws the same values on every run. Values cannot match ONNX Runtime, whose generator differs. A model without noise has no key, and each node gives a fixed value (see the `:noise` option of `Transmuter.load!/2`).
   """
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, dtype: 1]
@@ -16,7 +16,7 @@ defmodule Transmuter.Ops.Random do
   def apply(node, inputs, key) do
     key =
       case attr(node, "seed") do
-        nil -> Nx.Random.fold_in(key, :erlang.phash2(hd(node.output)))
+        nil -> Transmuter.Random.fold_in(key, :erlang.phash2(hd(node.output)))
         seed -> Nx.Random.key(trunc(seed))
       end
 
@@ -39,7 +39,7 @@ defmodule Transmuter.Ops.Random do
   # small p.
   defp op(node = %{op_type: "Bernoulli"}, [p], key) do
     type = Nx.Type.merge(Nx.type(p), {:f, 32})
-    {u, _key} = Nx.Random.uniform(key, shape: Nx.shape(p), type: type)
+    u = Transmuter.Random.uniform(key, 0.0, 1.0, shape: Nx.shape(p), type: type)
     u |> Nx.less(Nx.as_type(p, type)) |> Nx.as_type(like_type(node, p))
   end
 
@@ -48,7 +48,7 @@ defmodule Transmuter.Ops.Random do
   defp op(node = %{op_type: "Multinomial"}, [x], key) do
     {batch, classes} = Nx.shape(x)
     samples = attr(node, "sample_size", 1)
-    {noise, _key} = Nx.Random.gumbel(key, shape: {batch, samples, classes}, type: Nx.type(x))
+    noise = Transmuter.Random.gumbel(key, shape: {batch, samples, classes}, type: Nx.type(x))
 
     x
     |> Nx.new_axis(1)
@@ -88,13 +88,13 @@ defmodule Transmuter.Ops.Random do
   defp normal(node, key, shape, type) do
     mean = attr(node, "mean", 0.0)
     scale = attr(node, "scale", 1.0)
-    key |> Nx.Random.normal(mean, scale, shape: shape, type: type) |> elem(0)
+    Transmuter.Random.normal(key, mean, scale, shape: shape, type: type)
   end
 
   defp uniform(node, key, shape, type) do
     low = attr(node, "low", 0.0)
     high = attr(node, "high", 1.0)
-    key |> Nx.Random.uniform(low, high, shape: shape, type: type) |> elem(0)
+    Transmuter.Random.uniform(key, low, high, shape: shape, type: type)
   end
 
   defp like_type(node, x) do

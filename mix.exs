@@ -116,6 +116,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Fusion,
           Transmuter.GraphBreaks,
           Transmuter.Shared,
+          Transmuter.Random,
           Transmuter.Ops,
           Transmuter.Ops.Elementwise,
           Transmuter.Ops.LinAlg,

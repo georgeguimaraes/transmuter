@@ -645,7 +645,7 @@ defmodule Transmuter.Generation do
       Enum.map([logits, index, seen, states, keys], &Nx.vectorize(&1, :rows))
 
     logits = Nx.take(logits, index)
-    key = Nx.Random.fold_in(keys, step)
+    key = Transmuter.Random.fold_in(keys, step)
     token = select_token(logits, seen, suppressed, states, key, settings)
     Nx.devectorize(token, keep_names: false)
   end
@@ -696,7 +696,7 @@ defmodule Transmuter.Generation do
 
   # The Gumbel-max trick samples from the softmax of the logits.
   defp sample(logits, key) do
-    {uniform, _} = Nx.Random.uniform(key, 1.0e-10, 1.0, shape: logits.shape)
+    uniform = Transmuter.Random.uniform(key, 1.0e-10, 1.0, shape: logits.shape, type: :f32)
     gumbel = uniform |> Nx.log() |> Nx.negate() |> Nx.log() |> Nx.negate()
     logits |> Nx.add(gumbel) |> Nx.argmax()
   end
