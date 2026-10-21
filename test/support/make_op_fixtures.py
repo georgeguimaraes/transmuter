@@ -1355,9 +1355,10 @@ for bits in [4, 8]:
 # ---------- static folding ----------
 
 # Values that depend only on the shape of x fold on the host. The ConstantOfShape and the
-# Range give 6400 elements, more than the 4096 that stay static, so they become literals of
-# the compiled function and the nodes that read them run on the device. NonZero still reads
-# the values of the Range, and Reshape reads the small target that the Concat folds.
+# Range give 6400 elements, more than the 4096 that stay static, so the nodes that read them
+# run on the device. The compiled function computes the ConstantOfShape from its small input,
+# and the Range of scalars becomes a literal. The NonZero nodes still read both values, and
+# Reshape reads the small target that the Concat folds.
 r = rng_for("static folding")
 case("Fold_large_static",
      [node("Shape", ["x"], ["shape"]), node("Gather", ["shape", "zero"], ["rows"]), node("Gather", ["shape", "one"], ["cols"]),
@@ -1366,9 +1367,10 @@ case("Fold_large_static",
       node("Range", ["zero", "n", "one"], ["idx"]), node("Cast", ["idx"], ["idx_f"], to=TensorProto.FLOAT),
       node("Add", ["fill", "idx_f"], ["ramp"]), node("Unsqueeze", ["rows", "axes"], ["rows1"]),
       node("Unsqueeze", ["cols", "axes"], ["cols1"]), node("Concat", ["rows1", "cols1"], ["target"], axis=0),
-      node("Reshape", ["ramp", "target"], ["grid"]), node("Add", ["grid", "x"], ["y"]), node("NonZero", ["idx"], ["nz"])],
+      node("Reshape", ["ramp", "target"], ["grid"]), node("Add", ["grid", "x"], ["y"]), node("NonZero", ["idx"], ["nz"]),
+      node("NonZero", ["fill"], ["nz_fill"])],
      {"x": r.standard_normal((80, 80)).astype(np.float32)},
-     {"zero": np.array(0, np.int64), "one": np.array(1, np.int64), "axes": np.array([0], np.int64)}, outputs=["y", "nz"])
+     {"zero": np.array(0, np.int64), "one": np.array(1, np.int64), "axes": np.array([0], np.int64)}, outputs=["y", "nz", "nz_fill"])
 
 # ---------- half precision ----------
 

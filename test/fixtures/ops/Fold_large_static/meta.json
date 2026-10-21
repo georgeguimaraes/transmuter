@@ -15,7 +15,7 @@
   "Add": 2,
   "Concat": 1,
   "Reshape": 1,
-  "NonZero": 1
+  "NonZero": 2
  },
  "static_inputs": [],
  "reference": "onnxruntime",
@@ -47,6 +47,15 @@
    "shape": [
     1,
     6399
+   ]
+  },
+  {
+   "name": "nz_fill",
+   "file": "out_2.bin",
+   "dtype": "s64",
+   "shape": [
+    1,
+    6400
    ]
   }
  ],

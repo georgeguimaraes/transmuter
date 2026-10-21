@@ -59,9 +59,16 @@ defmodule Transmuter.Ops.Shape do
 
     dims = ints!(shape)
 
+    # The fill value is a constant of the default backend, so a traced function builds the
+    # output on the device.
     if 0 in dims,
       do: {:empty, List.to_tuple(dims)},
-      else: value |> Nx.reshape({}) |> Nx.broadcast(List.to_tuple(dims))
+      else:
+        value
+        |> Nx.reshape({})
+        |> Nx.to_number()
+        |> Nx.tensor(type: Nx.type(value))
+        |> Nx.broadcast(List.to_tuple(dims))
   end
 
   defp op(%{op_type: "Expand"}, [a, shape]) do

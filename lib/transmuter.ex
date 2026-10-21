@@ -445,7 +445,7 @@ defmodule Transmuter do
               Random.apply(node, inputs, ctx.key)
 
             Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
-              node |> fold(inputs, ctx) |> Enum.map(&unfold(&1, ctx))
+              node |> fold(inputs, ctx) |> unfold(node, inputs, ctx)
 
             true ->
               apply_on_backend(node, inputs, ctx)
@@ -528,19 +528,49 @@ defmodule Transmuter do
     Nx.with_default_backend(Nx.BinaryBackend, fn -> Ops.apply(node, inputs, ctx.opset) end)
   end
 
-  # A large folded value is data, which the host computes slowly in Elixir. It becomes a
-  # literal of the traced function, or moves to the backend of an eager run, so the nodes
-  # that read it run on the device. A literal is still known, so a node in the same trace
-  # can read its values.
-  defp unfold(t = %Nx.Tensor{}, ctx) do
+  # A large folded value is data, so the nodes that read it run on the device. An eager run
+  # moves it to the backend of the model. A traced function computes it again from the
+  # small static inputs, so the device builds it and the program holds no large literal.
+  # The traced value keeps the host value, so a node in the same trace can read it. When
+  # the operator cannot trace on literals, the value becomes a literal.
+  defp unfold(outputs, node, inputs, ctx) do
     cond do
-      Nx.size(t) <= @fold_max_size -> t
-      Compiler.current() -> Expr.tensor(t)
-      true -> Nx.backend_transfer(t, ctx.backend)
+      not Enum.any?(outputs, &large?/1) ->
+        outputs
+
+      Compiler.current() ->
+        traced = trace_folded(node, inputs, ctx) || outputs
+
+        Enum.zip_with(outputs, traced, fn
+          host, t = %Nx.Tensor{data: %Expr{}} when is_struct(host, Nx.Tensor) ->
+            if large?(host) and Nx.to_template(t) == Nx.to_template(host),
+              do: Expr.metadata(t, %{transmuter_value: host}),
+              else: unfold_literal(host)
+
+          host, _traced ->
+            unfold_literal(host)
+        end)
+
+      true ->
+        Enum.map(outputs, &if(large?(&1), do: Nx.backend_transfer(&1, ctx.backend), else: &1))
     end
   end
 
-  defp unfold(value, _ctx), do: value
+  defp large?(value), do: is_struct(value, Nx.Tensor) and Nx.size(value) > @fold_max_size
+
+  defp unfold_literal(value), do: if(large?(value), do: Expr.tensor(value), else: value)
+
+  defp trace_folded(node, inputs, ctx) do
+    literals =
+      Enum.map(
+        inputs,
+        &if(is_struct(&1, Nx.Tensor) and Nx.rank(&1) > 0, do: Expr.tensor(&1), else: &1)
+      )
+
+    Ops.apply(node, literals, ctx.opset)
+  rescue
+    _error -> nil
+  end
 
   @doc false
   def with_fold_memo(fun) do
