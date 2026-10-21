@@ -446,6 +446,21 @@ defmodule TransmuterTest do
     assert_all_close(y, Nx.dot(Nx.tensor([[1.0, 2.0, 3.0, 4.0]]), Nx.as_type(weight, :f32)))
   end
 
+  # EyeLike builds its output from Nx.iota and reads only the shape of its input.
+  test "an eager run builds the constants of an operator on the backend of the model" do
+    graph = %GraphProto{
+      input: [value("x", [3, 3])],
+      output: [value("y")],
+      node: [node("EyeLike", ["x"], ["y"])]
+    }
+
+    model = Transmuter.load!(write_model(graph), backend: @backend)
+    x = Nx.iota({3, 3}, type: :f32, backend: @backend)
+    %{"y" => y} = Transmuter.run(model, model.params, %{"x" => x})
+    assert %Nx.Tensor{data: %EMLX.Backend{}} = y
+    assert_all_close(y, Nx.eye(3))
+  end
+
   defp node(op_type, input, output, opts \\ []) do
     struct!(
       %NodeProto{op_type: op_type, name: String.downcase(op_type), input: input, output: output},

@@ -448,7 +448,7 @@ defmodule Transmuter do
               node |> fold(inputs, ctx) |> Enum.map(&unfold(&1, ctx))
 
             true ->
-              Ops.apply(node, inputs, ctx.opset)
+              apply_on_backend(node, inputs, ctx)
           end
           |> Enum.map(&upcast(&1, ctx.compute_type))
         rescue
@@ -473,6 +473,15 @@ defmodule Transmuter do
 
       Map.merge(env, Map.new(Enum.zip(node.output, outputs)))
     end)
+  end
+
+  # Operators build constants, such as the positions of a causal mask, on the default
+  # backend. A traced function makes them part of the graph. An eager run makes them on the
+  # backend of the model, as its other values, and not on Nx.BinaryBackend in Elixir.
+  defp apply_on_backend(node, inputs, ctx) do
+    if Compiler.current(),
+      do: Ops.apply(node, inputs, ctx.opset),
+      else: Nx.with_default_backend(ctx.backend, fn -> Ops.apply(node, inputs, ctx.opset) end)
   end
 
   defp input!(_env, "", _node), do: nil
