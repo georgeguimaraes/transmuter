@@ -10,17 +10,22 @@ permissions:
   contents: read
 
 jobs:
-  # EXLA on the CPU is a real Linux deployment, so these jobs run all tests. mix test gives
-  # the sorted test files to the partitions in turn. With 3 partitions, the text, audio and
-  # vision tests, which take most of the time, run in different jobs. The slowest tests and
-  # modules in the log show how to keep the partitions balanced.
+  # EXLA on the CPU is a real Linux deployment, so these jobs run all tests. The slowest
+  # test modules have a :ci_partition tag, and each tagged partition runs in its own job.
+  # Partition 1 runs all tests without the tag. The tests of one module run one at a time,
+  # so a slow test goes in a module of its own. The slowest tests and modules in the log
+  # show how to keep the partitions balanced.
   exla:
-    name: Tests / exla (${{ matrix.partition }}/3)
+    name: Tests / exla (${{ matrix.partition }}/4)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3]
+        include:
+          - { partition: 1, select: "--exclude ci_partition" }
+          - { partition: 2, select: "--only ci_partition:2" }
+          - { partition: 3, select: "--only ci_partition:3" }
+          - { partition: 4, select: "--only ci_partition:4" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # mix test starts the emlx application in this job too, and EMLX on Linux needs
@@ -103,8 +108,7 @@ jobs:
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: exla
-          MIX_TEST_PARTITION: ${{ matrix.partition }}
-        run: mix test --exclude large_model --max-cases 2 --partitions 3 --slowest 10 --slowest-modules 6
+        run: mix test --exclude large_model --max-cases 2 ${{ matrix.select }} --slowest 10 --slowest-modules 6
       - name: List the cached models
         id: model-files
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

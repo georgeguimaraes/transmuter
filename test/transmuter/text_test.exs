@@ -5,6 +5,7 @@ defmodule Transmuter.TextTest do
   # see test/support/pipeline_references.py. The first run downloads the models.
   @moduletag :hub
   @moduletag timeout: 900_000
+  @moduletag ci_partition: 4
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -338,31 +339,6 @@ defmodule Transmuter.TextTest do
     assert streamed_summary == summary
   end
 
-  test "a batch gives the text of each prompt alone in each mode of the KV cache" do
-    questions = [
-      "What is the capital of France?",
-      "Hi",
-      "What is the capital of Spain?",
-      "Write a long poem about the sea and the wind, in three verses."
-    ]
-
-    chats = for q <- questions, do: %{messages: [%{role: "user", content: q}]}
-
-    # The fourth input runs in a partial batch with two padding rows. gpt2 runs a group for
-    # each prompt length, and the questions about France and Spain have the same length.
-    for {repo, inputs} <- [
-          {"HuggingFaceTB/SmolLM2-135M-Instruct", chats},
-          {"onnx-community/SmolLM2-135M-Instruct-ONNX", chats},
-          {"Xenova/gpt2", questions}
-        ] do
-      opts = [variant: :fp32, strategy: :greedy, max_new_tokens: 12] ++ @opts
-      single = Transmuter.Text.generation({:hf, repo}, opts)
-      batched = Transmuter.Text.generation({:hf, repo}, [compile: [batch_size: 3]] ++ opts)
-      alone = for input <- inputs, do: Nx.Serving.run(single, input)
-      assert Nx.Serving.run(batched, inputs) == alone
-    end
-  end
-
   test "concurrent streams of a started serving get the tokens of their own rows" do
     serving =
       Transmuter.Text.generation(
@@ -438,6 +414,7 @@ defmodule Transmuter.TextServingTest do
 
   @moduletag :hub
   @moduletag timeout: 900_000
+  @moduletag ci_partition: 4
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -494,5 +471,45 @@ defmodule Transmuter.TextServingTest do
     assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
              Nx.tensor(1, type: :u8),
            "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end
+
+# The batch test is the slowest text test, so with --max-cases 2 it runs next to the other
+# text tests in its CI partition.
+defmodule Transmuter.TextBatchTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :hub
+  @moduletag timeout: 900_000
+  @moduletag ci_partition: 4
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  test "a batch gives the text of each prompt alone in each mode of the KV cache" do
+    questions = [
+      "What is the capital of France?",
+      "Hi",
+      "What is the capital of Spain?",
+      "Write a long poem about the sea and the wind, in three verses."
+    ]
+
+    chats = for q <- questions, do: %{messages: [%{role: "user", content: q}]}
+
+    # The fourth input runs in a partial batch with two padding rows. gpt2 runs a group for
+    # each prompt length, and the questions about France and Spain have the same length.
+    for {repo, inputs} <- [
+          {"HuggingFaceTB/SmolLM2-135M-Instruct", chats},
+          {"onnx-community/SmolLM2-135M-Instruct-ONNX", chats},
+          {"Xenova/gpt2", questions}
+        ] do
+      opts = [variant: :fp32, strategy: :greedy, max_new_tokens: 12] ++ @opts
+      single = Transmuter.Text.generation({:hf, repo}, opts)
+      batched = Transmuter.Text.generation({:hf, repo}, [compile: [batch_size: 3]] ++ opts)
+      alone = for input <- inputs, do: Nx.Serving.run(single, input)
+      assert Nx.Serving.run(batched, inputs) == alone
+    end
   end
 end
