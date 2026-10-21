@@ -11,6 +11,7 @@ defmodule Transmuter.Ops.Transformer do
 
   import Transmuter.Ops,
     only: [
+      add_optional: 2,
       along_axis: 3,
       attr: 2,
       attr: 3,
@@ -18,14 +19,16 @@ defmodule Transmuter.Ops.Transformer do
       emlx?: 1,
       emlx_norm: 4,
       empty?: 1,
-      ints!: 1,
       known!: 2,
       known?: 1,
       matmul: 2,
       normalize: 3,
       normalize_axis: 2,
+      optional: 2,
+      scalar!: 1,
       shape_of: 1,
       softmax_last: 1,
+      split_along: 3,
       widen: 2
     ]
 
@@ -46,7 +49,7 @@ defmodule Transmuter.Ops.Transformer do
     do: packed_attention(node, inputs)
 
   defp op(node = %{op_type: "Attention"}, [q, k, v | optional]) do
-    [mask, past_k, past_v] = pad(optional, 3)
+    [mask, past_k, past_v] = optional(optional, 3)
     rank = Nx.rank(q)
     q = to_heads(q, attr(node, "q_num_heads"))
     k = to_heads(k, attr(node, "kv_num_heads"))
@@ -91,12 +94,12 @@ defmodule Transmuter.Ops.Transformer do
          seqlens_k,
          total_len | optional
        ]) do
-    [cos_cache, sin_cache, position_ids, attention_bias] = pad(optional, 4)
+    [cos_cache, sin_cache, position_ids, attention_bias] = optional(optional, 4)
     heads = attr(node, "num_heads")
     kv_heads = attr(node, "kv_num_heads")
     {q, k, v} = split_packed_qkv(q, k, v, heads, kv_heads)
     {b, s, _} = Nx.shape(q)
-    [total_len] = ints!(total_len)
+    total_len = scalar!(total_len)
 
     q = to_heads(q, heads)
     k = to_heads(k, kv_heads)
@@ -144,7 +147,7 @@ defmodule Transmuter.Ops.Transformer do
 
   # com.microsoft MultiHeadAttention: query {B, S, N*H}, key/value {B, L, N*H} or {B, N, L, H}.
   defp op(node = %{op_type: "MultiHeadAttention"}, [q, k, v | optional]) do
-    [bias, key_padding_mask, attention_bias, past_k, past_v] = pad(optional, 5)
+    [bias, key_padding_mask, attention_bias, past_k, past_v] = optional(optional, 5)
     heads = attr(node, "num_heads")
     {q, k, v} = add_qkv_bias(q, k, v, bias)
     q = to_heads(q, heads)
@@ -198,7 +201,7 @@ defmodule Transmuter.Ops.Transformer do
   # The recurrence runs token by token in f32 on a {B, H_kv, d_k, d_v} state. Gated rules
   # decay the state by exp(decay), delta rules add beta * (v - S^T k) in place of v.
   defp op(node = %{op_type: "LinearAttention"}, [query, key, value | optional]) do
-    [past, decay, beta] = pad(optional, 3)
+    [past, decay, beta] = optional(optional, 3)
     heads = attr(node, "q_num_heads")
     kv_heads = attr(node, "kv_num_heads")
     rule = attr(node, "update_rule", "gated_delta")
@@ -265,7 +268,7 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   defp op(node = %{op_type: "SkipLayerNormalization"}, [x, skip, gamma | rest]) do
-    [beta, bias] = pad(rest, 2)
+    [beta, bias] = optional(rest, 2)
     sum = add_optional(Nx.add(x, skip), bias)
     [layer_norm(sum, gamma, beta, attr(node, "epsilon", 1.0e-12)), nil, nil, sum]
   end
@@ -279,7 +282,7 @@ defmodule Transmuter.Ops.Transformer do
          gamma,
          beta | rest
        ]) do
-    [mask, position_ids] = pad(rest, 2)
+    [mask, position_ids] = optional(rest, 2)
     {b, s} = Nx.shape(ids)
     position_ids = position_ids || Nx.iota({b, s}, axis: 1)
 
@@ -304,7 +307,7 @@ defmodule Transmuter.Ops.Transformer do
   # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
   # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
   defp attention_core(node, [q, k, v | optional], opset) do
-    [mask, keep, divisor] = pad(optional, 3)
+    [mask, keep, divisor] = optional(optional, 3)
     scale = attr(node, "scale")
 
     {scale, divisor} =
@@ -369,12 +372,12 @@ defmodule Transmuter.Ops.Transformer do
 
   # com.microsoft Attention from BERT exports: one input projected to Q, K and V.
   defp packed_attention(node, [x, weights, bias | rest]) do
-    [mask, nil, attention_bias] = pad(rest, 3)
+    [mask, nil, attention_bias] = optional(rest, 3)
     heads = attr(node, "num_heads")
     {b, s, _} = Nx.shape(x)
     qkv = x |> Nx.dot([2], weights, [0]) |> add_optional(bias)
     sizes = attr(node, "qkv_hidden_sizes") || List.duplicate(div(Nx.axis_size(weights, 1), 3), 3)
-    [q, k, v] = split(qkv, sizes, 2)
+    [q, k, v] = split_along(qkv, sizes, 2)
     [q, k, v] = Enum.map([q, k, v], &to_heads(&1, heads))
     # ONNX Runtime adds mask_filter_value to the scores of the hidden keys.
     hidden =
@@ -529,7 +532,10 @@ defmodule Transmuter.Ops.Transformer do
 
   defp split_packed_qkv(qkv, nil, nil, heads, kv_heads) do
     head_size = div(Nx.axis_size(qkv, 2), heads + 2 * kv_heads)
-    List.to_tuple(split(qkv, [heads * head_size, kv_heads * head_size, kv_heads * head_size], 2))
+
+    List.to_tuple(
+      split_along(qkv, [heads * head_size, kv_heads * head_size, kv_heads * head_size], 2)
+    )
   end
 
   defp split_packed_qkv(q, k, v, _heads, _kv_heads), do: {q, k, v}
@@ -544,16 +550,8 @@ defmodule Transmuter.Ops.Transformer do
     end
 
     hidden = Nx.axis_size(q, -1)
-    [qb, kb, vb] = split(bias, [hidden, hidden, Nx.size(bias) - 2 * hidden], 0)
+    [qb, kb, vb] = split_along(bias, [hidden, hidden, Nx.size(bias) - 2 * hidden], 0)
     {Nx.add(q, qb), Nx.add(k, kb), Nx.add(v, vb)}
-  end
-
-  defp split(t, sizes, axis) do
-    sizes
-    |> Enum.map_reduce(0, fn size, start ->
-      {Nx.slice_along_axis(t, start, size, axis: axis), start + size}
-    end)
-    |> elem(0)
   end
 
   # The attention core of the attention ops: softmax(q · k * scale + masks) · v, for q
@@ -754,12 +752,8 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   defp norm_axes(x, axis) do
-    axis = if axis < 0, do: axis + Nx.rank(x), else: axis
-    Enum.to_list(axis..(Nx.rank(x) - 1))
+    Enum.to_list(normalize_axis(axis, Nx.rank(x))..(Nx.rank(x) - 1))
   end
-
-  defp add_optional(t, nil), do: t
-  defp add_optional(t, other), do: Nx.add(t, other)
 
   # The scale attribute, where 0 or no attribute means 1 / sqrt(head size) of q {B, N, S, H}.
   defp scale(node, q) do
@@ -768,6 +762,4 @@ defmodule Transmuter.Ops.Transformer do
       scale -> scale
     end
   end
-
-  defp pad(list, n), do: Enum.take(list ++ List.duplicate(nil, n), n)
 end

@@ -3,7 +3,17 @@ defmodule Transmuter.Ops.Vision do
   Spatial operators: sampling grids, crops, patch folding, region pooling, deformable convolution and image decoding. Sizes that decide output shapes must be known: static, or read while the model runs eagerly, as at a graph break of `Transmuter.compile/3`.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, known!: 2, static_tensor: 2]
+  import Transmuter.Ops,
+    only: [
+      attr: 2,
+      attr: 3,
+      known!: 2,
+      normalize_axis: 2,
+      optional: 2,
+      scalar!: 1,
+      static_tensor: 2,
+      values!: 1
+    ]
 
   @compile {:no_warn_undefined, StbImage}
 
@@ -36,7 +46,7 @@ defmodule Transmuter.Ops.Vision do
   # Sampling grid {N, H, W, 2} (or {N, D, H, W, 3}) of theta times the normalized
   # coordinates (x, y[, z], 1) of every output pixel.
   defp op(node = %{op_type: "AffineGrid"}, [theta, size]) do
-    [n, _c | spatial] = ints!(size)
+    [n, _c | spatial] = values!(size)
     align = attr(node, "align_corners", 0) == 1
 
     axes =
@@ -54,13 +64,13 @@ defmodule Transmuter.Ops.Vision do
   end
 
   defp op(node = %{op_type: "CenterCropPad"}, [x, shape]) do
-    targets = ints!(shape)
+    targets = values!(shape)
     rank = Nx.rank(x)
 
     axes =
       node
       |> attr("axes", Enum.to_list(0..(rank - 1)))
-      |> Enum.map(&if(&1 < 0, do: &1 + rank, else: &1))
+      |> Enum.map(&normalize_axis(&1, rank))
 
     Enum.zip(axes, targets)
     |> Enum.reduce(x, fn {axis, target}, acc ->
@@ -89,8 +99,8 @@ defmodule Transmuter.Ops.Vision do
 
   # Sums sliding blocks {N, C * prod(block), L} back into images {N, C, image...}.
   defp op(node = %{op_type: "Col2Im"}, [x, image_shape, block_shape]) do
-    image = ints!(image_shape)
-    block = ints!(block_shape)
+    image = values!(image_shape)
+    block = values!(block_shape)
     spatial = length(image)
     dilations = attr(node, "dilations", List.duplicate(1, spatial))
     strides = attr(node, "strides", List.duplicate(1, spatial))
@@ -252,7 +262,7 @@ defmodule Transmuter.Ops.Vision do
   end
 
   defp op(node = %{op_type: "DeformConv"}, [x, w, offset | rest]) do
-    [bias, mask] = Enum.take(rest ++ [nil, nil], 2)
+    [bias, mask] = optional(rest, 2)
     {n, c, h, wd} = Nx.shape(x)
     {m, c_per_group, kh, kw} = Nx.shape(w)
     groups = attr(node, "group", 1)
@@ -343,11 +353,10 @@ defmodule Transmuter.Ops.Vision do
       for value <- [boxes, scores | rest],
           do: value && known!(value, "the NonMaxSuppression input")
 
-    [max_boxes, iou, score_threshold] = Enum.take(rest ++ [nil, nil, nil], 3)
-
-    limit = if max_boxes, do: max(hd(ints!(max_boxes)), 0), else: 0
-    iou = if iou, do: hd(Nx.to_flat_list(iou)), else: 0.0
-    score_threshold = score_threshold && hd(Nx.to_flat_list(score_threshold))
+    [max_boxes, iou, score_threshold] = optional(rest, 3)
+    limit = if max_boxes, do: max(scalar!(max_boxes), 0), else: 0
+    iou = if iou, do: scalar!(iou), else: 0.0
+    score_threshold = score_threshold && scalar!(score_threshold)
     center? = attr(node, "center_point_box", 0) == 1
     {_batches, classes, count} = Nx.shape(scores)
 

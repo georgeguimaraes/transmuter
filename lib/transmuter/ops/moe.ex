@@ -5,7 +5,7 @@ defmodule Transmuter.Ops.MoE do
   `MoE` takes a softmax over all experts, then uses the top-k probabilities as weights. `QMoE` takes the top-k router values, then a softmax over those k values. `QMoE` dequantizes 4-bit and 8-bit block-wise weights as (q - zero point) * scale.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, softmax_last: 1]
+  import Transmuter.Ops, only: [attr: 2, attr: 3, optional: 2, softmax_last: 1]
 
   @op_types ~w(MoE QMoE)
 
@@ -17,7 +17,7 @@ defmodule Transmuter.Ops.MoE do
 
   # com.microsoft MoE: float expert weights, full-softmax routing.
   defp op(node = %{op_type: "MoE"}, [input, router_probs | rest]) do
-    [fc1_w, fc1_bias, fc2_w, fc2_bias, fc3_w, fc3_bias] = pad(rest, 6)
+    [fc1_w, fc1_bias, fc2_w, fc2_bias, fc3_w, fc3_bias] = optional(rest, 6)
     {k, normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
 
     # Full softmax over all experts, then top-k selection.
@@ -36,7 +36,7 @@ defmodule Transmuter.Ops.MoE do
 
   # com.microsoft QMoE: block-wise quantized expert weights, local-softmax routing.
   defp op(node = %{op_type: "QMoE"}, [input, router_probs | rest]) do
-    [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = pad(rest, 12)
+    [fc1_w, fc1_scales, fc1_bias, fc2_w, fc2_scales, fc2_bias | opt] = optional(rest, 12)
     [fc3_w, fc3_scales, fc3_bias, fc1_zp, fc2_zp, fc3_zp] = opt
 
     {k, _normalize, _act, _fusion, _alpha, _beta, _limit} = moe_attrs(node)
@@ -314,6 +314,4 @@ defmodule Transmuter.Ops.MoE do
 
   defp nonzero_float(v) when v == 0 or v == 0.0, do: nil
   defp nonzero_float(v), do: v
-
-  defp pad(list, n), do: Enum.take(list ++ List.duplicate(nil, n), n)
 end

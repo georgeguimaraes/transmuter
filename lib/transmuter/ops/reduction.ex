@@ -3,7 +3,7 @@ defmodule Transmuter.Ops.Reduction do
   Reductions along axes, arg reductions, cumulative sums and products, and TopK.
   """
 
-  import Transmuter.Ops, only: [attr: 3, ints!: 1, normalize_axis: 2]
+  import Transmuter.Ops, only: [attr: 3, normalize_axis: 2, scalar!: 1, values_or_attr: 4]
 
   @op_types ~w(ReduceSum ReduceMean CumSum TopK CumProd ReduceMax ReduceMin ReduceProd ReduceL2
                ReduceSumSquare ReduceL1 ReduceLogSum ReduceLogSumExp ArgMax ArgMin)
@@ -17,12 +17,7 @@ defmodule Transmuter.Ops.Reduction do
   # The axes come from the second input (opset 18) or the axes attribute. No axes reduce
   # every axis, or none with noop_with_empty_axes.
   defp op(node = %{op_type: "Reduce" <> _}, [a | rest]) do
-    axes =
-      case rest do
-        [axes | _] when axes != nil -> ints!(axes)
-        _ -> attr(node, "axes", [])
-      end
-
+    axes = values_or_attr(node, List.first(rest), "axes", [])
     opts = [keep_axes: attr(node, "keepdims", 1) == 1]
 
     cond do
@@ -47,7 +42,7 @@ defmodule Transmuter.Ops.Reduction do
   # The exclusive forms shift the inclusive result by one along the axis, with the
   # identity element in the first place.
   defp op(node = %{op_type: cumulative}, [x, axis]) when cumulative in ["CumSum", "CumProd"] do
-    axis = normalize_axis(axis |> ints!() |> hd(), Nx.rank(x))
+    axis = normalize_axis(scalar!(axis), Nx.rank(x))
     reverse = attr(node, "reverse", 0) == 1
 
     {out, identity} =
@@ -65,11 +60,8 @@ defmodule Transmuter.Ops.Reduction do
   end
 
   defp op(node = %{op_type: "TopK"}, [x, k]) do
-    [k] = ints!(k)
-    rank = Nx.rank(x)
-    axis = attr(node, "axis", -1)
-    axis = if axis < 0, do: axis + rank, else: axis
-
+    k = scalar!(k)
+    axis = normalize_axis(attr(node, "axis", -1), Nx.rank(x))
     largest? = attr(node, "largest", 1) == 1
 
     cond do

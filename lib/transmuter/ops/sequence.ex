@@ -4,7 +4,16 @@ defmodule Transmuter.Ops.Sequence do
   """
 
   import Transmuter.Ops,
-    only: [attr: 2, attr: 3, ints!: 1, normalize_axis: 2, shape_of: 1, static_tensor: 2]
+    only: [
+      attr: 2,
+      attr: 3,
+      normalize_axis: 2,
+      scalar!: 1,
+      shape_of: 1,
+      split_along: 3,
+      static_tensor: 2,
+      values!: 1
+    ]
 
   alias Transmuter.Ops.Shape
 
@@ -48,20 +57,17 @@ defmodule Transmuter.Ops.Sequence do
       case rest do
         [split] when split != nil ->
           if Nx.rank(split) == 0 do
-            chunk = hd(ints!(split))
+            chunk = scalar!(split)
             Enum.map(0..(dim - 1)//chunk, &min(chunk, dim - &1))
           else
-            ints!(split)
+            values!(split)
           end
 
         _ ->
           List.duplicate(1, dim)
       end
 
-    parts =
-      sizes
-      |> Enum.scan({0, 0}, fn size, {start, prev} -> {start + prev, size} end)
-      |> Enum.map(fn {start, size} -> Nx.slice_along_axis(a, start, size, axis: axis) end)
+    parts = split_along(a, sizes, axis)
 
     squeeze? = rest in [[], [nil]] and attr(node, "keepdims", 1) == 0
     {:sequence, if(squeeze?, do: Enum.map(parts, &Nx.squeeze(&1, axes: [axis])), else: parts)}
@@ -95,7 +101,7 @@ defmodule Transmuter.Ops.Sequence do
 
   # A negative position counts from the end of the sequence.
   defp position!(position, count, last) do
-    [given] = ints!(position)
+    given = scalar!(position)
     at = if given < 0, do: given + count, else: given
 
     unless at in 0..last//1 do

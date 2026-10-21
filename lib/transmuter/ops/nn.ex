@@ -10,11 +10,12 @@ defmodule Transmuter.Ops.NN do
       emlx?: 1,
       emlx_norm: 4,
       empty?: 1,
-      ints!: 1,
       normalize: 3,
       normalize_axis: 2,
+      optional: 2,
       round_half_even: 1,
       static_tensor: 2,
+      values!: 1,
       widen: 2
     ]
 
@@ -31,7 +32,7 @@ defmodule Transmuter.Ops.NN do
   def apply(node, inputs), do: node |> op(inputs) |> List.wrap()
 
   defp op(node = %{op_type: "ConvInteger"}, [x, w | zero_points]) do
-    [x_zero, w_zero] = Enum.take(zero_points ++ [nil, nil], 2)
+    [x_zero, w_zero] = optional(zero_points, 2)
     x = Nx.as_type(x, :f32)
     x = if x_zero, do: Nx.subtract(x, Nx.reshape(Nx.as_type(x_zero, :f32), {})), else: x
     w = Nx.as_type(w, :f32)
@@ -103,8 +104,7 @@ defmodule Transmuter.Ops.NN do
   end
 
   defp op(node = %{op_type: "LayerNormalization"}, [x, scale | bias]) do
-    axis = attr(node, "axis", -1)
-    axis = if axis < 0, do: axis + Nx.rank(x), else: axis
+    axis = normalize_axis(attr(node, "axis", -1), Nx.rank(x))
     axes = Enum.to_list(axis..(Nx.rank(x) - 1))
     eps = attr(node, "epsilon", 1.0e-5)
 
@@ -246,7 +246,7 @@ defmodule Transmuter.Ops.NN do
 
     {scales, sizes} =
       if given.(sizes) do
-        sizes = ints!(sizes)
+        sizes = values!(sizes)
 
         case attr(node, "keep_aspect_ratio_policy", "stretch") do
           "stretch" ->
@@ -258,7 +258,7 @@ defmodule Transmuter.Ops.NN do
             {Enum.map(in_sizes, fn _ -> scale end), Enum.map(in_sizes, &round(&1 * scale))}
         end
       else
-        scales = ints!(scales)
+        scales = values!(scales)
         {scales, Enum.zip_with(in_sizes, scales, &floor(&1 * &2))}
       end
 
@@ -269,7 +269,7 @@ defmodule Transmuter.Ops.NN do
 
     roi =
       if crop? and given.(roi),
-        do: ints!(roi),
+        do: values!(roi),
         else: List.duplicate(0, count) ++ List.duplicate(1, count)
 
     regions = Enum.zip(Enum.take(roi, count), Enum.drop(roi, count))
@@ -321,7 +321,7 @@ defmodule Transmuter.Ops.NN do
 
     shape =
       if s = List.first(output_shape),
-        do: ints!(s),
+        do: values!(s),
         else: [
           n,
           c
@@ -340,7 +340,7 @@ defmodule Transmuter.Ops.NN do
   # Depthwise causal Conv1d over the past state and the input. The present state is the
   # last k - 1 positions of that sequence.
   defp op(node = %{op_type: "CausalConvWithState"}, [x, w | rest]) do
-    [bias, past] = Enum.take(rest ++ [nil, nil], 2)
+    [bias, past] = optional(rest, 2)
     {b, c, _} = Nx.shape(x)
     k = Nx.axis_size(w, 2)
     past = past || Nx.broadcast(Nx.tensor(0, type: Nx.type(x)), {b, c, k - 1})

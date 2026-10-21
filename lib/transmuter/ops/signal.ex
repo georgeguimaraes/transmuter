@@ -3,7 +3,8 @@ defmodule Transmuter.Ops.Signal do
   Recurrent layers and Fourier transforms. Short recurrences unroll over the sequence, which has a static length. Long traced recurrences run as an Nx while loop, because an unrolled graph gets too deep to compile. Fourier transforms multiply by static DFT matrices, so they need no complex numbers on the backend.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, ints!: 1, static_tensor: 2]
+  import Transmuter.Ops,
+    only: [attr: 2, attr: 3, normalize_axis: 2, optional: 2, scalar!: 1, static_tensor: 2]
 
   alias Nx.Defn.Expr
 
@@ -19,7 +20,7 @@ defmodule Transmuter.Ops.Signal do
   # The peepholes add P * c to the i, o and f gates, zeros without the P input. With
   # input_forget, the forget gate is 1 - i.
   defp op(node = %{op_type: "LSTM"}, [x, w, r | rest]) do
-    [bias, lengths, h0, c0, peepholes] = Enum.take(rest ++ List.duplicate(nil, 5), 5)
+    [bias, lengths, h0, c0, peepholes] = optional(rest, 5)
     hidden = attr(node, "hidden_size")
     coupled? = attr(node, "input_forget", 0) == 1
 
@@ -51,7 +52,7 @@ defmodule Transmuter.Ops.Signal do
 
   # ONNX GRU, gates in z, r, h order.
   defp op(node = %{op_type: "GRU"}, [x, w, r | rest]) do
-    [bias, lengths, h0] = Enum.take(rest ++ List.duplicate(nil, 3), 3)
+    [bias, lengths, h0] = optional(rest, 3)
     before_reset? = attr(node, "linear_before_reset", 0) == 1
 
     step = fn [f, g] ->
@@ -76,7 +77,7 @@ defmodule Transmuter.Ops.Signal do
 
   # ONNX RNN: one gate, h = f(x W + h R + Wb + Rb).
   defp op(node = %{op_type: "RNN"}, [x, w, r | rest]) do
-    [bias, lengths, h0] = Enum.take(rest ++ List.duplicate(nil, 3), 3)
+    [bias, lengths, h0] = optional(rest, 3)
 
     step = fn [f] ->
       fn x_gates, {r, rb, _}, {h_prev} ->
@@ -89,7 +90,7 @@ defmodule Transmuter.Ops.Signal do
 
   defp op(node = %{op_type: window}, [size])
        when window in ["HannWindow", "HammingWindow", "BlackmanWindow"] do
-    [n] = ints!(size)
+    n = scalar!(size)
     denominator = if attr(node, "periodic", 1) == 1, do: n, else: n - 1
 
     values =
@@ -110,10 +111,9 @@ defmodule Transmuter.Ops.Signal do
 
   # Triangular mel filters, {dft_length / 2 + 1, num_mel_bins}, as the ONNX reference builds them.
   defp op(node = %{op_type: "MelWeightMatrix"}, [bins, dft_length, sample_rate, low, high]) do
-    [bins, dft_length, sample_rate] =
-      Enum.map([bins, dft_length, sample_rate], &(&1 |> ints!() |> hd()))
+    [bins, dft_length, sample_rate, low, high] =
+      Enum.map([bins, dft_length, sample_rate, low, high], &scalar!/1)
 
-    [low, high] = Enum.map([low, high], &(&1 |> ints!() |> hd()))
     to_mel = &(2595 * :math.log10(1 + &1 / 700))
     {low_mel, high_mel} = {to_mel.(low), to_mel.(high)}
     step = (high_mel - low_mel) / (bins + 2)
@@ -150,9 +150,9 @@ defmodule Transmuter.Ops.Signal do
 
   # STFT of signal {B, L, 1 or 2}. Output {B, frames, bins, 2}.
   defp op(node = %{op_type: "STFT"}, [signal, frame_step | rest]) do
-    [window, frame_length] = Enum.take(rest ++ [nil, nil], 2)
-    [step] = ints!(frame_step)
-    size = if window, do: Nx.axis_size(window, 0), else: hd(ints!(frame_length))
+    [window, frame_length] = optional(rest, 2)
+    step = scalar!(frame_step)
+    size = if window, do: Nx.axis_size(window, 0), else: scalar!(frame_length)
     # The spec signal is {B, L, 1 or 2}. ONNX Runtime also takes a real {B, L} signal.
     signal = if Nx.rank(signal) == 2, do: Nx.new_axis(signal, 2), else: signal
     stft(signal, window, size, step, attr(node, "onesided", 1) == 1)
@@ -160,11 +160,9 @@ defmodule Transmuter.Ops.Signal do
 
   # DFT along one axis of {..., n, 1 or 2}. Output keeps the layout with 2 components.
   defp op(node = %{op_type: "DFT"}, [x | rest]) do
-    [length, axis] = Enum.take(rest ++ [nil, nil], 2)
-    rank = Nx.rank(x)
-    axis = if axis, do: hd(ints!(axis)), else: attr(node, "axis", -2)
-    axis = if axis < 0, do: axis + rank, else: axis
-    n = if length, do: hd(ints!(length)), else: Nx.axis_size(x, axis)
+    [length, axis] = optional(rest, 2)
+    axis = normalize_axis(if(axis, do: scalar!(axis), else: attr(node, "axis", -2)), Nx.rank(x))
+    n = if length, do: scalar!(length), else: Nx.axis_size(x, axis)
     x = fit_length(x, axis, n)
     inverse? = attr(node, "inverse", 0) == 1
     bins = if attr(node, "onesided", 0) == 1, do: div(n, 2) + 1, else: n

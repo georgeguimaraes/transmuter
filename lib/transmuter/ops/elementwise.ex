@@ -3,7 +3,8 @@ defmodule Transmuter.Ops.Elementwise do
   Elementwise operators: arithmetic, comparisons, logic, bitwise, trigonometry and activations.
   """
 
-  import Transmuter.Ops, only: [attr: 2, attr: 3, broadcast_shape: 1, round_half_even: 1]
+  import Transmuter.Ops,
+    only: [add_optional: 2, attr: 2, attr: 3, broadcast_shape: 1, round_half_even: 1]
 
   @op_types ~w(Add Sub Mul Div Pow Sqrt Erf Tanh Abs Exp Sigmoid Mod Equal Less LessOrEqual
                Greater GreaterOrEqual Not And Or Xor Neg Sin Cos Atan Log Floor Ceil Round Sign
@@ -208,9 +209,6 @@ defmodule Transmuter.Ops.Elementwise do
     do: inputs |> Enum.reduce(&Nx.add(&2, &1)) |> Nx.divide(length(inputs))
 
   defp swish(x, alpha), do: Nx.multiply(x, Nx.sigmoid(Nx.multiply(x, alpha)))
-
-  defp add_optional(t, nil), do: t
-  defp add_optional(t, other), do: Nx.add(t, other)
 
   defp gelu(x),
     do: Nx.multiply(Nx.multiply(x, 0.5), Nx.add(1, Nx.erf(Nx.divide(x, :math.sqrt(2)))))

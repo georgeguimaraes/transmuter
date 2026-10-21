@@ -10,13 +10,16 @@ defmodule Transmuter.Ops.Shape do
       broadcast_shape: 1,
       dtype: 1,
       empty?: 1,
-      ints!: 1,
       known!: 2,
       normalize_axis: 2,
+      scalar!: 1,
       shape_of: 1,
+      split_along: 3,
       static?: 1,
       static_tensor: 2,
-      tensor: 1
+      tensor: 1,
+      values!: 1,
+      values_or_attr: 3
     ]
 
   @op_types ~w(Cast Constant ConstantOfShape Expand Tile Squeeze Size Shape Gather Concat
@@ -57,7 +60,7 @@ defmodule Transmuter.Ops.Shape do
     value =
       node |> attr("value") |> then(&if(&1, do: tensor(&1), else: static_tensor([0.0], :f32)))
 
-    dims = ints!(shape)
+    dims = values!(shape)
 
     # The fill value is a constant of the default backend, so a traced function builds the
     # output on the device.
@@ -72,7 +75,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(%{op_type: "Expand"}, [a, shape]) do
-    out = broadcast_shape([Nx.shape(a), List.to_tuple(ints!(shape))])
+    out = broadcast_shape([Nx.shape(a), List.to_tuple(values!(shape))])
     pad = List.duplicate(1, tuple_size(out) - Nx.rank(a)) ++ Tuple.to_list(Nx.shape(a))
 
     if 0 in Tuple.to_list(out),
@@ -81,7 +84,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(%{op_type: "Tile"}, [a, repeats]) do
-    repeats = ints!(repeats)
+    repeats = values!(repeats)
 
     if 0 in repeats,
       do:
@@ -91,7 +94,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "Squeeze"}, [a | rest]) do
-    axes = if rest == [] or rest == [nil], do: attr(node, "axes"), else: ints!(hd(rest))
+    axes = values_or_attr(node, List.first(rest), "axes")
     if axes, do: Nx.squeeze(a, axes: axes), else: Nx.squeeze(a)
   end
 
@@ -108,11 +111,8 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "Gather"}, [data, indices]) do
-    axis = attr(node, "axis", 0)
-    axis = if axis < 0, do: axis + Nx.rank(data), else: axis
-    dim = Nx.axis_size(data, axis)
-
-    indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices)
+    axis = normalize_axis(attr(node, "axis", 0), Nx.rank(data))
+    indices = wrap_negative(indices, Nx.axis_size(data, axis))
 
     # EMLX 0.5 scatters gradients to the wrong place when the gathered axis is not 0,
     # so other axes move to the front, gather there and move back.
@@ -136,11 +136,11 @@ defmodule Transmuter.Ops.Shape do
   defp op(node = %{op_type: "Concat"}, inputs), do: concatenate(inputs, attr(node, "axis"))
 
   defp op(node = %{op_type: "Unsqueeze"}, [a | rest]) do
-    axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
+    axes = values_or_attr(node, List.first(rest), "axes")
     out_rank = Nx.rank(a) + length(axes)
 
     axes
-    |> Enum.map(&if(&1 < 0, do: &1 + out_rank, else: &1))
+    |> Enum.map(&normalize_axis(&1, out_rank))
     |> Enum.sort()
     |> Enum.reduce(a, fn axis, acc ->
       acc |> Nx.shape() |> Tuple.insert_at(axis, 1) |> then(&Nx.reshape(acc, &1))
@@ -150,7 +150,7 @@ defmodule Transmuter.Ops.Shape do
   defp op(%{op_type: "Reshape"}, [a, shape]) do
     dims =
       shape
-      |> ints!()
+      |> values!()
       |> Enum.with_index()
       |> Enum.map(fn
         {0, i} -> elem(Nx.shape(a), i)
@@ -162,8 +162,8 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(%{op_type: "Slice"}, [data, starts, ends | rest]) do
-    starts = ints!(starts)
-    ends = ints!(ends)
+    starts = values!(starts)
+    ends = values!(ends)
 
     axes = optional_ints(Enum.at(rest, 0), Enum.to_list(0..(length(starts) - 1)))
     steps = optional_ints(Enum.at(rest, 1), List.duplicate(1, length(starts)))
@@ -200,7 +200,7 @@ defmodule Transmuter.Ops.Shape do
   defp op(%{op_type: "CastLike"}, [a, like]), do: Nx.as_type(a, Nx.type(like))
 
   defp op(%{op_type: "Range"}, [start_t, limit, delta]) do
-    [start, limit, delta] = Enum.map([start_t, limit, delta], &(&1 |> ints!() |> hd()))
+    [start, limit, delta] = Enum.map([start_t, limit, delta], &scalar!/1)
     n = max(ceil((limit - start) / delta), 0)
 
     if n == 0,
@@ -209,30 +209,16 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "Split"}, [a | rest]) do
-    axis = attr(node, "axis", 0)
-    axis = if axis < 0, do: axis + Nx.rank(a), else: axis
+    axis = normalize_axis(attr(node, "axis", 0), Nx.rank(a))
     dim = Nx.axis_size(a, axis)
     n_out = length(node.output)
+    chunk = ceil(dim / n_out)
 
     sizes =
-      cond do
-        rest != [] and hd(rest) != nil ->
-          ints!(hd(rest))
+      values_or_attr(node, List.first(rest), "split") ||
+        Enum.map(0..(n_out - 1), &((dim - &1 * chunk) |> min(chunk) |> max(0)))
 
-        attr(node, "split") ->
-          attr(node, "split")
-
-        true ->
-          chunk = ceil(dim / n_out)
-          Enum.map(0..(n_out - 1), &((dim - &1 * chunk) |> min(chunk) |> max(0)))
-      end
-
-    sizes
-    |> Enum.scan({0, 0}, fn size, {start, prev} -> {start + prev, size} end)
-    |> Enum.map(fn
-      {_start, 0} -> {:empty, a |> Nx.shape() |> put_elem(axis, 0)}
-      {start, size} -> Nx.slice_along_axis(a, start, size, axis: axis)
-    end)
+    split_along(a, sizes, axis)
   end
 
   defp op(node = %{op_type: "Pad"}, [a | rest]) do
@@ -244,11 +230,11 @@ defmodule Transmuter.Ops.Shape do
           {attr(node, "pads"), attr(node, "value", 0.0), nil}
 
         [pads | more] ->
-          {ints!(pads), Enum.at(more, 0) || 0, Enum.at(more, 1) && ints!(Enum.at(more, 1))}
+          {values!(pads), Enum.at(more, 0) || 0, Enum.at(more, 1) && values!(Enum.at(more, 1))}
       end
 
     rank = Nx.rank(a)
-    axes = Enum.map(axes || Enum.to_list(0..(rank - 1)), &if(&1 < 0, do: &1 + rank, else: &1))
+    axes = Enum.map(axes || Enum.to_list(0..(rank - 1)), &normalize_axis(&1, rank))
     {lo, hi} = Enum.split(pads, length(axes))
     by_axis = Map.new(Enum.zip([axes, lo, hi]), fn {ax, l, h} -> {ax, {l, h, 0}} end)
 
@@ -304,10 +290,9 @@ defmodule Transmuter.Ops.Shape do
        when scatter in ["ScatterElements", "Scatter"] do
     rank = Nx.rank(data)
     axis = normalize_axis(attr(node, "axis", 0), rank)
-    dim = Nx.axis_size(data, axis)
     # Static indices make static coordinates, which a reduction can read.
     iota_opts = if static?(indices), do: [backend: Nx.BinaryBackend], else: []
-    indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices)
+    indices = wrap_negative(indices, Nx.axis_size(data, axis))
     shape = Nx.shape(indices)
 
     coords =
@@ -329,8 +314,7 @@ defmodule Transmuter.Ops.Shape do
     dims =
       data |> Nx.shape() |> Tuple.to_list() |> Enum.slice(batch_dims, k) |> static_tensor(:s64)
 
-    indices = Nx.as_type(indices, :s64)
-    indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, dims), indices)
+    indices = indices |> Nx.as_type(:s64) |> wrap_negative(dims)
     outer = indices |> Nx.shape() |> Tuple.delete_at(Nx.rank(indices) - 1)
 
     batch_coords =
@@ -356,8 +340,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "Flatten"}, [a]) do
-    axis = attr(node, "axis", 1)
-    axis = if axis < 0, do: axis + Nx.rank(a), else: axis
+    axis = normalize_axis(attr(node, "axis", 1), Nx.rank(a))
     {outer, inner} = a |> Nx.shape() |> Tuple.to_list() |> Enum.split(axis)
     Nx.reshape(a, {Enum.product(outer), Enum.product(inner)})
   end
@@ -381,9 +364,8 @@ defmodule Transmuter.Ops.Shape do
 
   defp op(node = %{op_type: "OneHot"}, [indices, depth, values]) do
     [depth] = depth |> known!("the OneHot depth") |> Nx.to_flat_list() |> Enum.map(&trunc/1)
-    axis = attr(node, "axis", -1)
-    axis = if axis < 0, do: axis + Nx.rank(indices) + 1, else: axis
-    indices = Nx.select(Nx.less(indices, 0), Nx.add(indices, depth), indices)
+    axis = normalize_axis(attr(node, "axis", -1), Nx.rank(indices) + 1)
+    indices = wrap_negative(indices, depth)
     expanded = Nx.new_axis(indices, axis)
     shape = expanded |> Nx.shape() |> put_elem(axis, depth)
     hot = Nx.equal(Nx.broadcast(expanded, shape), Nx.iota(shape, axis: axis))
@@ -391,13 +373,8 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(node = %{op_type: "GatherElements"}, [data, indices]) do
-    axis = attr(node, "axis", 0)
-    axis = if axis < 0, do: axis + Nx.rank(data), else: axis
-    dim = Nx.axis_size(data, axis)
-
-    Nx.take_along_axis(data, Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices),
-      axis: axis
-    )
+    axis = normalize_axis(attr(node, "axis", 0), Nx.rank(data))
+    Nx.take_along_axis(data, wrap_negative(indices, Nx.axis_size(data, axis)), axis: axis)
   end
 
   defp op(node = %{op_type: "EyeLike"}, [a]) do
@@ -502,8 +479,11 @@ defmodule Transmuter.Ops.Shape do
     Nx.take_along_axis(x, index, axis: time_axis)
   end
 
+  defp wrap_negative(indices, dim),
+    do: Nx.select(Nx.less(indices, 0), Nx.add(indices, dim), indices)
+
   defp optional_ints(nil, default), do: default
-  defp optional_ints(t, _default), do: ints!(t)
+  defp optional_ints(t, _default), do: values!(t)
 
   # The input position that position i of a padded axis of size n reads: the nearest
   # edge, the mirror image that does not repeat the edge, or i modulo n.

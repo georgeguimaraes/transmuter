@@ -166,7 +166,7 @@ defmodule Transmuter.Ops do
   end
 
   defp empty_shape(node = %{op_type: "Unsqueeze"}, [x | rest]) do
-    axes = if rest == [], do: attr(node, "axes"), else: ints!(hd(rest))
+    axes = values_or_attr(node, List.first(rest), "axes")
     rank = length(shape_list(x)) + length(axes)
 
     axes
@@ -177,7 +177,7 @@ defmodule Transmuter.Ops do
 
   defp empty_shape(node = %{op_type: "Squeeze"}, [x | rest]) do
     dims = shape_list(x)
-    axes = if rest in [[], [nil]], do: attr(node, "axes"), else: ints!(hd(rest))
+    axes = values_or_attr(node, List.first(rest), "axes")
 
     if axes do
       axes = Enum.map(axes, &normalize_axis(&1, length(dims)))
@@ -199,7 +199,7 @@ defmodule Transmuter.Ops do
 
     target =
       shape
-      |> ints!()
+      |> values!()
       |> Enum.with_index()
       |> Enum.map(fn
         {0, i} when copy? -> Enum.at(dims, i)
@@ -212,7 +212,7 @@ defmodule Transmuter.Ops do
 
   # A dimension of 1 takes the target size, any other dimension stays, also 0.
   defp empty_shape(%{op_type: "Expand"}, [x, shape]) do
-    {dims, target} = {shape_list(x), ints!(shape)}
+    {dims, target} = {shape_list(x), values!(shape)}
     rank = max(length(dims), length(target))
     pad = &(List.duplicate(1, rank - length(&1)) ++ &1)
     Enum.zip_with(pad.(dims), pad.(target), fn d, t -> if d == 1, do: t, else: d end)
@@ -236,8 +236,7 @@ defmodule Transmuter.Ops do
 
   defp empty_shape(node = %{op_type: "OneHot"}, [indices, depth, _values]) do
     dims = shape_list(indices)
-    [depth] = ints!(depth)
-    List.insert_at(dims, normalize_axis(attr(node, "axis", -1), length(dims) + 1), depth)
+    List.insert_at(dims, normalize_axis(attr(node, "axis", -1), length(dims) + 1), scalar!(depth))
   end
 
   defp empty_shape(%{op_type: "MatMul"}, [a, b]) do
@@ -293,9 +292,16 @@ defmodule Transmuter.Ops do
   def static?(_), do: false
 
   @doc false
-  def ints!({:empty, _shape}), do: []
+  def values!({:empty, _shape}), do: []
+  def values!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
 
-  def ints!(t), do: t |> known!("a value that decides a shape") |> Nx.to_flat_list()
+  @doc false
+  def scalar!(t), do: t |> values!() |> hd()
+
+  @doc false
+  def values_or_attr(node, input, name, default \\ nil)
+  def values_or_attr(node, nil, name, default), do: attr(node, name, default)
+  def values_or_attr(_node, input, _name, _default), do: values!(input)
 
   @doc """
   Returns the host value of `value`, or raises `Transmuter.UnknownValueError` when the value is not known on the host. A literal of a traced function and a large value that it folds from static values give their host tensor, and any other known value gives itself, so callers read the value that this function returns.
@@ -375,6 +381,25 @@ defmodule Transmuter.Ops do
   def normalize_axis(axis, _rank), do: axis
 
   @doc false
+  def optional(inputs, count), do: Enum.take(inputs ++ List.duplicate(nil, count), count)
+
+  @doc false
+  def add_optional(t, nil), do: t
+  def add_optional(t, other), do: Nx.add(t, other)
+
+  @doc """
+  Splits `t` along `axis` into parts of `sizes`. A part of size 0 is a zero-size value.
+  """
+  def split_along(t, sizes, axis) do
+    sizes
+    |> Enum.map_reduce(0, fn
+      0, start -> {{:empty, t |> Nx.shape() |> put_elem(axis, 0)}, start}
+      size, start -> {Nx.slice_along_axis(t, start, size, axis: axis), start + size}
+    end)
+    |> elem(0)
+  end
+
+  @doc false
   def matmul(a, b) do
     case {Nx.rank(a), Nx.rank(b)} do
       {_, 1} ->
@@ -410,8 +435,7 @@ defmodule Transmuter.Ops do
   """
   def along_axis(node, a, opset) do
     rank = Nx.rank(a)
-    axis = attr(node, "axis", if(opset >= 13, do: -1, else: 1))
-    axis = if axis < 0, do: axis + rank, else: axis
+    axis = normalize_axis(attr(node, "axis", if(opset >= 13, do: -1, else: 1)), rank)
 
     last =
       case node.op_type do
