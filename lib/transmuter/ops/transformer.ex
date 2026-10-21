@@ -6,7 +6,7 @@ defmodule Transmuter.Ops.Transformer do
 
   All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel.
 
-  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep and divisor. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, the softmax is along the last axis, the masks broadcast to the scores and the host can read the divisor.
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep and divisor. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores and the host can read the divisor.
   """
 
   import Transmuter.Ops,
@@ -312,10 +312,17 @@ defmodule Transmuter.Ops.Transformer do
         _other -> {scale, divisor}
       end
 
-    if divisor == nil and fused_core?(q, k, v, [mask, keep], attr(node, "axis")) do
+    # Exports such as Whisper and TrOCR put the heads in the batch, {B * N, S, d}. These are
+    # the heads of a batch of one.
+    last? = attr(node, "axis") in [-1, Nx.rank(q) - 1]
+    heads = if Enum.all?([q, k, v], &(Nx.rank(&1) == 3)), do: &Nx.new_axis(&1, 0), else: & &1
+    {q4, k4, v4} = {heads.(q), heads.(k), heads.(v)}
+
+    if divisor == nil and last? and fused_core?(q4, k4, v4, [mask, keep]) do
       hidden = keep && Nx.equal(keep, 0)
       opts = %{scale: scale, softcap: 0.0, bias: mask, hidden: hidden, causal: false}
-      attend(q, Nx.transpose(k, axes: [0, 1, 3, 2]), v, opts)
+      out = attend(q4, Nx.transpose(k4, axes: [0, 1, 3, 2]), v4, opts)
+      if Nx.rank(q) == 3, do: Nx.squeeze(out, axes: [0]), else: out
     else
       [q, k, v, mask, divisor]
       |> widen(fn [q, k, v, mask, divisor] ->
@@ -346,15 +353,13 @@ defmodule Transmuter.Ops.Transformer do
     Nx.select(Nx.broadcast(keep, shape), Nx.broadcast(scores, shape), fill)
   end
 
-  defp fused_core?(q, k, v, masks, axis) do
+  defp fused_core?(q, k, v, masks) do
     with true <- Enum.all?([q, k, v], &(Nx.rank(&1) == 4 and Nx.type(&1) == Nx.type(q))),
          {b, heads, s, _head_size} <- Nx.shape(q),
          true <-
            Enum.all?([k, v], &(&1 |> Nx.shape() |> Tuple.to_list() |> Enum.take(2) == [b, heads])) do
       scores = {b, heads, s, Nx.axis_size(k, 3)}
-
-      axis in [-1, 3] and
-        Enum.all?(masks, &(&1 == nil or broadcast_shape([scores, Nx.shape(&1)]) == scores))
+      Enum.all?(masks, &(&1 == nil or broadcast_shape([scores, Nx.shape(&1)]) == scores))
     end
   end
 

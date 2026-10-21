@@ -19,7 +19,7 @@ defmodule Transmuter.Fusion do
     * The weight, gamma and beta are constants of at most one axis, so they broadcast only along the last axis.
     * No value inside the subgraph has a consumer outside it, also not a graph output or a subgraph.
 
-  Without shapes at load time, `AttentionCore` checks the shapes when it runs and uses the fused kernel only for 4-D heads with a softmax over the last axis.
+  Without shapes at load time, `AttentionCore` checks the shapes when it runs and uses the fused kernel only for 4-D heads, or 3-D heads in the batch as in Whisper and TrOCR exports, with a softmax over the last axis.
   """
 
   alias Transmuter.Onnx.{AttributeProto, NodeProto}

@@ -104,6 +104,29 @@ defmodule Transmuter.FusionTest do
     end
   end
 
+  # Whisper and TrOCR exports put the heads in the batch, {B * N, S, d}. EMLX runs these
+  # as the heads of a batch of one, with the mask of each head.
+  test "an attention core with the heads in the batch becomes AttentionCore", %{tmp_dir: dir} do
+    nodes = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 2, 1]),
+      node("MatMul", ["q", "kt"], ["scores"]),
+      node("Add", ["scores", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: 2),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    model = write(dir, nodes, %{}, ["q", "k", "v", "mask"], ["y"], 13)
+    assert ops(model) == ["Transpose", "AttentionCore"]
+
+    key = Nx.Random.key(0)
+    {q, key} = Nx.Random.normal(key, shape: {6, 3, 64})
+    {k, key} = Nx.Random.normal(key, shape: {6, 5, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {6, 5, 64})
+    mask = Nx.iota({6, 1, 5}) |> Nx.remainder(4) |> Nx.equal(3) |> Nx.multiply(-1.0e9)
+
+    assert_same_outputs(model, %{"q" => q, "k" => k, "v" => v, "mask" => mask})
+  end
+
   test "a subgraph that computes another function stays", %{tmp_dir: dir} do
     variants = [
       rms_norm(one_over_sqrt(), exponent: "three"),
@@ -201,6 +224,8 @@ defmodule Transmuter.FusionTest do
 
   defp assert_close(actual, expected) do
     for {name, t} <- expected do
+      assert Nx.shape(actual[name]) == Nx.shape(t), name
+
       assert Nx.all_close(Nx.backend_copy(actual[name], Nx.BinaryBackend), t,
                atol: 1.0e-4,
                rtol: 1.0e-4
