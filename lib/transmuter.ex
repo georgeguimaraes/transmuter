@@ -506,12 +506,14 @@ defmodule Transmuter do
 
   # A node with static inputs runs on the host. Nodes with the same operator, attributes and
   # input values give the same outputs, so each runs once in a call. For example, each layer
-  # of a vision encoder builds the same attention mask from the same shapes.
+  # of a vision encoder builds the same attention mask from the same shapes. A tensor
+  # attribute counts by its value, without the name that each node gives it.
   defp fold(node, [], ctx), do: fold_on_host(node, [], ctx)
 
   defp fold(node, inputs, ctx) do
     memo = Process.get(@fold_memo)
-    key = {ctx.opset, node.op_type, node.domain, node.attribute, Enum.map(inputs, &Ops.digest/1)}
+    attributes = Enum.map(node.attribute, &if(&1.t, do: %{&1 | t: %{&1.t | name: ""}}, else: &1))
+    key = {ctx.opset, node.op_type, node.domain, attributes, Enum.map(inputs, &Ops.digest/1)}
 
     case memo do
       %{^key => outputs} ->
