@@ -12,7 +12,7 @@ defmodule Transmuter.Featurizer do
   The steps and their order are those of the image processors of Python transformers:
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
-    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side.
+    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. The DETR and YOLOS image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
     3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
@@ -60,6 +60,7 @@ defmodule Transmuter.Featurizer do
     crop = if config["do_center_crop"], do: square(config["crop_size"])
     size = config_size(config["size"], crop != nil or is_number(config["crop_pct"]))
     {size, crop} = crop_pct(config["crop_pct"], size, crop)
+    size = detr_size(config["image_processor_type"], size)
 
     %__MODULE__{
       resize: if(Map.get(config, "do_resize", true), do: size),
@@ -93,6 +94,18 @@ defmodule Transmuter.Featurizer do
   defp crop_pct(pct, {:edges, edge, nil}, _crop) when is_number(pct), do: {{edge, edge}, nil}
   defp crop_pct(_pct, size, crop), do: {size, crop}
 
+  # The DETR and YOLOS image processors compute the size with get_size_with_aspect_ratio.
+  # YOLOS also rounds each side down to a multiple of 16.
+  defp detr_size(type, {:edges, shortest, longest}) when is_binary(type) do
+    cond do
+      String.starts_with?(type, "Yolos") -> {:detr, shortest, longest, 16}
+      String.starts_with?(type, "Detr") -> {:detr, shortest, longest, 1}
+      true -> {:edges, shortest, longest}
+    end
+  end
+
+  defp detr_size(_type, size), do: size
+
   defp mean_std(%{"image_mean" => mean, "image_std" => std}) when is_list(mean) and is_list(std),
     do: {mean, std}
 
@@ -109,6 +122,17 @@ defmodule Transmuter.Featurizer do
   def size(%__MODULE__{crop: {_, _} = crop}), do: crop
   def size(%__MODULE__{resize: {height, width}}) when is_integer(height), do: {height, width}
   def size(%__MODULE__{}), do: nil
+
+  @doc """
+  Returns the `{height, width}` that `process/2` gives for an image of size `{height, width}`.
+  """
+  def image_size(featurizer, size) do
+    cond do
+      featurizer.crop -> featurizer.crop
+      featurizer.resize -> output_size(featurizer.resize, size)
+      true -> size
+    end
+  end
 
   @doc """
   Turns a list of images into one tensor of shape `{batch, channels, height, width}` and type `:f32`. The images must give the same size.
@@ -180,7 +204,38 @@ defmodule Transmuter.Featurizer do
     if height <= width, do: {short, long}, else: {long, short}
   end
 
+  # As get_size_with_aspect_ratio of the DETR and YOLOS image processors of Python
+  # transformers. When the long side is larger than longest_edge, the short side gets
+  # longest_edge times the aspect ratio, rounded half to even as round of Python.
+  defp output_size({:detr, size, max_size, multiple}, {height, width}) do
+    {short, long} = {min(height, width), max(height, width)}
+    raw = if max_size && long / short * size > max_size, do: max_size * short / long
+    size = if raw, do: round_even(raw), else: size
+    scale = raw || size
+
+    {out_height, out_width} =
+      cond do
+        min(height, width) == size -> {height, width}
+        width < height -> {trunc(scale * height / width), size}
+        true -> {size, trunc(scale * width / height)}
+      end
+
+    {out_height - rem(out_height, multiple), out_width - rem(out_width, multiple)}
+  end
+
   defp output_size(size, _image_size), do: size
+
+  defp round_even(x) do
+    floor = Float.floor(x)
+    low = trunc(floor)
+
+    cond do
+      x - floor < 0.5 -> low
+      x - floor > 0.5 -> low + 1
+      rem(low, 2) == 0 -> low
+      true -> low + 1
+    end
+  end
 
   # As center_crop of Python transformers: an image smaller than the crop is padded with zeros.
   defp center_crop(image, {height, width}) do

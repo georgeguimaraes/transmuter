@@ -317,3 +317,9 @@ for name, (images, messages) in chats.items():
         position_ids = np.full((3, 1, 1), length + delta, np.int64)
         length += 1
     print("qwen2-vl onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
+# The resized sizes of DETR and YOLOS. A long side over longest_edge gives the short side
+# longest_edge times the aspect ratio, rounded half to even: 1333 * 400 / 800 is 666.5.
+for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
+    processor = AutoImageProcessor.from_pretrained(repo, use_fast=False)
+    print(repo, "sizes", [tuple(processor(Image.new("RGB", (width, height)), return_tensors="np")["pixel_values"].shape[2:]) for height, width in [(240, 320), (100, 1000), (1000, 100), (400, 800), (800, 600)]])

@@ -308,6 +308,28 @@ defmodule Transmuter.VisionTest do
     assert Nx.Serving.run(serving, hd(chats)) == hd(results)
   end
 
+  test "the featurizer gives the sizes of the DETR and YOLOS image processors" do
+    # A long side over longest_edge gives the short side longest_edge times the aspect ratio,
+    # rounded half to even: 1333 * 400 / 800 is 666.5. YOLOS rounds each side down to a
+    # multiple of 16.
+    for {repo, expected} <- [
+          {"Xenova/detr-resnet-50",
+           [{800, 1066}, {133, 1333}, {1333, 133}, {666, 1333}, {1066, 800}]},
+          {"Xenova/yolos-tiny", [{512, 672}, {128, 1328}, {1328, 128}, {512, 1024}, {672, 512}]}
+        ] do
+      featurizer = Featurizer.load!({:hf, repo})
+
+      got =
+        for size <- [{240, 320}, {100, 1000}, {1000, 100}, {400, 800}, {800, 600}] do
+          image = Nx.broadcast(Nx.tensor(0, type: :u8), Tuple.insert_at(size, 2, 3))
+          {1, 3, height, width} = Nx.shape(Featurizer.process(featurizer, [image], @opts))
+          {height, width}
+        end
+
+      assert got == expected, "#{repo}: expected #{inspect(expected)}, got #{inspect(got)}"
+    end
+  end
+
   defp assert_predictions(%{predictions: predictions}, expected) do
     assert Enum.map(predictions, & &1.label) == Enum.map(expected, &elem(&1, 0))
 
