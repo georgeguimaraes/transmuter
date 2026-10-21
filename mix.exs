@@ -29,6 +29,7 @@ defmodule Transmuter.MixProject do
       {:protox, "~> 2.1"},
       {:req, "~> 0.5"},
       {:telemetry, "~> 1.0"},
+      {:exla, "~> 1.0", optional: true},
       {:emlx, "~> 0.5", optional: true},
       {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", optional: true},
