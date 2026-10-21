@@ -366,6 +366,7 @@ defmodule TransmuterTest do
     ModelProto,
     NodeProto,
     OperatorSetIdProto,
+    TensorProto,
     TensorShapeProto,
     TypeProto,
     ValueInfoProto
@@ -417,6 +418,32 @@ defmodule TransmuterTest do
 
     assert %RuntimeError{message: "Cast " <> _} = error
     assert :erts_debug.flat_size({error, stacktrace}) < 10_000
+  end
+
+  test "compute_type converts the half-precision params on the backend" do
+    weight = Nx.iota({4, 8}, type: :f16, backend: Nx.BinaryBackend) |> Nx.divide(8)
+
+    initializer = %TensorProto{
+      name: "w",
+      data_type: 10,
+      dims: [4, 8],
+      raw_data: Nx.to_binary(weight)
+    }
+
+    graph = %GraphProto{
+      input: [value("x", [1, 4], 10)],
+      output: [value("y")],
+      initializer: [initializer],
+      node: [node("MatMul", ["x", "w"], ["y"])]
+    }
+
+    model = Transmuter.load!(write_model(graph), backend: @backend, compute_type: :f32)
+    assert %Nx.Tensor{type: {:f, 32}, data: %EMLX.Backend{}} = model.params["w"]
+
+    x = Nx.tensor([[1.0, 2.0, 3.0, 4.0]], type: :f16, backend: @backend)
+    %{"y" => y} = Transmuter.run(model, model.params, %{"x" => x})
+    assert Nx.type(y) == {:f, 32}
+    assert_all_close(y, Nx.dot(Nx.tensor([[1.0, 2.0, 3.0, 4.0]]), Nx.as_type(weight, :f32)))
   end
 
   defp node(op_type, input, output, opts \\ []) do

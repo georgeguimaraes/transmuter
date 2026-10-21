@@ -148,7 +148,7 @@ defmodule Transmuter do
     model = %{
       nodes: toposort(graph.node, inputs ++ initializers),
       static: Map.new(static, fn {k, t} -> {k, upcast(t, compute_type)} end),
-      params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end),
+      params: Map.new(params),
       backend: opts[:backend],
       compute_type: compute_type,
       inputs: inputs,
@@ -157,7 +157,10 @@ defmodule Transmuter do
       opset: opset
     }
 
-    if backend = opts[:backend], do: %{model | params: move_params(model, backend)}, else: model
+    # The params move before they get compute_type, so the device converts them. On
+    # Nx.BinaryBackend, the 153M f16 weights of vit-gpt2 take 14 s to convert.
+    params = if backend = opts[:backend], do: move_params(model, backend), else: model.params
+    %{model | params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end)}
   end
 
   # Tensors in node attributes, such as the value of a Constant, and the initializers of

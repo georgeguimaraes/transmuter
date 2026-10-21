@@ -83,7 +83,11 @@ if Code.ensure_loaded?(EMLX.Quantization) do
         |> Nx.reshape({n, div(k * bits, 32)})
         |> Nx.backend_transfer(backend)
 
-      scales = scales_name |> then(value) |> Nx.reshape({n, groups})
+      scales =
+        scales_name
+        |> then(value)
+        |> Transmuter.upcast(model[:compute_type])
+        |> Nx.reshape({n, groups})
 
       biases =
         scales
