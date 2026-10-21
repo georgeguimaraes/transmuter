@@ -7,6 +7,8 @@ defmodule Transmuter.Ops.MoE do
 
   import Transmuter.Ops, only: [attr: 2, attr: 3, optional: 2, softmax_last: 1]
 
+  alias Transmuter.Ops.Packed
+
   @op_types ~w(MoE QMoE)
 
   @doc false
@@ -237,51 +239,35 @@ defmodule Transmuter.Ops.MoE do
     Nx.multiply(h, Nx.multiply(0.5, Nx.add(1, Nx.erf(Nx.multiply(h, inv_sqrt2)))))
   end
 
-  # Dequantizes packed integer weights: (q - zero_point) * scale.
-  # packed: {M, N, K_packed}
-  # scales: {M, N, blocks} for block_size > 0, or {M, N} for per-row, or nil
-  # Returns {M, N, K} as type.
+  # Dequantizes the packed weights {M, N, K / per byte} to {M, N, K} of type. Block-wise
+  # scales {M, N, blocks} work in f32, and K pads to whole blocks. Per-row scales are {M, N}
+  # or {M, N, 1}, with zero points {M, N} packed along N.
   defp dequant(packed, scales, zp, bits, block_size, type) do
-    q = packed |> unpack(bits) |> Nx.as_type(type)
+    q = packed |> Packed.unpack(bits) |> Nx.as_type(type)
     {m, n, k} = Nx.shape(q)
     default_zero = 2 ** (bits - 1)
 
     if block_size > 0 and scales != nil do
       blocks = Nx.axis_size(scales, 2)
       padded = blocks * block_size
+      q = Nx.as_type(q, :f32)
+      q = if padded > k, do: Nx.pad(q, 0.0, [{0, 0, 0}, {0, 0, 0}, {0, padded - k, 0}]), else: q
 
-      # Pad if k is not aligned to block_size (keeps the same K after dequant).
-      q_for_blocks =
-        if padded > k,
-          do: Nx.pad(Nx.as_type(q, :f32), 0.0, [{0, 0, 0}, {0, 0, 0}, {0, padded - k, 0}]),
-          else: Nx.as_type(q, :f32)
-
-      zero_4d =
+      zero =
         if zp do
-          # zp is packed; unpack and slice to match blocks.
-          zp
-          |> unpack(bits)
-          |> Nx.slice_along_axis(0, blocks, axis: 2)
-          |> Nx.as_type(:f32)
-          |> Nx.reshape({m, n, blocks, 1})
+          zp |> Packed.unpack(bits) |> Nx.slice_along_axis(0, blocks, axis: 2) |> Nx.as_type(:f32)
         else
           Nx.tensor(default_zero, type: :f32)
         end
 
-      scales_4d = scales |> Nx.as_type(:f32) |> Nx.reshape({m, n, blocks, 1})
-
-      q_for_blocks
-      |> Nx.reshape({m, n, blocks, block_size})
-      |> Nx.subtract(zero_4d)
-      |> Nx.multiply(scales_4d)
-      |> Nx.reshape({m, n, padded})
+      q
+      |> Packed.dequantize(zero, Nx.as_type(scales, :f32))
       |> Nx.slice_along_axis(0, k, axis: 2)
       |> Nx.as_type(type)
     else
-      # Per-row scales {M, N} or {M, N, 1}, and per-row zero points {M, N}, packed along N.
       zero =
         if zp,
-          do: zp |> unpack(bits) |> Nx.as_type(type) |> Nx.reshape({m, n, 1}),
+          do: zp |> Packed.unpack(bits) |> Nx.as_type(type) |> Nx.reshape({m, n, 1}),
           else: default_zero
 
       q_sub = Nx.subtract(q, zero)
@@ -293,23 +279,6 @@ defmodule Transmuter.Ops.MoE do
         q_sub
       end
     end
-  end
-
-  # Unpacks bits-wide unsigned values from the last axis of a u8 tensor.
-  defp unpack(packed, 8), do: packed
-
-  defp unpack(packed, bits) do
-    per = div(8, bits)
-    shifts = Nx.multiply(Nx.iota({per}, type: :s16), bits)
-    {last, shape} = packed |> Nx.shape() |> Tuple.to_list() |> List.pop_at(-1)
-
-    packed
-    |> Nx.as_type(:s16)
-    |> Nx.bitwise_and(255)
-    |> Nx.new_axis(-1)
-    |> Nx.right_shift(shifts)
-    |> Nx.bitwise_and(2 ** bits - 1)
-    |> Nx.reshape(List.to_tuple(shape ++ [last * per]))
   end
 
   defp nonzero_float(v) when v == 0 or v == 0.0, do: nil

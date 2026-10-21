@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Quantized do
   @moduledoc """
-  Quantized weights are dequantized to floats inside the graph. On EMLX, the `MatMulNBits` weights that `Transmuter.EMLX` keeps packed are not dequantized. Packed sub-byte values hold the lowest bits first, so element 2i of a 4-bit tensor is the low nibble of byte i.
+  Quantized weights are dequantized to floats inside the graph (see `Transmuter.Ops.Packed`). On EMLX, the `MatMulNBits` weights that `Transmuter.EMLX` keeps packed are not dequantized.
   """
 
   import Transmuter.Ops,
@@ -14,7 +14,7 @@ defmodule Transmuter.Ops.Quantized do
       round_half_even: 1
     ]
 
-  alias Transmuter.Ops.NN
+  alias Transmuter.Ops.{NN, Packed}
 
   @op_types ~w(MatMulNBits GatherBlockQuantized DequantizeLinear QuantizeLinear
                DynamicQuantizeLinear MatMulInteger ConvInteger QLinearMatMul QLinearConv QLinearAdd
@@ -60,28 +60,12 @@ defmodule Transmuter.Ops.Quantized do
     end
 
     bits = attr(node, "bits", 4)
-    block_size = attr(node, "block_size", 128)
     type = Nx.type(scales)
-
     q = data |> Nx.take(indices) |> unpack(bits) |> Nx.as_type(type)
-    blocks = Nx.axis_size(scales, -1)
-    shape = Nx.shape(q) |> put_elem(Nx.rank(q) - 1, blocks)
-    scales = Nx.take(scales, indices)
-
-    zero =
-      block_zero_points(
-        zero_points && Nx.take(zero_points, indices),
-        shape,
-        bits,
-        type,
-        signed?(data)
-      )
-
-    q
-    |> Nx.reshape(Tuple.insert_at(shape, tuple_size(shape), block_size))
-    |> Nx.subtract(Nx.new_axis(zero, -1))
-    |> Nx.multiply(Nx.new_axis(scales, -1))
-    |> Nx.reshape(Nx.shape(q))
+    shape = put_elem(Nx.shape(q), Nx.rank(q) - 1, Nx.axis_size(scales, -1))
+    zero_points = zero_points && Nx.take(zero_points, indices)
+    zero = block_zero_points(zero_points, shape, bits, type, signed?(data))
+    Packed.dequantize(q, zero, Nx.take(scales, indices))
   end
 
   # The zero point is subtracted in s32 for integer x, and the product with the scale is
@@ -241,17 +225,10 @@ defmodule Transmuter.Ops.Quantized do
   end
 
   defp dequantized_matmul(a, b, scales, zero_points, bias, {k, n, bits, block_size, blocks, type}) do
-    q = b |> unpack(bits) |> Nx.reshape({n, blocks, block_size}) |> Nx.as_type(type)
-    scales = scales |> Nx.reshape({n, blocks, 1}) |> Nx.as_type(type)
+    q = b |> unpack(bits) |> Nx.reshape({n, blocks * block_size}) |> Nx.as_type(type)
+    scales = scales |> Nx.reshape({n, blocks}) |> Nx.as_type(type)
     zero = block_zero_points(zero_points, {n, blocks}, bits, type)
-    zero = if Nx.rank(zero) == 2, do: Nx.new_axis(zero, 2), else: zero
-
-    w =
-      q
-      |> Nx.subtract(zero)
-      |> Nx.multiply(scales)
-      |> Nx.reshape({n, blocks * block_size})
-      |> Nx.slice_along_axis(0, k, axis: 1)
+    w = q |> Packed.dequantize(zero, scales) |> Nx.slice_along_axis(0, k, axis: 1)
 
     out = Nx.dot(a, [-1], w, [1])
     if bias, do: Nx.add(out, bias), else: out
@@ -303,25 +280,11 @@ defmodule Transmuter.Ops.Quantized do
     if Nx.size(t) == 1, do: Nx.reshape(t, {}), else: on_axis(t, rank, axis)
   end
 
-  # Unpacks bits-wide unsigned values from the last axis of a u8 tensor.
-  defp unpack(packed, 8), do: packed
-
   # Signed packed values (int4 tensors load as s8 bytes) are sign extended.
   defp unpack(packed, bits) do
-    per = div(8, bits)
-    shifts = Nx.multiply(Nx.iota({per}, type: :s16), bits)
-    {last, shape} = packed |> Nx.shape() |> Tuple.to_list() |> List.pop_at(-1)
+    values = Packed.unpack(packed, bits)
 
-    values =
-      packed
-      |> Nx.as_type(:s16)
-      |> Nx.bitwise_and(255)
-      |> Nx.new_axis(-1)
-      |> Nx.right_shift(shifts)
-      |> Nx.bitwise_and(2 ** bits - 1)
-      |> Nx.reshape(List.to_tuple(shape ++ [last * per]))
-
-    if signed?(packed),
+    if bits < 8 and signed?(packed),
       do: Nx.subtract(values, Nx.multiply(Nx.greater_equal(values, 2 ** (bits - 1)), 2 ** bits)),
       else: values
   end

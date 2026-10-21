@@ -18,6 +18,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     weights is MLX groups of 128 with the scale of the block.
     """
 
+    alias Transmuter.Ops.Packed
+
     @doc """
     Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed.
 
@@ -125,15 +127,9 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       if Nx.Type.float?(Nx.type(zero)) do
         Nx.reshape(zero, {n, groups})
       else
-        per = div(8, bits)
-        bytes = zero |> Nx.reshape({n, :auto}) |> Nx.as_type(:u16)
-        shifts = Nx.multiply(Nx.iota({per}, type: :u16), bits)
-
-        bytes
-        |> Nx.new_axis(-1)
-        |> Nx.right_shift(shifts)
-        |> Nx.bitwise_and(2 ** bits - 1)
+        zero
         |> Nx.reshape({n, :auto})
+        |> Packed.unpack(bits)
         |> Nx.slice_along_axis(0, groups, axis: 1)
       end
     end
