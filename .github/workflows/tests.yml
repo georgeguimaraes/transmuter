@@ -10,23 +10,15 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # EXLA on the CPU is a real Linux deployment, so this job runs all tests.
+  exla:
+    name: Tests / exla
     runs-on: ubuntu-latest
-    name: OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}} / ${{matrix.backend}}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { elixir: "1.20", otp: "29", backend: emlx }
-          - { elixir: "1.19", otp: "28", backend: emlx }
-          - { elixir: "1.18", otp: "27", backend: emlx }
-          - { elixir: "1.20", otp: "29", backend: exla }
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # EMLX runs MLX on the CPU on Linux and needs OpenBLAS. The exla job needs it too,
-      # because mix test starts the emlx application in every job. apt-get can block on
-      # the dpkg lock without a timeout, so each call is bounded and retried once.
+      # mix test starts the emlx application in this job too, and EMLX on Linux needs
+      # OpenBLAS. apt-get can block on the dpkg lock without a timeout, so each call is
+      # bounded and retried once.
       - name: Install OpenBLAS (for emlx)
         timeout-minutes: 6
         run: |
@@ -61,8 +53,8 @@ jobs:
       - name: Set up Elixir
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          otp-version: ${{matrix.otp}}
-          elixir-version: ${{matrix.elixir}}
+          otp-version: "29"
+          elixir-version: "1.20"
       # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -71,11 +63,11 @@ jobs:
             deps
             _build
             ~/.cache/xla
-          key: ${{ runner.os }}-mix-otp${{ matrix.otp }}-elixir${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
-      # The tests download ONNX models from the Hugging Face Hub. Every job restores the
-      # newest model cache. Only one job saves it, on main, and only when the set of cached
-      # files changed, because a save uploads the whole cache. Change v2 to start a cache
-      # without the models that the tests no longer use.
+          key: ${{ runner.os }}-mix-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
+      # The tests download ONNX models from the Hugging Face Hub. Each job restores the
+      # newest model cache of its OS, and saves it on main only when the set of cached files
+      # changed, because a save uploads the whole cache. Change v2 to start a cache without
+      # the models that the tests no longer use.
       - name: Restore model cache
         id: models
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -85,6 +77,7 @@ jobs:
           restore-keys: ${{ runner.os }}-transmuter-models-v2-
       - name: Install dependencies
         run: mix deps.get
+      # Elixir and OTP are pinned in this job only, so the version-dependent checks run here.
       - name: Check formatting
         run: mix format --check-formatted
       - name: Compile without warnings
@@ -94,21 +87,72 @@ jobs:
       - name: Run Credo
         run: mix credo --strict
       # Tests tagged large_model are too large or too slow for a runner, for example models
-      # with billions of parameters. They run locally. EMLX runs all CPU work of the BEAM on
-      # one worker thread, so concurrent tests wait for each other and a small test can time
-      # out behind a large one. One test at a time is also faster on the runner.
+      # with billions of parameters. They run locally. Two tests at a time take 30% less
+      # time than one, with a peak of about 7 GB on a runner that has 16 GB.
       - name: Run tests
         env:
-          TRANSMUTER_TEST_BACKEND: ${{ matrix.backend }}
-        run: mix test --exclude large_model --max-cases 1
+          TRANSMUTER_TEST_BACKEND: exla
+        run: mix test --exclude large_model --max-cases 2
       - name: List the cached models
         id: model-files
-        if: matrix.otp == '29' && matrix.backend == 'emlx' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: &list-models |
           cd ~/.cache/transmuter
-          hash=$(find . -type f ! -name '*.part' | sort | sha256sum | cut -c1-16)
+          hash=$(find . -type f ! -name '*.part' | sort | shasum -a 256 | cut -c1-16)
           echo "hash=$hash" >> "$GITHUB_OUTPUT"
           echo "Model cache: $(du -sh . | cut -f1), file list hash $hash"
+      - name: Save model cache
+        if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/transmuter
+          key: ${{ runner.os }}-transmuter-models-v2-${{ steps.model-files.outputs.hash }}
+
+  # EMLX on the Metal GPU of an Apple silicon runner, the configuration that EMLX users have.
+  # The full EMLX suite runs on Apple silicon before a push. Here, EMLX runs the tests that
+  # need no Hub (operator fixtures, fusion, compilation) and one small model of each
+  # pipeline (tag :smoke).
+  emlx:
+    name: Tests / emlx
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # erlef/setup-beam does not support macOS. Homebrew installs the latest release.
+      - name: Set up Elixir
+        id: beam
+        run: |
+          brew install elixir
+          echo "version=$(elixir -e 'IO.write(System.version() <> "-otp" <> System.otp_release())')" >> "$GITHUB_OUTPUT"
+          mix local.hex --force
+          mix local.rebar --force
+      # The Library/Caches directories keep the MLX and XLA archives and the compiled NIFs.
+      - name: Restore dependencies cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+            ~/Library/Caches/libmlx
+            ~/Library/Caches/xla
+          key: ${{ runner.os }}-mix-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
+      - name: Restore model cache
+        id: models
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/transmuter
+          key: ${{ runner.os }}-transmuter-models-v2-
+          restore-keys: ${{ runner.os }}-transmuter-models-v2-
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Run tests
+        env:
+          TRANSMUTER_TEST_BACKEND: emlx
+          TRANSMUTER_TEST_DEVICE: gpu
+        run: mix test --exclude large_model --exclude hub --include smoke
+      - name: List the cached models
+        id: model-files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: *list-models
       - name: Save model cache
         if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
