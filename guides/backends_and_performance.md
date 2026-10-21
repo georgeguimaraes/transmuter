@@ -87,6 +87,14 @@ model = Transmuter.load!(source, backend: {EXLA.Backend, client: :host})
 run = Transmuter.compile(model, inputs, compiler: EXLA, client: :host)
 ```
 
+On NVIDIA GPUs of the Ampere generation and later, XLA computes the f32 matrix products in TF32 by default. TF32 keeps 10 bits of the mantissa, so the results differ from ONNX Runtime by about 1e-3. For f32 precision, set these environment variables before the BEAM starts:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 XLA_FLAGS=--xla_gpu_enable_triton_gemm=false
+```
+
+On an RTX 3060, the test suite passes with both variables. Without them, 15 tests that compare with reference values fail.
+
 ### Nx.BinaryBackend (CPU, no compilation)
 
 `Nx.BinaryBackend` runs computations in Elixir on the CPU. It has no compilation step. Use it for testing and for models that are too small to benefit from a GPU.
