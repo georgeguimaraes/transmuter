@@ -8,6 +8,7 @@ defmodule TransmuterTest do
   @backend Transmuter.TestBackend.backend()
   @compiler Transmuter.TestBackend.compiler_opts()
 
+  @tag :hub
   test "runs a BERT encoder" do
     model = load("Xenova/all-MiniLM-L6-v2", "onnx/model.onnx")
     ids = Nx.tensor([[101, 7592, 2088, 2003, 1037, 3231, 102]], type: :s64, backend: @backend)
@@ -27,6 +28,7 @@ defmodule TransmuterTest do
     ])
   end
 
+  @tag :hub
   test "resizes with interpolation matrices" do
     model = load("Xenova/segformer-b0-finetuned-ade-512-512", "onnx/model.onnx")
     %{"logits" => logits} = run(model, %{"pixel_values" => pattern({1, 3, 512, 512})})
@@ -38,6 +40,7 @@ defmodule TransmuterTest do
     ])
   end
 
+  @tag :hub
   test "selects an If branch from a static input" do
     model = load("Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx")
 
@@ -63,6 +66,7 @@ defmodule TransmuterTest do
     assert_all_close(traced[[0, 0, 0..4]], [11.7904, 7.4783, 7.9252, 8.0604, 6.4908])
   end
 
+  @tag :hub
   test "generates with a static KV cache like transformers" do
     model = load("HuggingFaceTB/SmolLM2-135M-Instruct", "onnx/model.onnx")
 
@@ -154,6 +158,7 @@ defmodule TransmuterTest do
 
   # The BERT pooler gathers the first token on axis 1, a path whose gradient EMLX 0.5
   # scatters to the wrong place. Autodiff must match central finite differences.
+  @tag :hub
   test "computes gradients that match finite differences" do
     model = load("Xenova/ms-marco-MiniLM-L-6-v2", "onnx/model.onnx", trainable: true)
     params = model.params

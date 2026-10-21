@@ -3,6 +3,7 @@ defmodule Transmuter.VisionTest do
 
   # Reference values come from Python transformers, see test/support/pipeline_references.py.
   # The first run downloads the models.
+  @moduletag :hub
   @moduletag timeout: 900_000
 
   @opts [
@@ -38,6 +39,7 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @tag :smoke
   test "image classification matches the pipeline" do
     for {repo, expected} <- [
           {"Xenova/vit-base-patch16-224",

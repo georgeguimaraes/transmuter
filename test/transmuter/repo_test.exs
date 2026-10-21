@@ -3,6 +3,7 @@ defmodule Transmuter.RepoTest do
 
   alias Transmuter.Repo
 
+  @moduletag :hub
   @moduletag :tmp_dir
 
   defp repo(dir, files, opts \\ []) do

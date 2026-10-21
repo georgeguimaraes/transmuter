@@ -3,6 +3,7 @@ defmodule Transmuter.TextTest do
 
   # Reference values come from the pipelines of Python transformers and sentence-transformers,
   # see test/support/pipeline_references.py. The first run downloads the models.
+  @moduletag :hub
   @moduletag timeout: 900_000
 
   @opts [
@@ -30,6 +31,7 @@ defmodule Transmuter.TextTest do
     assert inputs["input_ids"][[0, -1]] |> Nx.to_number() == 102
   end
 
+  @tag :smoke
   test "an embedding takes the pooling and normalization of the base model" do
     # Neither repository has 1_Pooling/config.json: MiniLM uses mean pooling and bge the
     # CLS token, both normalized.
@@ -257,6 +259,7 @@ defmodule Transmuter.TextTest do
              Nx.Serving.run(serving, chat)
   end
 
+  @tag :smoke
   test "greedy generation matches transformers in each mode of the KV cache" do
     chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
 
@@ -433,6 +436,7 @@ end
 defmodule Transmuter.TextServingTest do
   use ExUnit.Case, async: false
 
+  @moduletag :hub
   @moduletag timeout: 900_000
 
   @opts [

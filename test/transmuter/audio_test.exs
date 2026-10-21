@@ -5,6 +5,7 @@ defmodule Transmuter.AudioTest do
   # automatic-speech-recognition pipeline of Python transformers, see
   # test/support/pipeline_references.py. The audio is the first sample of
   # hf-internal-testing/librispeech_asr_dummy, 5.86 s at 16 kHz.
+  @moduletag :hub
   @moduletag timeout: 900_000
 
   @backend Transmuter.TestBackend.backend()
@@ -40,6 +41,7 @@ defmodule Transmuter.AudioTest do
     assert_in_delta Nx.to_number(Nx.mean(features)), -0.65635, 1.0e-4
   end
 
+  @tag :smoke
   test "greedy transcription matches transformers" do
     for repo <- ["Xenova/whisper-tiny.en", "onnx-community/whisper-base"] do
       serving = Transmuter.Audio.speech_to_text({:hf, repo}, @opts)

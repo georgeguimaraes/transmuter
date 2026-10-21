@@ -1,6 +1,7 @@
 defmodule Transmuter.HubTest do
   use ExUnit.Case, async: true
 
+  @moduletag :hub
   @moduletag :tmp_dir
 
   test "an error from the Hub raises and is not saved", %{tmp_dir: dir} do
