@@ -1438,6 +1438,18 @@ case("MultiHeadAttention_unidirectional_decode",
      [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],
      {"q": cf(B, 1, H * Hd), "k": cf(B, 1, H * Hd), "v": cf(B, 1, H * Hd), "pk": cf(B, H, 4, Hd), "pv": cf(B, H, 4, Hd)}, ms=True)
 
+# ---------- MatMulNBits with large blocks ----------
+
+# A block of 256 weights is 2 MLX groups of 128 with the scale and the zero point of the block. B has more
+# than 4096 bytes, so it is a param, which stays packed on EMLX.
+r = rng_for("MatMulNBits large blocks")
+K, N, bs = 512, 40, 256
+q = r.integers(0, 16, (N, K))
+case("MatMulNBits_b4_bs256_packed", [node("MatMulNBits", ["A", "B", "scales", "zp"], ["Y"], domain=MS, K=K, N=N, bits=4, block_size=bs)],
+     {"A": r.standard_normal((2, 3, K)).astype(np.float32)},
+     {"B": pack(q, 4).reshape(N, K // bs, bs // 2), "scales": (r.random(N * K // bs) * 0.1 + 0.01).astype(np.float32),
+      "zp": pack(r.integers(0, 16, (N, K // bs)), 4).reshape(-1)}, ms=True)
+
 # ---------- MoE decode ----------
 
 # One token selects 2 of 8 experts, fewer than the experts, so only the weights of these 2 are read.

@@ -12,12 +12,11 @@ if Code.ensure_loaded?(EMLX.Quantization) do
 
     `Transmuter.load!/2` with `backend: EMLX.Backend` calls `params/2` for you.
 
-    Weights that MLX cannot hold (other bit widths, group sizes other than 32,
-    64 or 128, or a K that is not a whole number of groups) stay packed bytes
-    and are dequantized in the graph.
+    Weights that MLX cannot hold (other bit widths, block sizes other than 32,
+    64 or a multiple of 128, or a K that is not a whole number of blocks) stay
+    packed bytes and are dequantized in the graph. A block of more than 128
+    weights is MLX groups of 128 with the scale of the block.
     """
-
-    @group_sizes [32, 64, 128]
 
     @doc """
     Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed.
@@ -30,8 +29,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     A weight is compatible when:
 
     - The bit width is 4 or 8.
-    - The group (block) size is 32, 64, or 128.
-    - The K dimension is a whole number of groups.
+    - The block size is 32, 64, or a multiple of 128.
+    - The K dimension is a whole number of blocks.
 
     Weights that do not meet these criteria stay as packed bytes and are
     dequantized in the graph.
@@ -62,18 +61,27 @@ if Code.ensure_loaded?(EMLX.Quantization) do
           Map.has_key?(model.params, b),
           Enum.at(rest, 1, "") == "",
           Transmuter.Ops.attr(node, "bits", 4) in [4, 8],
-          Transmuter.Ops.attr(node, "block_size") in @group_sizes,
+          block_size?(Transmuter.Ops.attr(node, "block_size")),
           rem(Transmuter.Ops.attr(node, "K"), Transmuter.Ops.attr(node, "block_size")) == 0,
           uniq: true,
           do: node
     end
 
+    defp block_size?(size), do: size in [32, 64] or rem(size, 128) == 0
+
     defp quantize(node = %{input: [_, b_name, scales_name | rest]}, model, backend) do
-      [k, n, bits, group] =
+      [k, n, bits, block] =
         Enum.map(["K", "N", "bits", "block_size"], &Transmuter.Ops.attr(node, &1))
 
-      groups = div(k, group)
+      blocks = div(k, block)
+      group = min(block, 128)
       value = &(Map.get(model.params, &1) || Map.fetch!(model.static, &1))
+
+      per_group =
+        &(&1
+          |> Nx.new_axis(-1)
+          |> Nx.broadcast({n, blocks, div(block, group)})
+          |> Nx.reshape({n, :auto}))
 
       packed =
         b_name
@@ -87,12 +95,14 @@ if Code.ensure_loaded?(EMLX.Quantization) do
         scales_name
         |> then(value)
         |> Transmuter.upcast(model[:compute_type])
-        |> Nx.reshape({n, groups})
+        |> Nx.reshape({n, blocks})
 
       biases =
         scales
-        |> Nx.multiply(zero_points(List.first(rest), value, n, groups, bits))
+        |> Nx.multiply(zero_points(List.first(rest), value, n, blocks, bits))
         |> Nx.negate()
+
+      {scales, biases} = {per_group.(scales), per_group.(biases)}
 
       tensor =
         EMLX.Quantization.quantized_tensor(
