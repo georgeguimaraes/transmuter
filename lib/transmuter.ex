@@ -49,9 +49,10 @@ defmodule Transmuter do
 
     * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params
       to this backend after loading. For example, `EMLX.Backend` or
-      `{EXLA.Backend, client: :cuda}`. On EMLX, 4-bit and 8-bit `MatMulNBits`
-      weights stay packed as MLX quantized tensors (see `Transmuter.EMLX`). The
-      default is `Nx.BinaryBackend`.
+      `{EXLA.Backend, client: :cuda}`. On the EMLX GPU, 4-bit and 8-bit
+      `MatMulNBits` weights stay packed as MLX quantized tensors. On the EMLX
+      CPU, they become float weights when the model loads (see
+      `Transmuter.EMLX`). The default is `Nx.BinaryBackend`.
 
     * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
       through every operator. The default is `nil`, which keeps the types of the

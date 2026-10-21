@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Quantized do
   @moduledoc """
-  Quantized weights are dequantized to floats inside the graph (see `Transmuter.Ops.Packed`). On EMLX, the `MatMulNBits` weights that `Transmuter.EMLX` keeps packed are not dequantized.
+  Quantized weights are dequantized to floats inside the graph (see `Transmuter.Ops.Packed`). On EMLX, `Transmuter.EMLX` gives `MatMulNBits` a weight of shape `{N, K}`: packed on the GPU, or dequantized once at load on the CPU. The graph does not dequantize these weights.
   """
 
   import Transmuter.Ops,

@@ -1,12 +1,17 @@
 if Code.ensure_loaded?(EMLX.Quantization) do
   defmodule Transmuter.EMLX do
     @moduledoc """
-    Moves a model's params to EMLX and keeps 4-bit and 8-bit weights packed.
+    Moves a model's params to EMLX and keeps 4-bit and 8-bit weights packed on the GPU.
 
-    `MatMulNBits` weights become MLX quantized tensors. `Nx.dot` then runs
-    `mx::quantized_matmul` on the packed weights, so the float weights never
-    exist in memory. ONNX packs the lowest bits first, which is also the MLX
-    order, and an ONNX zero point becomes the MLX bias `-zero_point * scale`.
+    On the GPU, `MatMulNBits` weights become MLX quantized tensors. `Nx.dot`
+    then runs `mx::quantized_matmul` on the packed weights, so the float weights
+    never exist in memory. ONNX packs the lowest bits first, which is also the
+    MLX order, and an ONNX zero point becomes the MLX bias `-zero_point * scale`.
+
+    On the CPU (`device: :cpu`), MLX runs `mx::quantized_matmul` on one thread.
+    So the weights are dequantized once, when the model loads, and the matmul
+    runs in the BLAS of the CPU on all cores. The weights then take the memory
+    of float weights. See the guide "Backends and Performance".
 
         model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"}, backend: EMLX.Backend)
 
@@ -21,12 +26,14 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     alias Transmuter.Ops.Packed
 
     @doc """
-    Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed.
+    Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed on the GPU.
 
-    Compatible `MatMulNBits` weights become MLX quantized tensors, so
+    On the GPU, compatible `MatMulNBits` weights become MLX quantized tensors, so
     `mx::quantized_matmul` reads the packed weights directly. This avoids
-    materializing the float weights in memory on each forward pass. Other params
-    are transferred to EMLX with `Nx.backend_transfer/2`.
+    materializing the float weights in memory on each forward pass. On the CPU,
+    these weights become float tensors of shape `{N, K}`, in the type of the
+    scales (or `:compute_type`), so the matmul uses BLAS. Other params are
+    transferred to EMLX with `Nx.backend_transfer/2`.
 
     A weight is compatible when:
 
@@ -72,6 +79,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     defp block_size?(size), do: size in [32, 64] or rem(size, 128) == 0
 
     defp quantize(node = %{input: [_, b_name, scales_name | rest]}, model, backend) do
+      {EMLX.Backend, device: device} = backend
+
       [k, n, bits, block] =
         Enum.map(["K", "N", "bits", "block_size"], &Transmuter.Ops.attr(node, &1))
 
@@ -116,7 +125,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
           group_size: group
         )
 
-      {b_name, tensor}
+      {b_name, if(device == :cpu, do: EMLX.dequantize(tensor), else: tensor)}
     end
 
     defp zero_points(name, _value, _n, _groups, bits) when name in [nil, ""], do: 2 ** (bits - 1)

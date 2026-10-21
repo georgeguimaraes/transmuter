@@ -22,7 +22,7 @@ EMLX runs on Apple silicon (M-series). It uses the Metal GPU, or the CPU with `d
 
 Use EMLX for:
 - Apple silicon Macs
-- Models with `MatMulNBits` (4-bit or 8-bit quantized weights), which EMLX keeps packed for fast matmul
+- Models with `MatMulNBits` (4-bit or 8-bit quantized weights), which EMLX keeps packed on the GPU for fast matmul
 
 Set the device explicitly when needed:
 
@@ -43,6 +43,27 @@ Many exports write RMSNorm, LayerNorm and the attention core as separate operato
 - The decode step of SmolLM2 135M q4 (onnx-community export) takes 7.8 ms instead of 8.6 ms.
 - all-MiniLM-L6-v2 embeds 128 tokens in 2.34 ms instead of 2.57 ms, and a batch of 8 in 9.15 ms instead of 10.0 ms.
 - bert-base-uncased embeds 128 tokens in 10.5 ms instead of 11.5 ms, and a batch of 8 in 58.4 ms instead of 64.2 ms.
+
+### 4-bit and 8-bit weights on the EMLX CPU
+
+On the GPU, `Transmuter.EMLX` keeps the `MatMulNBits` weights packed, and `mx::quantized_matmul` reads them. On the CPU (`device: :cpu`), MLX runs `mx::quantized_matmul` on one thread. So on the CPU, `Transmuter.EMLX` dequantizes these weights once, when the model loads, and each matmul runs in the BLAS of the CPU (OpenBLAS on Linux, Accelerate on macOS) on all cores.
+
+The float weights take the memory of an fp32 export: 8 times the memory of the 4-bit weights. The 106M `MatMulNBits` weights of SmolLM2 135M take about 425 MB instead of about 66 MB. The 85M weights of the SmolVLM 256M vision encoder take about 340 MB instead of about 53 MB. On the CPU, a q4 export thus saves only download size. When memory is the limit on the CPU, use the q8 export (`model_quantized.onnx`). Its `MatMulInteger` weights stay 8-bit integers.
+
+On a Linux runner with 4 vCPUs and OpenBLAS (packed weights against float weights):
+
+| Work | Packed | Float |
+| --- | --- | --- |
+| SmolLM2 135M q4, one decode step | 109.7 ms | 75.2 ms |
+| SmolLM2 135M q4, prompt and first token | 3435 ms | 600 ms |
+| SmolVLM 256M q4 vision encoder, one 512x512 tile | 57.5 s | 3.8 s |
+| SmolVLM 256M q4 vision encoder, 13 tiles | not measured | 40.9 s |
+| Peak memory, SmolLM2 135M q4 (two servings) | 881 MB | 1279 MB |
+| Peak memory, SmolVLM 256M q4 vision encoder | 423 MB | 716 MB |
+
+`bench/q4_matmul.exs` times the 210 `MatMulNBits` weights of SmolLM2 135M alone, eagerly. On an Apple M2 Pro CPU with Accelerate, packed weights take 33.3 ms for 1 row, 998 ms for 64 rows and 16647 ms for 1024 rows. Float weights take 26.3 ms, 46.1 ms and 382 ms. The quantized matmul uses one core on macOS too, so the rule does not depend on the operating system. With f16 weights (the scales of a q4f16 export), packed weights take 42.7 ms for 1 row and 1532 ms for 64 rows, and float weights take 56.4 ms and 85.0 ms.
+
+On macOS, EMLX 0.5 runs compiled graphs on the GPU also with `device: :cpu`. The outputs say `:cpu`, but the GPU does the work. Eager operations run on the CPU. Thus the numbers of compiled servings with `device: :cpu` on a Mac are GPU numbers.
 
 ### EXLA
 
