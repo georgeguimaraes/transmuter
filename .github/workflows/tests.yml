@@ -10,10 +10,16 @@ permissions:
   contents: read
 
 jobs:
-  # EXLA on the CPU is a real Linux deployment, so this job runs all tests.
+  # EXLA on the CPU is a real Linux deployment, so these jobs run all tests. mix test gives
+  # the sorted test files to the partitions in turn. With 3 partitions, the text, audio and
+  # vision tests, which take most of the time, run in different jobs.
   exla:
-    name: Tests / exla
+    name: Tests / exla (${{ matrix.partition }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # mix test starts the emlx application in this job too, and EMLX on Linux needs
@@ -77,14 +83,18 @@ jobs:
           restore-keys: ${{ runner.os }}-transmuter-models-v2-
       - name: Install dependencies
         run: mix deps.get
-      # Elixir and OTP are pinned in this job only, so the version-dependent checks run here.
+      # Elixir and OTP are pinned in these jobs only, so the version-dependent checks run here,
+      # in the first partition.
       - name: Check formatting
+        if: matrix.partition == 1
         run: mix format --check-formatted
       - name: Compile without warnings
+        if: matrix.partition == 1
         env:
           MIX_ENV: test
         run: mix compile --force --warnings-as-errors
       - name: Run Credo
+        if: matrix.partition == 1
         run: mix credo --strict
       # Tests tagged large_model are too large or too slow for a runner, for example models
       # with billions of parameters. They run locally. Two tests at a time take 30% less
@@ -92,7 +102,8 @@ jobs:
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: exla
-        run: mix test --exclude large_model --max-cases 2
+          MIX_TEST_PARTITION: ${{ matrix.partition }}
+        run: mix test --exclude large_model --max-cases 2 --partitions 3
       - name: List the cached models
         id: model-files
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
