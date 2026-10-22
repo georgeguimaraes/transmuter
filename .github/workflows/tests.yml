@@ -18,6 +18,9 @@ jobs:
   # slow module has its own partition. --only also includes the :large_model tests
   # of a tagged module, so a tagged module has none (Transmuter.CIPartitionTest checks
   # this). The slowest tests and modules in the log show how to keep the partitions balanced.
+  # Each partition downloads only the models of its tests. A new model goes first in the
+  # partition with the fewest models, and a partition keeps under about 5 GB of models. A test
+  # that needs more than 1 GB of model files has the :large_model tag.
   exla:
     name: Tests / exla (${{ matrix.partition }}/6)
     runs-on: ubuntu-latest
@@ -36,7 +39,9 @@ jobs:
       # mix test starts the emlx application in this job too, and EMLX on Linux needs
       # OpenBLAS. The Ubuntu mirror often stalls, so the packages come from the cache, and
       # apt-get downloads them only when the cache is empty. apt-get can block on the dpkg
-      # lock without a timeout, so each call is bounded and the download is retried once.
+      # lock without a timeout, so each call is bounded and the download is retried once. A
+      # download that gets no data for 20 s fails. apt reads its mirrors from apt-mirrors.txt,
+      # and the second attempt removes the Azure mirror from it, so apt uses archive.ubuntu.com.
       # Change v1 when the cached packages no longer install on the runner image.
       - name: Restore OpenBLAS packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -46,6 +51,9 @@ jobs:
       - name: Install OpenBLAS (for emlx)
         timeout-minutes: 6
         run: |
+          mirrors=/etc/apt/apt-mirrors.txt
+          cat "$mirrors" || true
+
           if ldconfig -p | grep -q libopenblas.so.0; then
             echo "libopenblas already present, nothing to install"
             exit 0
@@ -60,12 +68,13 @@ jobs:
             for attempt in 1 2; do
               if [ "$attempt" -gt 1 ]; then
                 sleep 10
+                [ -f "$mirrors" ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
               fi
 
               status=0
-              timeout 60 sudo apt-get update &&
+              timeout 60 sudo apt-get update -o Acquire::http::Timeout=20 &&
                 timeout 90 sudo apt-get install -y --no-install-recommends --download-only \
-                  -o Dir::Cache::archives="$debs" libopenblas0 ||
+                  -o Acquire::http::Timeout=20 -o Dir::Cache::archives="$debs" libopenblas0 ||
                 status=$?
 
               if [ "$status" -eq 0 ]; then
@@ -100,17 +109,6 @@ jobs:
             _build
             ~/.cache/xla
           key: ${{ runner.os }}-mix-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
-      # The tests download ONNX models from the Hugging Face Hub. Each job restores the
-      # newest model cache of its OS, and saves it on main only when the set of cached files
-      # changed, because a save uploads the whole cache. Change v2 to start a cache without
-      # the models that the tests no longer use.
-      - name: Restore model cache
-        id: models
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/transmuter
-          key: ${{ runner.os }}-transmuter-models-v2-
-          restore-keys: ${{ runner.os }}-transmuter-models-v2-
       - name: Install dependencies
         run: mix deps.get
       # Elixir and OTP are pinned in these jobs only, so the version-dependent checks run here,
@@ -129,29 +127,21 @@ jobs:
       # Tests tagged large_model are too large or too slow for a runner, for example models
       # with billions of parameters. They run locally. Two tests at a time take 30% less
       # time than one, with a peak of about 7 GB on a runner that has 16 GB.
+      # The tests download their ONNX models from the Hugging Face Hub, and there is no model
+      # cache. GitHub keeps 10 GB of caches for a repository, and the models of all partitions
+      # are 8.1 GB compressed, so a model cache made GitHub evict the other caches. The Hub
+      # gives 74 to 176 MB/s on a runner, so the 4.7 GB of the largest partition take about
+      # 65 s, as long as a restore of the cache took.
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: exla
         run: mix test --exclude large_model --max-cases 2 ${{ matrix.select }} --slowest 10 --slowest-modules 6
-      - name: List the cached models
-        id: model-files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: &list-models |
-          cd ~/.cache/transmuter
-          hash=$(find . -type f ! -name '*.part' | sort | shasum -a 256 | cut -c1-16)
-          echo "hash=$hash" >> "$GITHUB_OUTPUT"
-          echo "Model cache: $(du -sh . | cut -f1), file list hash $hash"
-      - name: Save model cache
-        if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/transmuter
-          key: ${{ runner.os }}-transmuter-models-v2-${{ steps.model-files.outputs.hash }}
 
   # EMLX on the Metal GPU of an Apple silicon runner, the configuration that EMLX users have.
   # The full EMLX suite runs on Apple silicon before a push. Here, EMLX runs the tests that
   # need no Hub (operator fixtures, fusion, compilation) and one small model of each
-  # pipeline (tag :smoke).
+  # pipeline (tag :smoke). These tests download 2.7 GB of models from the Hub, without a
+  # model cache for the reason in the exla job.
   emlx:
     name: Tests / emlx
     runs-on: macos-latest
@@ -175,13 +165,6 @@ jobs:
             ~/Library/Caches/libmlx
             ~/Library/Caches/xla
           key: ${{ runner.os }}-mix-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
-      - name: Restore model cache
-        id: models
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/transmuter
-          key: ${{ runner.os }}-transmuter-models-v2-
-          restore-keys: ${{ runner.os }}-transmuter-models-v2-
       - name: Install dependencies
         run: mix deps.get
       - name: Run tests
@@ -189,13 +172,3 @@ jobs:
           TRANSMUTER_TEST_BACKEND: emlx
           TRANSMUTER_TEST_DEVICE: gpu
         run: mix test --exclude large_model --exclude hub --include smoke
-      - name: List the cached models
-        id: model-files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: *list-models
-      - name: Save model cache
-        if: steps.model-files.outputs.hash != '' && steps.models.outputs.cache-matched-key != format('{0}-transmuter-models-v2-{1}', runner.os, steps.model-files.outputs.hash)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/transmuter
-          key: ${{ runner.os }}-transmuter-models-v2-${{ steps.model-files.outputs.hash }}
