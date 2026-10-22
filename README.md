@@ -156,7 +156,7 @@ Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX 
 
 Three models do not match value by value, because they make small rounding differences large:
 
-- **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
+- **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On `test/fixtures/cats.png` with three labels, Transmuter gives the same labels and number of detections as ONNX Runtime, with scores within 0.001.
 - **The Gemma 4 E2B decoder** has activations up to about 1300 and final norm weights up to about 700. When the test changes the float inputs of ONNX Runtime by 1e-7 of their values, about one f32 rounding step, the logits of ONNX Runtime change by up to 5.5. The logits of Transmuter differ from ONNX Runtime by 5.3 on the CPU and by 13.6 on the GPU, which is the same noise. The two give the same token for 7 of 8 positions of the random test input.
 - **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently. Also, the `atan2` of the export gives a different phase for an exact STFT than for the STFT of ONNX Runtime (see [Text to speech with Kokoro](#text-to-speech-with-kokoro)). When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. With the `atan2` fix of the example, the spectrum of the speech matches PyTorch, with no tone at 4.8 kHz.
 
@@ -165,7 +165,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | Model | Check |
 |---|---|
 | [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) | Speech for inputs of up to 505 phonemes. With the `atan2` fix of the example, the spectrum matches PyTorch |
-| [Grounding DINO tiny](https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX) | The same detections on a COCO image, with scores within 0.0001 |
+| [Grounding DINO tiny](https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX) | The same labels and number of detections on `test/fixtures/cats.png`, with scores within 0.001 |
 | [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5. Without noise, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SpeechT5](https://huggingface.co/Xenova/speecht5_tts) | With a decoder dropout that keeps all values, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |

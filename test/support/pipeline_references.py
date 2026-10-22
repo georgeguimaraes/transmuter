@@ -548,7 +548,7 @@ for name, picture in pictures:
 # to 6e-4, so the reference is ONNX Runtime with the post-processing of the pipeline: the
 # sigmoid of the highest logit over the tokens, the boxes times the size of the image, the
 # threshold 0.1, and a stable sort by score.
-from transformers import AutoModelForZeroShotObjectDetection, AutoTokenizer
+from transformers import AutoModelForZeroShotObjectDetection, AutoTokenizer, GroundingDinoImageProcessor
 from transformers.models.grounding_dino.processing_grounding_dino import _merge_candidate_labels_text
 from transformers.pipelines.zero_shot_object_detection import ZeroShotObjectDetectionPipeline
 
@@ -561,6 +561,13 @@ ZeroShotObjectDetectionPipeline._get_bounding_box = lambda self, box: dict(zip([
 def print_detections(name, detections):
     print(name, [(d["label"], round(d["score"], 6), [round(x, 4) for x in d["box"].values()]) for d in detections])
 
+
+# GroundingDinoImageProcessor with shortest_edge and longest_edge resizes as DETR, with
+# get_size_with_aspect_ratio. The export uses a fixed 800x800, so this processor has the
+# default values and the size of IDEA-Research/grounding-dino-tiny. The 259x100 crop of the
+# image gets 515x1333, and the rule of shortest_edge alone gives 514x1333.
+values = GroundingDinoImageProcessor(size={"shortest_edge": 800, "longest_edge": 1333})(image.crop((0, 0, 259, 100)), return_tensors="np")["pixel_values"][0]
+print("grounding-dino shortest_edge 800 pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
 
 tile = Image.fromarray(np.tile(np.array(image), (6, 6, 1)))
 for repo, export in [("google/owlvit-base-patch32", "Xenova/owlvit-base-patch32"), ("google/owlv2-base-patch16-ensemble", "Xenova/owlv2-base-patch16-ensemble")]:

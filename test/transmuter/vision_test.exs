@@ -25,9 +25,21 @@ defmodule Transmuter.VisionTest do
     # resizes to 512x512 with bilinear. OWL-ViT resizes to 768x768 with bicubic. OWLv2 pads
     # the image to a square and resizes it to 960x960 with the resize of scikit-image, which
     # blurs the 6x6 tile of the image (1920x1440) with sigma 0.5 before it interpolates.
+    # Grounding DINO with shortest_edge 800 resizes as DETR. The 259x100 crop of the image
+    # gets 515x1333, with the short side rounded half to even. The rule of shortest_edge
+    # alone gives 514x1333.
     tile = Nx.tile(StbImage.to_nx(@image), [6, 6, 1])
+    crop = Nx.slice(StbImage.to_nx(@image), [0, 0, 0], [100, 259, 3])
 
-    for {repo, image, {height, width}, expected, mean} <- [
+    grounding_dino =
+      Featurizer.new(%{
+        "image_processor_type" => "GroundingDinoImageProcessor",
+        "size" => %{"shortest_edge" => 800, "longest_edge" => 1333},
+        "image_mean" => [0.485, 0.456, 0.406],
+        "image_std" => [0.229, 0.224, 0.225]
+      })
+
+    for {featurizer, image, {height, width}, expected, mean} <- [
           {"Xenova/vit-base-patch16-224", @image, {224, 224},
            [0.1137, 0.2941, -0.5608, 0.4902, -0.2863], 0.4666},
           {"Xenova/clip-vit-base-patch32", @image, {224, 224},
@@ -41,9 +53,12 @@ defmodule Transmuter.VisionTest do
           {"Xenova/owlv2-base-patch16-ensemble", @image, {960, 960},
            [0.2986, -1.527, 1.3496, 0.198, 1.4762], 0.7126},
           {"Xenova/owlv2-base-patch16-ensemble", tile, {960, 960},
-           [0.3245, -0.2768, 0.8887, 0.9414, -0.7501], 0.7012}
+           [0.3245, -0.2768, 0.8887, 0.9414, -0.7501], 0.7012},
+          {grounding_dino, crop, {515, 1333}, [0.2967, -1.9132, 2.1868, 0.6734, -1.8256], 0.9977}
         ] do
-      featurizer = Featurizer.load!({:hf, repo})
+      featurizer =
+        if is_binary(featurizer), do: Featurizer.load!({:hf, featurizer}), else: featurizer
+
       values = Featurizer.process(featurizer, [image], backend: @opts[:backend])
       values = Nx.backend_transfer(values, Nx.BinaryBackend)
 

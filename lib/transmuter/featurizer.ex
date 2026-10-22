@@ -12,7 +12,7 @@ defmodule Transmuter.Featurizer do
   The steps and their order are those of the image processors of Python transformers:
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
-    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR and YOLOS image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
+    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR, YOLOS and Grounding DINO image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
     3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
@@ -105,12 +105,13 @@ defmodule Transmuter.Featurizer do
   defp crop_pct(pct, {:edges, edge, nil}, _crop) when is_number(pct), do: {{edge, edge}, nil}
   defp crop_pct(_pct, size, crop), do: {size, crop}
 
-  # The DETR and YOLOS image processors compute the size with get_size_with_aspect_ratio.
+  # The DETR, YOLOS and Grounding DINO image processors compute the size with
+  # get_size_with_aspect_ratio.
   # YOLOS also rounds each side down to a multiple of 16.
   defp detr_size(type, {:edges, shortest, longest}) when is_binary(type) do
     cond do
       String.starts_with?(type, "Yolos") -> {:detr, shortest, longest, 16}
-      String.starts_with?(type, "Detr") -> {:detr, shortest, longest, 1}
+      String.starts_with?(type, ["Detr", "GroundingDino"]) -> {:detr, shortest, longest, 1}
       true -> {:edges, shortest, longest}
     end
   end
