@@ -281,6 +281,30 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  # The n-grams include the prompt, and min_new_tokens counts only the new tokens. The empty
+  # prompt is the bos token of gpt2, a prompt of one token, so the forced bos token is the
+  # first new token.
+  test "the logits processors that read the tokens of a row change the text as in transformers" do
+    gpt2 = {:hf, "Xenova/gpt2"}
+    chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
+
+    for {repo, opts, input, expected} <- [
+          {gpt2, [no_repeat_ngram_size: 2, max_new_tokens: 12],
+           "The history of the printing press begins",
+           " with the invention of printing presses in the early 19th century"},
+          {gpt2, [forced_bos_token_id: 464, max_new_tokens: 8], "",
+           "The first time I saw the new version"},
+          {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, [min_new_tokens: 12, max_new_tokens: 16],
+           chat,
+           "The capital of France is Paris. It is a city known for its historical landmarks"}
+        ] do
+      serving =
+        Transmuter.Text.generation(repo, [variant: :fp32, strategy: :greedy] ++ opts ++ @opts)
+
+      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, input)
+    end
+  end
+
   test "a half-precision export gives the f32 text in native f16" do
     # The fp16 export writes RMSNorm as Pow, ReduceMean, Add and Sqrt, which overflow in
     # native f16. Transmuter.Fusion replaces them with SimplifiedLayerNormalization.

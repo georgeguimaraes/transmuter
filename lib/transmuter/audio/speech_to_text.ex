@@ -42,6 +42,9 @@ defmodule Transmuter.Audio.SpeechToText do
           :top_k,
           :top_p,
           :repetition_penalty,
+          :no_repeat_ngram_size,
+          :min_length,
+          :min_new_tokens,
           :seed,
           :language,
           :chunk_num_seconds,
@@ -70,7 +73,12 @@ defmodule Transmuter.Audio.SpeechToText do
 
     ctx =
       if timestamps?,
-        do: %{ctx | processor: timestamp_processor(settings, gen["max_initial_timestamp_index"])},
+        do:
+          Map.update!(
+            ctx,
+            :processors,
+            &(&1 ++ [timestamp_processor(settings, gen["max_initial_timestamp_index"])])
+          ),
         else: ctx
 
     init = fn defn_options ->
@@ -244,7 +252,7 @@ defmodule Transmuter.Audio.SpeechToText do
   # the tokens after `above`. Then, when the timestamps together are more probable than each
   # text token, the step selects a timestamp.
   defp timestamp_processor(%{timestamp_begin: begin, eos: eos}, max_initial) do
-    state = fn generated ->
+    state = fn %{generated: generated} ->
       Nx.tensor(bounds(generated, begin, eos, max_initial), type: :s32, backend: Nx.BinaryBackend)
     end
 

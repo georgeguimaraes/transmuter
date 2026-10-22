@@ -157,6 +157,8 @@ defmodule Transmuter.Text do
 
     * `:temperature`, `:top_k`, `:top_p` and `:repetition_penalty` - as in Python transformers. The defaults are `1.0`, `50`, `1.0` and `1.0`.
 
+    * `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id` and `:forced_eos_token_id` - as in Python transformers. `:min_length` counts the prompt and the new tokens, and `:min_new_tokens` counts only the new tokens. The n-grams include the prompt. The defaults are those of the configuration, else no processor. `Transmuter.Generation` tells how each one counts the tokens of a row.
+
     * `:seed` - the seed of sampling for inputs without their own seed. The default is a new seed for each input.
 
     * `:template_options` - other variables of the chat template, such as `enable_thinking: false` for Qwen3.
@@ -212,7 +214,7 @@ defmodule Transmuter.Text do
 
     * `:max_new_tokens` - the maximum number of new tokens. The default is that of the `text2text-generation` pipeline of transformers (see `Transmuter.Generation.max_new_tokens/3`): 256 for T5, and `max_length` minus 1 for the start token when the configuration gives a `max_length` other than 20, such as 511 for Marian.
 
-    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`.
+    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id`, `:forced_eos_token_id`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`. The prompt of the decoder is `decoder_start_token_id`, so `:min_length` counts it, and the forced bos token is the first new token.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

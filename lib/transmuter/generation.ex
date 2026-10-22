@@ -14,7 +14,18 @@ defmodule Transmuter.Generation do
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
-  The token selection applies the logits processors of Python transformers that `generation_config.json` sets: `repetition_penalty`, `suppress_tokens`, `begin_suppress_tokens` (on the first new token), the bad words of one token in `bad_words_ids`, `temperature`, `top_k` and `top_p`.
+  The token selection applies the logits processors of Python transformers that `generation_config.json` sets, in the order of `_get_logits_processor`: `repetition_penalty`, `no_repeat_ngram_size`, the bad words of one token in `bad_words_ids`, `min_length` or `min_new_tokens`, `forced_bos_token_id`, `forced_eos_token_id`, `suppress_tokens`, `begin_suppress_tokens`, the processors of the task, `temperature`, `top_k` and `top_p`.
+
+  ## Lengths
+
+  The processors count the tokens of each row as Python transformers counts the columns of `input_ids`: the prompt and the new tokens. The prompt of a decoder-only model is the text, and the prompt of the decoder of an encoder-decoder model starts with `decoder_start_token_id`. Each row has its own length, and the rows of a batch are not padded. Transmuter limits the new tokens with `max_new_tokens`, so the `max_length` of a row in Python is the length of its prompt plus `max_new_tokens`. Thus:
+
+    * `no_repeat_ngram_size` - the n-grams of the prompt and the new tokens can occur only once.
+    * `min_length` - the eos tokens are removed while the prompt and the new tokens are fewer than `min_length`.
+    * `min_new_tokens` - the eos tokens are removed while the new tokens are fewer than `min_new_tokens`. As in Python, `min_new_tokens` replaces `min_length` when both are set.
+    * `forced_bos_token_id` - the token when the row has one token, which is the first new token of an encoder-decoder model. A decoder-only prompt of more than one token gets no forced token, as in Python.
+    * `forced_eos_token_id` - the token when the row has `max_length - 1` tokens, which is the last new token.
+    * `begin_suppress_tokens` - removed at the first new token, or at the second new token after a forced bos token of a prompt of one token.
 
   ## Embeddings and image features
 
@@ -26,7 +37,11 @@ defmodule Transmuter.Generation do
 
   Each token of a row has the position of its index in the row. The task can give other positions for the prompt of each row in `:position_ids` of `generate/5`, such as the 3-D positions of M-RoPE in Qwen2-VL. There, the image tokens of a prompt have the positions of their rows and columns in the image. A decoder whose `position_ids` has 3 axes takes 3 positions for each token. The tokens after the prompt continue from the largest position of the prompt: the token at index `i` has the position `i + delta` on all axes. `delta` is the largest position of the prompt, plus 1, minus the length of the prompt, as the rope delta of Python transformers.
 
-  A task can add one more processor in the `:processor` key of the context, as `{state, process}`. Before each step, `state` takes the new tokens of a row (the last token first) and gives a tensor. `process` takes the logits and that tensor of one row in the compiled selection, after the suppressed tokens and before the temperature, and gives the new logits.
+  ## Processors
+
+  The `:processors` key of the context is the list of processors, which apply in order after the repetition penalty and before the temperature. `context/4` puts the processors of `generation_config.json` in it, and a task can add its own processors at the end. A processor is `{state, process}`. Before each step, `state` takes a map of one row and gives a tensor of the same shape at each step. The map has the token ids of the prompt in `:prompt`, the new token ids in `:generated` (the last token first), and the size of the vocabulary in `:vocab`. `process` takes the logits and that tensor of one row in the compiled selection, and gives the new logits.
+
+  The atoms `:bad_words` and `:suppress_tokens` in the list are the places of two masks that do not change between steps: the bad words of one token and `suppress_tokens`. Generation makes these masks once for each group of rows.
 
   ## Batches
 
@@ -59,25 +74,25 @@ defmodule Transmuter.Generation do
             "expected :strategy to be :greedy or :sampling, got: #{inspect(opts[:strategy])}"
     end
 
+    max_new_tokens = opts[:max_new_tokens] || gen["max_new_tokens"] || @default_max_new_tokens
+    eos = List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"])
+
     %{
       model: model,
       mode: mode(model, given, opts[:embed]),
       embed: opts[:embed],
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
-      max_new_tokens: opts[:max_new_tokens] || gen["max_new_tokens"] || @default_max_new_tokens,
+      max_new_tokens: max_new_tokens,
       sampling?: Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling,
       temperature: opts[:temperature] || gen["temperature"] || 1.0,
       top_k: opts[:top_k] || gen["top_k"] || 50,
       top_p: opts[:top_p] || gen["top_p"] || 1.0,
       repetition_penalty: opts[:repetition_penalty] || gen["repetition_penalty"] || 1.0,
-      suppress: suppress_tokens(gen),
-      begin_suppress: List.wrap(gen["begin_suppress_tokens"]),
-      eos: List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"]),
+      masks: masks(gen),
+      eos: eos,
       bos: gen["bos_token_id"] || repo.config["bos_token_id"],
-      processor:
-        {fn _generated -> Nx.tensor(0, backend: Nx.BinaryBackend) end,
-         fn logits, _state -> logits end}
+      processors: processors(gen, opts, max_new_tokens, eos)
     }
   end
 
@@ -104,9 +119,103 @@ defmodule Transmuter.Generation do
     end
   end
 
-  # The tokens that each step suppresses: suppress_tokens and the bad words of one token.
-  defp suppress_tokens(gen),
-    do: List.wrap(gen["suppress_tokens"]) ++ for([id] <- List.wrap(gen["bad_words_ids"]), do: id)
+  # The token ids of the masks of the processors :bad_words and :suppress_tokens.
+  defp masks(gen) do
+    %{
+      bad_words: for([id] <- List.wrap(gen["bad_words_ids"]), do: id),
+      suppress_tokens: List.wrap(gen["suppress_tokens"])
+    }
+  end
+
+  # The processors in the order of _get_logits_processor of Python transformers. An option
+  # replaces the value of generation_config.json.
+  defp processors(gen, opts, max_new_tokens, eos) do
+    setting = &(opts[&1] || gen[Atom.to_string(&1)])
+    ngram_size = setting.(:no_repeat_ngram_size) || 0
+    forced_bos = setting.(:forced_bos_token_id)
+    forced_eos = setting.(:forced_eos_token_id)
+    begin_suppress = List.wrap(gen["begin_suppress_tokens"])
+    min_new_tokens = setting.(:min_new_tokens)
+    min_length = setting.(:min_length) || 0
+
+    # _prepare_generated_length of transformers replaces min_length with min_new_tokens plus
+    # the length of the prompt.
+    {min_length?, min_length} =
+      if min_new_tokens,
+        do: {min_new_tokens > 0, &(length(&1) + min_new_tokens)},
+        else: {min_length > 0, fn _prompt -> min_length end}
+
+    [
+      ngram_size > 0 && no_repeat_ngram(ngram_size),
+      :bad_words,
+      min_length? && eos != [] && min_length(min_length, eos),
+      forced_bos != nil && forced(&(length(&1.prompt) + length(&1.generated) == 1), [forced_bos]),
+      # The row has max_length - 1 tokens, where max_length is the prompt and max_new_tokens.
+      forced_eos != nil &&
+        forced(&(length(&1.generated) == max_new_tokens - 1), List.wrap(forced_eos)),
+      :suppress_tokens,
+      begin_suppress != [] && begin_suppress(begin_suppress, forced_bos != nil)
+    ]
+    |> Enum.filter(& &1)
+  end
+
+  # NoRepeatNGramLogitsProcessor: the last token of each n-gram whose first n - 1 tokens are the
+  # last n - 1 tokens of the row.
+  defp no_repeat_ngram(size) do
+    state = fn %{prompt: prompt, generated: generated, vocab: vocab} ->
+      tokens = prompt ++ Enum.reverse(generated)
+      last = Enum.take(tokens, 1 - size)
+
+      banned =
+        for ngram <- Enum.chunk_every(tokens, size, 1, :discard),
+            Enum.take(ngram, size - 1) == last,
+            uniq: true,
+            do: [List.last(ngram)]
+
+      mark(none({vocab}), banned)
+    end
+
+    {state, &remove/2}
+  end
+
+  # MinLengthLogitsProcessor, with the minimum length of the row from its prompt.
+  defp min_length(min_length, eos) do
+    state = fn %{prompt: prompt, generated: generated} ->
+      flag(length(prompt) + length(generated) < min_length.(prompt))
+    end
+
+    {state, &remove(&1, Nx.logical_and(&2, any_of(&1, eos)))}
+  end
+
+  # ForcedBOSTokenLogitsProcessor and ForcedEOSTokenLogitsProcessor: when `at?` is true for the
+  # row, the forced tokens get 0 and the other tokens are removed.
+  defp forced(at?, ids) do
+    process = fn logits, at ->
+      forced = Nx.select(any_of(logits, ids), 0.0, Nx.Constants.min_finite(:f32))
+      Nx.select(at, forced, logits)
+    end
+
+    {&flag(at?.(&1)), process}
+  end
+
+  # SuppressTokensAtBeginLogitsProcessor. Its begin_index in transformers is the length of
+  # the prompt, plus 1 after a forced bos token of a prompt of one token.
+  defp begin_suppress(ids, forced_bos?) do
+    state = fn %{prompt: prompt, generated: generated} ->
+      flag(length(generated) == if(forced_bos? and length(prompt) == 1, do: 1, else: 0))
+    end
+
+    {state, &remove(&1, Nx.logical_and(&2, any_of(&1, ids)))}
+  end
+
+  defp flag(value), do: Nx.tensor(if(value, do: 1, else: 0), type: :u8, backend: Nx.BinaryBackend)
+
+  defp any_of(logits, ids) do
+    iota = Nx.iota(Nx.shape(logits))
+    ids |> Enum.map(&Nx.equal(iota, &1)) |> Enum.reduce(&Nx.logical_or/2)
+  end
+
+  defp remove(logits, mask), do: Nx.select(mask, Nx.Constants.min_finite(:f32), logits)
 
   @inputs ~w(input_ids inputs_embeds attention_mask position_ids num_logits_to_keep use_cache_branch)
 
@@ -219,7 +328,15 @@ defmodule Transmuter.Generation do
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
     settings =
-      Map.take(ctx, [:repetition_penalty, :sampling?, :temperature, :top_k, :top_p, :processor])
+      ctx
+      |> Map.take([:repetition_penalty, :sampling?, :temperature, :top_k, :top_p])
+      |> Map.put(
+        :processes,
+        Enum.map(ctx.processors, fn
+          {_state, process} -> process
+          mask -> mask
+        end)
+      )
 
     ctx
     |> Map.put(
@@ -344,7 +461,12 @@ defmodule Transmuter.Generation do
     state = %{state | features: nil}
 
     {rows, _n, vocab} = Nx.shape(state.logits)
-    suppressed = mark(none({vocab}), Enum.map(ctx.suppress, &[&1]))
+
+    masks =
+      Map.new(ctx.masks, fn {name, ids} ->
+        mask = mark(none({vocab}), Enum.map(ids, &[&1]))
+        {name, Nx.backend_transfer(mask, ctx.backend)}
+      end)
 
     # The tokens that the repetition penalty applies to: the prompt and the new tokens.
     prompt_ids = for {prompt, i} <- Enum.with_index(prompts), id <- prompt, do: [i, id]
@@ -353,9 +475,9 @@ defmodule Transmuter.Generation do
     %{
       state: state,
       seen: seen,
-      suppressed: suppressed,
-      first: mark(suppressed, Enum.map(ctx.begin_suppress, &[&1])),
+      masks: masks,
       keys: seeds |> Enum.map(&Nx.Random.key/1) |> Nx.stack() |> Nx.backend_transfer(ctx.backend),
+      prompts: prompts,
       ids: Enum.map(prompts, fn _ -> [] end),
       new: [],
       done: Enum.map(prompts, &(&1 == []))
@@ -372,13 +494,19 @@ defmodule Transmuter.Generation do
   end
 
   defp select(ctx, group, remaining) do
-    suppressed = if remaining == ctx.max_new_tokens, do: group.first, else: group.suppressed
-    {processor_state, _process} = ctx.processor
-    states = group.ids |> Enum.map(processor_state) |> Nx.stack()
+    %{logits: logits, index: index} = group.state
+    vocab = Nx.axis_size(logits, -1)
+    rows = Enum.zip_with(group.prompts, group.ids, &%{prompt: &1, generated: &2, vocab: vocab})
+
+    states =
+      for {state, _process} <- ctx.processors do
+        rows |> Enum.map(state) |> Nx.stack()
+      end
 
     step = Nx.tensor(ctx.max_new_tokens - remaining, type: :u32, backend: Nx.BinaryBackend)
-    %{logits: logits, index: index} = group.state
-    tokens = ctx.select.(logits, index, group.seen, suppressed, states, group.keys, step)
+
+    tokens =
+      ctx.select.(logits, index, group.seen, group.masks, List.to_tuple(states), group.keys, step)
 
     new =
       Enum.zip_with(Nx.to_flat_list(tokens), group.done, fn token, done? ->
@@ -640,30 +768,33 @@ defmodule Transmuter.Generation do
   # of the row folded with the number of the step. The serving compiles this function,
   # because eager random numbers over a large vocabulary are slow. EMLX evaluates each
   # output of a compiled function separately, so the function gives only the tokens.
-  defp select_tokens(logits, index, seen, suppressed, states, keys, step, settings) do
-    [logits, index, seen, states, keys] =
-      Enum.map([logits, index, seen, states, keys], &Nx.vectorize(&1, :rows))
+  defp select_tokens(logits, index, seen, masks, states, keys, step, settings) do
+    [logits, index, seen, keys | states] =
+      Enum.map([logits, index, seen, keys | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
 
     logits = Nx.take(logits, index)
     key = Transmuter.Random.fold_in(keys, step)
-    token = select_token(logits, seen, suppressed, states, key, settings)
+    token = select_token(logits, seen, masks, states, key, settings)
     Nx.devectorize(token, keep_names: false)
   end
 
-  # The logits processors of Python transformers, in its order: repetition penalty,
-  # suppressed tokens, the processor of the task, temperature, top-k, top-p. Removed tokens
-  # get the smallest finite value, because EMLX 0.5 does not compile infinite constants.
-  defp select_token(logits, seen, suppressed, state, key, settings) do
+  # The logits processors of Python transformers: repetition penalty, the processors of the
+  # context with the masks in their places, temperature, top-k, top-p. Removed tokens get the
+  # smallest finite value, because EMLX 0.5 does not compile infinite constants.
+  defp select_token(logits, seen, masks, states, key, settings) do
     logits = Nx.as_type(logits, :f32)
     penalty = settings.repetition_penalty
-    {_state, process} = settings.processor
 
     penalized =
       Nx.select(Nx.greater(logits, 0), Nx.divide(logits, penalty), Nx.multiply(logits, penalty))
 
     logits = Nx.select(seen, penalized, logits)
-    logits = Nx.select(suppressed, Nx.Constants.min_finite(:f32), logits)
-    logits = process.(logits, state)
+
+    {logits, []} =
+      Enum.reduce(settings.processes, {logits, states}, fn
+        mask, {logits, states} when is_atom(mask) -> {remove(logits, masks[mask]), states}
+        process, {logits, [state | states]} -> {process.(logits, state), states}
+      end)
 
     if settings.sampling? do
       logits

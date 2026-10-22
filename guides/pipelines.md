@@ -137,6 +137,8 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "Write a haiku abo
 
 Messages go through the chat template of the repository (see `Transmuter.ChatTemplate`). A string input does not. The settings of `generation_config.json` apply, such as sampling with `temperature`, `top_k` and `top_p`. The options override them. Give `:seed` in the input or as an option to get the same text again.
 
+The logits processors of Python transformers that read the tokens of a row also apply: `no_repeat_ngram_size`, `min_length`, `min_new_tokens`, `forced_bos_token_id` and `forced_eos_token_id`. They count the tokens as Python does. `min_length` and the n-grams include the prompt, and `min_new_tokens` counts only the new tokens. `Transmuter.Generation` gives the rule of each processor.
+
 The serving works with any decoder export that has a KV cache. It reads the shape of the cache from the graph:
 
 - Exports with GroupQueryAttention that counts the valid rows from the values of the attention mask, such as the `onnx-community` exports of Qwen3 and SmolLM2, write the cache in place.

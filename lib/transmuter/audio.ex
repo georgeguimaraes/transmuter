@@ -42,7 +42,7 @@ defmodule Transmuter.Audio do
 
     * `:compile` - `:batch_size`, the number of windows that the decoder transcribes together. The windows come from one long audio, from a list of audio, or from concurrent calls to `Nx.Serving.batched_run/2`. The default is `1`.
 
-    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty` and `:seed` - as in `Transmuter.Text.generation/2`. `:max_new_tokens` applies to each pass of the decoder over a window. Its default is `max_length` of `generation_config.json` (448 for Whisper) minus the length of the prompt, as in the pipeline of transformers.
+    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens` and `:seed` - as in `Transmuter.Text.generation/2`. The prompt of the decoder counts in `:min_length`. Python transformers makes the prompt of Whisper and its first suppressed tokens itself, so the serving does not take `:forced_bos_token_id` and `:forced_eos_token_id`. `:max_new_tokens` applies to each pass of the decoder over a window. Its default is `max_length` of `generation_config.json` (448 for Whisper) minus the length of the prompt, as in the pipeline of transformers.
 
   An English-only model, such as `whisper-tiny.en`, raises an error for a `:language` or `:task` other than English transcription.
 
