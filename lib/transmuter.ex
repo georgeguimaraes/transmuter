@@ -84,7 +84,7 @@ defmodule Transmuter do
 
   Returns a map with:
 
-    * `:params` - the weights, on the `:backend` when it is given
+    * `:params` - the weights and the other large tensors of the graph, on the `:backend` when it is given. These are the large initializers and the values of large `Constant` nodes, also those of subgraphs, such as the branches of an `If`
     * `:backend` - the `:backend` option. An eager `run/4` computes large values that do not depend on the inputs, such as attention masks from shapes, on this backend
     * `:inputs` - the names of the graph inputs
     * `:outputs` - the names of the graph outputs
@@ -158,11 +158,18 @@ defmodule Transmuter do
       if Keyword.get(opts, :fuse, true), do: Transmuter.Fusion.graph(graph, opset), else: graph
 
     trainable = Keyword.get(opts, :trainable, false)
+    {graph, constants} = hoist_constants(graph, false)
+
+    for {name, count} <- Enum.frequencies_by(constants, &elem(&1, 0)), count > 1 do
+      raise ArgumentError, "the graph defines the large constant #{name} more than once"
+    end
 
     {static, params} =
       graph.initializer
       |> Enum.map(&{&1.name, Ops.tensor(&1, dir)})
       |> Enum.split_with(fn {_, t} -> static_initializer?(t, trainable) end)
+
+    params = params ++ constants
 
     initializers = Enum.map(graph.initializer, & &1.name)
     graph_inputs = for i <- graph.input, i.name not in initializers, do: i
@@ -883,6 +890,52 @@ defmodule Transmuter do
   end
 
   defp value_type(_input), do: nil
+
+  # Large Constant nodes and the large initializers of subgraphs become params, as the large
+  # initializers of the main graph do. A static value is a literal of each compiled function,
+  # and EXLA writes each literal into the program as text. The 1876x768 positional table in
+  # each If branch of the SpeechT5 decoder took 3.5 s of each compile of a step.
+  defp hoist_constants(graph, subgraph?) do
+    {initializers, large} =
+      if subgraph?,
+        do: Enum.split_with(graph.initializer, &static_initializer?(Ops.tensor(&1), false)),
+        else: {graph.initializer, []}
+
+    hoisted = Enum.map(large, &{&1.name, Ops.tensor(&1)})
+
+    {nodes, hoisted} =
+      Enum.flat_map_reduce(graph.node, hoisted, fn node, hoisted ->
+        case large_constant(node) do
+          nil ->
+            {attribute, hoisted} = Enum.map_reduce(node.attribute, hoisted, &hoist_attribute/2)
+            {[%{node | attribute: attribute}], hoisted}
+
+          constant ->
+            {[], [constant | hoisted]}
+        end
+      end)
+
+    {%{graph | node: nodes, initializer: initializers}, hoisted}
+  end
+
+  defp hoist_attribute(a, hoisted) do
+    {g, hoisted} = if a.g, do: hoist_subgraph(a.g, hoisted), else: {nil, hoisted}
+    {graphs, hoisted} = Enum.map_reduce(a.graphs, hoisted, &hoist_subgraph/2)
+    {%{a | g: g, graphs: graphs}, hoisted}
+  end
+
+  defp hoist_subgraph(graph, hoisted) do
+    {graph, inner} = hoist_constants(graph, true)
+    {graph, inner ++ hoisted}
+  end
+
+  defp large_constant(%{op_type: "Constant", domain: domain, output: [name], attribute: [a]})
+       when domain in [nil, ""] and a.name == "value" do
+    tensor = Ops.tensor(a.t)
+    if not static_initializer?(tensor, false), do: {name, tensor}
+  end
+
+  defp large_constant(_node), do: nil
 
   defp static_initializer?({:empty, _shape}, _trainable), do: true
   defp static_initializer?({:strings, _shape, _values}, _trainable), do: true

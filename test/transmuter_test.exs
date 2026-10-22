@@ -507,6 +507,76 @@ defmodule TransmuterTest do
     end
   end
 
+  # A merged decoder can keep a large table as a Constant node or an initializer in each
+  # branch, such as the positional table of the SpeechT5 decoder. As params, they are no
+  # literals in the compiled functions.
+  test "large Constant nodes and subgraph initializers are params" do
+    table =
+      &%TensorProto{
+        name: &1,
+        dims: [32],
+        data_type: 1,
+        float_data: Enum.map(&2, fn v -> v * 1.0 end)
+      }
+
+    constant =
+      &node("Constant", [], [&1],
+        attribute: [%AttributeProto{name: "value", type: :TENSOR, t: table.("", &2)}]
+      )
+
+    branch = fn name, nodes, initializers ->
+      %GraphProto{
+        name: name,
+        node: nodes ++ [node("Add", ["x", "#{name}_w"], ["#{name}_y"])],
+        initializer: initializers,
+        output: [value("#{name}_y")]
+      }
+    end
+
+    graph = %GraphProto{
+      input: [value("x", [32]), value("flag", [1], 9)],
+      output: [value("y")],
+      node: [
+        constant.("scale", 1..32),
+        node("If", ["flag"], ["b"],
+          attribute: [
+            %AttributeProto{
+              name: "then_branch",
+              type: :GRAPH,
+              g: branch.("then", [constant.("then_w", 0..31)], [])
+            },
+            %AttributeProto{
+              name: "else_branch",
+              type: :GRAPH,
+              g: branch.("else", [], [table.("else_w", 31..0//-1)])
+            }
+          ]
+        ),
+        node("Mul", ["b", "scale"], ["y"])
+      ]
+    }
+
+    model = graph |> write_model() |> Transmuter.load!(backend: @backend)
+    assert Enum.sort(Map.keys(model.params)) == ["else_w", "scale", "then_w"]
+    assert [%{op_type: "If", attribute: branches}, %{op_type: "Mul"}] = model.nodes
+
+    for %{g: g} <- branches do
+      assert {Enum.map(g.node, & &1.op_type), g.initializer} == {["Add"], []}
+    end
+
+    x = Nx.iota({32}, type: :f32, backend: @backend)
+    scale = Nx.add(x, 1)
+
+    for {flag, w} <- [{1, x}, {0, Nx.subtract(31, x)}] do
+      flag = Nx.tensor([flag], type: :u8, backend: Nx.BinaryBackend)
+
+      assert_all_close(
+        run(model, %{"x" => x}, %{"flag" => flag})["y"],
+        Nx.multiply(Nx.add(x, w), scale)
+      )
+    end
+  end
+
   # Each Add reads its input twice, so the expression of x16 is a graph with 16 levels and
   # 2^16 paths. An error that kept it would copy all paths when it leaves the process.
   test "an error in a traced node keeps no traced values" do
