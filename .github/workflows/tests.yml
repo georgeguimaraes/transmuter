@@ -34,8 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # mix test starts the emlx application in this job too, and EMLX on Linux needs
-      # OpenBLAS. apt-get can block on the dpkg lock without a timeout, so each call is
-      # bounded and retried once.
+      # OpenBLAS. The Ubuntu mirror often stalls, so the packages come from the cache, and
+      # apt-get downloads them only when the cache is empty. apt-get can block on the dpkg
+      # lock without a timeout, so each call is bounded and the download is retried once.
+      # Change v1 when the cached packages no longer install on the runner image.
+      - name: Restore OpenBLAS packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/openblas-debs
+          key: ${{ runner.os }}-openblas-debs-v1
       - name: Install OpenBLAS (for emlx)
         timeout-minutes: 6
         run: |
@@ -44,29 +51,41 @@ jobs:
             exit 0
           fi
 
-          for attempt in 1 2; do
-            if [ "$attempt" -gt 1 ]; then
-              sleep 10
+          debs="$HOME/openblas-debs"
+
+          if ! ls "$debs"/*.deb > /dev/null 2>&1; then
+            mkdir -p "$debs/partial"
+            status=1
+
+            for attempt in 1 2; do
+              if [ "$attempt" -gt 1 ]; then
+                sleep 10
+              fi
+
+              status=0
+              timeout 60 sudo apt-get update &&
+                timeout 90 sudo apt-get install -y --no-install-recommends --download-only \
+                  -o Dir::Cache::archives="$debs" libopenblas0 ||
+                status=$?
+
+              if [ "$status" -eq 0 ]; then
+                break
+              elif [ "$status" -eq 124 ]; then
+                echo "::warning::apt attempt $attempt stalled and was killed"
+              else
+                echo "::warning::apt attempt $attempt failed with status $status"
+              fi
+            done
+
+            if [ "$status" -ne 0 ]; then
+              echo "::error::could not download libopenblas0. A stall is usually the Ubuntu mirror; the apt output above says which."
+              exit 1
             fi
 
-            status=0
-            timeout 60 sudo apt-get update &&
-              timeout 90 sudo apt-get install -y --no-install-recommends libopenblas0 ||
-              status=$?
+            sudo rm -rf "$debs/partial" "$debs/lock"
+          fi
 
-            if [ "$status" -eq 0 ]; then
-              exit 0
-            fi
-
-            if [ "$status" -eq 124 ]; then
-              echo "::warning::apt attempt $attempt stalled and was killed"
-            else
-              echo "::warning::apt attempt $attempt failed with status $status"
-            fi
-          done
-
-          echo "::error::could not install libopenblas0. A stall is usually the Ubuntu mirror; the apt output above says which."
-          exit 1
+          timeout 60 sudo dpkg -i "$debs"/*.deb
       - name: Set up Elixir
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
