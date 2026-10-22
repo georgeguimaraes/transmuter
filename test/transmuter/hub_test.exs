@@ -29,6 +29,29 @@ defmodule Transmuter.HubTest do
     end
   end
 
+  test "a revision gives the files of that commit, branch or tag", %{tmp_dir: dir} do
+    source = {:hf, "Xenova/all-MiniLM-L6-v2"}
+    files = &Transmuter.Hub.files(source, cache_dir: dir, revision: &1)
+
+    # The commit 57cbdab uploaded model_int8.onnx to the root, and cb3d680 moved it to onnx/.
+    assert "model_int8.onnx" in files.("57cbdab1181b7eba8170805260bd39e733b0e25d")
+    refute "onnx/model_int8.onnx" in files.("57cbdab1181b7eba8170805260bd39e733b0e25d")
+    assert "onnx/model_int8.onnx" in files.(nil)
+    assert "onnx/model_fp16.onnx" in files.("refs/pr/1")
+
+    readme = &Transmuter.Hub.fetch!(source, "README.md", cache_dir: dir, revision: &1)
+    old = readme.("a162ec1733c9eead894ebbf7cf40d15ecf3f3f65")
+
+    assert Path.dirname(old) ==
+             Path.join(dir, "Xenova/all-MiniLM-L6-v2@a162ec1733c9eead894ebbf7cf40d15ecf3f3f65")
+
+    assert File.read!(old) != File.read!(readme.(nil))
+
+    assert_raise ArgumentError, ~r/has no revision no-such-revision/, fn ->
+      files.("no-such-revision")
+    end
+  end
+
   test "concurrent downloads of one file all succeed", %{tmp_dir: dir} do
     paths =
       1..8

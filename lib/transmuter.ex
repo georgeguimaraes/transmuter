@@ -44,7 +44,7 @@ defmodule Transmuter do
 
   ## Options
 
-    * `:cache_dir` and `:offline` - the options of `Transmuter.Hub` for Hub
+    * `:cache_dir`, `:revision` and `:offline` - the options of `Transmuter.Hub` for Hub
       files.
 
     * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params

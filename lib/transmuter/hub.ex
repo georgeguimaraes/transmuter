@@ -8,6 +8,8 @@ defmodule Transmuter.Hub do
 
   * `:cache_dir` - the directory for Hub downloads. The default is `~/.cache/transmuter`.
 
+  * `:revision` - a branch, a tag or a commit hash of the repository. The default is `"main"`. The files of another revision go in a directory of their own in the cache, `<repo>@<revision>`. The files of a commit hash do not change, so its metadata comes from the Hub only once.
+
   * `:offline` - when `true`, no request goes to the Hub. Files and metadata come only from the cache, and a file that is not in the cache raises. The default is `true` when the `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` environment variable is `1`, `ON`, `YES` or `TRUE`, as in Python, and `false` otherwise.
 
   The tasks of `Transmuter.Text`, `Transmuter.Vision` and `Transmuter.Audio`, `Transmuter.Repo.load!/2` and `Transmuter.load!/2` take these options too.
@@ -15,7 +17,7 @@ defmodule Transmuter.Hub do
   A large download shows a progress bar on the standard output. To disable it, set `config :transmuter, progress_bar_enabled: false`.
   """
 
-  @options [:cache_dir, :offline]
+  @options [:cache_dir, :revision, :offline]
 
   @doc """
   Returns the names of the options of this module, which the tasks take and give to it.
@@ -42,13 +44,21 @@ defmodule Transmuter.Hub do
   def fetch(source = {:hf, repo}, file, opts) do
     dir = cache_dir(repo, opts)
     path = Path.join(dir, file)
-    files = if File.exists?(path), do: [file], else: files(source, opts)
 
-    if file in files do
-      for f <- data_files(file, files) ++ [file], do: download!(repo, f, Path.join(dir, f), opts)
+    if File.exists?(path) do
       {:ok, path}
     else
-      :error
+      info = info(source, opts)
+      files = Enum.map(info["siblings"], & &1["rfilename"])
+
+      if file in files do
+        for f <- data_files(file, files) ++ [file],
+            do: download!(repo, info["sha"], f, Path.join(dir, f), opts)
+
+        {:ok, path}
+      else
+        :error
+      end
     end
   end
 
@@ -94,15 +104,17 @@ defmodule Transmuter.Hub do
     path = Path.join(cache_dir(repo, opts), ".info.json")
     saved? = File.exists?(path)
 
+    refresh? = Keyword.get(opts, :refresh, false) and not commit?(opts[:revision])
+
     cond do
-      saved? and (offline?(opts) or not Keyword.get(opts, :refresh, false)) ->
+      saved? and (offline?(opts) or not refresh?) ->
         path |> File.read!() |> JSON.decode!()
 
       offline?(opts) ->
         raise ArgumentError, "#{repo} is not in the cache, and the Hub is offline"
 
       true ->
-        case get("https://huggingface.co/api/models/#{repo}") do
+        case get("https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}") do
           {:ok, %{status: 200, body: info}} ->
             File.mkdir_p!(Path.dirname(path))
             File.write!(path, JSON.encode!(info))
@@ -110,6 +122,9 @@ defmodule Transmuter.Hub do
 
           _error when saved? ->
             path |> File.read!() |> JSON.decode!()
+
+          {:ok, %{headers: %{"x-error-code" => ["RevisionNotFound"]}}} ->
+            raise ArgumentError, "#{repo} has no revision #{opts[:revision]}"
 
           {:ok, %{status: status, body: body}} ->
             raise ArgumentError,
@@ -135,7 +150,9 @@ defmodule Transmuter.Hub do
 
   # Each download writes its own part file, so processes that download the same file at the
   # same time do not write into one file. The rename puts a complete file in place at once.
-  defp download!(repo, file, target, opts) do
+  # The file comes from the commit of the metadata, so it matches the file list even when the
+  # branch moves on.
+  defp download!(repo, commit, file, target, opts) do
     cond do
       File.exists?(target) ->
         :ok
@@ -150,7 +167,7 @@ defmodule Transmuter.Hub do
         try do
           File.open!(part, [:write, :binary], fn device ->
             Req.get!(
-              "https://huggingface.co/#{repo}/resolve/main/#{file}",
+              "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
               req_options(into: &write(device, file, &1, &2), http_errors: :raise)
             )
           end)
@@ -208,8 +225,17 @@ defmodule Transmuter.Hub do
   end
 
   defp cache_dir(repo, opts) do
-    Path.join(opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"]), repo)
+    root = opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"])
+
+    if opts[:revision],
+      do: Path.join(root, "#{repo}@#{revision(opts)}"),
+      else: Path.join(root, repo)
   end
+
+  # A branch name can have a slash, such as refs/pr/1.
+  defp revision(opts), do: URI.encode(opts[:revision] || "main", &URI.char_unreserved?/1)
+
+  defp commit?(revision), do: is_binary(revision) and revision =~ ~r/\A[0-9a-f]{40}\z/
 
   defp get(url), do: Req.get(url, req_options(retry: false))
 
