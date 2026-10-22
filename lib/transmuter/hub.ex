@@ -120,8 +120,15 @@ defmodule Transmuter.Hub do
         raise ArgumentError, "#{repo} is not in the cache, and the Hub is offline"
 
       true ->
-        case get(
-               "https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}?blobs=true"
+        # With saved metadata, an error gives the saved metadata at once. Without it, Req
+        # retries a transient error.
+        case Req.get(
+               request(
+                 url:
+                   "https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}?blobs=true",
+                 retry: if(saved?, do: false, else: :safe_transient),
+                 receive_timeout: 30_000
+               )
              ) do
           {:ok, %{status: 200, body: info}} ->
             File.mkdir_p!(Path.dirname(path))
@@ -304,8 +311,6 @@ defmodule Transmuter.Hub do
   defp revision(opts), do: URI.encode(opts[:revision] || "main", &URI.char_unreserved?/1)
 
   defp commit?(revision), do: is_binary(revision) and revision =~ ~r/\A[0-9a-f]{40}\z/
-
-  defp get(url), do: Req.get(request(url: url, retry: false))
 
   defp request(opts) do
     headers = if token = token(), do: [authorization: "Bearer #{token}"], else: []

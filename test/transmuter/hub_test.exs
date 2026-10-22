@@ -160,10 +160,12 @@ defmodule Transmuter.HubEnvTest do
   end
 
   defmodule Adapter do
-    # Gives the metadata of an empty repository, so no request leaves the test.
+    # Gives the metadata of an empty repository, or the status that the test puts in its
+    # process, so no request leaves the test.
     def run(request) do
       send(Transmuter.HubEnvTest, {:request, request})
-      {request, Req.Response.new(status: 200, body: %{"sha" => "0", "siblings" => []})}
+      status = Process.get(:hub_status, 200)
+      {request, Req.Response.new(status: status, body: %{"sha" => "0", "siblings" => []})}
     end
   end
 
@@ -211,5 +213,16 @@ defmodule Transmuter.HubEnvTest do
         ] do
       assert request(env, dir).options[:connect_options] == expected, inspect(env)
     end
+  end
+
+  test "an error of the Hub API gives the saved metadata at once, without retries", %{
+    tmp_dir: dir
+  } do
+    info = Transmuter.Hub.info({:hf, "a/b"}, cache_dir: dir)
+    assert_received {:request, _request}
+    Process.put(:hub_status, 503)
+    assert Transmuter.Hub.info({:hf, "a/b"}, cache_dir: dir, refresh: true) == info
+    assert_received {:request, _request}
+    refute_received {:request, _request}
   end
 end
