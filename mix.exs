@@ -110,6 +110,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.ImageToText,
           Transmuter.Vision.ImageTextToText,
           Transmuter.Vision.ObjectDetection,
+          Transmuter.Vision.DepthEstimation,
           Transmuter.Vision.Idefics3Processor,
           Transmuter.Vision.Qwen2VLProcessor,
           Transmuter.Audio.SpeechToText,
