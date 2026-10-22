@@ -870,6 +870,32 @@ defmodule Transmuter.VisionLargeModelTest do
     assert Enum.join(Nx.Serving.run(stream, hd(chats))) == hd(expected)
   end
 
+  # Python has no reference for this export. Both chats have 13 tiles, so they run in one
+  # batch, and each beam of a chat must read the image features of its chat.
+  @tag :large_model
+  test "image-text-to-text with beams gives the text of each chat alone in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for {image, text} <- [
+            {@image, "Can you describe this image?"},
+            {tall, "What animals are in the image?"}
+          ],
+          do: %{
+            messages: [
+              %{
+                role: "user",
+                content: [%{type: "image", image: image}, %{type: "text", text: text}]
+              }
+            ]
+          }
+
+    opts = [num_beams: 3, max_new_tokens: 12] ++ @opts
+    alone = Nx.Serving.run(Vision.image_text_to_text(@smolvlm, opts), chats)
+    batched = Vision.image_text_to_text(@smolvlm, [compile: [batch_size: 2]] ++ opts)
+    assert Nx.Serving.run(batched, chats) == alone
+  end
+
   # The reference is ONNX Runtime on the same files: the fp32 vision encoder, the fp16
   # embeddings and the q4 decoder, with the 3-D positions of get_rope_index. The 8-bit vision
   # encoder of the default variants gives another text in Transmuter than in ONNX Runtime. The

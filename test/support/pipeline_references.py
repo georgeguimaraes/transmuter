@@ -719,3 +719,84 @@ for name, export, processor, model in [
             ort_differences = max(ort_differences, int((ort_mask != mask).sum(axis=(1, 2)).max()))
         Image.fromarray(np.concatenate([m.reshape(-1, m.shape[-1]) for m in masks]).astype(np.uint8) * 255).save(f"test/fixtures/sam_{name}_{picture_name}.png")
         print(name, picture_name, "largest number of different pixels in a mask of ONNX Runtime", ort_differences)
+
+# Beam search, as Transmuter.Generation with :num_beams.
+from transformers import GenerationMixin
+from transformers.generation.logits_process import WhisperTimeStampLogitsProcessor
+
+# Beam search: generate with num_beams and do_sample=False. The script also prints the margin
+# of each input: the score of the best beam minus the score of the second beam. A small margin
+# shows a result that small numeric differences can change. Whisper runs the generate of
+# GenerationMixin with the prompt of the Whisper generate, because the Whisper generate gives
+# no beam scores. Both give the same text.
+def beams(model, inputs, **options):
+    output = GenerationMixin.generate(model, **inputs, do_sample=False, num_return_sequences=options["num_beams"], output_scores=True, return_dict_in_generate=True, **options)
+    scores = output.sequences_scores.view(-1, options["num_beams"])
+    return output.sequences[:: options["num_beams"]], [round(float(s[0] - s[1]), 5) for s in scores]
+
+# Each case gives another text than greedy, so it fails when the beams fall back to greedy.
+# "What is 2 + 2?" ends with eos at the eighth token while other beams still run. The
+# options of "Say yes or no." and of the T5 inputs give other texts than the defaults.
+def greedy(model, inputs, **options):
+    return model.generate(**inputs, do_sample=False, num_beams=1, **options)
+
+tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+for question, options in [("What is 2 + 2?", {}), ("Say yes or no.", {}), ("Say yes or no.", {"length_penalty": 2.0}), ("Say yes or no.", {"length_penalty": 2.0, "early_stopping": "never"})]:
+    inputs = tokenizer.apply_chat_template([{"role": "user", "content": question}], add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    n = inputs["input_ids"].shape[1]
+    tokens = 12 if question == "What is 2 + 2?" else 16
+    sequences, margins = beams(model, inputs, num_beams=3, max_new_tokens=tokens, **options)
+    text = tokenizer.decode(sequences[0, n:], skip_special_tokens=True)
+    print("smollm2 beams", repr(question), options, repr(text), margins, "greedy", repr(tokenizer.decode(greedy(model, inputs, max_new_tokens=tokens)[0, n:], skip_special_tokens=True)))
+
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+inputs = tokenizer("The history of the printing press begins", return_tensors="pt")
+sequences, margins = beams(model, inputs, num_beams=3, max_new_tokens=12)
+print("gpt2 beams", repr(tokenizer.decode(sequences[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)), margins)
+
+# Python runs each T5 text alone, without padding. The T5 text keeps the spaces of the tokens,
+# as the text2text-generation pipeline decodes with clean_up_tokenization_spaces=False.
+# Marian runs with the settings of its generation_config.json: 4 beams, bad_words_ids,
+# forced_eos_token_id and renormalize_logits.
+sentence = "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
+tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
+model = AutoModelForSeq2SeqLM.from_pretrained("google-t5/t5-small")
+for options in [{}, {"early_stopping": True}, {"length_penalty": -1.0}]:
+    for text in ["summarize: Scientists found a new species of frog in the rainforest. The frog is very small and has bright colors. It lives near streams and eats insects.", "translate English to French: The weather is nice today, so we walk to the park."]:
+        inputs = tokenizer(text, return_tensors="pt")
+        sequences, margins = beams(model, inputs, num_beams=3, max_new_tokens=48, **options)
+        decode = lambda ids: repr(tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False))
+        print("t5 beams", options, decode(sequences[0]), margins, "greedy", decode(greedy(model, inputs, max_new_tokens=48)[0]))
+
+tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-de")
+model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-de")
+sequences, margins = beams(model, tokenizer(sentence, return_tensors="pt"), num_beams=model.generation_config.num_beams, max_new_tokens=64)
+print("marian beams", model.generation_config.num_beams, repr(tokenizer.decode(sequences[0], skip_special_tokens=True)), margins)
+
+# With 5 new tokens, forced_eos_token_id gives the fifth token of each beam.
+sequences, margins = beams(model, tokenizer(sentence, return_tensors="pt"), num_beams=model.generation_config.num_beams, max_new_tokens=5)
+print("marian beams, 5 tokens", sequences[0].tolist(), repr(tokenizer.decode(sequences[0], skip_special_tokens=True)), margins)
+
+# Whisper with 3 beams on test/fixtures/librispeech_0.f32: whisper-base in French, and
+# whisper-tiny.en with timestamps.
+audio = np.fromfile("test/fixtures/librispeech_0.f32", dtype="<f4")
+processor = WhisperProcessor.from_pretrained("openai/whisper-base")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
+features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+config = model.generation_config
+prompt = torch.tensor([[config.decoder_start_token_id, config.lang_to_id["<|fr|>"], config.task_to_id["transcribe"], config.no_timestamps_token_id]])
+sequences, margins = beams(model, {"input_features": features, "decoder_input_ids": prompt}, num_beams=3, max_new_tokens=444)
+print("whisper-base fr beams", repr(processor.decode(sequences[0], skip_special_tokens=True)), margins)
+print("whisper-base fr generate", repr(processor.batch_decode(model.generate(features, do_sample=False, num_beams=3, language="fr", task="transcribe"), skip_special_tokens=True)[0]))
+
+processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
+features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+config = model.generation_config
+prompt = torch.tensor([[config.decoder_start_token_id]])
+timestamps = [WhisperTimeStampLogitsProcessor(config, begin_index=1)]
+sequences, margins = beams(model, {"input_features": features, "decoder_input_ids": prompt, "logits_processor": timestamps}, num_beams=3, max_new_tokens=447)
+print("whisper-tiny.en timestamps beams", repr(processor.decode(sequences[0], decode_with_timestamps=True)), margins)
+print("whisper-tiny.en timestamps generate", repr(processor.batch_decode(model.generate(features, do_sample=False, num_beams=3, return_timestamps=True), decode_with_timestamps=True)[0]))

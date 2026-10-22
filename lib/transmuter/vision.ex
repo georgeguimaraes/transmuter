@@ -253,7 +253,7 @@ defmodule Transmuter.Vision do
       Nx.Serving.run(serving, image)
       #=> %{results: [%{text: "a cat laying on a blanket next to a cat laying on a bed "}]}
 
-  The settings of generation come from `generation_config.json`, as in `Transmuter.Text.generation/2`. The serving does not do beam search. It ignores `num_beams`.
+  The settings of generation come from `generation_config.json`, as in `Transmuter.Text.generation/2`, with beam search when the configuration has `num_beams`.
 
   ## Options
 
@@ -261,7 +261,7 @@ defmodule Transmuter.Vision do
 
     * `:compile` - `:batch_size`, the number of images that generate together. The default is `1`.
 
-    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 
@@ -297,7 +297,7 @@ defmodule Transmuter.Vision do
 
     * `:compile` - `:batch_size`, the number of chats that generate together. The default is `1`. Chats go into one batch when the number of their tiles (SmolVLM) or patches (Qwen2-VL) rounds up to the same power of two. A chat can have up to 65536 tiles or patches. An image of SmolVLM gives up to 17 tiles, and an image of Qwen2-VL gives up to `max_pixels / 196` patches.
 
-    * `:max_new_tokens`, `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+    * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 

@@ -14,7 +14,7 @@ defmodule Transmuter.Generation do
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
-  The token selection applies the logits processors of Python transformers that `generation_config.json` sets, in the order of `_get_logits_processor`: `repetition_penalty`, `no_repeat_ngram_size`, the bad words of one token in `bad_words_ids`, `min_length` or `min_new_tokens`, `forced_bos_token_id`, `forced_eos_token_id`, `suppress_tokens`, `begin_suppress_tokens`, the processors of the task, `temperature`, `top_k` and `top_p`.
+  The token selection applies the logits processors of Python transformers that `generation_config.json` sets, in the order of `_get_logits_processor`: `repetition_penalty`, `no_repeat_ngram_size`, the bad words of one token in `bad_words_ids`, `min_length` or `min_new_tokens`, `forced_bos_token_id`, `forced_eos_token_id`, `suppress_tokens`, `begin_suppress_tokens`, the processors of the task, `renormalize_logits`, `temperature`, `top_k` and `top_p`.
 
   ## Lengths
 
@@ -42,6 +42,18 @@ defmodule Transmuter.Generation do
   The `:processors` key of the context is the list of processors, which apply in order after the repetition penalty and before the temperature. `context/4` puts the processors of `generation_config.json` in it, and a task can add its own processors at the end. A processor is `{state, process}`. Before each step, `state` takes a map of one row and gives a tensor of the same shape at each step. The map has the token ids of the prompt in `:prompt`, the new token ids in `:generated` (the last token first), and the size of the vocabulary in `:vocab`. `process` takes the logits and that tensor of one row in the compiled selection, and gives the new logits.
 
   The atoms `:bad_words` and `:suppress_tokens` in the list are the places of two masks that do not change between steps: the bad words of one token and `suppress_tokens`. Generation makes these masks once for each group of rows.
+
+  ## Beam search
+
+  With `num_beams` above 1, generation does the beam search of `_beam_search` in Python transformers 4.57. The beams of a prompt are rows of the batch: prompt `i` has the rows `i * num_beams` to `i * num_beams + num_beams - 1`, and its inputs, image features and positions repeat for each row. `compile/3` compiles the decoder for `batch_size * num_beams` rows. At the start, all beams of a prompt are equal, and only the first beam counts.
+
+  Each step takes the log-softmax of the logits, applies the processors to it, and adds the score of the beam. Of the `num_beams * vocabulary` candidates of a prompt, the compiled selection keeps the best `max(2, 1 + eos tokens) * num_beams`. On the host:
+
+    1. A candidate ends when its token is an eos token or when it is the last new token. The candidates that end among the first `num_beams` become finished hypotheses. The score of a hypothesis is its sum divided by its length to the power of `length_penalty`, and its length counts the eos token. A prompt keeps its best `num_beams` hypotheses.
+    2. The best `num_beams` candidates that do not end are the next beams. Each row takes the cache and the tokens of the row of its beam. The cache entries that the step did not write, such as the cross-attention cache, are the same for all beams of a prompt, so they do not move.
+    3. A prompt stops when it cannot improve: it has `num_beams` hypotheses, and its best beam divided by the best length to the power of `length_penalty` scores less than the worst hypothesis. The best length is the length now, or the longest length for `early_stopping: :never` with a positive `length_penalty`. With `early_stopping: true`, a prompt stops when it has `num_beams` hypotheses. A stopped prompt has padding rows until all prompts stop.
+
+  The result of a prompt is its best hypothesis. The scores are f32 as in transformers. Removed tokens have the smallest finite value in place of an infinite one, and a score never goes below it.
 
   ## Batches
 
@@ -76,6 +88,7 @@ defmodule Transmuter.Generation do
 
     max_new_tokens = opts[:max_new_tokens] || gen["max_new_tokens"] || @default_max_new_tokens
     eos = List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"])
+    sampling? = Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling
 
     %{
       model: model,
@@ -84,15 +97,26 @@ defmodule Transmuter.Generation do
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
       max_new_tokens: max_new_tokens,
-      sampling?: Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling,
+      sampling?: sampling?,
       temperature: opts[:temperature] || gen["temperature"] || 1.0,
       top_k: opts[:top_k] || gen["top_k"] || 50,
       top_p: opts[:top_p] || gen["top_p"] || 1.0,
       repetition_penalty: opts[:repetition_penalty] || gen["repetition_penalty"] || 1.0,
+      renormalize?: gen["renormalize_logits"] == true,
       masks: masks(gen),
       eos: eos,
       bos: gen["bos_token_id"] || repo.config["bos_token_id"],
       processors: processors(gen, opts, max_new_tokens, eos)
+    }
+    |> Map.merge(beam_search(gen, opts, sampling?))
+  end
+
+  # The settings of beam search. An option replaces the value of generation_config.json.
+  defp beam_search(gen, opts, sampling?) do
+    %{
+      num_beams: num_beams(opts[:num_beams] || gen["num_beams"] || 1, sampling?, opts[:stream]),
+      length_penalty: opts[:length_penalty] || gen["length_penalty"] || 1.0,
+      early_stopping: early_stopping(Keyword.get(opts, :early_stopping, gen["early_stopping"]))
     }
   end
 
@@ -119,8 +143,43 @@ defmodule Transmuter.Generation do
     end
   end
 
+  defp num_beams(num_beams, _sampling?, _stream?) when not is_integer(num_beams) or num_beams < 1,
+    do:
+      raise(
+        ArgumentError,
+        "expected :num_beams to be a positive integer, got: #{inspect(num_beams)}"
+      )
+
+  defp num_beams(num_beams, true, _stream?) when num_beams > 1,
+    do: raise(ArgumentError, "beam search takes strategy: :greedy, got strategy: :sampling")
+
+  defp num_beams(num_beams, _sampling?, true) when num_beams > 1,
+    do:
+      raise(ArgumentError, "beam search changes earlier tokens, so it does not take stream: true")
+
+  defp num_beams(num_beams, _sampling?, _stream?), do: num_beams
+
+  defp early_stopping(value) when value in [nil, false], do: false
+  defp early_stopping(true), do: true
+  defp early_stopping(value) when value in [:never, "never"], do: :never
+
+  defp early_stopping(value),
+    do:
+      raise(
+        ArgumentError,
+        "expected :early_stopping to be true, false or :never, got: #{inspect(value)}"
+      )
+
   # The token ids of the masks of the processors :bad_words and :suppress_tokens.
   defp masks(gen) do
+    case Enum.reject(List.wrap(gen["bad_words_ids"]), &match?([_], &1)) do
+      [] ->
+        :ok
+
+      other ->
+        raise ArgumentError, "generation takes bad_words_ids of one token, got: #{inspect(other)}"
+    end
+
     %{
       bad_words: for([id] <- List.wrap(gen["bad_words_ids"]), do: id),
       suppress_tokens: List.wrap(gen["suppress_tokens"])
@@ -288,10 +347,11 @@ defmodule Transmuter.Generation do
   end
 
   @doc """
-  Compiles the model and the token selection of `ctx` for batches of `batch_size` rows. Call this function in the serving process, which owns the cache of compiled shapes.
+  Compiles the model and the token selection of `ctx` for batches of `batch_size` prompts. With beam search, the decoder runs `batch_size * num_beams` rows. Call this function in the serving process, which owns the cache of compiled shapes.
   """
   def compile(ctx, batch_size, defn_options) do
     ctx = Map.put(ctx, :backend, Nx.Defn.to_backend(defn_options))
+    batch_size = batch_size * ctx.num_beams
 
     # The first step of :grow takes the branch without cache, so each value of the static
     # inputs has a function. The inputs that the caller gives have their declared dimensions,
@@ -329,7 +389,9 @@ defmodule Transmuter.Generation do
 
     settings =
       ctx
-      |> Map.take([:repetition_penalty, :sampling?, :temperature, :top_k, :top_p])
+      |> Map.take([:repetition_penalty, :renormalize?, :sampling?, :temperature, :top_k, :top_p])
+      |> Map.put(:num_beams, ctx.num_beams)
+      |> Map.put(:candidates, candidates(ctx))
       |> Map.put(
         :processes,
         Enum.map(ctx.processors, fn
@@ -343,8 +405,18 @@ defmodule Transmuter.Generation do
       :select,
       Nx.Defn.jit(&select_tokens(&1, &2, &3, &4, &5, &6, &7, settings), defn_options)
     )
+    |> Map.put(
+      :select_beams,
+      Nx.Defn.jit(&select_beams(&1, &2, &3, &4, &5, &6, settings), defn_options)
+    )
     |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
+    |> Map.put(:reorder, Nx.Defn.jit(&reorder_rows/2, defn_options))
   end
+
+  # _beam_search of transformers keeps the best candidates of each prompt: num_beams for each
+  # eos token and num_beams more, at least 2 * num_beams. So num_beams of the candidates do
+  # not end, even when each beam gives each eos token.
+  defp candidates(ctx), do: max(2, 1 + length(ctx.eos)) * ctx.num_beams
 
   # A prompt runs in chunks of each power of two up to 2^30, see chunks/1.
   @chunk_sizes 31
@@ -418,12 +490,16 @@ defmodule Transmuter.Generation do
 
     ids =
       for prompts <- groups(ctx, prompts) do
-        notify = &notify(on_token, prompts, &1)
+        if ctx.num_beams == 1 do
+          notify = &notify(on_token, prompts, &1)
 
-        group =
-          decode(ctx, start(ctx, prompts, seeds, inputs, extras), ctx.max_new_tokens, notify)
+          group =
+            decode(ctx, start(ctx, prompts, seeds, inputs, extras), ctx.max_new_tokens, notify)
 
-        Enum.map(group.ids, &Enum.reverse/1)
+          Enum.map(group.ids, &Enum.reverse/1)
+        else
+          search(ctx, prompts, seeds, inputs, extras)
+        end
       end
 
     Enum.zip_with([Enum.map(prompts, fn _ -> [] end) | ids], &Enum.concat/1)
@@ -495,18 +571,9 @@ defmodule Transmuter.Generation do
 
   defp select(ctx, group, remaining) do
     %{logits: logits, index: index} = group.state
-    vocab = Nx.axis_size(logits, -1)
-    rows = Enum.zip_with(group.prompts, group.ids, &%{prompt: &1, generated: &2, vocab: vocab})
-
-    states =
-      for {state, _process} <- ctx.processors do
-        rows |> Enum.map(state) |> Nx.stack()
-      end
-
+    states = processor_states(ctx, group, Nx.axis_size(logits, -1))
     step = Nx.tensor(ctx.max_new_tokens - remaining, type: :u32, backend: Nx.BinaryBackend)
-
-    tokens =
-      ctx.select.(logits, index, group.seen, group.masks, List.to_tuple(states), group.keys, step)
+    tokens = ctx.select.(logits, index, group.seen, group.masks, states, group.keys, step)
 
     new =
       Enum.zip_with(Nx.to_flat_list(tokens), group.done, fn token, done? ->
@@ -522,6 +589,202 @@ defmodule Transmuter.Generation do
         done: Enum.map(new, &(&1 == nil or remaining == 1)),
         ids: Enum.zip_with(new, group.ids, &if(&1, do: [&1 | &2], else: &2))
     }
+  end
+
+  # Beam search as _beam_search of Python transformers 4.57. The rows of prompt `i` are
+  # `i * num_beams` to `i * num_beams + num_beams - 1`, and the inputs, the image features and
+  # the positions of the prompt repeat for each of them. Each step selects the best
+  # candidates of each prompt on the device, and the host keeps the beams, the finished
+  # hypotheses and their scores. Returns the token ids of the best hypothesis of each prompt.
+  defp search(ctx, prompts, seeds, inputs, extras) do
+    beams = ctx.num_beams
+    repeat = &Enum.flat_map(&1, fn value -> List.duplicate(value, beams) end)
+    index = Nx.tensor(repeat.(Enum.to_list(0..(length(prompts) - 1))), backend: Nx.BinaryBackend)
+    inputs = Map.new(inputs, fn {name, tensor} -> {name, Nx.take(tensor, index)} end)
+    extras = %{extras | cursors: repeat.(extras.cursors), positions: repeat.(extras.positions)}
+    group = start(ctx, repeat.(prompts), repeat.(seeds), inputs, extras)
+
+    # The first beam of each prompt starts at 0 and the others at -1e9, so the first step
+    # selects only from the first beam.
+    scores = Enum.flat_map(prompts, fn _ -> [0.0 | List.duplicate(-1.0e9, beams - 1)] end)
+    items = Enum.map(prompts, &%{finished: [], open?: true, done?: &1 == []})
+
+    %{items: items} = search_steps(ctx, group, items, scores, 0)
+
+    for item <- items do
+      case item.finished do
+        [] -> []
+        [{_score, ids} | _] -> Enum.reverse(ids)
+      end
+    end
+  end
+
+  defp search_steps(ctx, group, items, scores, step) do
+    %{logits: logits, index: index} = group.state
+    vocab = Nx.axis_size(logits, -1)
+
+    if ctx.num_beams * vocab > 2 ** 24 do
+      raise ArgumentError,
+            "beam search takes num_beams * vocabulary size up to 2^24, got: #{ctx.num_beams * vocab}"
+    end
+
+    states = processor_states(ctx, group, vocab)
+    scores_tensor = Nx.tensor(scores, type: :f32, backend: Nx.BinaryBackend)
+
+    candidates =
+      ctx.select_beams.(logits, index, group.seen, group.masks, states, scores_tensor)
+      |> Nx.to_list()
+
+    {items, beams} =
+      items
+      |> Enum.zip(candidates)
+      |> Enum.with_index()
+      |> Enum.map(fn {{item, [values, indices]}, i} ->
+        rows = Enum.to_list((i * ctx.num_beams)..(i * ctx.num_beams + ctx.num_beams - 1))
+
+        if item.done? do
+          {item, Enum.map(rows, &{&1, nil, 0.0})}
+        else
+          candidates =
+            Enum.zip_with(values, indices, fn score, flat ->
+              flat = trunc(flat)
+              %{score: score, row: hd(rows) + div(flat, vocab), token: rem(flat, vocab)}
+            end)
+
+          beam_step(ctx, item, rows, candidates, group.ids, step)
+        end
+      end)
+      |> Enum.unzip()
+
+    if Enum.all?(items, & &1.done?) do
+      %{items: items}
+    else
+      beams = Enum.concat(beams)
+      sources = Enum.map(beams, &elem(&1, 0))
+      group = reorder(ctx, group, sources)
+      new = Enum.map(beams, &elem(&1, 1))
+      marks = for {token, i} <- Enum.with_index(new), token, do: [i, token]
+
+      group = %{
+        group
+        | seen: mark(group.seen, marks),
+          ids: Enum.zip_with(new, group.ids, &if(&1, do: [&1 | &2], else: &2))
+      }
+
+      group = %{group | state: step(ctx, group.state, Enum.map(new, &List.wrap/1))}
+      search_steps(ctx, group, items, Enum.map(beams, &elem(&1, 2)), step + 1)
+    end
+  end
+
+  # One step of a prompt with its candidates, best first. The best candidates that do not end
+  # are the next beams. The candidates that end among the first num_beams are finished
+  # hypotheses, scored by their sum of log-probabilities over their length (with the eos
+  # token) to the power of length_penalty. The prompt keeps its best num_beams hypotheses.
+  # Returns the item and, for each row of the prompt, its source row, its token and its score.
+  defp beam_step(ctx, item, rows, candidates, ids, step) do
+    %{num_beams: beams, length_penalty: penalty, early_stopping: early_stopping} = ctx
+    last? = step + 1 == ctx.max_new_tokens
+    candidates = Enum.map(candidates, &Map.put(&1, :end?, last? or &1.token in ctx.eos))
+
+    added =
+      if item.open? and not (early_stopping == true and length(item.finished) == beams) do
+        for candidate <- Enum.take(candidates, beams), candidate.end? do
+          ids = Enum.at(ids, candidate.row)
+          ids = if candidate.token in ctx.eos, do: ids, else: [candidate.token | ids]
+          {f32(candidate.score / f32((step + 1) ** penalty)), ids}
+        end
+      else
+        []
+      end
+
+    finished = (item.finished ++ added) |> Enum.sort_by(&elem(&1, 0), :desc) |> Enum.take(beams)
+    running = candidates |> Enum.reject(& &1.end?) |> Enum.take(beams)
+
+    # _check_early_stop_heuristic: the prompt can improve while it has fewer than num_beams
+    # finished hypotheses, or while its best beam at the best length scores more than the
+    # worst finished hypothesis. The best length is the longest one for "never" with a
+    # positive length_penalty, else the length now.
+    best_length =
+      if early_stopping == :never and penalty > 0, do: ctx.max_new_tokens, else: step + 1
+
+    open? =
+      item.open? and not last? and
+        (length(finished) < beams or
+           f32(hd(running).score / f32(best_length ** penalty)) >
+             finished |> Enum.map(&elem(&1, 0)) |> Enum.min())
+
+    done? = not open? or (early_stopping == true and length(finished) == beams)
+    item = %{item | finished: finished, open?: open?, done?: done?}
+
+    if done?,
+      do: {item, Enum.map(rows, &{&1, nil, 0.0})},
+      else: {item, Enum.map(running, &{&1.row, &1.token, &1.score})}
+  end
+
+  # The state of each processor for the rows of the group.
+  defp processor_states(ctx, group, vocab) do
+    rows = Enum.zip_with(group.prompts, group.ids, &%{prompt: &1, generated: &2, vocab: vocab})
+
+    states =
+      for {state, _process} <- ctx.processors do
+        rows |> Enum.map(state) |> Nx.stack()
+      end
+
+    List.to_tuple(states)
+  end
+
+  # Gives each row the cache, the tokens and the other state of its source row. The cache
+  # entries that the last step did not write, such as the cross-attention cache, are the same
+  # for all beams of a prompt, so they keep their rows.
+  defp reorder(ctx, group, sources) do
+    if sources == Enum.to_list(0..(length(sources) - 1)) do
+      group
+    else
+      take = fn list -> Enum.map(sources, &Enum.at(list, &1)) end
+      %{state: state} = group
+      index = Nx.tensor(sources, type: :s32, backend: Nx.BinaryBackend)
+      cache = Map.merge(state.cache, ctx.reorder.(Map.take(state.cache, state.written), index))
+
+      state = %{
+        state
+        | cache: cache,
+          cursors: take.(state.cursors),
+          positions: take.(state.positions),
+          lengths: take.(state.lengths)
+      }
+
+      %{
+        group
+        | state: state,
+          prompts: take.(group.prompts),
+          ids: take.(group.ids),
+          seen: take_rows(group.seen, sources)
+      }
+    end
+  end
+
+  defp reorder_rows(cache, index),
+    do: Map.new(cache, fn {name, tensor} -> {name, Nx.take(tensor, index)} end)
+
+  # The rows of a mask of tokens on the host, from its binary.
+  defp take_rows(tensor, sources) do
+    {_rows, width} = Nx.shape(tensor)
+    binary = Nx.to_binary(tensor)
+
+    sources
+    |> Enum.map(&binary_part(binary, &1 * width, width))
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(:u8, backend: Nx.BinaryBackend)
+    |> Nx.reshape(Nx.shape(tensor))
+  end
+
+  @min_f32 Nx.to_number(Nx.Constants.min_finite(:f32, backend: Nx.BinaryBackend))
+
+  # The scores of transformers are f32, so each division rounds to f32 as torch does, and a
+  # score below the f32 range stays at its lowest value.
+  defp f32(value) do
+    <<rounded::float-32>> = <<max(value, @min_f32)::float-32>>
+    rounded
   end
 
   # The rows of other groups have no token and are not finished.
@@ -594,6 +857,7 @@ defmodule Transmuter.Generation do
 
     %{
       cache: cache,
+      written: [],
       inputs: %{},
       features: nil,
       cursors: List.duplicate(0, batch_size),
@@ -646,6 +910,7 @@ defmodule Transmuter.Generation do
     %{
       state
       | cache: Map.merge(state.cache, present),
+        written: Map.keys(present),
         lengths: lengths,
         logits: logits,
         index: index
@@ -782,7 +1047,23 @@ defmodule Transmuter.Generation do
   # context with the masks in their places, temperature, top-k, top-p. Removed tokens get the
   # smallest finite value, because EMLX 0.5 does not compile infinite constants.
   defp select_token(logits, seen, masks, states, key, settings) do
-    logits = Nx.as_type(logits, :f32)
+    logits = logits |> Nx.as_type(:f32) |> process(seen, masks, states, settings)
+
+    if settings.sampling? do
+      logits
+      |> Nx.divide(settings.temperature)
+      |> top_k(settings.top_k)
+      |> top_p(settings.top_p)
+      |> sample(key)
+    else
+      Nx.argmax(logits)
+    end
+  end
+
+  # The processors before the temperature: the repetition penalty, the processors of the
+  # context with the masks in their places, and the log-softmax of renormalize_logits, which
+  # changes the scores of beam search but not the token of greedy or sampling selection.
+  defp process(logits, seen, masks, states, settings) do
     penalty = settings.repetition_penalty
 
     penalized =
@@ -796,15 +1077,35 @@ defmodule Transmuter.Generation do
         process, {logits, [state | states]} -> {process.(logits, state), states}
       end)
 
-    if settings.sampling? do
+    if settings.renormalize?, do: log_softmax(logits), else: logits
+  end
+
+  defp log_softmax(logits), do: Nx.subtract(logits, Nx.logsumexp(logits))
+
+  # The candidates of beam search for each prompt, as {prompts, 2, candidates}: their scores
+  # and their indices in the scores of all beams of the prompt (beam * vocabulary + token),
+  # as f32 in one output. The score of a candidate is the log-softmax of the logits after the
+  # processors, plus the score of its beam, as in _beam_search of transformers. Removed
+  # tokens of beams at -1e9 stay at the smallest finite value, so the sum is never infinite.
+  defp select_beams(logits, index, seen, masks, states, scores, settings) do
+    [logits, index, seen, scores | states] =
+      Enum.map([logits, index, seen, scores | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
+
+    scores =
       logits
-      |> Nx.divide(settings.temperature)
-      |> top_k(settings.top_k)
-      |> top_p(settings.top_p)
-      |> sample(key)
-    else
-      Nx.argmax(logits)
-    end
+      |> Nx.take(index)
+      |> Nx.as_type(:f32)
+      |> log_softmax()
+      |> process(seen, masks, states, settings)
+      |> Nx.add(scores)
+      |> Nx.max(Nx.Constants.min_finite(:f32))
+      |> Nx.devectorize(keep_names: false)
+
+    {rows, vocab} = Nx.shape(scores)
+    beams = settings.num_beams
+    scores = Nx.reshape(scores, {div(rows, beams), beams * vocab})
+    {values, indices} = Nx.top_k(scores, k: settings.candidates)
+    Nx.stack([values, Nx.as_type(indices, :f32)], axis: 1)
   end
 
   defp top_k(logits, k) when k > 0 and k < elem(logits.shape, 0) do

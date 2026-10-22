@@ -155,6 +155,10 @@ defmodule Transmuter.Text do
 
     * `:strategy` - `:greedy` or `:sampling`. The default is `:sampling` when `do_sample` in the configuration is `true`, else `:greedy`.
 
+    * `:num_beams` - the number of beams of beam search. The default is `num_beams` of the configuration, else `1`. As in Python transformers, `:strategy` does not change it, so a model with `num_beams: 4` in its configuration, such as Marian, runs 4 beams by default. Beam search takes `strategy: :greedy`, and it does not take `:stream`. The result is the best hypothesis. See `Transmuter.Generation`.
+
+    * `:length_penalty` and `:early_stopping` - the settings of beam search, as in Python transformers. The length of a hypothesis to the power of `:length_penalty` divides its score. `:early_stopping` is `true`, `false` or `:never`. The defaults are those of the configuration, else `1.0` and `false`.
+
     * `:temperature`, `:top_k`, `:top_p` and `:repetition_penalty` - as in Python transformers. The defaults are `1.0`, `50`, `1.0` and `1.0`.
 
     * `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id` and `:forced_eos_token_id` - as in Python transformers. `:min_length` counts the prompt and the new tokens, and `:min_new_tokens` counts only the new tokens. The n-grams include the prompt. The defaults are those of the configuration, else no processor. `Transmuter.Generation` tells how each one counts the tokens of a row.
@@ -202,7 +206,7 @@ defmodule Transmuter.Text do
 
   The input is a string, `%{text: string}` or a list of them. A map input can also have `:seed`. The result is `%{results: [%{text: text, token_summary: %{input: count, output: count, padding: count}}]}`. `padding` is the number of pad tokens that the source text gets.
 
-  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the exports of Xenova and onnx-community. The default variant is fp32. The settings come from `generation_config.json`, as in `generation/2`. The serving does not do beam search. It ignores `num_beams`.
+  The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the exports of Xenova and onnx-community. The default variant is fp32. The settings come from `generation_config.json`, as in `generation/2`, with beam search when the configuration has `num_beams`.
 
       serving = Transmuter.Text.text_to_text({:hf, "Xenova/t5-small"})
       Nx.Serving.run(serving, "translate English to German: The house is wonderful.")
@@ -214,7 +218,7 @@ defmodule Transmuter.Text do
 
     * `:max_new_tokens` - the maximum number of new tokens. The default is that of the `text2text-generation` pipeline of transformers (see `Transmuter.Generation.max_new_tokens/3`): 256 for T5, and `max_length` minus 1 for the start token when the configuration gives a `max_length` other than 20, such as 511 for Marian.
 
-    * `:strategy`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id`, `:forced_eos_token_id`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`. The prompt of the decoder is `decoder_start_token_id`, so `:min_length` counts it, and the forced bos token is the first new token.
+    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id`, `:forced_eos_token_id`, `:seed`, `:stream` and `:stream_done` - as in `generation/2`. The prompt of the decoder is `decoder_start_token_id`, so `:min_length` counts it, and the forced bos token is the first new token.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

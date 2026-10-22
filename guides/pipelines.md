@@ -191,6 +191,18 @@ The mode of the KV cache decides how the rows share the cache:
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 
+#### Beam search
+
+Set `:num_beams` to keep the best `n` sequences at each step and return the best one at the end:
+
+```elixir
+serving = Transmuter.Text.generation({:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, num_beams: 3)
+```
+
+The default is `num_beams` of `generation_config.json`, else 1, as in Python transformers. `:strategy` does not change it, so a model with `num_beams` in its configuration, such as Marian, runs beam search by default. Give `num_beams: 1` for greedy selection. `:length_penalty` and `:early_stopping` work as in Python transformers, and their defaults also come from the configuration. Beam search takes greedy selection, not sampling, and it does not stream, because a later step can change the earlier tokens of the best sequence.
+
+The beams of an input are rows of the batch, so the decoder compiles for `batch_size * num_beams` rows. The encoder of an encoder-decoder model runs once for each input. The text is the same as the `generate` function of Python transformers 4.57 with the same `num_beams`. All tasks that generate text take these options.
+
 ### Translation and other text-to-text tasks
 
 ```elixir
@@ -206,7 +218,7 @@ The serving runs an encoder-decoder model, such as T5 or Marian. The repository 
 
 T5 takes the task in the text, for example `"translate English to German: The house is wonderful."`. A Marian model translates one language pair, and its tokenizer encodes the text with `source.spm`, as `MarianTokenizer` of Python transformers.
 
-The settings of `generation_config.json` apply, as for `generation/2`. The serving does not do beam search, so it ignores `num_beams`. With `strategy: :greedy`, the text is the same as the `generate` function of transformers with `num_beams=1`.
+The settings of `generation_config.json` apply, as for `generation/2`. As in Python transformers, `num_beams` of the configuration gives beam search, so Marian runs 4 beams by default. The text is the same as the `generate` function of transformers with the same `num_beams`.
 
 ### Speech recognition
 

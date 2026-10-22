@@ -395,7 +395,8 @@ defmodule Transmuter.TextTest do
 
     # Marian encodes with source.spm. The vocabulary of tokenizer.json gives "▁Trans", "mut",
     # "er" for "Transmuter", and then the translation starts with "Transmuter läuft". The T5
-    # inputs run as one batch.
+    # inputs run as one batch. Marian has 4 beams in its generation_config.json, so the test
+    # gives num_beams: 1.
     for {repo, inputs, expected} <- [
           {"Xenova/t5-small",
            [
@@ -414,7 +415,8 @@ defmodule Transmuter.TextTest do
       serving =
         Transmuter.Text.text_to_text(
           {:hf, repo},
-          [strategy: :greedy, max_new_tokens: 64, compile: [batch_size: 2]] ++ @opts
+          [strategy: :greedy, num_beams: 1, max_new_tokens: 64, compile: [batch_size: 2]] ++
+            @opts
         )
 
       results = Nx.Serving.run(serving, inputs)
