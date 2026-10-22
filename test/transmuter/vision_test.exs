@@ -20,16 +20,20 @@ defmodule Transmuter.VisionTest do
 
   test "the featurizer gives the pixel values of the Pillow image processors" do
     # ViT resizes to 224x224 with bilinear. CLIP resizes the short side to 224 with bicubic
-    # and crops the center.
-    for {repo, expected, mean} <- [
-          {"Xenova/vit-base-patch16-224", [0.1137, 0.2941, -0.5608, 0.4902, -0.2863], 0.4666},
-          {"Xenova/clip-vit-base-patch32", [0.6165, -0.8516, 0.8519, -0.639, -0.4314], 0.8819}
+    # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic.
+    for {repo, {height, width}, expected, mean} <- [
+          {"Xenova/vit-base-patch16-224", {224, 224}, [0.1137, 0.2941, -0.5608, 0.4902, -0.2863],
+           0.4666},
+          {"Xenova/clip-vit-base-patch32", {224, 224}, [0.6165, -0.8516, 0.8519, -0.639, -0.4314],
+           0.8819},
+          {"onnx-community/depth-anything-v2-small", {392, 518},
+           [0.2967, -1.3179, 1.1934, 1.4269, 0.9055], 1.0595}
         ] do
       featurizer = Featurizer.load!({:hf, repo})
       values = Featurizer.process(featurizer, [@image], backend: @opts[:backend])
       values = Nx.backend_transfer(values, Nx.BinaryBackend)
 
-      assert Nx.shape(values) == {1, 3, 224, 224}
+      assert Nx.shape(values) == {1, 3, height, width}
 
       got =
         for [c, y, x] <- [[0, 0, 0], [1, 100, 37], [2, 223, 223], [0, 57, 190], [1, 150, 120]],
@@ -231,19 +235,23 @@ defmodule Transmuter.VisionTest do
     end
   end
 
-  test "the featurizer gives the sizes of the DETR and YOLOS image processors" do
+  test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
     # A long side over longest_edge gives the short side longest_edge times the aspect ratio,
     # rounded half to even: 1333 * 400 / 800 is 666.5. YOLOS rounds each side down to a
-    # multiple of 16.
+    # multiple of 16. DPT takes the scale nearer to 1 for both sides and rounds each side half
+    # to even to a multiple of 14: 35x518 keeps the scale 1, and 35 / 14 is 2.5.
     for {repo, expected} <- [
           {"Xenova/detr-resnet-50",
-           [{800, 1066}, {133, 1333}, {1333, 133}, {666, 1333}, {1066, 800}]},
-          {"Xenova/yolos-tiny", [{512, 672}, {128, 1328}, {1328, 128}, {512, 1024}, {672, 512}]}
+           [{800, 1066}, {133, 1333}, {1333, 133}, {666, 1333}, {1066, 800}, {90, 1333}]},
+          {"Xenova/yolos-tiny",
+           [{512, 672}, {128, 1328}, {1328, 128}, {512, 1024}, {672, 512}, {80, 1328}]},
+          {"onnx-community/depth-anything-v2-small",
+           [{392, 518}, {56, 518}, {518, 56}, {518, 1036}, {686, 518}, {28, 518}]}
         ] do
       featurizer = Featurizer.load!({:hf, repo})
 
       got =
-        for size <- [{240, 320}, {100, 1000}, {1000, 100}, {400, 800}, {800, 600}] do
+        for size <- [{240, 320}, {100, 1000}, {1000, 100}, {400, 800}, {800, 600}, {35, 518}] do
           image = Nx.broadcast(Nx.tensor(0, type: :u8), Tuple.insert_at(size, 2, 3))
           {1, 3, height, width} = Nx.shape(Featurizer.process(featurizer, [image], @opts))
           {height, width}
@@ -357,6 +365,48 @@ defmodule Transmuter.VisionTest do
       {:miss, position, shapes} -> [{position, shapes} | receive_misses()]
     after
       0 -> []
+    end
+  end
+
+  # The reference of Depth Anything V2 is the depth-estimation pipeline of transformers. The
+  # ONNX file of Xenova/depth-anything-small-hf gives a depth up to 0.9% away from its PyTorch
+  # model, so its reference is ONNX Runtime with the post-processing of the pipeline. Each row
+  # has predicted_depth and the 8-bit depth at (y, x) and their means. The 8-bit depth
+  # truncates, so a value can be one step away.
+  test "depth estimation matches the pipeline" do
+    points = [[0, 0], [100, 37], [57, 190], [150, 120], [239, 239]]
+
+    for {repo, wide, tall} <- [
+          {"onnx-community/depth-anything-v2-small",
+           {[2.3001, 2.576, 2.4813, 2.3204, 3.7449], 2.5175, [104, 123, 117, 105, 205], 119.047},
+           {[2.7954, 1.4816, 2.8761, 1.9743, 3.4688], 2.6133, [130, 34, 136, 70, 179], 116.8685}},
+          {"Xenova/depth-anything-small-hf",
+           {[7.5774, 10.0037, 8.7434, 9.9116, 14.4565], 9.8135, [81, 137, 108, 135, 240],
+            132.5709},
+           {[8.6462, 5.4587, 11.3492, 7.6599, 12.2932], 8.9703, [112, 33, 178, 87, 201], 119.6214}}
+        ] do
+      serving = Vision.depth_estimation({:hf, repo}, @opts)
+      tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+      # A tensor and a StbImage give the same result.
+      [image, tensor, tall_result] =
+        Nx.Serving.run(serving, [@image, StbImage.to_nx(@image), tall_image])
+
+      assert image == tensor
+
+      for {result, size, {depth, mean, u8, u8_mean}} <- [
+            {image, {240, 320}, wide},
+            {tall_result, {320, 240}, tall}
+          ] do
+        assert {Nx.shape(result.predicted_depth), Nx.type(result.depth)} == {size, {:u, 8}}
+
+        for {point, d, u} <- Enum.zip([points, depth, u8]) do
+          assert_in_delta Nx.to_number(result.predicted_depth[point]), d, 1.0e-3 * d, repo
+          assert_in_delta Nx.to_number(result.depth[point]), u, 1, repo
+        end
+
+        assert_in_delta Nx.to_number(Nx.mean(result.predicted_depth)), mean, 1.0e-3 * mean
+        assert_in_delta Nx.to_number(Nx.mean(result.depth)), u8_mean, 0.01
+      end
     end
   end
 

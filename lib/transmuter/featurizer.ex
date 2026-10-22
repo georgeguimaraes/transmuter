@@ -12,7 +12,7 @@ defmodule Transmuter.Featurizer do
   The steps and their order are those of the image processors of Python transformers:
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
-    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. The DETR and YOLOS image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
+    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR and YOLOS image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
     3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
@@ -61,6 +61,7 @@ defmodule Transmuter.Featurizer do
     size = config_size(config["size"], crop != nil or is_number(config["crop_pct"]))
     {size, crop} = crop_pct(config["crop_pct"], size, crop)
     size = detr_size(config["image_processor_type"], size)
+    size = dpt_size(config, size)
 
     %__MODULE__{
       resize: if(Map.get(config, "do_resize", true), do: size),
@@ -105,6 +106,24 @@ defmodule Transmuter.Featurizer do
   end
 
   defp detr_size(_type, size), do: size
+
+  # As get_resize_output_image_size of the DPT image processor of Python transformers. Each
+  # side becomes a multiple of ensure_multiple_of. With keep_aspect_ratio, both sides take the
+  # scale that is nearer to 1, so the size depends on the image.
+  defp dpt_size(config, {height, width})
+       when is_map_key(config, "keep_aspect_ratio") or is_map_key(config, "ensure_multiple_of") do
+    if config["do_pad"],
+      do:
+        raise(ArgumentError, "the featurizer does not support do_pad of preprocessor_config.json")
+
+    multiple = config["ensure_multiple_of"] || 1
+
+    if config["keep_aspect_ratio"],
+      do: {:dpt, height, width, multiple},
+      else: {multiple_of(height, multiple), multiple_of(width, multiple)}
+  end
+
+  defp dpt_size(_config, size), do: size
 
   defp mean_std(%{"image_mean" => mean, "image_std" => std}) when is_list(mean) and is_list(std),
     do: {mean, std}
@@ -223,7 +242,18 @@ defmodule Transmuter.Featurizer do
     {out_height - rem(out_height, multiple), out_width - rem(out_width, multiple)}
   end
 
+  defp output_size({:dpt, out_height, out_width, multiple}, {height, width}) do
+    {scale_height, scale_width} = {out_height / height, out_width / width}
+
+    scale =
+      if abs(1 - scale_width) < abs(1 - scale_height), do: scale_width, else: scale_height
+
+    {multiple_of(scale * height, multiple), multiple_of(scale * width, multiple)}
+  end
+
   defp output_size(size, _image_size), do: size
+
+  defp multiple_of(value, multiple), do: round_even(value / multiple) * multiple
 
   defp round_even(x) do
     floor = Float.floor(x)

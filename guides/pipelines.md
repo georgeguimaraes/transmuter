@@ -269,8 +269,9 @@ image = StbImage.read_file!("cats.jpg")
 | `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
 | `image_text_to_text/2` | `%{messages: messages}` with image parts | `%{results: [%{text: text, token_summary: summary}]}` |
 | `object_detection/2` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
+| `depth_estimation/2` | image | `%{predicted_depth: tensor, depth: tensor}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away.
 
 ### Image preprocessing
 
@@ -335,6 +336,20 @@ The serving runs DETR, YOLOS, RT-DETR and RF-DETR exports, such as `Xenova/detr-
 `model_type` in `config.json` selects the scores. DETR and YOLOS take the softmax over the classes, without the last class, which is "no object". Each query gives one detection, in the order of the queries. RT-DETR and RF-DETR take a sigmoid of each pair of a query and a class, and keep the `:top_k` pairs with the highest scores. The default `:top_k` is the number of queries.
 
 DETR and YOLOS resize the short side to `shortest_edge`, so each image has its own size. The serving runs each image alone, and the model compiles each new image size on its first call. Use `batch_size: 1` with these models. RF-DETR resizes each image to 384x384, so its images go into batches.
+
+### Depth estimation
+
+```elixir
+serving = Transmuter.Vision.depth_estimation({:hf, "onnx-community/depth-anything-v2-small"})
+Nx.Serving.run(serving, image)
+#=> %{predicted_depth: #Nx.Tensor<f32[240][320]>, depth: #Nx.Tensor<u8[240][320]>}
+```
+
+The serving runs Depth Anything exports, such as `onnx-community/depth-anything-v2-small` and `Xenova/depth-anything-small-hf`. `predicted_depth` is the output of the model, resized to the size of the image with the bicubic interpolation of PyTorch, as in the `depth-estimation` pipeline of Python transformers. `depth` is the same map as an 8-bit gray image: the nearest pixel is 255 and the farthest pixel is 0.
+
+The DPT image processor keeps the aspect ratio and makes each side a multiple of 14, so a 320x240 image gives pixel values of 518x392. The size depends on the image, so the serving runs each image alone, and the model compiles each new image size on its first call.
+
+The ONNX file of `Xenova/depth-anything-small-hf` gives a depth up to 0.9% away from its PyTorch model, also in ONNX Runtime. Transmuter gives the depth of ONNX Runtime.
 
 ### Image-text-to-text
 

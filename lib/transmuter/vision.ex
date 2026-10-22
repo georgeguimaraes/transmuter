@@ -122,6 +122,27 @@ defmodule Transmuter.Vision do
   defdelegate object_detection(source, opts \\ []), to: Transmuter.Vision.ObjectDetection
 
   @doc """
+  Builds a serving that estimates the depth of each pixel of an image, such as Depth Anything.
+
+  The input is an image or a list of images. The result is `%{predicted_depth: tensor, depth: tensor}`, as the `depth-estimation` pipeline of Python transformers gives. Both tensors have the shape `{height, width}` of the input image.
+
+      serving = Transmuter.Vision.depth_estimation({:hf, "onnx-community/depth-anything-v2-small"})
+      Nx.Serving.run(serving, image)
+      #=> %{predicted_depth: #Nx.Tensor<f32[240][320]>, depth: #Nx.Tensor<u8[240][320]>}
+
+  `predicted_depth` is the output of the model, resized to the image with the bicubic `torch.nn.functional.interpolate` of Python transformers (see `Transmuter.Serving.interpolate/3`). Depth Anything gives a relative depth, which is larger for nearer pixels. `depth` is an image of 8 bits: the minimum of `predicted_depth` is 0 and the maximum is 255.
+
+  The featurizer resizes the image as the DPT image processor of Python transformers. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, and each side becomes the nearest multiple of `ensure_multiple_of`. So the size of the pixel values depends on the image, and the model compiles each new image size on its first call.
+
+  ## Options
+
+    * `:compile` - `:batch_size` must be `1`, the default. The depth map has the size of the image, so each image is a batch of its own.
+
+  See the module documentation for the other options.
+  """
+  defdelegate depth_estimation(source, opts \\ []), to: Transmuter.Vision.DepthEstimation
+
+  @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.

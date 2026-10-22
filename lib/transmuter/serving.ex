@@ -12,6 +12,8 @@ defmodule Transmuter.Serving do
   @behaviour Nx.Serving
 
   alias Transmuter.{Featurizer, Generation, Repo, Shared, Tokenizer}
+  alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Ops.NN
 
   @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
 
@@ -127,7 +129,7 @@ defmodule Transmuter.Serving do
     size = Featurizer.size(featurizer)
     batch_size = image_batch_size!(size, compile[:batch_size])
     key = {:image_size, size}
-    {height, width} = size || Featurizer.image_size(featurizer, @nominal_size)
+    {height, width} = compile_size(featurizer)
     template = image_inputs(model, zeros({batch_size, 3, height, width}, :f32))
     backend = opts[:backend] || Nx.default_backend()
 
@@ -158,6 +160,12 @@ defmodule Transmuter.Serving do
 
     new(model, opts, shapes, preprocess, fun, postprocess, validate)
   end
+
+  @doc """
+  Returns the `{height, width}` of the images that a serving of `featurizer` compiles when it starts: the size of the featurizer, or else the size that it gives for a 640x480 image.
+  """
+  def compile_size(featurizer),
+    do: Featurizer.size(featurizer) || Featurizer.image_size(featurizer, @nominal_size)
 
   defp image_batch_size!(nil, batch_size) when batch_size != 1,
     do:
@@ -653,6 +661,33 @@ defmodule Transmuter.Serving do
   def softmax(logits) do
     exp = Nx.exp(Nx.subtract(logits, Nx.reduce_max(logits, axes: [-1], keep_axes: true)))
     Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+  end
+
+  @interpolations %{bilinear: "linear", bicubic: "cubic"}
+
+  @doc """
+  Resizes the last two axes of `tensor` to `{height, width}` as `torch.nn.functional.interpolate` with `align_corners=False` and without antialias, which the post-processing of Python transformers uses. `mode` is `:bilinear` or `:bicubic`, whose cubic coefficient is -0.75 as in PyTorch.
+
+  The resize is the ONNX `Resize` operator with the `pytorch_half_pixel` coordinates. `Transmuter.Featurizer.resize/3` gives the pixels of Pillow, whose filters widen when the image gets smaller. This filter does not widen.
+  """
+  def interpolate(tensor, {height, width}, mode) do
+    node = %NodeProto{
+      op_type: "Resize",
+      attribute: [
+        %AttributeProto{name: "mode", type: :STRING, s: Map.fetch!(@interpolations, mode)},
+        %AttributeProto{
+          name: "coordinate_transformation_mode",
+          type: :STRING,
+          s: "pytorch_half_pixel"
+        },
+        %AttributeProto{name: "cubic_coeff_a", type: :FLOAT, f: -0.75},
+        %AttributeProto{name: "axes", type: :INTS, ints: [-2, -1]}
+      ]
+    }
+
+    sizes = Nx.tensor([height, width], type: :s64, backend: Nx.BinaryBackend)
+    [resized] = NN.apply(node, [tensor, {:empty, {0}}, {:empty, {0}}, sizes])
+    resized
   end
 
   @doc """

@@ -336,11 +336,43 @@ for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
         result = processor.post_process_object_detection(outputs, threshold=0.5, target_sizes=[(picture.height, picture.width)])[0]
         print(repo, name, tuple(inputs["pixel_values"].shape), [(model.config.id2label[int(label)], round(float(score), 6), [round(float(x), 4) for x in box]) for score, label, box in zip(result["scores"], result["labels"], result["boxes"])])
 
-# The resized sizes of DETR and YOLOS. A long side over longest_edge gives the short side
-# longest_edge times the aspect ratio, rounded half to even: 1333 * 400 / 800 is 666.5.
-for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny"]:
+# The resized sizes of DETR, YOLOS and DPT. A long side over longest_edge gives the short side
+# longest_edge times the aspect ratio, rounded half to even: 1333 * 400 / 800 is 666.5. DPT
+# also rounds half to even: the 35x518 image keeps the scale 1, and 35 / 14 is 2.5.
+for repo in ["facebook/detr-resnet-50", "hustvl/yolos-tiny", "onnx-community/depth-anything-v2-small"]:
     processor = AutoImageProcessor.from_pretrained(repo, use_fast=False)
-    print(repo, "sizes", [tuple(processor(Image.new("RGB", (width, height)), return_tensors="np")["pixel_values"].shape[2:]) for height, width in [(240, 320), (100, 1000), (1000, 100), (400, 800), (800, 600)]])
+    print(repo, "sizes", [tuple(processor(Image.new("RGB", (width, height)), return_tensors="np")["pixel_values"].shape[2:]) for height, width in [(240, 320), (100, 1000), (1000, 100), (400, 800), (800, 600), (35, 518)]])
+
+# Depth estimation: the slow DPT image processor and the depth-estimation pipeline, on the wide
+# and the tall image. The script prints pixel_values[0] of the wide image at (channel, y, x)
+# and the mean of the absolute values, then predicted_depth and the 8-bit depth at (y, x) and
+# their means. The ONNX file of onnx-community/depth-anything-v2-small gives the depth of
+# the PyTorch model within 2e-5. The ONNX file of Xenova/depth-anything-small-hf gives a
+# depth up to 0.9% away from LiheYoung/depth-anything-small-hf, so its reference is ONNX Runtime
+# with the post-processing of the pipeline: a bicubic resize to the image, then the scale to
+# 8 bits with the minimum and the maximum.
+from transformers import AutoModelForDepthEstimation
+
+image = Image.open("test/fixtures/cats.png")
+processor = AutoImageProcessor.from_pretrained("onnx-community/depth-anything-v2-small", use_fast=False)
+values = processor(image, return_tensors="np")["pixel_values"][0]
+print("dpt pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+
+
+def print_depth(name, depth, u8):
+    points = [(0, 0), (100, 37), (57, 190), (150, 120), (239, 239)]
+    print(name, depth.shape, [round(float(depth[p]), 4) for p in points], round(float(depth.mean()), 4), [int(u8[p]) for p in points], round(float(u8.mean()), 4))
+
+
+estimate = pipeline("depth-estimation", model=AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf"), image_processor=processor, device="cpu")
+directory = snapshot_download("Xenova/depth-anything-small-hf", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
+    result = estimate(picture)
+    print_depth(f"depth-anything-v2-small {name}", result["predicted_depth"].numpy(), np.array(result["depth"]))
+    predicted = session.run(None, {"pixel_values": processor(picture, return_tensors="np")["pixel_values"]})[0]
+    depth = torch.nn.functional.interpolate(torch.from_numpy(predicted)[None], size=(picture.height, picture.width), mode="bicubic", align_corners=False).squeeze().numpy()
+    print_depth(f"depth-anything-small-hf onnxruntime {name}", depth, ((depth - depth.min()) / (depth.max() - depth.min()) * 255).astype("uint8"))
 
 # Text-to-speech without noise, as Transmuter.Audio.text_to_speech/2 with noise: false. VITS
 # runs with noise_scale and noise_scale_duration at 0. The decoder prenet of SpeechT5 applies
