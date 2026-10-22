@@ -5,7 +5,8 @@ defmodule Transmuter.HubTest do
   @moduletag :tmp_dir
 
   test "an error from the Hub raises and is not saved", %{tmp_dir: dir} do
-    assert_raise ArgumentError, ~r/gave status 401/, fn ->
+    # The Hub gives 404 with a token and 401 without one.
+    assert_raise ArgumentError, ~r/gave status 40[14]/, fn ->
       Transmuter.Hub.files({:hf, "Xenova/no-such-repository"}, cache_dir: dir)
     end
 
@@ -124,5 +125,91 @@ defmodule Transmuter.HubTest do
     assert [path] = Enum.uniq(paths)
     assert %{"model_type" => "bert"} = path |> File.read!() |> JSON.decode!()
     assert Path.wildcard(Path.join(dir, "**/*.part")) == []
+  end
+end
+
+defmodule Transmuter.HubEnvTest do
+  # The tests set environment variables and the default options of Req, which all processes
+  # read, so they run when no other test runs.
+  use ExUnit.Case, async: false
+
+  @moduletag :tmp_dir
+
+  @vars ~w(HF_TOKEN HUGGING_FACE_HUB_TOKEN HF_TOKEN_PATH HF_HOME XDG_CACHE_HOME
+           https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY)
+
+  setup %{tmp_dir: dir} do
+    env = Map.new(@vars, &{&1, System.get_env(&1)})
+    defaults = Req.default_options()
+
+    on_exit(fn ->
+      Req.default_options(defaults)
+
+      Enum.each(env, fn
+        {name, nil} -> System.delete_env(name)
+        {name, value} -> System.put_env(name, value)
+      end)
+    end)
+
+    Enum.each(@vars, &System.delete_env/1)
+    File.mkdir_p!(Path.join(dir, "hf"))
+    System.put_env("HF_HOME", Path.join(dir, "hf"))
+    Process.register(self(), __MODULE__)
+    Req.default_options(adapter: __MODULE__.Adapter)
+    :ok
+  end
+
+  defmodule Adapter do
+    # Gives the metadata of an empty repository, so no request leaves the test.
+    def run(request) do
+      send(Transmuter.HubEnvTest, {:request, request})
+      {request, Req.Response.new(status: 200, body: %{"sha" => "0", "siblings" => []})}
+    end
+  end
+
+  defp request(env, dir) do
+    System.put_env(env)
+    Transmuter.Hub.info({:hf, "a/b"}, cache_dir: dir, refresh: true)
+    Enum.each(env, fn {name, _value} -> System.delete_env(name) end)
+    assert_received {:request, request}
+    request
+  end
+
+  test "the token comes from HF_TOKEN, else from the token file of hf auth login", %{
+    tmp_dir: dir
+  } do
+    File.write!(Path.join(dir, "hf/token"), " from-home\n")
+    File.write!(Path.join(dir, "other"), "from-path")
+
+    for {env, expected} <- [
+          {%{}, ["Bearer from-home"]},
+          {%{"HF_TOKEN_PATH" => Path.join(dir, "other")}, ["Bearer from-path"]},
+          {%{"HF_TOKEN" => "from-env"}, ["Bearer from-env"]},
+          {%{"HF_HOME" => Path.join(dir, "none")}, []}
+        ] do
+      assert Req.Request.get_header(request(env, dir), "authorization") == expected,
+             inspect(env)
+    end
+  end
+
+  test "the proxy comes from HTTPS_PROXY, except for the hosts of NO_PROXY", %{tmp_dir: dir} do
+    proxy = %{"HTTPS_PROXY" => "http://user:secret@proxy.test:3128"}
+
+    auth = [
+      proxy: {:http, "proxy.test", 3128, []},
+      proxy_headers: [{"proxy-authorization", "Basic " <> Base.encode64("user:secret")}]
+    ]
+
+    for {env, expected} <- [
+          {proxy, auth},
+          {Map.put(proxy, "NO_PROXY", "example.com, .huggingface.co"), nil},
+          {Map.put(proxy, "NO_PROXY", "example.com"), auth},
+          {%{"all_proxy" => "proxy.test:8080"},
+           [proxy: {:http, "proxy.test", 8080, []}, proxy_headers: []]},
+          # The lowercase variable wins, also when it is empty.
+          {Map.put(proxy, "https_proxy", ""), nil}
+        ] do
+      assert request(env, dir).options[:connect_options] == expected, inspect(env)
+    end
   end
 end

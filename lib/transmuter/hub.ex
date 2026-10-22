@@ -2,7 +2,19 @@ defmodule Transmuter.Hub do
   @moduledoc """
   Reads the files of a model repository on the Hugging Face Hub or in a local directory.
 
-  A source is `{:hf, repo}` or the path of a local directory. Hub files download into the cache directory and come from there later. When the metadata of the repository gives a new ETag for a file, the file downloads again. Each download must match its ETag. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option. Set the `HF_TOKEN` environment variable for private repositories.
+  A source is `{:hf, repo}` or the path of a local directory. Hub files download into the cache directory and come from there later. When the metadata of the repository gives a new ETag for a file, the file downloads again. Each download must match its ETag. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option.
+
+  ## Environment
+
+  This module reads these environment variables, as Python `huggingface_hub` does:
+
+  * `HF_TOKEN` (or the older `HUGGING_FACE_HUB_TOKEN`) - the token for private and gated repositories. Without it, the token comes from the file that `hf auth login` writes: `HF_TOKEN_PATH`, else `token` in `HF_HOME`, else `huggingface/token` in `XDG_CACHE_HOME`, else `~/.cache/huggingface/token`. A token from the browser login of `hf auth login` expires. Python `huggingface_hub` refreshes it in the token file when less than one day remains, on each command that reads the token, such as `hf auth whoami`. Transmuter only reads the file, so when the Hub gives status 401 for such a token, run `hf auth whoami`.
+
+  * `HTTPS_PROXY` (and `HTTP_PROXY` for an `http` URL), else `ALL_PROXY` - the HTTP or HTTPS proxy, such as `http://user:password@proxy:3128`. A lowercase name wins over the uppercase name.
+
+  * `NO_PROXY` - hosts that connect without the proxy, separated by commas. A host that ends with an entry connects directly, and `*` matches all hosts. The Hub redirects downloads to other hosts, such as `cas-bridge.xethub.hf.co`, and each host gets its own rule.
+
+  * `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` - see the `:offline` option.
 
   ## Options
 
@@ -125,7 +137,7 @@ defmodule Transmuter.Hub do
           {:ok, %{status: status, body: body}} ->
             raise ArgumentError,
                   "the Hugging Face Hub gave status #{status} for #{repo}: #{inspect(body)}. " <>
-                    "Set HF_TOKEN for a private or gated repository"
+                    "Set HF_TOKEN or run hf auth login for a private or gated repository"
 
           {:error, error} ->
             raise ArgumentError,
@@ -168,8 +180,11 @@ defmodule Transmuter.Hub do
           response =
             File.open!(part, [:write, :binary], fn device ->
               Req.get!(
-                "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
-                req_options(into: &write(device, file, hash, &1, &2), http_errors: :raise)
+                request(
+                  url: "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
+                  into: &write(device, file, hash, &1, &2),
+                  http_errors: :raise
+                )
               )
             end)
 
@@ -290,12 +305,98 @@ defmodule Transmuter.Hub do
 
   defp commit?(revision), do: is_binary(revision) and revision =~ ~r/\A[0-9a-f]{40}\z/
 
-  defp get(url), do: Req.get(url, req_options(retry: false))
+  defp get(url), do: Req.get(request(url: url, retry: false))
 
-  defp req_options(opts) do
-    headers =
-      if token = System.get_env("HF_TOKEN"), do: [authorization: "Bearer #{token}"], else: []
+  defp request(opts) do
+    headers = if token = token(), do: [authorization: "Bearer #{token}"], else: []
 
-    [headers: headers, receive_timeout: 600_000, redirect_log_level: false] ++ opts
+    [headers: headers, receive_timeout: 600_000, redirect_log_level: false]
+    |> Keyword.merge(opts)
+    |> Req.new()
+    |> Req.Request.append_request_steps(proxy: &proxy/1)
   end
+
+  # As in Python huggingface_hub: HF_TOKEN or HUGGING_FACE_HUB_TOKEN, else the file that
+  # `hf auth login` writes.
+  defp token do
+    env = Enum.find_value(["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"], &non_empty(System.get_env(&1)))
+
+    clean_token(env) ||
+      case File.read(token_path()) do
+        {:ok, token} -> clean_token(token)
+        {:error, _reason} -> nil
+      end
+  end
+
+  defp token_path do
+    home =
+      System.get_env("HF_HOME") ||
+        Path.join(
+          System.get_env("XDG_CACHE_HOME", Path.join(System.user_home!(), ".cache")),
+          "huggingface"
+        )
+
+    Path.expand(System.get_env("HF_TOKEN_PATH") || Path.join(home, "token"))
+  end
+
+  defp clean_token(nil), do: nil
+
+  defp clean_token(token),
+    do: token |> String.replace(["\r", "\n"], "") |> String.trim() |> non_empty()
+
+  # As in Python requests, the proxy of a URL comes from the <scheme>_proxy variable, else
+  # from all_proxy. A host that ends with an entry of no_proxy connects directly, and the
+  # entry * matches all hosts. The step runs again for each redirect, because a redirect can
+  # go to another host.
+  defp proxy(request) do
+    request = Req.Request.delete_option(request, :connect_options)
+    %URI{scheme: scheme, host: host} = request.url
+    proxy = proxy_env("#{scheme}_proxy") || proxy_env("all_proxy")
+
+    if proxy && not bypass?(host) do
+      uri = URI.parse(if proxy =~ "://", do: proxy, else: "http://" <> proxy)
+
+      scheme =
+        case uri.scheme do
+          "http" ->
+            :http
+
+          "https" ->
+            :https
+
+          other ->
+            raise ArgumentError, "Transmuter supports only HTTP and HTTPS proxies, got #{other}"
+        end
+
+      headers =
+        if uri.userinfo,
+          do: [{"proxy-authorization", "Basic " <> Base.encode64(URI.decode(uri.userinfo))}],
+          else: []
+
+      Req.Request.put_option(request, :connect_options,
+        proxy: {scheme, uri.host, uri.port, []},
+        proxy_headers: headers
+      )
+    else
+      request
+    end
+  end
+
+  defp bypass?(host) do
+    (proxy_env("no_proxy") || "")
+    |> String.replace(" ", "")
+    |> String.split(",", trim: true)
+    |> Enum.any?(&(&1 == "*" or String.ends_with?(host, String.trim_leading(&1, "."))))
+  end
+
+  # The lowercase variable wins over the uppercase one, also when it is empty.
+  defp proxy_env(name) do
+    case System.get_env(name) do
+      nil -> non_empty(System.get_env(String.upcase(name)))
+      value -> non_empty(value)
+    end
+  end
+
+  defp non_empty(value) when value in [nil, ""], do: nil
+  defp non_empty(value), do: value
 end
