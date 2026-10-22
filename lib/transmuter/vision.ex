@@ -143,6 +143,23 @@ defmodule Transmuter.Vision do
   defdelegate depth_estimation(source, opts \\ []), to: Transmuter.Vision.DepthEstimation
 
   @doc """
+  Builds a serving that gives the label of each pixel of an image, with a semantic segmentation model such as Segformer.
+
+  The input is an image or a list of images. The result is `%{segments: [%{label: label, score: nil, mask: tensor}]}`, as the `image-segmentation` pipeline of Python transformers gives for semantic segmentation. Each mask is a `:u8` tensor of shape `{height, width}` of the input image, with 255 for the pixels of its label and 0 for the other pixels.
+
+      serving = Transmuter.Vision.image_segmentation({:hf, "Xenova/segformer-b0-finetuned-ade-512-512"})
+      Nx.Serving.run(serving, image)
+      #=> %{segments: [%{label: "wall", score: nil, mask: #Nx.Tensor<u8[240][320]>}, ...]}
+
+  As `post_process_semantic_segmentation` of Python transformers, the logits of the model are resized to the image with the bilinear `torch.nn.functional.interpolate` (see `Transmuter.Serving.interpolate/3`), and each pixel gets the label with the highest logit. Each label that some pixel has gives one segment, in the order of the label ids. The labels come from `id2label` in `config.json`. Semantic segmentation gives no scores, so the score is `nil`.
+
+  The model must give `logits` of shape `{batch, labels, height, width}`. Panoptic and instance segmentation models, such as DETR and Mask2Former, give mask outputs, and the serving raises an `ArgumentError` for them. `do_reduce_labels` of `preprocessor_config.json` changes only the segmentation maps for training, so the featurizer does not use it.
+
+  See the module documentation for the options.
+  """
+  defdelegate image_segmentation(source, opts \\ []), to: Transmuter.Vision.ImageSegmentation
+
+  @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.

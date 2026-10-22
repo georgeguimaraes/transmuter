@@ -483,3 +483,27 @@ for name, samples in [("short", audio), ("cut", audio[:32000])]:
     scores = torch.from_numpy(session.run(None, {"input_values": values})[0][0]).softmax(-1)
     top = scores.topk(5)
     print("wav2vec2", name, [(id2label[i], round(s, 6)) for s, i in zip(top.values.tolist(), top.indices.tolist())])
+
+# Image segmentation: the slow Segformer image processor of the Xenova export and the
+# image-segmentation pipeline with the PyTorch model, on the wide and the tall image. The
+# script prints pixel_values[0] of the wide image at (channel, y, x) and the mean of the
+# absolute values, then the label and the pixel count of each segment. It writes the label
+# id of each pixel to test/fixtures/cats_segformer_wide.png and cats_segformer_tall.png. The
+# ONNX file gives the same label map in ONNX Runtime.
+from transformers import AutoModelForSemanticSegmentation
+
+image = Image.open("test/fixtures/cats.png")
+pictures = [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]
+processor = AutoImageProcessor.from_pretrained("Xenova/segformer-b0-finetuned-ade-512-512", use_fast=False)
+values = processor(image, return_tensors="np")["pixel_values"][0]
+print("segformer pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+model = AutoModelForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+segment = pipeline("image-segmentation", model=model, image_processor=processor, device="cpu")
+label2id = {label: i for i, label in model.config.id2label.items()}
+for name, picture in pictures:
+    segments = segment(picture)
+    labels = np.zeros((picture.height, picture.width), np.uint8)
+    for s in segments:
+        labels[np.array(s["mask"]) == 255] = label2id[s["label"]]
+    Image.fromarray(labels).save(f"test/fixtures/cats_segformer_{name}.png")
+    print("segformer", name, [(s["label"], s["score"], int((np.array(s["mask"]) == 255).sum())) for s in segments])

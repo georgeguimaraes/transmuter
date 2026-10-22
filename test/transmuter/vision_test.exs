@@ -20,14 +20,17 @@ defmodule Transmuter.VisionTest do
 
   test "the featurizer gives the pixel values of the Pillow image processors" do
     # ViT resizes to 224x224 with bilinear. CLIP resizes the short side to 224 with bicubic
-    # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic.
+    # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic. Segformer
+    # resizes to 512x512 with bilinear.
     for {repo, {height, width}, expected, mean} <- [
           {"Xenova/vit-base-patch16-224", {224, 224}, [0.1137, 0.2941, -0.5608, 0.4902, -0.2863],
            0.4666},
           {"Xenova/clip-vit-base-patch32", {224, 224}, [0.6165, -0.8516, 0.8519, -0.639, -0.4314],
            0.8819},
           {"onnx-community/depth-anything-v2-small", {392, 518},
-           [0.2967, -1.3179, 1.1934, 1.4269, 0.9055], 1.0595}
+           [0.2967, -1.3179, 1.1934, 1.4269, 0.9055], 1.0595},
+          {"Xenova/segformer-b0-finetuned-ade-512-512", {512, 512},
+           [0.2967, 1.6758, -1.8044, -0.902, 0.8704], 1.0497}
         ] do
       featurizer = Featurizer.load!({:hf, repo})
       values = Featurizer.process(featurizer, [@image], backend: @opts[:backend])
@@ -408,6 +411,53 @@ defmodule Transmuter.VisionTest do
         assert_in_delta Nx.to_number(Nx.mean(result.depth)), u8_mean, 0.01
       end
     end
+  end
+
+  # The reference is the image-segmentation pipeline of transformers. The fixtures have the
+  # label id of each pixel. The images have different sizes and go in one batch.
+  test "image segmentation matches the pipeline" do
+    repo = {:hf, "Xenova/segformer-b0-finetuned-ade-512-512"}
+    serving = Vision.image_segmentation(repo, [compile: [batch_size: 2]] ++ @opts)
+
+    # The panoptic DETR exports give logits, pred_boxes and pred_masks.
+    assert_raise ArgumentError, ~r/Panoptic and instance segmentation are not supported/, fn ->
+      model = %{outputs: ["logits", "pred_boxes", "pred_masks"]}
+      Vision.image_segmentation(repo, [model: model] ++ @opts)
+    end
+
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+    [wide_result, tall_result] = Nx.Serving.run(serving, [@image, tall])
+    assert Nx.Serving.run(serving, tall) == tall_result
+
+    %{"id2label" => id2label} = Transmuter.Repo.load!(repo).config
+
+    ids = Map.new(id2label, fn {id, label} -> {label, String.to_integer(id)} end)
+
+    for {result, name, labels} <- [
+          {wide_result, "wide", ~w(wall floor person sofa base box signboard ball)},
+          {tall_result, "tall",
+           ["wall", "floor", "bed ", "person", "table", "seat", "cushion", "box", "towel"] ++
+             ~w(plaything bag blanket)}
+        ] do
+      assert Enum.map(result.segments, & &1.label) == labels
+      expected = fixture("cats_segformer_#{name}.png")
+
+      got =
+        Enum.reduce(result.segments, Nx.broadcast(Nx.tensor(0, type: :u8), expected), fn
+          %{label: label, score: nil, mask: mask}, got ->
+            assert MapSet.new(Nx.to_flat_list(mask)) == MapSet.new([0, 255])
+            Nx.select(mask, ids[label], got)
+        end)
+
+      assert Nx.to_number(Nx.sum(Nx.not_equal(got, expected))) == 0, name
+    end
+  end
+
+  defp fixture(name) do
+    Path.expand("../fixtures/#{name}", __DIR__)
+    |> StbImage.read_file!()
+    |> StbImage.to_nx()
+    |> Nx.squeeze(axes: [2])
   end
 
   # Box coordinates can be near 0, so their tolerance is 1e-3 of the side of the image, 0.32
