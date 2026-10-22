@@ -20,7 +20,7 @@ defmodule Transmuter.Text do
 
     * `:variant` - the variant of the ONNX file, such as `:q4`. See `Transmuter.Repo`.
 
-    * `:cache_dir` - see `Transmuter.Hub`.
+    * `:cache_dir` and `:offline` - see `Transmuter.Hub`.
 
     * `:model` and `:tokenizer` - a model from `Transmuter.load!/2` and a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the files of the repository.
 

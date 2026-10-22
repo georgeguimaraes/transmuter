@@ -12,7 +12,7 @@ defmodule Transmuter.Audio do
 
   The tasks with text need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
 
-  The options `:defn_options`, `:backend`, `:compute_type`, `:variant`, `:cache_dir` and `:tokenizer` are the same as in `Transmuter.Text`. Use `backend: EMLX.Backend, defn_options: [compiler: EMLX]` on Apple silicon, because `Nx.BinaryBackend` is very slow.
+  The options `:defn_options`, `:backend`, `:compute_type`, `:variant`, `:cache_dir`, `:offline` and `:tokenizer` are the same as in `Transmuter.Text`. Use `backend: EMLX.Backend, defn_options: [compiler: EMLX]` on Apple silicon, because `Nx.BinaryBackend` is very slow.
   """
 
   @doc """

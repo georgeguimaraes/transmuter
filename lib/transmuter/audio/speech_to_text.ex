@@ -29,27 +29,29 @@ defmodule Transmuter.Audio.SpeechToText do
   @doc false
   def speech_to_text(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :variant,
-        :cache_dir,
-        :tokenizer,
-        :backend,
-        :compute_type,
-        :max_new_tokens,
-        :strategy,
-        :temperature,
-        :top_k,
-        :top_p,
-        :repetition_penalty,
-        :seed,
-        :language,
-        :chunk_num_seconds,
-        :context_num_seconds,
-        :timestamps,
-        task: :transcribe,
-        compile: [],
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :variant,
+          :tokenizer,
+          :backend,
+          :compute_type,
+          :max_new_tokens,
+          :strategy,
+          :temperature,
+          :top_k,
+          :top_p,
+          :repetition_penalty,
+          :seed,
+          :language,
+          :chunk_num_seconds,
+          :context_num_seconds,
+          :timestamps,
+          task: :transcribe,
+          compile: [],
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
 

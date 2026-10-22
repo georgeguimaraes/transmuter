@@ -5,30 +5,32 @@ defmodule Transmuter.Vision.ImageToText do
   The client turns each image into `pixel_values` with `Transmuter.Featurizer`, as the other image tasks do. The serving compiles the encoder for the batch size and the image size of the featurizer. The decoder generates from `decoder_start_token_id` and reads the output of the encoder (`encoder_hidden_states`) in each step.
   """
 
-  alias Transmuter.{Featurizer, Generation, Serving, Tokenizer}
+  alias Transmuter.{Featurizer, Generation, Hub, Serving, Tokenizer}
 
   @doc false
   def image_to_text(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :compile,
-        :variant,
-        :cache_dir,
-        :tokenizer,
-        :featurizer,
-        :backend,
-        :compute_type,
-        :max_new_tokens,
-        :strategy,
-        :temperature,
-        :top_k,
-        :top_p,
-        :repetition_penalty,
-        :seed,
-        stream: false,
-        stream_done: false,
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :compile,
+          :variant,
+          :tokenizer,
+          :featurizer,
+          :backend,
+          :compute_type,
+          :max_new_tokens,
+          :strategy,
+          :temperature,
+          :top_k,
+          :top_p,
+          :repetition_penalty,
+          :seed,
+          stream: false,
+          stream_done: false,
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
     compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)

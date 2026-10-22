@@ -19,28 +19,30 @@ defmodule Transmuter.Vision.ImageTextToText do
   @doc false
   def image_text_to_text(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :variant,
-        :cache_dir,
-        :tokenizer,
-        :backend,
-        :compute_type,
-        :max_new_tokens,
-        :strategy,
-        :temperature,
-        :top_k,
-        :top_p,
-        :repetition_penalty,
-        :seed,
-        :template_options,
-        stream: false,
-        stream_done: false,
-        compile: [],
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :variant,
+          :tokenizer,
+          :backend,
+          :compute_type,
+          :max_new_tokens,
+          :strategy,
+          :temperature,
+          :top_k,
+          :top_p,
+          :repetition_penalty,
+          :seed,
+          :template_options,
+          stream: false,
+          stream_done: false,
+          compile: [],
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
-    repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     model_opts = Keyword.take(opts, [:backend, :compute_type])
     vision = Repo.load_component!(repo, "vision_encoder", :q4, model_opts)
     embed = Repo.load_component!(repo, "embed_tokens", :q8, model_opts)

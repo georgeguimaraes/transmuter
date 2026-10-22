@@ -427,7 +427,7 @@ With `compile: [batch_size: n]`, chats go into one batch when the number of thei
 - `:compile`: `:batch_size` (the default is 1) and, for text, `:sequence_length`, an integer or a list of lengths (the default is `[32, 128, 512]`, limited to the maximum length of the model). The serving compiles the model for each length and pads each input to the smallest length that fits. Inputs longer than the largest length are truncated. Generation and speech-to-text use only `:batch_size`, and they do not truncate the prompt.
 - `:backend` and `:compute_type`: options of `Transmuter.load!/2`.
 - `:defn_options`: options of `Transmuter.compile/3`, such as `compiler: EMLX`.
-- `:variant` and `:cache_dir`: see above and `Transmuter.Hub`.
+- `:variant`, `:cache_dir` and `:offline`: see above and `Transmuter.Hub`.
 - `:model`, `:tokenizer` and `:featurizer`: a model, a tokenizer and a featurizer that you loaded yourself.
 
 ## Run a serving in your application

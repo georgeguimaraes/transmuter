@@ -43,7 +43,7 @@ defmodule Transmuter.Repo do
 
   A Hub source reads its file list from the Hub again, or from the cache when the Hub cannot be reached.
 
-  Options: `:cache_dir` (see `Transmuter.Hub`) and `:variant`.
+  Options: `:variant` and the options of `Transmuter.Hub`.
   """
   def load!(source, opts \\ []) do
     # One read of the file list per load, so files added to the repository are found.

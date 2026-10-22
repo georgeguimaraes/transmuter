@@ -44,8 +44,8 @@ defmodule Transmuter do
 
   ## Options
 
-    * `:cache_dir` (`t:String.t/0`) - the directory for Hub downloads.
-      The default is `~/.cache/transmuter`.
+    * `:cache_dir` and `:offline` - the options of `Transmuter.Hub` for Hub
+      files.
 
     * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params
       to this backend after loading. For example, `EMLX.Backend` or

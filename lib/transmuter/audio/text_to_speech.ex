@@ -31,19 +31,21 @@ defmodule Transmuter.Audio.TextToSpeech do
   @doc false
   def text_to_speech(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :variant,
-        :cache_dir,
-        :tokenizer,
-        :backend,
-        :compute_type,
-        :seed,
-        :speaker_embedding,
-        noise: true,
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :variant,
+          :tokenizer,
+          :backend,
+          :compute_type,
+          :seed,
+          :speaker_embedding,
+          noise: true,
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
-    repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     model_opts = Keyword.take(opts, [:backend, :compute_type, :noise])
 

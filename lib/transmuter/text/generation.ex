@@ -5,31 +5,33 @@ defmodule Transmuter.Text.Generation do
 
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
 
-  alias Transmuter.{ChatTemplate, Generation, Serving, Tokenizer}
+  alias Transmuter.{ChatTemplate, Generation, Hub, Serving, Tokenizer}
 
   @doc false
   def generation(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :variant,
-        :cache_dir,
-        :model,
-        :tokenizer,
-        :backend,
-        :compute_type,
-        :max_new_tokens,
-        :strategy,
-        :temperature,
-        :top_k,
-        :top_p,
-        :repetition_penalty,
-        :seed,
-        :template_options,
-        stream: false,
-        stream_done: false,
-        compile: [],
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :variant,
+          :model,
+          :tokenizer,
+          :backend,
+          :compute_type,
+          :max_new_tokens,
+          :strategy,
+          :temperature,
+          :top_k,
+          :top_p,
+          :repetition_penalty,
+          :seed,
+          :template_options,
+          stream: false,
+          stream_done: false,
+          compile: [],
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
     Keyword.validate!(opts[:compile], [:batch_size])
 

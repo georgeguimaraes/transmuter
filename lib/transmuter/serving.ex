@@ -12,11 +12,12 @@ defmodule Transmuter.Serving do
   @behaviour Nx.Serving
 
   alias Transmuter.Audio.Featurizer, as: AudioFeaturizer
-  alias Transmuter.{Featurizer, Generation, Repo, Shared, Tokenizer}
+  alias Transmuter.{Featurizer, Generation, Hub, Repo, Shared, Tokenizer}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
   alias Transmuter.Ops.NN
 
-  @options [:compile, :variant, :cache_dir, :model, :backend, :compute_type, defn_options: []]
+  @options [:compile, :variant, :model, :backend, :compute_type | Hub.options()] ++
+             [defn_options: []]
 
   # Nx.Serving runs each batch in a new process, whose heap starts small. A step of
   # generation allocates more than that, so the heap grows through many collections. A
@@ -56,7 +57,7 @@ defmodule Transmuter.Serving do
   Loads the repository of `source` and its model. The model is the first of `components` that the repository has, in the default variant `variant` of the task. The `:outputs` in `opts` go to `Transmuter.load!/2`, so the model gives only the outputs that the task reads.
   """
   def load_model!(source, opts, variant, components \\ ["model"]) do
-    repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     component = Enum.find(components, hd(components), &(Repo.variants(repo, &1) != []))
 
     model =
@@ -426,7 +427,7 @@ defmodule Transmuter.Serving do
   Loads the repository of `source`, its encoder (`encoder_model`) and its merged decoder (`decoder_model_merged`). The default variant is fp32. The encoder gives only `last_hidden_state`, and the decoder gives only the outputs of `Transmuter.Generation.outputs/1`.
   """
   def load_encoder_decoder!(source, opts) do
-    repo = Repo.load!(source, Keyword.take(opts, [:variant, :cache_dir]))
+    repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     model_opts = Keyword.take(opts, [:backend, :compute_type])
     encoder_opts = [outputs: ["last_hidden_state"]] ++ model_opts
     encoder = Repo.load_component!(repo, "encoder_model", :fp32, encoder_opts)

@@ -4,8 +4,23 @@ defmodule Transmuter.Hub do
 
   A source is `{:hf, repo}` or the path of a local directory. Hub files download once into the cache directory and come from there later. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option. Set the `HF_TOKEN` environment variable for private repositories.
 
+  ## Options
+
+  * `:cache_dir` - the directory for Hub downloads. The default is `~/.cache/transmuter`.
+
+  * `:offline` - when `true`, no request goes to the Hub. Files and metadata come only from the cache, and a file that is not in the cache raises. The default is `true` when the `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` environment variable is `1`, `ON`, `YES` or `TRUE`, as in Python, and `false` otherwise.
+
+  The tasks of `Transmuter.Text`, `Transmuter.Vision` and `Transmuter.Audio`, `Transmuter.Repo.load!/2` and `Transmuter.load!/2` take these options too.
+
   A large download shows a progress bar on the standard output. To disable it, set `config :transmuter, progress_bar_enabled: false`.
   """
+
+  @options [:cache_dir, :offline]
+
+  @doc """
+  Returns the names of the options of this module, which the tasks take and give to it.
+  """
+  def options, do: @options
 
   @doc """
   Returns the local path of `file` in `source`. Raises if the repository does not have the file.
@@ -30,7 +45,7 @@ defmodule Transmuter.Hub do
     files = if File.exists?(path), do: [file], else: files(source, opts)
 
     if file in files do
-      for f <- data_files(file, files) ++ [file], do: download!(repo, f, Path.join(dir, f))
+      for f <- data_files(file, files) ++ [file], do: download!(repo, f, Path.join(dir, f), opts)
       {:ok, path}
     else
       :error
@@ -71,7 +86,7 @@ defmodule Transmuter.Hub do
   @doc """
   Returns the metadata of a Hub repository from the Hub API, such as `"siblings"` (the files), `"pipeline_tag"` and `"cardData"`, or `nil` for a local directory.
 
-  The metadata is saved in the cache directory and comes from there later. The `refresh: true` option reads it from the Hub again, and uses the saved metadata when the Hub cannot be reached, so a repository that was downloaded once also works offline.
+  The metadata is saved in the cache directory and comes from there later. The `refresh: true` option reads it from the Hub again, and uses the saved metadata when the Hub cannot be reached, so a repository that was downloaded once also works without a network. With `offline: true`, the metadata comes only from the cache.
   """
   def info(source, opts \\ [])
 
@@ -79,27 +94,32 @@ defmodule Transmuter.Hub do
     path = Path.join(cache_dir(repo, opts), ".info.json")
     saved? = File.exists?(path)
 
-    if saved? and not Keyword.get(opts, :refresh, false) do
-      path |> File.read!() |> JSON.decode!()
-    else
-      case get("https://huggingface.co/api/models/#{repo}") do
-        {:ok, %{status: 200, body: info}} ->
-          File.mkdir_p!(Path.dirname(path))
-          File.write!(path, JSON.encode!(info))
-          info
+    cond do
+      saved? and (offline?(opts) or not Keyword.get(opts, :refresh, false)) ->
+        path |> File.read!() |> JSON.decode!()
 
-        _error when saved? ->
-          path |> File.read!() |> JSON.decode!()
+      offline?(opts) ->
+        raise ArgumentError, "#{repo} is not in the cache, and the Hub is offline"
 
-        {:ok, %{status: status, body: body}} ->
-          raise ArgumentError,
-                "the Hugging Face Hub gave status #{status} for #{repo}: #{inspect(body)}. " <>
-                  "Set HF_TOKEN for a private or gated repository"
+      true ->
+        case get("https://huggingface.co/api/models/#{repo}") do
+          {:ok, %{status: 200, body: info}} ->
+            File.mkdir_p!(Path.dirname(path))
+            File.write!(path, JSON.encode!(info))
+            info
 
-        {:error, error} ->
-          raise ArgumentError,
-                "could not reach the Hugging Face Hub for #{repo}: #{Exception.message(error)}"
-      end
+          _error when saved? ->
+            path |> File.read!() |> JSON.decode!()
+
+          {:ok, %{status: status, body: body}} ->
+            raise ArgumentError,
+                  "the Hugging Face Hub gave status #{status} for #{repo}: #{inspect(body)}. " <>
+                    "Set HF_TOKEN for a private or gated repository"
+
+          {:error, error} ->
+            raise ArgumentError,
+                  "could not reach the Hugging Face Hub for #{repo}: #{Exception.message(error)}"
+        end
     end
   end
 
@@ -115,23 +135,30 @@ defmodule Transmuter.Hub do
 
   # Each download writes its own part file, so processes that download the same file at the
   # same time do not write into one file. The rename puts a complete file in place at once.
-  defp download!(repo, file, target) do
-    unless File.exists?(target) do
-      File.mkdir_p!(Path.dirname(target))
-      part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
+  defp download!(repo, file, target, opts) do
+    cond do
+      File.exists?(target) ->
+        :ok
 
-      try do
-        File.open!(part, [:write, :binary], fn device ->
-          Req.get!(
-            "https://huggingface.co/#{repo}/resolve/main/#{file}",
-            req_options(into: &write(device, file, &1, &2), http_errors: :raise)
-          )
-        end)
+      offline?(opts) ->
+        raise ArgumentError, "#{file} of #{repo} is not in the cache, and the Hub is offline"
 
-        File.rename!(part, target)
-      after
-        File.rm(part)
-      end
+      true ->
+        File.mkdir_p!(Path.dirname(target))
+        part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
+
+        try do
+          File.open!(part, [:write, :binary], fn device ->
+            Req.get!(
+              "https://huggingface.co/#{repo}/resolve/main/#{file}",
+              req_options(into: &write(device, file, &1, &2), http_errors: :raise)
+            )
+          end)
+
+          File.rename!(part, target)
+        after
+          File.rm(part)
+        end
     end
   end
 
@@ -170,6 +197,14 @@ defmodule Transmuter.Hub do
       IO.write(["\r#{file} |#{bar}| #{div(100 * size, total)}% (", megabytes, ")"])
       if size == total, do: IO.write("\n")
     end
+  end
+
+  defp offline?(opts) do
+    Keyword.get_lazy(opts, :offline, fn ->
+      Enum.any?(["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"], fn name ->
+        String.upcase(System.get_env(name, "")) in ["1", "ON", "YES", "TRUE"]
+      end)
+    end)
   end
 
   defp cache_dir(repo, opts) do

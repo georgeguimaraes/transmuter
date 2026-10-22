@@ -50,7 +50,7 @@ model = Transmuter.load!(
 )
 ```
 
-Transmuter downloads the ONNX file to `~/.cache/transmuter` and keeps it for later calls. Set `:cache_dir` to change the download location.
+Transmuter downloads the ONNX file to `~/.cache/transmuter` and keeps it for later calls. Set `:cache_dir` to change the download location. Set `offline: true`, or the `HF_HUB_OFFLINE=1` environment variable, to use only the files in the cache.
 
 Load a model from a local path:
 

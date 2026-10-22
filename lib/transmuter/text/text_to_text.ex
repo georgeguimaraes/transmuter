@@ -5,29 +5,31 @@ defmodule Transmuter.Text.TextToText do
   The tokenizer pads the text to a sequence length of the `:compile` option, so the encoder runs a small number of compiled shapes. The decoder reads the attention mask of the text (`encoder_attention_mask`), so the padding has no effect on the result. Generation starts from `decoder_start_token_id`.
   """
 
-  alias Transmuter.{Generation, Serving, Tokenizer}
+  alias Transmuter.{Generation, Hub, Serving, Tokenizer}
 
   @doc false
   def text_to_text(source, opts) do
     opts =
-      Keyword.validate!(opts, [
-        :compile,
-        :variant,
-        :cache_dir,
-        :tokenizer,
-        :backend,
-        :compute_type,
-        :max_new_tokens,
-        :strategy,
-        :temperature,
-        :top_k,
-        :top_p,
-        :repetition_penalty,
-        :seed,
-        stream: false,
-        stream_done: false,
-        defn_options: []
-      ])
+      Keyword.validate!(
+        opts,
+        [
+          :compile,
+          :variant,
+          :tokenizer,
+          :backend,
+          :compute_type,
+          :max_new_tokens,
+          :strategy,
+          :temperature,
+          :top_k,
+          :top_p,
+          :repetition_penalty,
+          :seed,
+          stream: false,
+          stream_done: false,
+          defn_options: []
+        ] ++ Hub.options()
+      )
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
     given = ~w(encoder_hidden_states encoder_attention_mask)

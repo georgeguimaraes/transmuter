@@ -12,6 +12,23 @@ defmodule Transmuter.HubTest do
     refute File.exists?(Path.join(dir, "Xenova/no-such-repository/.info.json"))
   end
 
+  test "offline mode reads only the cache", %{tmp_dir: dir} do
+    source = {:hf, "Xenova/all-MiniLM-L6-v2"}
+    online = Transmuter.Repo.load!(source, cache_dir: dir)
+    offline = Transmuter.Repo.load!(source, cache_dir: dir, offline: true)
+    assert offline.config == online.config and offline.files == online.files
+
+    assert_raise ArgumentError,
+                 ~r/onnx\/model.onnx of .* not in the cache, and the Hub is offline/,
+                 fn ->
+                   Transmuter.Hub.fetch!(source, "onnx/model.onnx", cache_dir: dir, offline: true)
+                 end
+
+    assert_raise ArgumentError, ~r/Xenova\/bert-base-uncased is not in the cache/, fn ->
+      Transmuter.Hub.files({:hf, "Xenova/bert-base-uncased"}, cache_dir: dir, offline: true)
+    end
+  end
+
   test "concurrent downloads of one file all succeed", %{tmp_dir: dir} do
     paths =
       1..8
