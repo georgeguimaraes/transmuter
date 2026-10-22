@@ -196,6 +196,19 @@ for repo, text in [("google-t5/t5-small", "translate English to German: The hous
     output = model.generate(**tokenizer(text, return_tensors="pt"), do_sample=False, num_beams=1, max_new_tokens=64)
     print(repo, repr(tokenizer.decode(output[0], skip_special_tokens=True)))
 
+# Translation with NLLB and M2M100: the translation pipeline, greedy. The pipeline gives src_lang
+# to the tokenizer and the token of tgt_lang to generate in forced_bos_token_id. The
+# configuration of m2m100_418M has num_beams=5, so the call sets num_beams=1. M2M100 has only
+# the slow tokenizer, which reads sentencepiece.bpe.model and vocab.json.
+french = "La vie est belle et le soleil brille sur la ville."
+for repo, languages in [("facebook/nllb-200-distilled-600M", [("eng_Latn", "fra_Latn"), ("fra_Latn", "deu_Latn")]), ("facebook/m2m100_418M", [("en", "fr"), ("fr", "de")])]:
+    translator = pipeline("translation", model=repo, device="cpu")
+    for (src, tgt), text in zip(languages, [sentence, french]):
+        tokenizer = AutoTokenizer.from_pretrained(repo, src_lang=src)
+        target = tokenizer.convert_tokens_to_ids(tgt) if "nllb" in repo else tokenizer.get_lang_id(tgt)
+        print(repo, src, tgt, "ids", tokenizer(text)["input_ids"], "forced_bos_token_id", target)
+        print(repo, src, tgt, repr(translator(text, src_lang=src, tgt_lang=tgt, do_sample=False, num_beams=1)[0]["translation_text"]))
+
 # Speech-to-text of test/fixtures/librispeech_0.f32, which this part writes. datasets 4
 # decodes audio with torchcodec, so the script uses datasets 3 with soundfile.
 from datasets import load_dataset

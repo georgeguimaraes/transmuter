@@ -12,6 +12,7 @@ defmodule Transmuter.TextTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
+  alias Transmuter.Text.TextToText
   alias Transmuter.Tokenizer
 
   test "the tokenizer pads to the smallest length that fits and truncates to the largest" do
@@ -424,12 +425,108 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  # The test downloads only the tokenizer and the configuration files. M2M100 has only the
+  # slow tokenizer in Python, and its tokenizer.json has merges of pieces that are not in
+  # its vocabulary.
+  test "the language tokens of NLLB and M2M100 give the ids and the forced bos token of transformers" do
+    text = "La vie est belle et le soleil brille sur la ville."
+
+    for {repo, source, target, ids, forced} <- [
+          {"Xenova/nllb-200-distilled-600M", "fra_Latn", "deu_Latn",
+           [
+             256_057,
+             1034,
+             6651,
+             613,
+             48_970,
+             410,
+             96,
+             229_372,
+             1212,
+             3305,
+             2562,
+             82,
+             11_959,
+             248_075,
+             2
+           ], 256_042},
+          {"Xenova/m2m100_418M", "__fr__", "__de__",
+           [128_028, 343, 7315, 769, 26_181, 118, 86, 102_928, 951, 1479, 954, 14, 8919, 5, 2],
+           128_020}
+        ] do
+      repo = Transmuter.Repo.load!({:hf, repo})
+      opts = [source_language_token: source, target_language_token: target]
+      {tokenizer, opts} = TextToText.languages(repo, Tokenizer.load!(repo), opts)
+      {%{"input_ids" => input_ids}, _encodings} = Tokenizer.encode(tokenizer, [text])
+      assert Nx.to_flat_list(input_ids) == ids
+      assert opts[:forced_bos_token_id] == forced
+    end
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 
     assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
              Nx.tensor(1, type: :u8),
            "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end
+
+# --only ci_partition:4 in CI would also include :large_model tests of TextTest, because an
+# included tag wins over an excluded one. So these tests are in a module without a
+# :ci_partition tag, and CI leaves them out.
+defmodule Transmuter.TextLargeModelTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :hub
+  @moduletag timeout: 900_000
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  # The reference is the greedy translation pipeline of transformers with src_lang and
+  # tgt_lang, see test/support/pipeline_references.py. The configuration of m2m100_418M has
+  # num_beams: 5, so the test gives num_beams: 1.
+  @tag :large_model
+  test "NLLB and M2M100 translate as the translation pipeline of transformers" do
+    sentence =
+      "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
+
+    french = "La vie est belle et le soleil brille sur la ville."
+
+    for {repo, variant, cases} <- [
+          {"Xenova/nllb-200-distilled-600M", :fp32,
+           [
+             {"eng_Latn", "fra_Latn", sentence,
+              "Le transmutateur exécute des modèles ONNX sur n'importe quel backend Nx, sans code pour chaque architecture."},
+             {"fra_Latn", "deu_Latn", french,
+              "Das Leben ist schön und die Sonne scheint auf der Stadt."}
+           ]},
+          {"Xenova/m2m100_418M", :fp32,
+           [
+             {"__en__", "__fr__", sentence,
+              "Le transmutateur fonctionne avec des modèles ONNX sur n'importe quel backend Nx, sans code pour chaque architecture."},
+             {"__fr__", "__de__", french,
+              "Das Leben ist schön und die Sonne schlägt auf die Stadt."}
+           ]}
+        ],
+        {source, target, text, expected} <- cases do
+      serving =
+        Transmuter.Text.text_to_text(
+          {:hf, repo},
+          [
+            variant: variant,
+            strategy: :greedy,
+            num_beams: 1,
+            source_language_token: source,
+            target_language_token: target
+          ] ++ @opts
+        )
+
+      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, text)
+    end
   end
 end
 

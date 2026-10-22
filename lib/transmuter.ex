@@ -160,9 +160,17 @@ defmodule Transmuter do
     trainable = Keyword.get(opts, :trainable, false)
     {graph, constants} = hoist_constants(graph, false)
 
-    for {name, count} <- Enum.frequencies_by(constants, &elem(&1, 0)), count > 1 do
-      raise ArgumentError, "the graph defines the large constant #{name} more than once"
-    end
+    # A merged decoder, such as that of NLLB, can have the same positional table, with the
+    # same name, in each branch of If. Equal values are one param.
+    constants =
+      for {name, [tensor | others]} <- Enum.group_by(constants, &elem(&1, 0), &elem(&1, 1)) do
+        unless Enum.all?(others, &(&1 == tensor)) do
+          raise ArgumentError,
+                "the graph defines the large constant #{name} more than once, with different values"
+        end
+
+        {name, tensor}
+      end
 
     {static, params} =
       graph.initializer

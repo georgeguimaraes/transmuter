@@ -220,6 +220,25 @@ T5 takes the task in the text, for example `"translate English to German: The ho
 
 The settings of `generation_config.json` apply, as for `generation/2`. As in Python transformers, `num_beams` of the configuration gives beam search, so Marian runs 4 beams by default. The text is the same as the `generate` function of transformers with the same `num_beams`.
 
+#### NLLB and M2M100
+
+```elixir
+serving =
+  Transmuter.Text.text_to_text({:hf, "Xenova/nllb-200-distilled-600M"},
+    source_language_token: "eng_Latn",
+    target_language_token: "fra_Latn"
+  )
+
+Nx.Serving.run(serving, "The house is wonderful.")
+```
+
+NLLB and M2M100 translate between many languages, and each language has a token in the tokenizer: `"eng_Latn"` and `"fra_Latn"` for NLLB, `"__en__"` and `"__fr__"` for M2M100. The serving does what the `translation` pipeline of transformers does with `src_lang` and `tgt_lang`:
+
+1. The source language token goes at the start of the text, in the place of the language token in the template of the post-processor of `tokenizer.json`. The text then ends with `</s>`.
+2. The id of the target language token is `forced_bos_token_id`, so the first new token of the decoder is the target language token.
+
+Without `:source_language_token`, the text gets the language token of `tokenizer.json`, which is English. Without `:target_language_token`, the decoder does not get a forced token.
+
 ### Speech recognition
 
 ```elixir

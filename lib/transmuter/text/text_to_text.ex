@@ -1,11 +1,14 @@
 defmodule Transmuter.Text.TextToText do
   @moduledoc """
-  The text-to-text task of encoder-decoder models, such as T5 and Marian. See `Transmuter.Text.text_to_text/2`.
+  The text-to-text task of encoder-decoder models, such as T5, Marian, NLLB and M2M100. See `Transmuter.Text.text_to_text/2`.
 
   The tokenizer pads the text to a sequence length of the `:compile` option, so the encoder runs a small number of compiled shapes. The decoder reads the attention mask of the text (`encoder_attention_mask`), so the padding has no effect on the result. Generation starts from `decoder_start_token_id`.
   """
 
-  alias Transmuter.{Generation, Hub, Serving, Tokenizer}
+  @compile {:no_warn_undefined, [Tokenizers.PostProcessor, Tokenizers.Tokenizer]}
+
+  alias Tokenizers.PostProcessor
+  alias Transmuter.{Generation, Hub, Repo, Serving, Tokenizer}
 
   @doc false
   def text_to_text(source, opts) do
@@ -33,6 +36,8 @@ defmodule Transmuter.Text.TextToText do
           :forced_bos_token_id,
           :forced_eos_token_id,
           :seed,
+          :source_language_token,
+          :target_language_token,
           stream: false,
           stream_done: false,
           defn_options: []
@@ -40,9 +45,6 @@ defmodule Transmuter.Text.TextToText do
       )
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
-    given = ~w(encoder_hidden_states encoder_attention_mask)
-    opts = Keyword.put(opts, :max_new_tokens, Generation.max_new_tokens(repo, opts, 1))
-    ctx = Generation.context(repo, decoder, opts, given)
 
     compile =
       Keyword.validate!(opts[:compile] || [],
@@ -52,6 +54,11 @@ defmodule Transmuter.Text.TextToText do
 
     lengths = List.wrap(compile[:sequence_length])
     tokenizer = Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), length: lengths)
+    {tokenizer, opts} = languages(repo, tokenizer, opts)
+
+    given = ~w(encoder_hidden_states encoder_attention_mask)
+    opts = Keyword.put(opts, :max_new_tokens, Generation.max_new_tokens(repo, opts, 1))
+    ctx = Generation.context(repo, decoder, opts, given)
 
     start =
       repo.generation_config["decoder_start_token_id"] || repo.config["decoder_start_token_id"]
@@ -98,6 +105,76 @@ defmodule Transmuter.Text.TextToText do
     }
 
     Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
+  end
+
+  @doc false
+  # The tokenizer with the source language token, and the options with the target language
+  # token in :forced_bos_token_id, as src_lang and tgt_lang of the translation pipeline of
+  # transformers for NLLB and M2M100.
+  def languages(repo, tokenizer, opts) do
+    tokenizer =
+      case opts[:source_language_token] do
+        nil -> tokenizer
+        token -> source_language(repo, tokenizer, token)
+      end
+
+    opts =
+      case opts[:target_language_token] do
+        nil -> opts
+        token -> Keyword.put(opts, :forced_bos_token_id, id!(tokenizer, token))
+      end
+
+    {tokenizer, opts}
+  end
+
+  # The template of the post-processor in tokenizer.json has the language token of the
+  # default source language, such as "eng_Latn $A </s>", and the source language token
+  # takes its place.
+  defp source_language(repo, tokenizer, token) do
+    %{"post_processor" => post} =
+      repo.source |> Hub.fetch!("tokenizer.json", repo.opts) |> File.read!() |> JSON.decode!()
+
+    {single, pair} =
+      case post do
+        %{"type" => "TemplateProcessing", "single" => single, "pair" => pair} -> {single, pair}
+        _other -> {[], []}
+      end
+
+    eos = Repo.special_token(repo, "eos")
+    language = for %{"SpecialToken" => %{"id" => id}} <- single, id != eos, uniq: true, do: id
+
+    unless match?([_], language) do
+      raise ArgumentError,
+            "expected one language token in the template of the post-processor of tokenizer.json, got: #{inspect(language)}"
+    end
+
+    replace = &if(&1 in language, do: token, else: &1)
+
+    template = fn pieces ->
+      Enum.map_join(pieces, " ", fn
+        %{"SpecialToken" => %{"id" => id, "type_id" => type}} -> "#{replace.(id)}:#{type}"
+        %{"Sequence" => %{"id" => id, "type_id" => type}} -> "$#{id}:#{type}"
+      end)
+    end
+
+    special_tokens =
+      for %{"SpecialToken" => %{"id" => id}} <- single ++ pair,
+          uniq: true,
+          do: {replace.(id), id!(tokenizer, replace.(id))}
+
+    processor =
+      PostProcessor.template(
+        single: template.(single),
+        pair: template.(pair),
+        special_tokens: special_tokens
+      )
+
+    %{tokenizer | native: Tokenizers.Tokenizer.set_post_processor(tokenizer.native, processor)}
+  end
+
+  defp id!(tokenizer, token) do
+    Tokenizer.token_to_id(tokenizer, token) ||
+      raise ArgumentError, "the tokenizer has no token #{inspect(token)}"
   end
 
   defp validate(text) when is_binary(text), do: {:ok, %{text: text}}

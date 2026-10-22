@@ -204,7 +204,7 @@ defmodule Transmuter.Text do
   defdelegate generation(source, opts \\ []), to: Transmuter.Text.Generation
 
   @doc """
-  Builds a serving that generates text from a source text with an encoder-decoder model, such as T5 or Marian for translation.
+  Builds a serving that generates text from a source text with an encoder-decoder model, such as T5, Marian, NLLB or M2M100 for translation.
 
   The input is a string, `%{text: string}` or a list of them. A map input can also have `:seed`. The result is `%{results: [%{text: text, token_summary: %{input: count, output: count, padding: count}}]}`. `padding` is the number of pad tokens that the source text gets.
 
@@ -214,7 +214,19 @@ defmodule Transmuter.Text do
       Nx.Serving.run(serving, "translate English to German: The house is wonderful.")
       #=> %{results: [%{text: "Das Haus ist wunderbar.", token_summary: %{input: 11, output: 5, padding: 21}}]}
 
+  NLLB and M2M100 translate between many languages. Give the language tokens of the tokenizer in `:source_language_token` and `:target_language_token`:
+
+      serving =
+        Transmuter.Text.text_to_text({:hf, "Xenova/nllb-200-distilled-600M"},
+          source_language_token: "eng_Latn",
+          target_language_token: "fra_Latn"
+        )
+
   ## Options
+
+    * `:source_language_token` - the token of the language of the source text, such as `"eng_Latn"` for NLLB or `"__en__"` for M2M100. It replaces the language token in the template of the post-processor of `tokenizer.json`, as `src_lang` of the tokenizer in Python transformers. The default is the token of `tokenizer.json`, English for NLLB and M2M100.
+
+    * `:target_language_token` - the token of the language of the result, such as `"fra_Latn"` or `"__fr__"`. Its id is `:forced_bos_token_id`, as `tgt_lang` of the translation pipeline of transformers. The default is no forced token.
 
     * `:compile` - `:sequence_length`, as for the other text tasks. The serving pads the source text to the smallest length that fits. `:batch_size` is the number of inputs that generate together, as in `generation/2`. Inputs of the same sequence length go into one batch.
 
