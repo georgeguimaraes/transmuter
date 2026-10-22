@@ -54,6 +54,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
 | `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
+| `Transmuter.Audio.audio_classification/2` | PCM samples at 16 kHz | `%{predictions: [%{label: label, score: score}]}` |
 | `Transmuter.Audio.text_to_speech/2` | text, or `%{text: text, seed: seed}` | `%{audio: tensor, sampling_rate: rate}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Bumblebee has no text-to-speech, so `text_to_speech/2` gives the shape of the pipeline of Python transformers. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task. The audio of text-to-speech depends on a random seed, so the tests compare the audio without noise.
@@ -228,6 +229,21 @@ Nx.Serving.run(serving, audio)
 ```
 
 See [Speech and audio](speech_and_audio.md) for the details.
+
+### Audio classification
+
+```elixir
+audio = Nx.from_binary(File.read!("speech.f32"), :f32)
+serving = Transmuter.Audio.audio_classification({:hf, "Xenova/ast-finetuned-audioset-10-10-0.4593"})
+Nx.Serving.run(serving, audio)
+#=> %{predictions: [%{label: "Speech", score: 0.84}, %{label: "Speech synthesizer", score: 0.025}, ...]}
+```
+
+`Transmuter.Audio.audio_classification/2` runs AST and wav2vec2 classifiers on PCM samples at the sampling rate of the model. `Transmuter.Audio.Featurizer` prepares the audio as the feature extractor of Python transformers, which `feature_extractor_type` in `preprocessor_config.json` selects. The scores are a softmax of the logits, as in the `audio-classification` pipeline of Python transformers.
+
+AST takes 1024 frames of log-mel features, about 10 s of audio. The serving cuts longer audio and pads shorter audio, so the audio goes into batches of `compile: [batch_size: n]`. wav2vec2 takes the mean over all frames of the audio, so padding would change the result. The serving runs each audio alone, and the model compiles each new audio length on its first call.
+
+The tests compare the labels and the scores with the pipeline of Python transformers for AST, and with ONNX Runtime for `onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX`, whose PyTorch model is no longer on the Hub. The labels are the same, and the scores agree within 1.0e-4.
 
 ### Speech synthesis
 

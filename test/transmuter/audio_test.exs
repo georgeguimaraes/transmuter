@@ -264,3 +264,127 @@ defmodule Transmuter.AudioBatchTest do
     end
   end
 end
+
+defmodule Transmuter.AudioClassificationTest do
+  use ExUnit.Case, async: true
+
+  # Reference values come from the feature extractors and the audio-classification pipeline of
+  # Python transformers, see test/support/pipeline_references.py. The reference of the
+  # wav2vec2 export is ONNX Runtime, because its PyTorch model is no longer on the Hub.
+  @moduletag :hub
+  @moduletag timeout: 900_000
+  @moduletag ci_partition: 5
+
+  @backend Transmuter.TestBackend.backend()
+  @opts [backend: @backend, defn_options: Transmuter.TestBackend.compiler_opts()]
+
+  alias Transmuter.Audio.Featurizer
+
+  @ast {:hf, "Xenova/ast-finetuned-audioset-10-10-0.4593"}
+  @wav2vec2 {:hf, "onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX"}
+
+  # 5.86 s, 62.46 s and the first 2 s of speech. AST takes 1024 frames, about 10.24 s.
+  @audio Nx.from_binary(File.read!("test/fixtures/librispeech_0.f32"), :f32)
+  @long Nx.from_binary(File.read!("test/fixtures/librispeech_long.f32"), :f32)
+  @cut @audio[0..31_999]
+
+  # The AST features of 5.86 s have 584 frames, then frames of zeros, which normalize to
+  # 0.46703. The features of 62.46 s keep the first 1024 frames.
+  test "the featurizers match the feature extractors of transformers" do
+    for {repo, audio, shape, points, expected, mean} <- [
+          {@ast, @audio, {1024, 128}, [[0, 0], [100, 37], [583, 127], [584, 0], [1023, 127]],
+           [-0.98939, 0.34332, -0.72132, 0.46703, 0.46703], 0.03871},
+          {@ast, @long, {1024, 128}, [[0, 0], [500, 64], [1023, 127]],
+           [-0.98939, -0.09159, 0.04984], -0.25028},
+          {@wav2vec2, @audio, {93_680}, [[0], [1000], [93_679]], [0.03858, 0.00064, 0.0169], 0.0},
+          {@wav2vec2, @cut, {32_000}, [[0], [1000], [31_999]], [0.03465, 0.00015, 0.29631], 0.0}
+        ] do
+      features =
+        Featurizer.load!(repo)
+        |> Featurizer.process([audio], backend: @backend)
+        |> Nx.backend_transfer(Nx.BinaryBackend)
+
+      features = features[0]
+      assert Nx.shape(features) == shape
+      assert_all_close(Nx.to_list(Nx.gather(features, Nx.tensor(points))), expected)
+      assert_in_delta Nx.to_number(Nx.mean(features)), mean, 1.0e-4
+    end
+  end
+
+  test "audio classification matches the pipeline of transformers" do
+    for {repo, inputs, expected} <- [
+          {@ast, [@audio, @long],
+           [
+             [
+               {"Speech", 0.841193},
+               {"Speech synthesizer", 0.024827},
+               {"Narration, monologue", 0.01955},
+               {"Male speech, man speaking", 0.01018},
+               {"Gasp", 0.006851}
+             ],
+             [
+               {"Speech", 0.807631},
+               {"Speech synthesizer", 0.091229},
+               {"Narration, monologue", 0.049116},
+               {"Male speech, man speaking", 0.008419},
+               {"Clicking", 0.007501}
+             ]
+           ]},
+          {@wav2vec2, [@audio, @cut],
+           [
+             [
+               {"ANGRY", 0.681742},
+               {"HAPPY", 0.134327},
+               {"DISGUST", 0.068611},
+               {"NEUTRAL", 0.065566},
+               {"FEAR", 0.025946}
+             ],
+             [
+               {"ANGRY", 0.721429},
+               {"HAPPY", 0.127242},
+               {"DISGUST", 0.055477},
+               {"NEUTRAL", 0.05137},
+               {"FEAR", 0.024066}
+             ]
+           ]}
+        ] do
+      serving = Transmuter.Audio.audio_classification(repo, @opts)
+
+      expected =
+        Enum.map(expected, &%{predictions: Enum.map(&1, fn {l, s} -> %{label: l, score: s} end)})
+
+      assert_predictions(Nx.Serving.run(serving, inputs), expected, 1.0e-4)
+    end
+  end
+
+  # Three audio in batches of 2: a full batch and a batch with a padding row. A batch of
+  # another size can round the last bits of the scores in another way on the GPU.
+  test "AST gives the same result in a batch as alone" do
+    inputs = [@audio, @long, @cut]
+    alone = Transmuter.Audio.audio_classification(@ast, @opts)
+    batched = Transmuter.Audio.audio_classification(@ast, [compile: [batch_size: 2]] ++ @opts)
+    expected = Enum.map(inputs, &Nx.Serving.run(alone, &1))
+    assert_predictions(Nx.Serving.run(batched, inputs), expected, 1.0e-6)
+  end
+
+  defp assert_predictions(results, expected, delta) do
+    for {%{predictions: got}, %{predictions: want}} <- Enum.zip(results, expected) do
+      assert Enum.map(got, & &1.label) == Enum.map(want, & &1.label)
+
+      for {g, w} <- Enum.zip(got, want),
+          do:
+            assert_in_delta(
+              g.score,
+              w.score,
+              delta,
+              "expected #{inspect(want)}, got #{inspect(got)}"
+            )
+    end
+  end
+
+  defp assert_all_close(got, expected) do
+    for {g, e} <- Enum.zip(got, expected) do
+      assert_in_delta g, e, 1.0e-4, "expected #{inspect(expected)}, got #{inspect(got)}"
+    end
+  end
+end

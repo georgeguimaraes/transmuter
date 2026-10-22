@@ -11,6 +11,7 @@ defmodule Transmuter.Serving do
 
   @behaviour Nx.Serving
 
+  alias Transmuter.Audio.Featurizer, as: AudioFeaturizer
   alias Transmuter.{Featurizer, Generation, Repo, Shared, Tokenizer}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
   alias Transmuter.Ops.NN
@@ -37,6 +38,11 @@ defmodule Transmuter.Serving do
   The options that all image tasks take. See `Transmuter.Vision`.
   """
   def image_options, do: [:featurizer | @options]
+
+  @doc """
+  The options that all audio tasks with a `Transmuter.Audio.Featurizer` take. See `Transmuter.Audio`.
+  """
+  def audio_options, do: [:featurizer | @options]
 
   @doc """
   Loads the repository of `source`, its model and its tokenizer. See `load_model!/4`.
@@ -188,6 +194,62 @@ defmodule Transmuter.Serving do
       %{"pixel_values" => pixels}
     end
   end
+
+  # The compiled model of a serving whose features depend on the length of the audio keeps
+  # this many lengths. The serving compiles 1 s of audio when it starts.
+  @audio_lengths 64
+
+  @doc """
+  Returns an `Nx.Serving` that runs `model` on audio.
+
+  The featurizer (`Transmuter.Audio.Featurizer`) turns the audio into `"input_values"` on the `:backend` of `opts`. When the features of all audio have one shape, such as the 1024 frames of AST, the serving compiles that shape, and the audio goes into batches of the `:batch_size` of `:compile`. When the shape depends on the length of the audio, such as the samples of wav2vec2, the batch size must be 1. Each audio is then a batch, and the compiled model compiles each new length on its first call. It keeps up to #{@audio_lengths} lengths.
+
+  `fun` and `postprocess` are as in `text/7`. An audio is one row, so `postprocess` takes a list of one row and a list of one audio tensor.
+  """
+  def audio(model, featurizer, opts, fun, postprocess) do
+    compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
+    shape = AudioFeaturizer.shape(featurizer)
+    batch_size = audio_batch_size!(shape, compile[:batch_size])
+    key = {:audio_shape, shape}
+    template = zeros(Tuple.insert_at(shape || {featurizer.sampling_rate}, 0, batch_size), :f32)
+    backend = opts[:backend] || Nx.default_backend()
+
+    preprocess = fn audio ->
+      groups =
+        for group <- if(shape, do: [audio], else: Enum.map(audio, &[&1])) do
+          values =
+            featurizer
+            |> AudioFeaturizer.process(group, backend: backend)
+            |> Nx.backend_transfer(Nx.BinaryBackend)
+
+          {%{"input_values" => values}, key}
+        end
+
+      {groups, Enum.map(audio, &[&1])}
+    end
+
+    validate = fn input ->
+      with {:ok, audio} <- AudioFeaturizer.tensor(input), do: {:ok, [audio]}
+    end
+
+    shapes = %{
+      batch_size: batch_size,
+      templates: %{key => %{"input_values" => template}},
+      inputs: %{},
+      cache_size: @audio_lengths
+    }
+
+    new(model, opts, shapes, preprocess, fun, postprocess, validate)
+  end
+
+  defp audio_batch_size!(nil, batch_size) when batch_size != 1,
+    do:
+      raise(
+        ArgumentError,
+        "the shape of the features depends on the length of the audio, so each audio is a batch of its own. Use batch_size: 1"
+      )
+
+  defp audio_batch_size!(_shape, batch_size), do: batch_size
 
   @doc """
   Returns the `{height, width}` of the images of `featurizer`. Raises when the size depends on the image, because images of different sizes cannot go in one batch.

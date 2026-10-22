@@ -81,6 +81,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Audio,
           Transmuter.Tokenizer,
           Transmuter.Featurizer,
+          Transmuter.Audio.Featurizer,
           Transmuter.ChatTemplate
         ],
         "Public API": [
@@ -112,6 +113,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.Idefics3Processor,
           Transmuter.Vision.Qwen2VLProcessor,
           Transmuter.Audio.SpeechToText,
+          Transmuter.Audio.AudioClassification,
           Transmuter.Audio.TextToSpeech,
           Transmuter.Fusion,
           Transmuter.GraphBreaks,

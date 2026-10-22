@@ -1,6 +1,6 @@
 defmodule Transmuter.Audio do
   @moduledoc """
-  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer and the configuration) and returns an `Nx.Serving`. `speech_to_text/2` takes audio and gives text in the shape of Bumblebee. `text_to_speech/2` takes text and gives audio in the shape of Python transformers.
+  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer or `preprocessor_config.json`, and the configuration) and returns an `Nx.Serving`. `speech_to_text/2` takes audio and gives text in the shape of Bumblebee. `audio_classification/2` takes audio and gives labels in the shape of Bumblebee. `text_to_speech/2` takes text and gives audio in the shape of Python transformers.
 
       serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"})
       Nx.Serving.run(serving, audio)
@@ -10,7 +10,7 @@ defmodule Transmuter.Audio do
       Nx.Serving.run(serving, %{text: "Hello, my dog is cute.", seed: 42})
       #=> %{audio: #Nx.Tensor<f32[31744]>, sampling_rate: 16000}
 
-  The tasks need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
+  The tasks with text need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
 
   The options `:defn_options`, `:backend`, `:compute_type`, `:variant`, `:cache_dir` and `:tokenizer` are the same as in `Transmuter.Text`. Use `backend: EMLX.Backend, defn_options: [compiler: EMLX]` on Apple silicon, because `Nx.BinaryBackend` is very slow.
   """
@@ -49,6 +49,41 @@ defmodule Transmuter.Audio do
   The serving does not stream the text, because it merges the windows of long audio only at the end.
   """
   defdelegate speech_to_text(source, opts \\ []), to: Transmuter.Audio.SpeechToText
+
+  @doc """
+  Builds a serving that classifies audio, such as AST and wav2vec2 models.
+
+  The input is a tensor of PCM samples at the sampling rate of the model (16 kHz for AST and wav2vec2), of any float type, or a list of them. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
+
+      serving = Transmuter.Audio.audio_classification({:hf, "Xenova/ast-finetuned-audioset-10-10-0.4593"})
+      Nx.Serving.run(serving, audio)
+      #=> %{predictions: [%{label: "Speech", score: 0.84}, ...]}
+
+  The labels come from `id2label` in `config.json`. As in the `audio-classification` pipeline of Python transformers, the scores are a softmax of the logits for all models, also for models with many labels per input, such as AST on AudioSet.
+
+  `Transmuter.Audio.Featurizer` prepares the audio as the feature extractor of Python transformers, which `feature_extractor_type` of `preprocessor_config.json` selects:
+
+    * AST (`ASTFeatureExtractor`) takes 1024 frames of log-mel features, about 10 s of audio. The serving cuts longer audio and pads shorter audio, so all audio has one shape, and the audio of a list or of concurrent calls goes into batches.
+
+    * wav2vec2 (`Wav2Vec2FeatureExtractor`) takes the samples. The model takes the mean over all frames, so padding would change the result. The serving runs each audio alone, and the model compiles each new audio length on its first call. It keeps 64 lengths.
+
+  The default variant is fp32.
+
+  ## Options
+
+    * `:top_k` - the number of predictions, or `nil` for all. The default is `5`.
+
+    * `:scores_function` - `:softmax`, `:sigmoid` or `:none` for the logits. The default is `:softmax`.
+
+    * `:compile` - `:batch_size`. The default is `1`. With wav2vec2, the batch size must be `1`.
+
+    * `:featurizer` - a featurizer from `Transmuter.Audio.Featurizer.load!/2`, to use in place of the `preprocessor_config.json` of the repository.
+
+    * `:model` - a model from `Transmuter.load!/2`, to use in place of the ONNX file of the repository.
+
+  The serving computes the features on the `:backend`. See the module documentation for the other options.
+  """
+  defdelegate audio_classification(source, opts \\ []), to: Transmuter.Audio.AudioClassification
 
   @doc """
   Builds a serving that turns text into speech with VITS (MMS-TTS) or SpeechT5.

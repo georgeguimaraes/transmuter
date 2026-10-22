@@ -22,6 +22,7 @@ defmodule Transmuter.Audio.SpeechToText do
   With timestamps, the processor of `WhisperTimeStampLogitsProcessor` selects the tokens.
   """
 
+  alias Transmuter.Audio.Featurizer
   alias Transmuter.{Generation, Hub, Serving, Tokenizer}
   alias Transmuter.Ops.Signal
 
@@ -126,12 +127,13 @@ defmodule Transmuter.Audio.SpeechToText do
       end
     end
 
-    validate = fn
-      audio = %Nx.Tensor{shape: {_samples}} -> {:ok, Nx.backend_transfer(audio, Nx.BinaryBackend)}
-      input -> {:error, "expected a tensor of PCM samples {samples}, got: #{inspect(input)}"}
-    end
+    task = %{
+      validate: &Featurizer.tensor/1,
+      preprocess: preprocess,
+      init: init,
+      postprocess: postprocess
+    }
 
-    task = %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess}
     Serving.generation(ctx, tokenizer, task, opts)
   end
 
@@ -450,7 +452,7 @@ defmodule Transmuter.Audio.SpeechToText do
   end
 
   @doc """
-  Returns the settings of the featurizer of `repo` from `preprocessor_config.json`, with the defaults of `WhisperFeatureExtractor`. `:filters` are the mel filters {bins, mels} and `:window` is the Hann window, as `Nx.BinaryBackend` tensors.
+  Returns the settings of the featurizer of `repo` from `preprocessor_config.json`, with the defaults of `WhisperFeatureExtractor`. `:filters` are the mel filters {bins, mels} and `:window` is the periodic Hann window, as `Nx.BinaryBackend` tensors.
   """
   def featurizer(repo) do
     config =
@@ -466,47 +468,23 @@ defmodule Transmuter.Audio.SpeechToText do
       )
 
     n_fft = config["n_fft"]
-    window = for i <- 0..(n_fft - 1), do: 0.5 - 0.5 * :math.cos(2 * :math.pi() * i / n_fft)
+    bins = div(n_fft, 2) + 1
 
     %{
       feature_size: config["feature_size"],
       sampling_rate: config["sampling_rate"],
       hop_length: config["hop_length"],
       n_samples: config["n_samples"],
-      filters: mel_filters(n_fft, config["feature_size"], config["sampling_rate"]),
-      window: Nx.tensor(window, type: :f32, backend: Nx.BinaryBackend)
+      filters:
+        Featurizer.mel_filters(bins, config["feature_size"], config["sampling_rate"],
+          min_frequency: 0.0,
+          max_frequency: 8000.0,
+          mel_scale: :slaney,
+          norm: :slaney
+        ),
+      window: Featurizer.hann_window(n_fft, true)
     }
   end
-
-  # mel_filter_bank of transformers with the Slaney scale and norm, from 0 Hz to 8000 Hz as in
-  # WhisperFeatureExtractor. Filter m rises from point m to point m + 1 and falls to m + 2.
-  defp mel_filters(n_fft, mels, sampling_rate) do
-    bins = div(n_fft, 2) + 1
-    max_mel = hz_to_mel(8000.0)
-    points = List.to_tuple(for i <- 0..(mels + 1), do: mel_to_hz(max_mel * i / (mels + 1)))
-
-    rows =
-      for bin <- 0..(bins - 1) do
-        hz = div(sampling_rate, 2) * bin / (bins - 1)
-
-        for m <- 0..(mels - 1) do
-          {low, center, high} = {elem(points, m), elem(points, m + 1), elem(points, m + 2)}
-          rise = (hz - low) / (center - low)
-          fall = (high - hz) / (high - center)
-          max(0.0, min(rise, fall)) * 2.0 / (high - low)
-        end
-      end
-
-    Nx.tensor(rows, type: :f32, backend: Nx.BinaryBackend)
-  end
-
-  defp hz_to_mel(hz) when hz >= 1000.0, do: 15.0 + :math.log(hz / 1000.0) * 27.0 / :math.log(6.4)
-  defp hz_to_mel(hz), do: 3.0 * hz / 200.0
-
-  defp mel_to_hz(mel) when mel >= 15.0,
-    do: 1000.0 * :math.exp(:math.log(6.4) / 27.0 * (mel - 15.0))
-
-  defp mel_to_hz(mel), do: 200.0 * mel / 3.0
 
   @doc """
   Returns the log-mel features {batch, mels, frames} of `audio` {batch, samples}, with the `filters` and the `window` of `featurizer/1`. The audio must already have its length of 30 s.

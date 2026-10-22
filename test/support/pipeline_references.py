@@ -450,3 +450,36 @@ for step in range(1, hidden.shape[1] * 20 // 2 + 1):
     past.update({k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present") and v.shape[2] > 0})
 waveform = vocoder.run(None, {"spectrogram": np.concatenate(spectrum)})[0].reshape(-1)
 print("speecht5 onnxruntime", len(spectrum), len(waveform), float(np.abs(waveform - speech).max()) if len(waveform) == len(speech) else None)
+
+# Audio classification of test/fixtures/librispeech_0.f32 (5.86 s) and librispeech_long.f32
+# (62.46 s). The command above does not install torchaudio, so ASTFeatureExtractor takes its
+# numpy path, as Transmuter does. The 5.86 s give 584 frames, so the features end with frames
+# of zeros, and the 62.46 s keep the first 1024 frames. The script prints input_values[0] at
+# (frame, mel) or at (sample) and the mean, then the top 5 of the pipeline. The pipeline gives
+# all labels without top_k, so the script passes top_k=5. The PyTorch model of the wav2vec2
+# export (DunnBC22/wav2vec2-base-Speech_Emotion_Recognition) is no longer on the Hub, so its
+# reference is ONNX Runtime with the post-processing of the pipeline: a softmax and the top 5.
+from transformers import AutoConfig, AutoFeatureExtractor
+from transformers.utils import is_speech_available
+
+assert not is_speech_available()
+audio = np.fromfile("test/fixtures/librispeech_0.f32", "<f4")
+long = np.fromfile("test/fixtures/librispeech_long.f32", "<f4")
+extractor = AutoFeatureExtractor.from_pretrained("Xenova/ast-finetuned-audioset-10-10-0.4593")
+classify = pipeline("audio-classification", model="MIT/ast-finetuned-audioset-10-10-0.4593", feature_extractor=extractor, device="cpu")
+for name, samples, points in [("short", audio, [(0, 0), (100, 37), (583, 127), (584, 0), (1023, 127)]), ("long", long, [(0, 0), (500, 64), (1023, 127)])]:
+    values = extractor(samples, sampling_rate=16000, return_tensors="np")["input_values"][0]
+    print("ast features", name, values.shape, [round(float(values[p]), 5) for p in points], round(float(values.mean()), 5))
+    print("ast", name, [(p["label"], round(p["score"], 6)) for p in classify(samples.copy(), top_k=5)])
+
+repo = "onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX"
+extractor = AutoFeatureExtractor.from_pretrained(repo)
+id2label = AutoConfig.from_pretrained(repo).id2label
+directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+for name, samples in [("short", audio), ("cut", audio[:32000])]:
+    values = extractor(samples, sampling_rate=16000, return_tensors="np")["input_values"]
+    print("wav2vec2 features", name, values.shape, [round(float(values[0, i]), 5) for i in [0, 1000, len(samples) - 1]])
+    scores = torch.from_numpy(session.run(None, {"input_values": values})[0][0]).softmax(-1)
+    top = scores.topk(5)
+    print("wav2vec2", name, [(id2label[i], round(s, 6)) for s, i in zip(top.values.tolist(), top.indices.tolist())])

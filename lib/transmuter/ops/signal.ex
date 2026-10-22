@@ -395,10 +395,12 @@ defmodule Transmuter.Ops.Signal do
   defp activation("Elu", alpha, _),
     do: &Nx.select(Nx.less(&1, 0), Nx.multiply(alpha, Nx.subtract(Nx.exp(&1), 1)), &1)
 
-  # Frame f holds samples f * step .. f * step + size - 1 of a {B, L, C} signal. The
-  # signal splits into chunks of gcd(size, step) samples, and a frame is size / gcd
+  @doc """
+  The first `frames` frames {B, frames, size, C} of a signal {B, L, C}. Frame `f` holds the samples from `f * step` to `f * step + size - 1`.
+  """
+  # The signal splits into chunks of gcd(size, step) samples, and a frame is size / gcd
   # consecutive chunks, so strided slices of the chunks build all frames.
-  defp frame(signal, size, step, frames) do
+  def frame(signal, size, step, frames) do
     {b, _l, c} = Nx.shape(signal)
     chunk = Integer.gcd(size, step)
     stride = div(step, chunk)
