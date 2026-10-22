@@ -75,6 +75,35 @@ defmodule Transmuter.AudioTest do
              Nx.Serving.run(serving, @audio)
   end
 
+  # The decoder of Xenova/whisper-tiny.en gives the cross attentions that word timestamps read.
+  test "short audio with word timestamps matches transformers" do
+    serving =
+      Transmuter.Audio.speech_to_text(
+        {:hf, "Xenova/whisper-tiny.en"},
+        [timestamps: :words] ++ @opts
+      )
+
+    assert_words(Nx.Serving.run(serving, @audio), [
+      {" Mr.", 0.0, 1.02},
+      {" Quilter", 1.02, 1.24},
+      {" is", 1.24, 1.48},
+      {" the", 1.48, 1.68},
+      {" apostle", 1.68, 2.08},
+      {" of", 2.08, 2.36},
+      {" the", 2.36, 2.5},
+      {" middle", 2.5, 2.7},
+      {" classes,", 2.7, 3.38},
+      {" and", 3.38, 3.54},
+      {" we", 3.54, 3.7},
+      {" are", 3.7, 3.82},
+      {" glad", 3.82, 4.1},
+      {" to", 4.1, 4.32},
+      {" welcome", 4.32, 4.64},
+      {" his", 4.64, 4.94},
+      {" gospel.", 4.94, 5.84}
+    ])
+  end
+
   # The audio of transformers without noise: VITS with noise_scale and noise_scale_duration at
   # 0, and SpeechT5 with a prenet dropout that keeps all values. See
   # test/support/pipeline_references.py. Transmuter is within 8.5e-5 of PyTorch on the GPU and
@@ -150,6 +179,17 @@ defmodule Transmuter.AudioTest do
     assert Nx.size(one.audio) in div(length, 2)..(length * 2), repo
   end
 
+  # The words are equal, and their times are within one step of 0.02 s.
+  @doc false
+  def assert_words(%{chunks: chunks}, expected) do
+    assert Enum.map(chunks, & &1.text) == Enum.map(expected, &elem(&1, 0))
+
+    for {chunk, {_text, start, stop}} <- Enum.zip(chunks, expected) do
+      assert_in_delta chunk.start_timestamp_seconds, start, 0.021
+      assert_in_delta chunk.end_timestamp_seconds, stop, 0.021
+    end
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 
@@ -177,6 +217,163 @@ defmodule Transmuter.AudioLongTest do
   # chunk_length_s=30 runs 3 windows. The texts differ between the models.
   @long Nx.from_binary(File.read!("test/fixtures/librispeech_long.f32"), :f32)
   @long_text " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is Mr. Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, "
+
+  # The words of whisper-tiny.en in the pipeline of transformers with
+  # return_timestamps="word", see test/support/pipeline_references.py. A word starts at the
+  # end of the token before it, so a word can start before the end of the word before it or
+  # have no length, as in transformers.
+  @long_words [
+    {" Mr.", 0.0, 0.96},
+    {" Quilter", 0.96, 1.24},
+    {" is", 1.24, 1.48},
+    {" the", 1.48, 1.68},
+    {" apostle", 1.68, 2.08},
+    {" of", 2.08, 2.34},
+    {" the", 2.34, 2.5},
+    {" middle", 2.5, 2.7},
+    {" classes,", 2.7, 3.4},
+    {" and", 3.4, 3.54},
+    {" we", 3.54, 3.7},
+    {" are", 3.7, 3.82},
+    {" glad", 3.82, 4.1},
+    {" to", 4.1, 4.3},
+    {" welcome", 4.3, 4.64},
+    {" his", 4.64, 4.94},
+    {" gospel.", 4.94, 6.44},
+    {" Nor", 6.56, 6.74},
+    {" is", 6.74, 7.0},
+    {" Mr.", 7.0, 7.34},
+    {" Quilter's", 7.34, 7.88},
+    {" manner", 7.88, 8.1},
+    {" less", 8.1, 8.64},
+    {" interesting", 8.64, 9.04},
+    {" than", 9.04, 9.48},
+    {" his", 9.48, 9.98},
+    {" matter.", 9.98, 11.26},
+    {" He", 11.26, 11.46},
+    {" tells", 11.46, 11.7},
+    {" us", 11.7, 12.12},
+    {" that", 12.12, 12.36},
+    {" at", 12.36, 12.6},
+    {" this", 12.6, 12.86},
+    {" festive", 12.86, 13.32},
+    {" season", 13.32, 13.74},
+    {" of", 13.74, 13.98},
+    {" the", 13.98, 14.18},
+    {" year,", 14.18, 14.98},
+    {" with", 14.98, 15.24},
+    {" Christmas", 15.24, 15.62},
+    {" and", 15.62, 15.94},
+    {" roast", 15.94, 16.28},
+    {" beef", 16.28, 16.64},
+    {" looming", 16.64, 16.98},
+    {" before", 16.98, 17.32},
+    {" us,", 17.32, 18.62},
+    {" similes", 18.62, 18.98},
+    {" drawn", 18.98, 19.32},
+    {" from", 19.32, 19.62},
+    {" eating", 19.62, 19.92},
+    {" and", 19.92, 20.16},
+    {" its", 20.16, 20.4},
+    {" results", 20.4, 20.84},
+    {" occur", 20.84, 21.24},
+    {" most", 21.24, 21.64},
+    {" readily", 21.64, 21.96},
+    {" to", 21.96, 22.24},
+    {" the", 22.24, 22.44},
+    {" mind.", 22.44, 23.76},
+    {" He", 23.76, 23.96},
+    {" has", 23.96, 24.22},
+    {" grave", 24.22, 24.5},
+    {" doubts", 24.5, 24.92},
+    {" whether", 24.92, 25.44},
+    {" Sir", 25.42, 25.7},
+    {" Frederick", 25.7, 26.02},
+    {" Layton's", 26.02, 26.56},
+    {" work", 26.56, 26.82},
+    {" is", 26.82, 27.14},
+    {" really", 27.14, 27.64},
+    {" Greek", 27.64, 28.02},
+    {" after", 28.02, 28.4},
+    {" all,", 28.4, 29.22},
+    {" and", 29.22, 29.52},
+    {" can", 29.52, 29.8},
+    {" discover", 29.8, 30.18},
+    {" in", 30.18, 30.36},
+    {" it", 30.36, 30.58},
+    {" but", 30.58, 30.82},
+    {" little", 30.82, 31.16},
+    {" of", 31.16, 31.66},
+    {" rocky", 31.66, 32.06},
+    {" Ithaca.", 32.06, 33.68},
+    {" Linnell's", 33.8, 34.36},
+    {" pictures", 34.36, 34.64},
+    {" are", 34.64, 35.2},
+    {" a", 35.2, 35.54},
+    {" sort", 35.54, 35.54},
+    {" of", 35.54, 36.1},
+    {" up", 36.1, 36.42},
+    {"-gards", 36.42, 36.66},
+    {" and", 36.66, 36.94},
+    {" atom", 36.94, 37.48},
+    {" paintings,", 37.48, 38.48},
+    {" and", 38.48, 38.76},
+    {" Mason's", 38.76, 39.4},
+    {" exquisite", 39.4, 39.84},
+    {" idles", 40.08, 40.32},
+    {" are", 40.32, 40.66},
+    {" as", 40.66, 41.12},
+    {" national", 41.12, 41.66},
+    {" as", 41.66, 41.94},
+    {" a", 41.94, 42.08},
+    {" jingo", 42.08, 42.38},
+    {" poem.", 42.38, 44.22},
+    {" Mr.", 44.64, 44.96},
+    {" Birkett", 44.96, 45.28},
+    {" Foster's", 45.28, 46.1},
+    {" landscapes", 46.1, 46.38},
+    {" smile", 46.38, 47.18},
+    {" at", 47.18, 47.48},
+    {" one", 47.48, 47.8},
+    {" much", 47.8, 48.08},
+    {" in", 48.08, 48.22},
+    {" the", 48.22, 48.4},
+    {" same", 48.4, 48.62},
+    {" way", 48.62, 48.86},
+    {" that", 48.86, 49.1},
+    {" Mr.", 49.1, 49.46},
+    {" Carker", 49.46, 49.94},
+    {" used", 49.94, 50.46},
+    {" to", 50.46, 50.64},
+    {" flash", 50.92, 50.92},
+    {" his", 50.92, 51.28},
+    {" teeth.", 51.28, 52.7},
+    {" And", 52.94, 53.04},
+    {" Mr.", 53.04, 53.4},
+    {" John", 53.4, 53.64},
+    {" Collier", 53.64, 54.1},
+    {" gives", 54.1, 54.7},
+    {" his", 54.7, 54.98},
+    {" sitter", 54.98, 55.38},
+    {" a", 55.38, 55.66},
+    {" cheerful", 55.66, 56.04},
+    {" slap", 56.04, 56.58},
+    {" in", 56.58, 56.78},
+    {" the", 56.78, 56.98},
+    {" back,", 56.98, 57.62},
+    {" before", 57.62, 57.92},
+    {" he", 57.92, 58.24},
+    {" says,", 58.24, 58.62},
+    {" like", 58.62, 58.84},
+    {" a", 58.84, 59.16},
+    {" shampooer", 59.16, 59.84},
+    {" and", 59.84, 60.0},
+    {" a", 60.0, 60.16},
+    {" Turkish", 60.16, 60.44},
+    {" bath,", 60.44, 61.32},
+    {" next", 61.32, 61.66},
+    {" man!", 61.66, 62.44}
+  ]
 
   test "long audio matches the pipeline of transformers" do
     for {repo, text} <- [
@@ -227,6 +424,19 @@ defmodule Transmuter.AudioLongTest do
                [{start, stop, @long_text <> text} | rest]
     end
   end
+
+  # The 3 windows are one batch. They have different numbers of frames and of passes, so a
+  # window that is done is a padding row in the later passes of the others. The merge
+  # compares the times of the tokens in the overlaps, as in transformers.
+  test "long audio word timestamps in a batch match the pipeline of transformers" do
+    serving =
+      Transmuter.Audio.speech_to_text(
+        {:hf, "Xenova/whisper-tiny.en"},
+        [timestamps: :words, compile: [batch_size: 3]] ++ @opts
+      )
+
+    Transmuter.AudioTest.assert_words(Nx.Serving.run(serving, @long), @long_words)
+  end
 end
 
 defmodule Transmuter.AudioBatchTest do
@@ -262,6 +472,32 @@ defmodule Transmuter.AudioBatchTest do
       alone = for audio <- [@long, @audio], do: Nx.Serving.run(single, audio)
       assert Nx.Serving.run(batched, [@long, @audio]) == alone
     end
+  end
+end
+
+defmodule Transmuter.Audio.WordTimestampsTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Audio.WordTimestamps
+
+  # _median_filter of transformers reflects the columns of the audio at both of its ends. With
+  # 1499 frames, the last columns read the columns before column 1498, not the padding of
+  # the 1500 encoder positions.
+  test "the median filter reflects the columns at the end of the audio" do
+    values = for i <- 0..1499, do: :math.sin(i * 1.7)
+    weights = Nx.tensor([values], type: :f32)
+    frames = 1499
+    result = WordTimestamps.median(weights, Nx.tensor(frames), 7)
+
+    values = weights |> Nx.to_flat_list() |> List.to_tuple()
+    reflect = &if(abs(&1) > frames - 1, do: 2 * (frames - 1) - abs(&1), else: abs(&1))
+
+    expected =
+      for c <- 0..(frames - 1) do
+        (c - 3)..(c + 3) |> Enum.map(&elem(values, reflect.(&1))) |> Enum.sort() |> Enum.at(3)
+      end
+
+    assert result[[0, 0..(frames - 1)]] |> Nx.to_flat_list() == expected
   end
 end
 

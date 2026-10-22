@@ -19,10 +19,10 @@ defmodule Transmuter.Audio.SpeechToText do
     2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again.
     3. The client merges the tokens of the windows as `_decode_asr` of the Whisper tokenizer does. It removes the timestamps in the context of each window, and joins the overlap of two token sequences at the middle of their best alignment (`_find_longest_common_sequence`).
 
-  With timestamps, the processor of `WhisperTimeStampLogitsProcessor` selects the tokens.
+  With timestamps, the processor of `WhisperTimeStampLogitsProcessor` selects the tokens. With word timestamps, `Transmuter.Audio.WordTimestamps` gives the end time of each token after each pass, and the merge compares these times in the overlaps, as `_decode_asr` does with `token_timestamps`.
   """
 
-  alias Transmuter.Audio.Featurizer
+  alias Transmuter.Audio.{Featurizer, WordTimestamps}
   alias Transmuter.{Generation, Hub, Serving, Tokenizer}
 
   @doc false
@@ -56,22 +56,33 @@ defmodule Transmuter.Audio.SpeechToText do
       )
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
+    mode = opts[:timestamps]
 
-    {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
+    unless mode in [nil, :segments, :words] do
+      raise ArgumentError,
+            "expected :timestamps to be nil, :segments or :words, got: #{inspect(mode)}"
+    end
+
+    outputs =
+      if mode == :words,
+        do: &(Generation.outputs(&1) ++ WordTimestamps.outputs(&1)),
+        else: &Generation.outputs/1
+
+    {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts, outputs)
     gen = repo.generation_config
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     featurizer = featurizer(repo)
-    timestamps? = timestamps?(opts[:timestamps])
     settings = settings(repo, featurizer, opts)
-    prompt = prompt(gen, opts[:language], opts[:task], timestamps?)
+    prompt = prompt(gen, opts[:language], opts[:task], mode != nil)
     [input] = encoder.inputs
 
     max_new_tokens = Generation.max_new_tokens(repo, opts, length(prompt))
     opts = Keyword.put(opts, :max_new_tokens, max_new_tokens)
-    ctx = Generation.context(repo, decoder, opts, ["encoder_hidden_states"])
+    generator = %{decoder | outputs: Generation.outputs(decoder.outputs)}
+    ctx = Generation.context(repo, generator, opts, ["encoder_hidden_states"])
 
     ctx =
-      if timestamps?,
+      if mode,
         do:
           Map.update!(
             ctx,
@@ -80,21 +91,35 @@ defmodule Transmuter.Audio.SpeechToText do
           ),
         else: ctx
 
+    aligner = aligner(mode, repo, decoder, settings, length(prompt), max_new_tokens)
+
     init = fn defn_options ->
       features = Nx.Defn.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
       shape = {compile[:batch_size], featurizer.feature_size, settings.frames}
       template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
       encode = Transmuter.compile(encoder, %{input => template}, defn_options)
+      align = aligner.(defn_options)
 
       encode = fn features ->
         %{"last_hidden_state" => hidden} = encode.(%{input => features})
         %{"encoder_hidden_states" => hidden}
       end
 
-      fn %{"audio" => audio}, prompts, generate ->
+      # Each token of a row goes out with its end time in feature frames, as two ids.
+      fn %{"audio" => audio, "frames" => frames}, prompts, generate ->
         features = features.(audio, featurizer.filters, featurizer.window)
+        frames = Nx.to_flat_list(frames)
         seeks = Enum.map(prompts, fn _ -> 0 end)
-        transcribe(features, prompts, seeks, settings, &generate.(encode.(&1), &2))
+
+        pass = fn input, prompts, seeks ->
+          inputs = encode.(input)
+          tokens = generate.(inputs, prompts)
+          times = align.(inputs, prompts, tokens, seeks, frames)
+          Enum.zip_with(tokens, times, &Enum.zip/2)
+        end
+
+        for row <- transcribe(features, prompts, seeks, settings, pass),
+            do: Enum.flat_map(row, &Tuple.to_list/1)
       end
     end
 
@@ -109,9 +134,21 @@ defmodule Transmuter.Audio.SpeechToText do
         {skip, take, padding} = {start * bits, size * bits, (featurizer.n_samples - size) * bits}
         <<_::bitstring-size(^skip), window::bitstring-size(^take), _::bitstring>> = samples
         window = Nx.from_binary(<<window::bitstring, 0::size(padding)>>, type)
-        %{prompt: prompt, seed: seed, tensors: %{"audio" => window}, stride: stride}
+
+        # The feature frames of the audio: the frames of the attention mask of
+        # WhisperFeatureExtractor, which word timestamps read.
+        frames = Nx.tensor(div(size + featurizer.hop_length - 1, featurizer.hop_length))
+        tensors = %{"audio" => window, "frames" => frames}
+        %{prompt: prompt, seed: seed, tensors: tensors, stride: stride}
       end
     end
+
+    frame_seconds = settings.precision / settings.frames_per_timestamp
+    # The language of the text. A translation is English.
+    language =
+      if gen["is_multilingual"] and opts[:task] != :translate,
+        do: opts[:language] || "en",
+        else: "en"
 
     postprocess = fn windows, runs ->
       strides =
@@ -119,21 +156,12 @@ defmodule Transmuter.Audio.SpeechToText do
           stride |> Tuple.to_list() |> Enum.map(&(&1 / featurizer.sampling_rate))
         end)
 
-      chunks =
-        windows
-        |> Enum.zip(strides)
-        |> merge(settings)
-        |> Enum.map(fn {start, stop, ids} ->
-          text = Tokenizer.decode(tokenizer, ids)
-          %{text: text, start_timestamp_seconds: start, end_timestamp_seconds: stop}
-        end)
+      windows =
+        for ids <- windows,
+            do: for([token, time] <- Enum.chunk_every(ids, 2), do: {token, time * frame_seconds})
 
-      if timestamps? do
-        %{chunks: chunks}
-      else
-        text = Enum.map_join(chunks, & &1.text)
-        %{chunks: [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]}
-      end
+      chunks = windows |> Enum.zip(strides) |> merge(settings)
+      %{chunks: result(mode, chunks, tokenizer, language)}
     end
 
     task = %{
@@ -146,12 +174,48 @@ defmodule Transmuter.Audio.SpeechToText do
     Serving.generation(ctx, tokenizer, task, opts)
   end
 
-  defp timestamps?(nil), do: false
-  defp timestamps?(:segments), do: true
+  # Without word timestamps, each token ends at the start of the window.
+  defp aligner(:words, repo, decoder, settings, prompt_length, max_new_tokens) do
+    WordTimestamps.aligner(repo, decoder, %{
+      prompt_length: prompt_length,
+      max_new_tokens: max_new_tokens,
+      frames_per_timestamp: settings.frames_per_timestamp,
+      positions: repo.config["max_target_positions"]
+    })
+  end
 
-  defp timestamps?(other),
-    do:
-      raise(ArgumentError, "expected :timestamps to be nil or :segments, got: #{inspect(other)}")
+  defp aligner(_mode, _repo, _decoder, _settings, _prompt_length, _max_new_tokens) do
+    fn _defn_options ->
+      fn _inputs, _prompts, tokens, _seeks, _frames ->
+        for row <- tokens, do: List.duplicate(0, length(row))
+      end
+    end
+  end
+
+  # The chunks of the result from the merged chunks {start, end, elements}.
+  defp result(nil, chunks, tokenizer, _language) do
+    text = Enum.map_join(chunks, fn {_start, _stop, elements} -> text(tokenizer, elements) end)
+    [%{text: text, start_timestamp_seconds: nil, end_timestamp_seconds: nil}]
+  end
+
+  defp result(:segments, chunks, tokenizer, _language) do
+    for {start, stop, elements} <- chunks do
+      %{
+        text: text(tokenizer, elements),
+        start_timestamp_seconds: start,
+        end_timestamp_seconds: stop
+      }
+    end
+  end
+
+  defp result(:words, chunks, tokenizer, language) do
+    for {_start, _stop, elements} <- chunks,
+        {text, start, stop} <- WordTimestamps.words(tokenizer, elements, language),
+        do: %{text: text, start_timestamp_seconds: start, end_timestamp_seconds: stop}
+  end
+
+  defp text(tokenizer, elements),
+    do: Tokenizer.decode(tokenizer, Enum.map(elements, &elem(&1, 0)))
 
   # The windows in samples, as chunk_length_s and stride_length_s of transformers, and the
   # settings of the timestamps. A timestamp is 0.02 s, and a feature frame is 0.01 s.
@@ -204,8 +268,9 @@ defmodule Transmuter.Audio.SpeechToText do
   # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of the window
   # of each row. Tokens that end with two timestamps leave the last segment incomplete, so
   # the next pass of that row starts at the last timestamp, and the features after the frames
-  # are zeros. A row without a prompt is done.
-  defp transcribe(features, prompts, seeks, settings, generate) do
+  # are zeros. A row without a prompt is done. A pass gives the tokens of each row as
+  # {token, time}.
+  defp transcribe(features, prompts, seeks, settings, pass) do
     if Enum.all?(prompts, &(&1 == [])) do
       Enum.map(prompts, fn _ -> [] end)
     else
@@ -221,28 +286,29 @@ defmodule Transmuter.Audio.SpeechToText do
         end)
         |> Nx.concatenate()
 
-      {kept, seeks} =
-        generate.(input, prompts)
+      {kept, next_seeks} =
+        pass.(input, prompts, seeks)
         |> Enum.zip_with(seeks, &next_pass(&1, &2, settings))
         |> Enum.unzip()
 
-      prompts = Enum.zip_with(prompts, seeks, &if(&2 < frames, do: &1, else: []))
-      seeks = Enum.map(seeks, &if(&1 < frames, do: &1, else: 0))
-      Enum.zip_with(kept, transcribe(features, prompts, seeks, settings, generate), &++/2)
+      prompts = Enum.zip_with(prompts, next_seeks, &if(&2 < frames, do: &1, else: []))
+      seeks = Enum.map(next_seeks, &if(&1 < frames, do: &1, else: 0))
+      Enum.zip_with(kept, transcribe(features, prompts, seeks, settings, pass), &++/2)
     end
   end
 
   # The tokens to keep from a pass and the seek of the next pass. The seek is the number of
   # frames when the row is done.
   defp next_pass(tokens, seek, settings = %{frames: frames, timestamp_begin: begin}) do
-    timestamps = Enum.map(tokens, &(&1 >= begin))
+    timestamps = Enum.map(tokens, fn {token, _time} -> token >= begin end)
     pairs = for {[true, true], i} <- Enum.with_index(Enum.chunk_every(timestamps, 2, 1), 1), do: i
 
     if pairs == [] or Enum.take(timestamps, -2) == [false, true] do
       {tokens, frames}
     else
       kept = Enum.take(tokens, List.last(pairs) + 1)
-      {kept, seek + (Enum.at(kept, -2) - begin) * settings.frames_per_timestamp}
+      {last, _time} = Enum.at(kept, -2)
+      {kept, seek + (last - begin) * settings.frames_per_timestamp}
     end
   end
 
@@ -310,7 +376,9 @@ defmodule Transmuter.Audio.SpeechToText do
   end
 
   # _decode_asr of the Whisper tokenizer: the windows are {tokens, [size, left, right]} in
-  # seconds. Returns the chunks as {start, end, tokens}, with timestamps in seconds.
+  # seconds, and a token is {id, end time in the window}. Returns the chunks as
+  # {start, end, elements}, with timestamps in seconds. An element is a text token with its
+  # start and end, {id, {start, end}}.
   defp merge(windows, settings) do
     state = %{chunks: [], start: nil, previous: [], offset: 0.0, skip: false}
     state = Enum.reduce(windows, state, &merge_window(&1, &2, settings))
@@ -327,11 +395,12 @@ defmodule Transmuter.Audio.SpeechToText do
     %{timestamp_begin: begin, precision: precision} = settings
     state = %{state | offset: state.offset - left}
     first = if left != 0, do: left / precision + begin, else: begin
+    {ids, times} = Enum.unzip(tokens)
 
     # Timestamps in the right context do not end a chunk, and the last timestamp never does.
     last =
       if right != 0 do
-        tokens
+        ids
         |> Enum.reverse()
         |> Enum.filter(&(&1 >= begin))
         |> Enum.reduce_while(nil, fn token, last ->
@@ -341,8 +410,15 @@ defmodule Transmuter.Audio.SpeechToText do
         end)
       end
 
+    # A token starts at the end of the token before it in the window.
+    stamps =
+      Enum.zip_with([0.0 | times], times, fn start, stop ->
+        {Float.round(start + state.offset, 2), Float.round(stop + state.offset, 2)}
+      end)
+
     window = %{
-      ids: List.to_tuple(tokens),
+      ids: List.to_tuple(ids),
+      stamps: List.to_tuple(stamps),
       first: first,
       last: last,
       max: 0.0,
@@ -352,7 +428,7 @@ defmodule Transmuter.Audio.SpeechToText do
     }
 
     {state, window} =
-      tokens
+      ids
       |> Enum.with_index()
       |> Enum.reduce({state, window}, &merge_token(&1, &2, settings))
 
@@ -376,7 +452,7 @@ defmodule Transmuter.Audio.SpeechToText do
     cond do
       token >= begin -> merge_timestamp(token, i, state, window, settings)
       token >= eos -> {state, window}
-      true -> {state, %{window | current: [token | window.current]}}
+      true -> {state, %{window | current: [{token, elem(window.stamps, i)} | window.current]}}
     end
   end
 
@@ -423,7 +499,10 @@ defmodule Transmuter.Audio.SpeechToText do
 
   # _find_longest_common_sequence of the Whisper tokenizer: slides each sequence over the
   # merged tokens, takes the alignment with the most matches (more than one), and cuts the
-  # overlap at its middle.
+  # overlap at its middle. Two elements match when their ids are equal and the
+  # {start, end} of the left one is not after the right one. Without word timestamps, each
+  # element has the offset of its window, which grows from window to window, so only the
+  # ids decide.
   defp longest_common_sequence([first | rest]) do
     {merged, last} =
       Enum.reduce(rest, {[], first}, fn right, {merged, left} ->
@@ -445,10 +524,11 @@ defmodule Transmuter.Audio.SpeechToText do
         right_start = max(0, i - l)
 
         matches =
-          Enum.count(
-            0..(left_stop - left_start - 1)//1,
-            &(elem(left_ids, left_start + &1) == elem(right_ids, right_start + &1))
-          )
+          Enum.count(0..(left_stop - left_start - 1)//1, fn k ->
+            {id, stamp} = elem(left_ids, left_start + k)
+            {other_id, other_stamp} = elem(right_ids, right_start + k)
+            id == other_id and stamp <= other_stamp
+          end)
 
         score = matches / i + i / 10_000.0
 

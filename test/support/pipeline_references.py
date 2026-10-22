@@ -202,6 +202,11 @@ for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"
 asr = pipeline("automatic-speech-recognition", model="openai/whisper-tiny.en", chunk_length_s=30, device="cpu")
 print("short timestamps", asr(audio.copy(), return_timestamps=True, generate_kwargs={"do_sample": False, "num_beams": 1})["chunks"])
 
+# Word timestamps of the short and the long audio: (text, start, end) of each word.
+for name, samples in [("short", audio), ("long", long)]:
+    result = asr(samples.copy(), return_timestamps="word", generate_kwargs={"do_sample": False, "num_beams": 1})
+    print(name, "words", [(c["text"], c["timestamp"][0], c["timestamp"][1]) for c in result["chunks"]])
+
 # Image-text-to-text with SmolVLM. The image processor is the slow one, so the pixel values
 # are those of Transmuter. The reference of the default files of Transmuter (the q4 vision
 # encoder and decoder and the 8-bit embeddings) is ONNX Runtime on the same files: the

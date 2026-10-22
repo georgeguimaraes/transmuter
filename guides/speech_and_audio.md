@@ -242,6 +242,36 @@ The serving does the steps of `return_timestamps=True` in transformers:
 
 The timestamps have steps of 0.02 s. On 62.5 s of speech, the chunks and their timestamps are the same as the pipeline of transformers for `whisper-tiny.en` and `whisper-base`. The end of the last chunk can be after the end of the audio, as in transformers.
 
+### Word timestamps
+
+With `timestamps: :words`, the result has one chunk for each word, as `return_timestamps="word"` in transformers:
+
+```elixir
+serving =
+  Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"},
+    timestamps: :words,
+    backend: EMLX.Backend,
+    defn_options: [compiler: EMLX]
+  )
+
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr.", start_timestamp_seconds: 0.0, end_timestamp_seconds: 1.02},
+#=>            %{text: " Quilter", start_timestamp_seconds: 1.02, end_timestamp_seconds: 1.24}, ...]}
+```
+
+The decoder predicts timestamp tokens as with `:segments`. The time of each token then comes from the cross attentions of the decoder, as `_extract_token_timestamps` of transformers computes it:
+
+1. After each pass over a window, the decoder runs again over the prompt and the new tokens, without the cache. Only the heads of `alignment_heads` in `generation_config.json` stay, so the serving keeps a matrix of tokens by encoder positions (0.02 s each) for each head.
+2. Each head is normalized over the tokens, and a median filter of 7 values smooths it over the positions. The matrix is the mean of the heads.
+3. Dynamic time warping finds the path of the least cost through the matrix. A token ends at the position where the path enters its row.
+4. A token starts at the end of the token before it. The tokens join into words at spaces, and punctuation joins the word next to it, as `_combine_tokens_into_words` of the Whisper tokenizer. A word starts at the start of its first token and ends at the end of its last token.
+
+The decoder must give the outputs `cross_attentions.N`. `Xenova/whisper-tiny.en` and the `_timestamped` exports of onnx-community, such as `onnx-community/whisper-tiny.en_timestamped`, give them. `onnx-community/whisper-base` does not, and the serving then raises an error.
+
+In Chinese, Japanese, Thai, Lao, Burmese and Cantonese, each piece of complete characters is a word, as OpenAI whisper and transformers.js do. The `:language` option gives the language. With `task: :translate`, the text is English, so the words split at spaces. The pipeline of Python transformers does not know the language there, so it splits all languages at spaces.
+
+With `whisper-tiny.en` and greedy selection, the words and their times are the same as the pipeline of transformers with `chunk_length_s=30`: 17 words on 5.9 s of speech, and 150 words on 62.5 s of speech. On the CPU with EXLA, the extra run of the decoder and the time warping add 2% to 4% to the time of `:segments`.
+
 ### Speed
 
 On an Apple M-series GPU, 5.9 s of speech takes 0.9 s with `whisper-tiny.en` and 1.0 s with `whisper-base`, a real-time factor of 0.15 to 0.17. The featurizer and the encoder take less than 0.12 s, and the decoder gives 25 to 28 tokens per second. The decoder of these exports computes the positions from the length of the cache, so each cache length compiles on its first step and stays cached (see `Transmuter.Generation`).

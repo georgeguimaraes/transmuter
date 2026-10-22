@@ -231,6 +231,14 @@ Nx.Serving.run(serving, audio)
 #=> %{chunks: [%{text: " Mr. Quilter is ...", start_timestamp_seconds: 0.0, end_timestamp_seconds: 50.44}, ...]}
 ```
 
+With `timestamps: :words`, the result has one chunk for each word, as `return_timestamps="word"` in transformers. The decoder must give its cross attentions, as the decoder of `Xenova/whisper-tiny.en` and the `_timestamped` exports of onnx-community do:
+
+```elixir
+serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, timestamps: :words)
+Nx.Serving.run(serving, audio)
+#=> %{chunks: [%{text: " Mr.", start_timestamp_seconds: 0.0, end_timestamp_seconds: 0.96}, ...]}
+```
+
 See [Speech and audio](speech_and_audio.md) for the details.
 
 ### Audio classification

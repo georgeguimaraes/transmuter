@@ -118,6 +118,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.Idefics3Processor,
           Transmuter.Vision.Qwen2VLProcessor,
           Transmuter.Audio.SpeechToText,
+          Transmuter.Audio.WordTimestamps,
           Transmuter.Audio.AudioClassification,
           Transmuter.Audio.TextToSpeech,
           Transmuter.Fusion,

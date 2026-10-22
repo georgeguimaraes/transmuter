@@ -20,7 +20,7 @@ defmodule Transmuter.Audio do
 
   The input is a tensor of PCM samples at the sampling rate of the model (16 kHz for Whisper), of any float type, or a list of them. The result is `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}`, as in Bumblebee. The text starts with a space, as in Python transformers.
 
-  Without timestamps, the result has one chunk with all the text, and its timestamps are `nil`. With `timestamps: :segments`, the result has one chunk for each segment of speech, with its start and end in seconds. The end of the last chunk is `nil` when the model does not predict it.
+  Without timestamps, the result has one chunk with all the text, and its timestamps are `nil`. With `timestamps: :segments`, the result has one chunk for each segment of speech, with its start and end in seconds. The end of the last chunk is `nil` when the model does not predict it. With `timestamps: :words`, the result has one chunk for each word, with its start and end in seconds. The text of a word starts with its space, and has the punctuation next to it.
 
   The audio can have any length. The serving does the steps of the `automatic-speech-recognition` pipeline of transformers with `chunk_length_s` and `stride_length_s`. It splits the audio into windows that overlap, transcribes each window, and merges the tokens of the windows at the overlaps (`_decode_asr` of the Whisper tokenizer). Audio of 30 s or less is one window.
 
@@ -38,7 +38,7 @@ defmodule Transmuter.Audio do
 
     * `:context_num_seconds` - the length of the context at each side of a window in seconds, `stride_length_s` in transformers. Two windows that follow each other overlap by two contexts. The default is `:chunk_num_seconds / 6`. The value must be less than half of `:chunk_num_seconds`.
 
-    * `:timestamps` - `:segments` gives a chunk for each segment of speech, with timestamps, as `return_timestamps=True` in transformers. The decoder then predicts timestamp tokens with the rules of `WhisperTimeStampLogitsProcessor`. The default is `nil`, with no timestamps.
+    * `:timestamps` - `:segments` gives a chunk for each segment of speech, with timestamps, as `return_timestamps=True` in transformers. The decoder then predicts timestamp tokens with the rules of `WhisperTimeStampLogitsProcessor`. `:words` gives a chunk for each word, as `return_timestamps="word"` in transformers. The time of each token comes from the cross attentions of the `alignment_heads` of `generation_config.json`, with dynamic time warping (see `Transmuter.Audio.WordTimestamps`). The decoder must give the outputs `cross_attentions.N`, as `Xenova/whisper-tiny.en` and the `_timestamped` exports of onnx-community do, such as `onnx-community/whisper-tiny.en_timestamped`. `onnx-community/whisper-base` does not give them. In Chinese, Japanese, Thai, Lao, Burmese and Cantonese, a word is each piece of complete characters, as in OpenAI whisper and transformers.js. Other languages and translations split at spaces. The pipeline of transformers splits all languages at spaces. The default is `nil`, with no timestamps.
 
     * `:compile` - `:batch_size`, the number of windows that the decoder transcribes together. The windows come from one long audio, from a list of audio, or from concurrent calls to `Nx.Serving.batched_run/2`. The default is `1`.
 
