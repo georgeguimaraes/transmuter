@@ -39,6 +39,7 @@ end
 # Transmuter.compile adds a closure that no later compile reads. The cache reads this limit
 # on each insert, so the limit applies to the cache that already runs.
 Application.put_env(:emlx, EMLX.CompileCache, max_items: 128)
+Application.put_env(:transmuter, :progress_bar_enabled, false)
 
 # EMLX 0.5 creates its compile cache, a named ETS table, in the first process that
 # compiles, and ETS deletes a table when its owner exits. A compile here makes this

@@ -52,6 +52,64 @@ defmodule Transmuter.HubTest do
     end
   end
 
+  # config.json is a Git blob, and onnx/model.onnx is an LFS file, so each case checks both
+  # kinds of ETag.
+  test "a file downloads again when its ETag changes", %{tmp_dir: dir} do
+    source = {:hf, "hf-internal-testing/tiny-random-bert"}
+    old = {{2000, 1, 1}, {0, 0, 0}}
+
+    for file <- ["config.json", "onnx/model.onnx"] do
+      path = Transmuter.Hub.fetch!(source, file, cache_dir: dir)
+      etag_path = Path.join(Path.dirname(path), ".#{Path.basename(path)}.etag")
+      contents = File.read!(path)
+      etag = File.read!(etag_path)
+
+      cases = [
+        # A file of an earlier version of Transmuter has no saved ETag. Its contents match.
+        {"no saved ETag", fn -> File.rm!(etag_path) end, :kept},
+        {"no saved ETag, other contents",
+         fn -> File.rm!(etag_path) == :ok and File.write!(path, "x") end, :downloaded},
+        {"a new ETag on the Hub",
+         fn -> File.write!(etag_path, String.duplicate("0", byte_size(etag))) end, :downloaded}
+      ]
+
+      for {name, change, result} <- cases do
+        File.touch!(path, old)
+        change.()
+        assert Transmuter.Hub.fetch!(source, file, cache_dir: dir) == path
+
+        assert {File.read!(path) == contents, File.read!(etag_path),
+                File.stat!(path).mtime == old} ==
+                 {true, etag, result == :kept},
+               "#{file}: #{name}"
+      end
+    end
+
+    info = Path.join(dir, "hf-internal-testing/tiny-random-bert/.info.json")
+
+    File.write!(
+      info,
+      String.replace(File.read!(info), etag_of(info, "config.json"), String.duplicate("0", 40))
+    )
+
+    File.rm!(Path.join(dir, "hf-internal-testing/tiny-random-bert/config.json"))
+
+    assert_raise ArgumentError, ~r/the download of config.json .* does not match its ETag/, fn ->
+      Transmuter.Hub.fetch!(source, "config.json", cache_dir: dir)
+    end
+
+    refute File.exists?(Path.join(dir, "hf-internal-testing/tiny-random-bert/config.json"))
+  end
+
+  defp etag_of(info, file) do
+    info
+    |> File.read!()
+    |> JSON.decode!()
+    |> Map.fetch!("siblings")
+    |> Enum.find(&(&1["rfilename"] == file))
+    |> Map.fetch!("blobId")
+  end
+
   test "concurrent downloads of one file all succeed", %{tmp_dir: dir} do
     paths =
       1..8
