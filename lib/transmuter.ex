@@ -345,6 +345,13 @@ defmodule Transmuter do
   All other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX` or
   `compiler: EXLA`.
 
+  With EXLA, a `:cache` path keeps the compiled segments on disk, so a later compile
+  of the same model, also in a new OS process, loads them. Each segment gets its own
+  file, `<path>-<hash>`, where the hash comes from the graph, the shapes of the
+  segment arguments and the values of the static inputs. So many models and tasks
+  can share one path. The weights are arguments of the segments, so new weights
+  use the same files.
+
   Each call of a model with random operators draws new values. A call that gives an
   `Nx.Random` key in the `Transmuter.random_input/0` input draws from that key, so the
   same key gives the same values.

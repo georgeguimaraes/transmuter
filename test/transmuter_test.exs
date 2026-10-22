@@ -765,4 +765,42 @@ defmodule TransmuterTest.EXLACacheTest do
 
     assert :ets.info(EXLA.Defn.LockedCache, :size) == before
   end
+
+  @tag :tmp_dir
+  test "each segment gets its own EXLA disk cache file, which a later compile loads", %{
+    tmp_dir: dir
+  } do
+    backend = Transmuter.TestBackend.backend()
+    opts = [cache: Path.join(dir, "model")] ++ Transmuter.TestBackend.compiler_opts()
+
+    # Cosh compiles one segment, and the Range break of the other model two segments.
+    runs =
+      for {name, x} <- [
+            Cosh: Nx.iota({3, 5}),
+            Break_Range_long_tail: Nx.tensor([3, 1, 1, 1, 1, 1])
+          ] do
+        model =
+          Transmuter.load!(Path.expand("fixtures/ops/#{name}/model.onnx", __DIR__),
+            backend: backend
+          )
+
+        inputs = %{"x" => Nx.as_type(x, :f32) |> Nx.backend_transfer(backend)}
+        fn -> Nx.to_list(Transmuter.compile(model, inputs, opts).(inputs)["y"]) end
+      end
+
+    expected = Enum.map(runs, & &1.())
+    files = Path.wildcard(Path.join(dir, "model-*"))
+    assert length(files) == 3
+
+    old = {{2000, 1, 1}, {0, 0, 0}}
+    Enum.each(files, &File.touch!(&1, old))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Enum.map(runs, & &1.()) == expected
+      end)
+
+    refute log =~ "does not match"
+    assert Enum.map(files, &File.stat!(&1).mtime) == List.duplicate(old, 3)
+  end
 end

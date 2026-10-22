@@ -23,7 +23,10 @@ defmodule Transmuter.GraphBreaks do
     # EXLA keeps each compiled function in a global cache that never evicts. The segments
     # are already cached here, with eviction and erasure when the owner exits, so EXLA must
     # not keep a second copy. Other compilers, such as EMLX, reject the :cache option.
-    opts = if compiler == EXLA, do: Keyword.put_new(opts, :cache, false), else: opts
+    {disk_cache, opts} =
+      if compiler == EXLA,
+        do: {opts[:cache], Keyword.put(opts, :cache, false)},
+        else: {nil, opts}
 
     :telemetry.span([:transmuter, :compile], metadata, fn ->
       nodes = List.to_tuple(model.nodes)
@@ -45,6 +48,7 @@ defmodule Transmuter.GraphBreaks do
         backend: Nx.Defn.to_backend(opts),
         table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
         scope: Shared.scope(),
+        disk_cache: disk_cache(disk_cache, model),
         random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
       }
 
@@ -55,6 +59,20 @@ defmodule Transmuter.GraphBreaks do
 
       {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
     end)
+  end
+
+  @doc """
+  Returns `Nx.Defn.jit/2` of `fun` with `defn_options`, without an EXLA `:cache` path.
+
+  A jit function compiles for the shapes of each call, and EXLA loads the program from a `:cache` path again on each call. So the small jit functions of the tasks keep their programs only in memory.
+  """
+  def jit(fun, defn_options) do
+    defn_options =
+      if is_binary(defn_options[:cache]),
+        do: Keyword.delete(defn_options, :cache),
+        else: defn_options
+
+    Nx.Defn.jit(fun, defn_options)
   end
 
   defp instrument(call, source) do
@@ -197,9 +215,9 @@ defmodule Transmuter.GraphBreaks do
     entry =
       :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
         ref = make_ref()
-        key = plan.key
-        fun = fn args -> trace(key, statics, args, pos, ref) end
-        entry = compile_segment(plan, fun, args, pos, ref)
+        plan_key = plan.key
+        fun = fn args -> trace(plan_key, statics, args, pos, ref) end
+        entry = compile_segment(plan, key, fun, args, ref)
         Process.delete(ref)
         {entry, Map.merge(metadata, %{stop: entry.stop, compiled: entry.compiled != nil})}
       end)
@@ -212,7 +230,7 @@ defmodule Transmuter.GraphBreaks do
   # break runs eagerly, so its trace stops the compiler. The first segment always compiles,
   # as a model without breaks always did. The compiled function keeps the trace function,
   # so it holds the number of nodes and not the plan.
-  defp compile_segment(plan, fun, args, pos, ref) do
+  defp compile_segment(plan, key = {pos, _shapes, _static_key}, fun, args, ref) do
     count = tuple_size(plan.nodes)
 
     bounded = fn args ->
@@ -225,10 +243,14 @@ defmodule Transmuter.GraphBreaks do
 
     compiled =
       try do
-        compile(plan, bounded, args)
+        compile_program(plan, key, bounded, args)
       catch
         {^ref, :eager} -> nil
       end
+
+    # A compiler that loads the program from its disk cache does not trace the segment.
+    # Then a trace gives where the segment stops and what it returns.
+    unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
 
     {stop, out_names, produced} = Process.get(ref)
 
@@ -243,8 +265,28 @@ defmodule Transmuter.GraphBreaks do
 
   # The compiled function keeps its example arguments, so it gets templates. With the
   # values, each cached segment would keep the device tensors of its first call.
-  defp compile(plan, fun, args),
-    do: Nx.Defn.compile(fun, [Composite.traverse(args, &Nx.to_template/1)], plan.opts)
+  defp compile_program(plan, key, fun, args) do
+    opts =
+      case plan.disk_cache do
+        nil -> plan.opts
+        {path, model} -> Keyword.put(plan.opts, :cache, path <> "-" <> hash({model, key}))
+      end
+
+    Nx.Defn.compile(fun, [Composite.traverse(args, &Nx.to_template/1)], opts)
+  end
+
+  # EXLA keeps one program in each :cache path and checks only the shapes of its arguments.
+  # So each segment gets its own path, from the graph and the key of the segment, and a
+  # function with other shapes or another graph does not overwrite or load it.
+  defp disk_cache(path, model) when is_binary(path),
+    do: {path, hash(Map.delete(model, :params))}
+
+  defp disk_cache(_cache, _model), do: nil
+
+  defp hash(term) do
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary(term, [:deterministic]))
+    Base.encode16(hash, case: :lower)
+  end
 
   defp classify(%{compiled: nil, stop: stop}), do: {:eager, stop}
   defp classify(entry = %{stop: :end}), do: {:end, entry}

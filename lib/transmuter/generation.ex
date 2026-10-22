@@ -64,7 +64,7 @@ defmodule Transmuter.Generation do
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
   """
 
-  alias Transmuter.Serving
+  alias Transmuter.{GraphBreaks, Serving}
 
   # Buffers have a capacity of a power of two, from this size.
   @min_capacity 256
@@ -403,14 +403,14 @@ defmodule Transmuter.Generation do
     ctx
     |> Map.put(
       :select,
-      Nx.Defn.jit(&select_tokens(&1, &2, &3, &4, &5, &6, &7, settings), defn_options)
+      GraphBreaks.jit(&select_tokens(&1, &2, &3, &4, &5, &6, &7, settings), defn_options)
     )
     |> Map.put(
       :select_beams,
-      Nx.Defn.jit(&select_beams(&1, &2, &3, &4, &5, &6, settings), defn_options)
+      GraphBreaks.jit(&select_beams(&1, &2, &3, &4, &5, &6, settings), defn_options)
     )
-    |> Map.put(:append, Nx.Defn.jit(&append_rows/3, defn_options))
-    |> Map.put(:reorder, Nx.Defn.jit(&reorder_rows/2, defn_options))
+    |> Map.put(:append, GraphBreaks.jit(&append_rows/3, defn_options))
+    |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
   end
 
   # _beam_search of transformers keeps the best candidates of each prompt: num_beams for each
@@ -443,7 +443,7 @@ defmodule Transmuter.Generation do
     end
 
     %{ctx | embed: embed}
-    |> Map.put(:merge, Nx.Defn.jit(&merge_features/4, defn_options))
+    |> Map.put(:merge, GraphBreaks.jit(&merge_features/4, defn_options))
   end
 
   defp merge_features(embeds, features, index, mask) do

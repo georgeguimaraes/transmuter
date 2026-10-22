@@ -23,7 +23,7 @@ defmodule Transmuter.Audio.SpeechToText do
   """
 
   alias Transmuter.Audio.{Featurizer, WordTimestamps}
-  alias Transmuter.{Generation, Hub, Serving, Tokenizer}
+  alias Transmuter.{Generation, GraphBreaks, Hub, Serving, Tokenizer}
 
   @doc false
   def speech_to_text(source, opts) do
@@ -97,7 +97,7 @@ defmodule Transmuter.Audio.SpeechToText do
     aligner = aligner(mode, repo, decoder, settings, length(prompt), max_new_tokens)
 
     init = fn defn_options ->
-      features = Nx.Defn.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
+      features = GraphBreaks.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
       shape = {compile[:batch_size], featurizer.feature_size, settings.frames}
       template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
       encode = Transmuter.compile(encoder, %{input => template}, defn_options)

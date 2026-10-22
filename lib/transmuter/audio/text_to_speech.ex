@@ -16,7 +16,7 @@ defmodule Transmuter.Audio.TextToSpeech do
   The serving runs each text as a batch of its own (`Transmuter.Serving.each/2`). The predicted durations of VITS decide the length of its audio, and the export gives no length for each row of a batch, so the audio of a padded row cannot be cut from a batch. The SpeechT5 exports take a batch of one text.
   """
 
-  alias Transmuter.{Hub, Repo, Serving, Tokenizer}
+  alias Transmuter.{GraphBreaks, Hub, Repo, Serving, Tokenizer}
 
   # The compiled models keep this many shapes: the text lengths and the audio lengths.
   @shapes 64
@@ -182,7 +182,7 @@ defmodule Transmuter.Audio.TextToSpeech do
         end)
 
       # An eager fold_in is many small calls to the device.
-      fold_in = Nx.Defn.jit(&Transmuter.Random.fold_in/2, defn_options)
+      fold_in = GraphBreaks.jit(&Transmuter.Random.fold_in/2, defn_options)
 
       fn %{"input_ids" => ids, "speaker_embeddings" => embedding, "seed" => seed} ->
         %{"encoder_outputs" => hidden, "encoder_attention_mask" => mask} =
