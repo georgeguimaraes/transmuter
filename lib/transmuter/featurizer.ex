@@ -12,12 +12,13 @@ defmodule Transmuter.Featurizer do
   The steps and their order are those of the image processors of Python transformers:
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
-    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/3`. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR, YOLOS and Grounding DINO image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The featurizer reads `image_processor_type` and does the same.
+    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/4`. For an `image_processor_type` that ends in `Fast`, the weights are those of torchvision, so a pixel can be one step away from Pillow. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR, YOLOS and Grounding DINO image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The SAM image processor gives the long side `longest_edge`, also when the image is smaller. The featurizer reads `image_processor_type` and does the same.
     3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
+    6. `do_pad` of the SAM image processor - zeros on the bottom and the right give the image the `pad_size`, 1024x1024 by default.
 
-  The OWLv2 image processor (`Owlv2ImageProcessor`) does the steps in another order, and the featurizer reads `image_processor_type` and does the same. It rescales the image, pads it to a square on the bottom and the right with the value 0.5 (`do_pad`), resizes it with the `:gaussian_linear` method of `resize/3`, and normalizes it.
+  The OWLv2 image processor (`Owlv2ImageProcessor`) does the steps in another order, and the featurizer reads `image_processor_type` and does the same. It rescales the image, pads it to a square on the bottom and the right with the value 0.5 (`do_pad`), resizes it with the `:gaussian_linear` method of `resize/4`, and normalizes it.
 
   The result has the shape `{batch, channels, height, width}` and the type `:f32`.
   """
@@ -26,7 +27,16 @@ defmodule Transmuter.Featurizer do
 
   alias Transmuter.{Hub, Repo}
 
-  defstruct [:resize, :crop, :rescale, :normalize, :pad, resample: :bilinear, rgb: true]
+  defstruct [
+    :resize,
+    :crop,
+    :rescale,
+    :normalize,
+    :pad,
+    resample: :bilinear,
+    weights: :pillow,
+    rgb: true
+  ]
 
   # The resample codes of Pillow.
   @resamples %{
@@ -68,16 +78,32 @@ defmodule Transmuter.Featurizer do
     owlv2(config, %__MODULE__{
       resize: if(Map.get(config, "do_resize", true), do: size),
       resample: Map.fetch!(@resamples, config["resample"] || 2),
+      weights: weights(config["image_processor_type"]),
       crop: crop,
       rescale: if(Map.get(config, "do_rescale", true), do: config["rescale_factor"] || 1 / 255),
       normalize: if(Map.get(config, "do_normalize", true), do: mean_std(config)),
+      pad: sam_pad(config),
       rgb: Map.get(config, "do_convert_rgb", true)
     })
   end
 
+  # The fast image processors of Python transformers resize with torchvision.
+  defp weights(type) when is_binary(type),
+    do: if(String.ends_with?(type, "Fast"), do: :torchvision, else: :pillow)
+
+  defp weights(_type), do: :pillow
+
+  # SamImageProcessor of Python transformers pads to pad_size with zeros after it normalizes.
+  defp sam_pad(config = %{"image_processor_type" => "SamImageProcessor" <> _}) do
+    if Map.get(config, "do_pad", true),
+      do: {square(config["pad_size"] || %{"height" => 1024, "width" => 1024}), 0}
+  end
+
+  defp sam_pad(_config), do: nil
+
   # Owlv2ImageProcessor of Python transformers ignores resample.
   defp owlv2(config = %{"image_processor_type" => "Owlv2ImageProcessor"}, featurizer) do
-    pad = if Map.get(config, "do_pad", true), do: 0.5
+    pad = if Map.get(config, "do_pad", true), do: {:square, 0.5}
     %{featurizer | resample: :gaussian_linear, pad: pad}
   end
 
@@ -107,11 +133,13 @@ defmodule Transmuter.Featurizer do
 
   # The DETR, YOLOS and Grounding DINO image processors compute the size with
   # get_size_with_aspect_ratio.
-  # YOLOS also rounds each side down to a multiple of 16.
+  # YOLOS also rounds each side down to a multiple of 16. The SAM image processor gives the
+  # long side longest_edge, also for a smaller image, and rounds the short side.
   defp detr_size(type, {:edges, shortest, longest}) when is_binary(type) do
     cond do
       String.starts_with?(type, "Yolos") -> {:detr, shortest, longest, 16}
       String.starts_with?(type, ["Detr", "GroundingDino"]) -> {:detr, shortest, longest, 1}
+      String.starts_with?(type, "SamImageProcessor") -> {:sam, longest}
       true -> {:edges, shortest, longest}
     end
   end
@@ -149,12 +177,13 @@ defmodule Transmuter.Featurizer do
   @doc """
   Returns the `{height, width}` of the images that `process/2` gives, or `nil` when the size depends on the image, for example with `shortest_edge` and no crop.
   """
+  def size(%__MODULE__{pad: {{_, _} = size, _value}}), do: size
   def size(%__MODULE__{crop: {_, _} = crop}), do: crop
   def size(%__MODULE__{resize: {height, width}}) when is_integer(height), do: {height, width}
   def size(%__MODULE__{}), do: nil
 
   @doc """
-  Returns the `{height, width}` that `process/2` gives for an image of size `{height, width}`.
+  Returns the `{height, width}` of the image in the result of `process/2` for an image of size `{height, width}`. A `pad_size` (as in SAM) adds padding on the bottom and the right after this size, and `size/1` gives the size with the padding.
   """
   def image_size(featurizer, size) do
     cond do
@@ -189,12 +218,20 @@ defmodule Transmuter.Featurizer do
 
     image =
       if featurizer.resample == :gaussian_linear do
-        image |> rescale(featurizer) |> pad_square(featurizer.pad) |> resize_step(featurizer)
+        image
+        |> rescale(featurizer)
+        |> pad(featurizer.pad)
+        |> resize_step(featurizer)
+        |> normalize(featurizer.normalize)
       else
-        image |> resize_step(featurizer) |> center_crop(featurizer.crop) |> rescale(featurizer)
+        image
+        |> resize_step(featurizer)
+        |> center_crop(featurizer.crop)
+        |> rescale(featurizer)
+        |> normalize(featurizer.normalize)
+        |> pad(featurizer.pad)
       end
 
-    image = if featurizer.normalize, do: normalize(image, featurizer.normalize), else: image
     Nx.transpose(image, axes: [2, 0, 1])
   end
 
@@ -202,7 +239,8 @@ defmodule Transmuter.Featurizer do
 
   defp resize_step(image, featurizer) do
     {height, width, _channels} = Nx.shape(image)
-    resize(image, output_size(featurizer.resize, {height, width}), featurizer.resample)
+    size = output_size(featurizer.resize, {height, width})
+    resize(image, size, featurizer.resample, featurizer.weights)
   end
 
   defp rescale(image, featurizer) do
@@ -210,13 +248,18 @@ defmodule Transmuter.Featurizer do
     if featurizer.rescale, do: Nx.multiply(image, featurizer.rescale), else: image
   end
 
-  # As pad of Owlv2ImageProcessor of Python transformers.
-  defp pad_square(image, nil), do: image
+  # Pads the bottom and the right of the image with a value, to a square of its long side
+  # (Owlv2ImageProcessor) or to a size (pad_size of SamImageProcessor).
+  defp pad(image, nil), do: image
 
-  defp pad_square(image, value) do
+  defp pad(image, {:square, value}) do
     {height, width, _channels} = Nx.shape(image)
-    side = max(height, width)
-    padding = [{0, side - height, 0}, {0, side - width, 0}, {0, 0, 0}]
+    pad(image, {{max(height, width), max(height, width)}, value})
+  end
+
+  defp pad(image, {{to_height, to_width}, value}) do
+    {height, width, _channels} = Nx.shape(image)
+    padding = [{0, to_height - height, 0}, {0, to_width - width, 0}, {0, 0, 0}]
     Nx.pad(image, Nx.tensor(value, type: Nx.type(image)), padding)
   end
 
@@ -282,6 +325,12 @@ defmodule Transmuter.Featurizer do
     {multiple_of(scale * height, multiple), multiple_of(scale * width, multiple)}
   end
 
+  # As _get_preprocess_shape of SamImageProcessor.
+  defp output_size({:sam, longest}, {height, width}) do
+    scale = longest / max(height, width)
+    {trunc(height * scale + 0.5), trunc(width * scale + 0.5)}
+  end
+
   defp output_size(size, _image_size), do: size
 
   defp multiple_of(value, multiple), do: round_even(value / multiple) * multiple
@@ -323,6 +372,8 @@ defmodule Transmuter.Featurizer do
     end
   end
 
+  defp normalize(image, nil), do: image
+
   defp normalize(image, {mean, std}) do
     mean = Nx.tensor(mean, type: :f32, backend: Nx.BinaryBackend)
     std = Nx.tensor(std, type: :f32, backend: Nx.BinaryBackend)
@@ -336,24 +387,30 @@ defmodule Transmuter.Featurizer do
 
   A `:u8` image gives a `:u8` image. As in Pillow, the weights are fixed-point numbers with 22 fraction bits, and each pass rounds to `:u8`. An image of another type is resized in `:f32`.
 
+  `weights` is `:pillow`, the default, or `:torchvision`, which the featurizer uses for the fast image processors of Python transformers (an `image_processor_type` that ends in `Fast`). On Apple silicon and on x86 with AVX2, torchvision resizes a `:u8` image with the filters and the taps of Pillow, but its weights are 16-bit integers. So for `:bilinear`, `:bicubic` and `:lanczos`, the weights of an axis get the most fraction bits, up to 22, that keep the largest weight as an integer below 2^15. With fewer bits, a pixel can be one step away from Pillow when the image gets smaller. The other methods and the images of other types resize as with `:pillow`.
+
   `:gaussian_linear` is the resize of the OWLv2 image processor of Python transformers, which is `skimage.transform.resize` with anti-aliasing. On each axis, a gaussian blur with sigma `max(0, (scale - 1) / 2)` comes first, where `scale` is the input size divided by the output size. Then a linear interpolation between the pixel centers gives the output. Both steps reflect the image at its edges, as the `"mirror"` mode of `scipy.ndimage`. The result is clipped to the minimum and the maximum of the image.
   """
-  def resize(image, size, :gaussian_linear) do
+  def resize(image, size, method, weights \\ :pillow)
+
+  def resize(image, size, :gaussian_linear, weights) do
     image = Nx.as_type(image, :f32)
-    resized = resize_pillow(image, size, :gaussian_linear)
+    resized = resize_pillow(image, size, :gaussian_linear, weights)
     Nx.clip(resized, Nx.reduce_min(image), Nx.reduce_max(image))
   end
 
-  def resize(image, size, method) do
+  def resize(image, size, method, weights) do
     image = if Nx.type(image) == {:u, 8}, do: image, else: Nx.as_type(image, :f32)
-    resize_pillow(image, size, method)
+    resize_pillow(image, size, method, weights)
   end
 
-  defp resize_pillow(image, {height, width}, method) do
-    image |> resize_axis(1, width, method) |> resize_axis(0, height, method)
+  defp resize_pillow(image, {height, width}, method, weights) do
+    image
+    |> resize_axis(1, width, method, weights)
+    |> resize_axis(0, height, method, weights)
   end
 
-  defp resize_axis(image, axis, size, method) do
+  defp resize_axis(image, axis, size, method, mode) do
     in_size = Nx.axis_size(image, axis)
 
     if in_size == size do
@@ -375,16 +432,27 @@ defmodule Transmuter.Featurizer do
         |> Nx.take(Nx.tensor(indices, backend: Nx.BinaryBackend), axis: axis)
         |> Nx.reshape(shape)
 
-      weighted_sum(gathered, weights, List.to_tuple(weight_shape), axis + 1, Nx.type(image))
+      bits = precision_bits(weights, method, mode)
+      weighted_sum(gathered, weights, List.to_tuple(weight_shape), axis + 1, Nx.type(image), bits)
     end
   end
 
-  @precision_bits 22
+  # Pillow rounds the weights of 8-bit images to integers with 22 fraction bits. torchvision
+  # takes the most bits that keep the weights in 16 bits, see
+  # _compute_index_ranges_int16_weights in aten/src/ATen/native/cpu/UpSampleKernel.cpp of
+  # PyTorch, which its bilinear, bicubic and lanczos filters use for 8-bit images.
+  defp precision_bits(weights, method, :torchvision)
+       when method in [:bilinear, :bicubic, :lanczos] do
+    largest = weights |> List.flatten() |> Enum.max()
+    Enum.find(0..21, 22, &(trunc(0.5 + largest * 2 ** (&1 + 1)) >= 2 ** 15))
+  end
 
-  # Pillow rounds the weights of 8-bit images to integers with 22 fraction bits, adds half
-  # of the last bit and clips the sum to 0..255.
-  defp weighted_sum(gathered, weights, shape, axis, {:u, 8}) do
-    one = 2 ** @precision_bits
+  defp precision_bits(_weights, _method, _mode), do: 22
+
+  # The weights of 8-bit images are integers with `bits` fraction bits. The sum gets half of
+  # the last bit and is clipped to 0..255.
+  defp weighted_sum(gathered, weights, shape, axis, {:u, 8}, bits) do
+    one = 2 ** bits
 
     weights =
       weights
@@ -397,12 +465,12 @@ defmodule Transmuter.Featurizer do
     |> Nx.multiply(weights)
     |> Nx.sum(axes: [axis])
     |> Nx.add(div(one, 2))
-    |> Nx.right_shift(@precision_bits)
+    |> Nx.right_shift(bits)
     |> Nx.clip(0, 255)
     |> Nx.as_type(:u8)
   end
 
-  defp weighted_sum(gathered, weights, shape, axis, type) do
+  defp weighted_sum(gathered, weights, shape, axis, type, _bits) do
     weights = weights |> Nx.tensor(type: type, backend: Nx.BinaryBackend) |> Nx.reshape(shape)
     gathered |> Nx.multiply(weights) |> Nx.sum(axes: [axis])
   end
