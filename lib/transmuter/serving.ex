@@ -220,15 +220,16 @@ defmodule Transmuter.Serving do
   @doc """
   Returns an `Nx.Serving` that runs `model` on audio.
 
-  The featurizer (`Transmuter.Audio.Featurizer`) turns the audio into `"input_values"` on the `:backend` of `opts`. When the features of all audio have one shape, such as the 1024 frames of AST, the serving compiles that shape, and the audio goes into batches of the `:batch_size` of `:compile`. When the shape depends on the length of the audio, such as the samples of wav2vec2, the batch size must be 1. Each audio is then a batch, and the compiled model compiles each new length on its first call. It keeps up to #{@audio_lengths} lengths.
+  The featurizer (`Transmuter.Audio.Featurizer`) turns the audio into the input of `Transmuter.Audio.Featurizer.input_name/1`, such as `"input_values"`, on the `:backend` of `opts`. When the features of all audio have one shape, such as the 1024 frames of AST, the serving compiles that shape, and the audio goes into batches of the `:batch_size` of `:compile`. When the shape depends on the length of the audio, such as the samples of wav2vec2, the batch size must be 1. Each audio is then a batch, and the compiled model compiles each new length on its first call. It keeps up to #{@audio_lengths} lengths.
 
-  `fun` and `postprocess` are as in `text/7`. An audio is one row, so `postprocess` takes a list of one row and a list of one audio tensor.
+  `fun` and `postprocess` are as in `text/7`. An audio is one row, so `postprocess` takes a list of one row and a list of one audio tensor. `inputs` are other inputs of the model that are the same for all audio, as in `image/6`.
   """
-  def audio(model, featurizer, opts, fun, postprocess) do
+  def audio(model, featurizer, opts, fun, postprocess, inputs \\ %{}) do
     compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
     shape = AudioFeaturizer.shape(featurizer)
     batch_size = audio_batch_size!(shape, compile[:batch_size])
     key = {:audio_shape, shape}
+    name = AudioFeaturizer.input_name(featurizer)
     template = zeros(Tuple.insert_at(shape || {featurizer.sampling_rate}, 0, batch_size), :f32)
     backend = opts[:backend] || Nx.default_backend()
 
@@ -240,7 +241,7 @@ defmodule Transmuter.Serving do
             |> AudioFeaturizer.process(group, backend: backend)
             |> Nx.backend_transfer(Nx.BinaryBackend)
 
-          {%{"input_values" => values}, key}
+          {%{name => values}, key}
         end
 
       {groups, Enum.map(audio, &[&1])}
@@ -252,8 +253,8 @@ defmodule Transmuter.Serving do
 
     shapes = %{
       batch_size: batch_size,
-      templates: %{key => %{"input_values" => template}},
-      inputs: %{},
+      templates: %{key => %{name => template}},
+      inputs: inputs,
       cache_size: @audio_lengths
     }
 

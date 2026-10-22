@@ -24,7 +24,6 @@ defmodule Transmuter.Audio.SpeechToText do
 
   alias Transmuter.Audio.Featurizer
   alias Transmuter.{Generation, Hub, Serving, Tokenizer}
-  alias Transmuter.Ops.Signal
 
   @doc false
   def speech_to_text(source, opts) do
@@ -500,16 +499,7 @@ defmodule Transmuter.Audio.SpeechToText do
   Returns the log-mel features {batch, mels, frames} of `audio` {batch, samples}, with the `filters` and the `window` of `featurizer/1`. The audio must already have its length of 30 s.
   """
   def features(audio, filters, window, hop_length) do
-    n_fft = Nx.axis_size(window, 0)
-    pad = div(n_fft, 2)
-    samples = Nx.axis_size(audio, 1)
-    left = audio |> Nx.slice_along_axis(1, pad, axis: 1) |> Nx.reverse(axes: [1])
-    right = audio |> Nx.slice_along_axis(samples - pad - 1, pad, axis: 1) |> Nx.reverse(axes: [1])
-    signal = Nx.concatenate([left, audio, right], axis: 1) |> Nx.new_axis(2)
-
-    power =
-      signal |> Signal.stft(window, n_fft, hop_length, true) |> Nx.pow(2) |> Nx.sum(axes: [3])
-
+    power = Featurizer.power_spectrogram(audio, window, hop_length)
     power = Nx.slice_along_axis(power, 0, Nx.axis_size(power, 1) - 1, axis: 1)
     mel = power |> Nx.dot([2], filters, [0]) |> Nx.transpose(axes: [0, 2, 1])
 

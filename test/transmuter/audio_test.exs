@@ -367,6 +367,57 @@ defmodule Transmuter.AudioClassificationTest do
     assert_predictions(Nx.Serving.run(batched, inputs), expected, 1.0e-6)
   end
 
+  # CLAP takes 10 s at 48 kHz. test/fixtures/librispeech_0_48k.f32 is librispeech_0.f32
+  # resampled by librosa. The 5.86 s repeat once and end with zeros. The first 2 s repeat 5
+  # times and fill the 10 s. Both have no energy above 8 kHz, so the highest mel bins are
+  # -100 dB.
+  @clap {:hf, "Xenova/clap-htsat-unfused"}
+  @audio_48k Nx.from_binary(File.read!("test/fixtures/librispeech_0_48k.f32"), :f32)
+  @clap_labels ["a man speaking", "music", "a dog barking", "rain"]
+
+  test "the CLAP featurizer matches ClapFeatureExtractor" do
+    points = [[0, 0], [100, 37], [281, 63], [290, 10], [600, 20], [1000, 63]]
+
+    for {audio, expected, mean} <- [
+          {@audio_48k, [-35.2137, -27.546, -100.0, -22.3653, -100.0, -100.0], -66.9249},
+          {@audio_48k[0..95_999], [-35.2137, -27.546, -100.0, -28.7763, -31.2363, -66.9281],
+           -44.5233}
+        ] do
+      features =
+        Featurizer.load!(@clap)
+        |> Featurizer.process([audio], backend: @backend)
+        |> Nx.backend_transfer(Nx.BinaryBackend)
+
+      features = features[[0, 0]]
+      assert Nx.shape(features) == {1001, 64}
+
+      for {got, want} <- Enum.zip(Nx.to_list(Nx.gather(features, Nx.tensor(points))), expected),
+          do: assert_in_delta(got, want, 1.0e-3)
+
+      assert_in_delta Nx.to_number(Nx.mean(features)), mean, 1.0e-3
+    end
+  end
+
+  # The q8 file quantizes the activations 105 times when the model runs, so its scores
+  # depend on float rounding inside the network. On the first 2 s, all operators of EMLX and
+  # the EXLA CPU agree within 1e-6, but the score of "a man speaking" is 0.654 on the EXLA
+  # CPU without compilation, 0.696 with compilation, 0.858 on EMLX CPU and 0.607 on EMLX GPU.
+  # ONNX Runtime gives 0.755. So this test checks only the order of the two top labels, and
+  # the fp32 test in ZeroShotAudioClassificationLargeModelTest compares the scores within 1e-4.
+  test "zero-shot audio classification with the q8 CLAP file gives the top labels" do
+    serving =
+      Transmuter.Audio.zero_shot_audio_classification(
+        @clap,
+        @clap_labels,
+        [variant: :q8, top_k: 2, compile: [batch_size: 2]] ++ @opts
+      )
+
+    for %{predictions: predictions} <-
+          Nx.Serving.run(serving, [@audio_48k, @audio_48k[0..95_999]]) do
+      assert Enum.map(predictions, & &1.label) == ["a man speaking", "music"]
+    end
+  end
+
   defp assert_predictions(results, expected, delta) do
     for {%{predictions: got}, %{predictions: want}} <- Enum.zip(results, expected) do
       assert Enum.map(got, & &1.label) == Enum.map(want, & &1.label)
@@ -385,6 +436,61 @@ defmodule Transmuter.AudioClassificationTest do
   defp assert_all_close(got, expected) do
     for {g, e} <- Enum.zip(got, expected) do
       assert_in_delta g, e, 1.0e-4, "expected #{inspect(expected)}, got #{inspect(got)}"
+    end
+  end
+end
+
+# The fp32 CLAP file is 619 MB, more than the model cache of CI can keep, so this test is
+# :large_model. A module with a :ci_partition tag cannot have it, see
+# test/transmuter/ci_partition_test.exs.
+defmodule Transmuter.ZeroShotAudioClassificationLargeModelTest do
+  use ExUnit.Case, async: true
+
+  # The reference is the zero-shot-audio-classification pipeline of Python transformers with
+  # the PyTorch model, see test/support/pipeline_references.py.
+  @moduletag :hub
+  @moduletag timeout: 900_000
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  @audio Nx.from_binary(File.read!("test/fixtures/librispeech_0_48k.f32"), :f32)
+
+  @tag :large_model
+  test "zero-shot audio classification with CLAP matches the pipeline" do
+    labels = ["a man speaking", "music", "a dog barking", "rain"]
+
+    serving =
+      Transmuter.Audio.zero_shot_audio_classification(
+        {:hf, "Xenova/clap-htsat-unfused"},
+        labels,
+        [top_k: nil] ++ @opts
+      )
+
+    expected = [
+      [
+        {"a man speaking", 0.950146},
+        {"music", 0.046542},
+        {"rain", 0.002626},
+        {"a dog barking", 0.000685}
+      ],
+      [
+        {"a man speaking", 0.88723},
+        {"music", 0.106899},
+        {"a dog barking", 0.004245},
+        {"rain", 0.001626}
+      ]
+    ]
+
+    results = Nx.Serving.run(serving, [@audio, @audio[0..95_999]])
+
+    for {%{predictions: got}, want} <- Enum.zip(results, expected) do
+      assert Enum.map(got, & &1.label) == Enum.map(want, &elem(&1, 0))
+
+      for {%{score: score}, {_label, expected}} <- Enum.zip(got, want),
+          do: assert_in_delta(score, expected, 1.0e-4, inspect(got))
     end
   end
 end

@@ -20,13 +20,34 @@ defmodule Transmuter.Audio.Featurizer do
       6. Keep the first `max_length` frames. Shorter audio gets frames of zeros after its end.
       7. When `do_normalize` is `true`, give `(x - mean) / (2 * std)` with `mean` and `std` of the configuration.
 
+    * `"ClapFeatureExtractor"` - the log-mel spectrogram in dB of CLAP, as `input_features`. The result has the shape `{batch, 1, frames, feature_size}` for all audio. The steps are those of Python transformers with `truncation: "rand_trunc"`:
+
+      1. Fit the audio to `max_length_s` seconds. Shorter audio gets the `padding` of the configuration: `"repeatpad"` repeats the audio as many whole times as fit and adds zeros, `"repeat"` repeats the audio and cuts it, and `"pad"` adds zeros. Python transformers cuts longer audio at a random position. The featurizer keeps the first `max_length_s` seconds, which is one of the cuts that Python can give.
+      2. Add `fft_window_size / 2` samples at each end, which reflect the audio.
+      3. Cut the audio into frames of `fft_window_size` samples every `hop_length` samples, and multiply each frame by a periodic Hann window.
+      4. Take the power spectrum, and multiply it by `feature_size` mel filters from `frequency_min` to `frequency_max`, with the Slaney mel scale and the Slaney norm.
+      5. Give `10 * log10(x)`, with `x` at least 1.0e-10.
+
   When torchaudio is installed, Python transformers computes the AST features with `torchaudio.compliance.kaldi.fbank` in place of the numpy path.
   """
 
   alias Transmuter.{Hub, Repo}
   alias Transmuter.Ops.Signal
 
-  defstruct [:type, :sampling_rate, :normalize, :frames, :mean, :std, :window, :dft, :filters]
+  defstruct [
+    :type,
+    :sampling_rate,
+    :normalize,
+    :frames,
+    :mean,
+    :std,
+    :window,
+    :dft,
+    :filters,
+    :samples,
+    :hop_length,
+    :padding
+  ]
 
   # The constants of ASTFeatureExtractor.
   @frame_length 400
@@ -86,16 +107,81 @@ defmodule Transmuter.Audio.Featurizer do
     }
   end
 
+  def new(config = %{"feature_extractor_type" => "ClapFeatureExtractor"}) do
+    config =
+      Map.merge(
+        %{
+          "feature_size" => 64,
+          "sampling_rate" => 48_000,
+          "hop_length" => 480,
+          "max_length_s" => 10,
+          "fft_window_size" => 1024,
+          "frequency_min" => 0,
+          "frequency_max" => 14_000,
+          "truncation" => "fusion",
+          "padding" => "repeatpad"
+        },
+        config
+      )
+
+    # The fused CLAP models take four spectrograms of each audio and the is_longer input.
+    if config["truncation"] != "rand_trunc" do
+      raise ArgumentError,
+            ~s(the featurizer supports the truncation "rand_trunc" of ClapFeatureExtractor, got: #{inspect(config["truncation"])})
+    end
+
+    rate = config["sampling_rate"]
+    size = config["fft_window_size"]
+    samples = config["max_length_s"] * rate
+
+    %__MODULE__{
+      type: :clap,
+      sampling_rate: rate,
+      samples: samples,
+      hop_length: config["hop_length"],
+      frames: div(samples, config["hop_length"]) + 1,
+      padding: padding_mode(config["padding"]),
+      window: hann_window(size, true),
+      filters:
+        mel_filters(div(size, 2) + 1, config["feature_size"], rate,
+          min_frequency: config["frequency_min"],
+          max_frequency: config["frequency_max"],
+          mel_scale: :slaney,
+          norm: :slaney
+        )
+    }
+  end
+
   def new(config) do
     raise ArgumentError,
-          "expected feature_extractor_type in preprocessor_config.json to be ASTFeatureExtractor or Wav2Vec2FeatureExtractor, got: #{inspect(config["feature_extractor_type"])}"
+          "expected feature_extractor_type in preprocessor_config.json to be ASTFeatureExtractor, ClapFeatureExtractor or Wav2Vec2FeatureExtractor, got: #{inspect(config["feature_extractor_type"])}"
   end
+
+  defp padding_mode("repeatpad"), do: :repeatpad
+  defp padding_mode("repeat"), do: :repeat
+  defp padding_mode("pad"), do: :pad
+
+  defp padding_mode(padding),
+    do:
+      raise(
+        ArgumentError,
+        ~s(expected padding of ClapFeatureExtractor to be "repeatpad", "repeat" or "pad", got: #{inspect(padding)})
+      )
+
+  @doc """
+  Returns the name of the model input of the features: `"input_features"` for CLAP, and `"input_values"` for the others, as `model_input_names` of the feature extractors of Python transformers.
+  """
+  def input_name(%__MODULE__{type: :clap}), do: "input_features"
+  def input_name(%__MODULE__{}), do: "input_values"
 
   @doc """
   Returns the shape of the features of one audio that `process/3` gives, or `nil` when the shape depends on the audio.
   """
   def shape(%__MODULE__{type: :ast, frames: frames, filters: filters}),
     do: {frames, Nx.axis_size(filters, 1)}
+
+  def shape(%__MODULE__{type: :clap, frames: frames, filters: filters}),
+    do: {1, frames, Nx.axis_size(filters, 1)}
 
   def shape(%__MODULE__{type: :wav2vec2}), do: nil
 
@@ -164,6 +250,60 @@ defmodule Transmuter.Audio.Featurizer do
     if featurizer.normalize,
       do: features |> Nx.subtract(featurizer.mean) |> Nx.divide(2 * featurizer.std),
       else: features
+  end
+
+  defp features(featurizer = %__MODULE__{type: :clap}, audio, backend) do
+    on_device = &Nx.backend_copy(&1, backend)
+
+    audio
+    |> Enum.map(&repeat(&1, featurizer.samples, featurizer.padding))
+    |> Nx.stack()
+    |> on_device.()
+    |> Nx.as_type(:f32)
+    |> power_spectrogram(on_device.(featurizer.window), featurizer.hop_length)
+    |> Nx.dot([2], on_device.(featurizer.filters), [0])
+    |> Nx.max(1.0e-10)
+    |> Nx.log()
+    |> Nx.multiply(10 / :math.log(10))
+    |> Nx.new_axis(1)
+  end
+
+  # As _get_input_mel of ClapFeatureExtractor: "repeatpad" repeats the audio as many whole
+  # times as fit in `samples`, and "repeat" one more time. Then fit/2 cuts the audio or adds
+  # zeros.
+  defp repeat(audio, samples, padding) do
+    size = Nx.size(audio)
+
+    times =
+      case padding do
+        _padding when size >= samples -> 1
+        :repeatpad -> div(samples, size)
+        :repeat -> div(samples, size) + 1
+        :pad -> 1
+      end
+
+    audio
+    |> Nx.to_binary()
+    |> :binary.copy(times)
+    |> Nx.from_binary(Nx.type(audio))
+    |> fit(samples)
+  end
+
+  @doc """
+  Returns the power spectrogram `{batch, frames, bins}` of audio `{batch, samples}`, as `spectrogram` of Python transformers with `center=True` and `power=2.0`. The audio gets `size / 2` samples at each end, which reflect the audio without the edge sample. Each frame of `size` samples every `hop_length` samples is multiplied by `window` `{size}`, and gives the power of its `size / 2 + 1` frequency bins.
+  """
+  def power_spectrogram(audio, window, hop_length) do
+    size = Nx.axis_size(window, 0)
+    pad = div(size, 2)
+    samples = Nx.axis_size(audio, 1)
+    left = audio |> Nx.slice_along_axis(1, pad, axis: 1) |> Nx.reverse(axes: [1])
+    right = audio |> Nx.slice_along_axis(samples - pad - 1, pad, axis: 1) |> Nx.reverse(axes: [1])
+
+    Nx.concatenate([left, audio, right], axis: 1)
+    |> Nx.new_axis(2)
+    |> Signal.stft(window, size, hop_length, true)
+    |> Nx.pow(2)
+    |> Nx.sum(axes: [3])
   end
 
   # The frames of 400 samples every 160 samples that end in the audio.

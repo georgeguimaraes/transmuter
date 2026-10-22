@@ -55,6 +55,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
 | `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
 | `Transmuter.Audio.audio_classification/2` | PCM samples at 16 kHz | `%{predictions: [%{label: label, score: score}]}` |
+| `Transmuter.Audio.zero_shot_audio_classification/3` | PCM samples at 48 kHz | `%{predictions: [%{label: label, score: score}]}` |
 | `Transmuter.Audio.text_to_speech/2` | text, or `%{text: text, seed: seed}` | `%{audio: tensor, sampling_rate: rate}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Bumblebee has no text-to-speech, so `text_to_speech/2` gives the shape of the pipeline of Python transformers. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task. The audio of text-to-speech depends on a random seed, so the tests compare the audio without noise.
@@ -246,6 +247,22 @@ Nx.Serving.run(serving, audio)
 AST takes 1024 frames of log-mel features, about 10 s of audio. The serving cuts longer audio and pads shorter audio, so the audio goes into batches of `compile: [batch_size: n]`. wav2vec2 takes the mean over all frames of the audio, so padding would change the result. The serving runs each audio alone, and the model compiles each new audio length on its first call.
 
 The tests compare the labels and the scores with the pipeline of Python transformers for AST, and with ONNX Runtime for `onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX`, whose PyTorch model is no longer on the Hub. The labels are the same, and the scores agree within 1.0e-4.
+
+### Zero-shot audio classification
+
+```elixir
+audio = Nx.from_binary(File.read!("speech_48k.f32"), :f32)
+labels = ["a man speaking", "music", "a dog barking", "rain"]
+serving = Transmuter.Audio.zero_shot_audio_classification({:hf, "Xenova/clap-htsat-unfused"}, labels)
+Nx.Serving.run(serving, audio)
+#=> %{predictions: [%{label: "a man speaking", score: 0.95}, %{label: "music", score: 0.047}, ...]}
+```
+
+`Transmuter.Audio.zero_shot_audio_classification/3` runs CLAP on PCM samples at 48 kHz, the sampling rate of the model. Resample other audio before the serving, for example with `ffmpeg -i speech.wav -f f32le -ar 48000 -ac 1 speech_48k.f32`. Each label goes into the hypothesis template `"This is a sound of {}."`, and the scores are a softmax of `logits_per_audio` over the labels, as in the `zero-shot-audio-classification` pipeline of Python transformers.
+
+`Transmuter.Audio.Featurizer` gives the log-mel features of `ClapFeatureExtractor`. CLAP takes 10 s of audio. Shorter audio repeats and gets zeros at the end, so the audio goes into batches of `compile: [batch_size: n]`. For longer audio, Python transformers takes 10 s at a random position, and the serving takes the first 10 s.
+
+The tests compare the features with `ClapFeatureExtractor` within 1.0e-3 dB. With the fp32 file, the labels are the same as those of the pipeline of Python transformers, and the scores agree within 1.0e-4. The q8 file quantizes the activations when the model runs, and its scores are up to 0.13 away from the fp32 model. Its scores are within 0.007 of ONNX Runtime on the same file on the EXLA CPU, and within 0.047 on CUDA. The quantization makes small differences large: when the features change by 1e-5 of their values, the scores of ONNX Runtime change by up to 0.014.
 
 ### Speech synthesis
 

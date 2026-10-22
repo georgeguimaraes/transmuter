@@ -501,6 +501,40 @@ for name, samples in [("short", audio), ("cut", audio[:32000])]:
     top = scores.topk(5)
     print("wav2vec2", name, [(id2label[i], round(s, 6)) for s, i in zip(top.values.tolist(), top.indices.tolist())])
 
+# Zero-shot audio classification with CLAP. The model takes 48 kHz audio, so librosa resamples
+# test/fixtures/librispeech_0.f32 from 16 kHz, and the script writes the result to
+# test/fixtures/librispeech_0_48k.f32. The 5.86 s are shorter than the 10 s of the model, so
+# repeatpad gives the audio once and zeros. The first 2 s repeat 5 times and fill the 10 s.
+# The script prints input_features[0, 0] at (frame, mel) and the mean, then the scores of
+# the zero-shot-audio-classification pipeline with the PyTorch model, then ONNX Runtime on the
+# fp32 and the q8 files with the same inputs: a softmax of logits_per_audio.
+import librosa
+
+audio = librosa.resample(np.fromfile("test/fixtures/librispeech_0.f32", "<f4"), orig_sr=16000, target_sr=48000).astype("<f4")
+audio.tofile("test/fixtures/librispeech_0_48k.f32")
+clap_inputs = [("short", audio), ("cut", audio[:96000])]
+labels = ["a man speaking", "music", "a dog barking", "rain"]
+extractor = AutoFeatureExtractor.from_pretrained("Xenova/clap-htsat-unfused")
+for name, samples in clap_inputs:
+    values = extractor(samples, sampling_rate=48000, return_tensors="np")["input_features"][0, 0]
+    points = [(0, 0), (100, 37), (281, 63), (290, 10), (600, 20), (1000, 63)]
+    print("clap features", name, values.shape, [round(float(values[p]), 4) for p in points], round(float(values.mean()), 4))
+
+classify = pipeline("zero-shot-audio-classification", model="laion/clap-htsat-unfused", device="cpu")
+for name, samples in clap_inputs:
+    print("clap", name, [(p["label"], round(p["score"], 6)) for p in classify(samples.copy(), candidate_labels=labels)])
+
+tokenizer = AutoTokenizer.from_pretrained("Xenova/clap-htsat-unfused")
+text = dict(tokenizer([f"This is a sound of {label}." for label in labels], padding=True, return_tensors="np"))
+for file in ["model", "model_quantized"]:
+    directory = snapshot_download("Xenova/clap-htsat-unfused", allow_patterns=[f"onnx/{file}.onnx"], local_dir=tempfile.mkdtemp())
+    session = ort.InferenceSession(f"{directory}/onnx/{file}.onnx", providers=["CPUExecutionProvider"])
+    for name, samples in clap_inputs:
+        features = extractor(samples, sampling_rate=48000, return_tensors="np")["input_features"]
+        logits = session.run(["logits_per_audio"], {**text, "input_features": features})[0][0]
+        scores = torch.from_numpy(logits).softmax(-1).tolist()
+        print("clap onnxruntime", file, name, sorted([(label, round(s, 6)) for label, s in zip(labels, scores)], key=lambda x: -x[1]))
+
 # Image segmentation: the slow Segformer image processor of the Xenova export and the
 # image-segmentation pipeline with the PyTorch model, on the wide and the tall image. The
 # script prints pixel_values[0] of the wide image at (channel, y, x) and the mean of the

@@ -1,6 +1,6 @@
 defmodule Transmuter.Audio do
   @moduledoc """
-  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer or `preprocessor_config.json`, and the configuration) and returns an `Nx.Serving`. `speech_to_text/2` takes audio and gives text in the shape of Bumblebee. `audio_classification/2` takes audio and gives labels in the shape of Bumblebee. `text_to_speech/2` takes text and gives audio in the shape of Python transformers.
+  Servings for audio tasks. Each function loads a model repository (the ONNX files, the tokenizer or `preprocessor_config.json`, and the configuration) and returns an `Nx.Serving`. `speech_to_text/2` takes audio and gives text in the shape of Bumblebee. `audio_classification/2` takes audio and gives labels in the shape of Bumblebee. `zero_shot_audio_classification/3` takes audio and gives scores for the labels that you give. `text_to_speech/2` takes text and gives audio in the shape of Python transformers.
 
       serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"})
       Nx.Serving.run(serving, audio)
@@ -84,6 +84,40 @@ defmodule Transmuter.Audio do
   The serving computes the features on the `:backend`. See the module documentation for the other options.
   """
   defdelegate audio_classification(source, opts \\ []), to: Transmuter.Audio.AudioClassification
+
+  @doc """
+  Builds a serving that classifies audio with labels that you give, such as CLAP.
+
+  `labels` is a list of strings. The input is a tensor of PCM samples at the sampling rate of the model (48 kHz for CLAP), of any float type, or a list of them. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
+
+      serving = Transmuter.Audio.zero_shot_audio_classification({:hf, "Xenova/clap-htsat-unfused"}, ["a man speaking", "music", "a dog barking"])
+      Nx.Serving.run(serving, audio)
+      #=> %{predictions: [%{label: "a man speaking", score: 0.99}, ...]}
+
+  The serving uses `model.onnx`, which has the text tower, the audio tower and the logit scale of the model. Each label goes into the hypothesis template. The text of all labels is padded to the longest text, as in Python transformers, and goes into each batch. As in the `zero-shot-audio-classification` pipeline of Python transformers, the scores are a softmax of `logits_per_audio` over the labels.
+
+  `Transmuter.Audio.Featurizer` prepares the audio as `ClapFeatureExtractor` of Python transformers, see its documentation. CLAP takes 10 s of audio. Shorter audio repeats and gets zeros at the end, so all audio has one shape, and the audio of a list or of concurrent calls goes into batches. For longer audio, Python transformers takes 10 s at a random position. The serving takes the first 10 s.
+
+  The fused CLAP models, such as `laion/clap-htsat-fused`, take four spectrograms of each audio. The featurizer does not support them, and raises an `ArgumentError`.
+
+  The default variant is fp32.
+
+  ## Options
+
+    * `:hypothesis_template` - the text for each label, with `{}` in the place of the label. The default is `"This is a sound of {}."`, as in Python transformers.
+
+    * `:top_k` - the number of predictions, or `nil` for all. The default is `5`.
+
+    * `:compile` - `:batch_size`. The default is `1`.
+
+    * `:featurizer` - a featurizer from `Transmuter.Audio.Featurizer.load!/2`, to use in place of the `preprocessor_config.json` of the repository.
+
+    * `:model` - a model from `Transmuter.load!/2`, to use in place of the ONNX file of the repository.
+
+  The serving computes the features on the `:backend`. See the module documentation for the other options.
+  """
+  defdelegate zero_shot_audio_classification(source, labels, opts \\ []),
+    to: Transmuter.Audio.ZeroShotAudioClassification
 
   @doc """
   Builds a serving that turns text into speech with VITS (MMS-TTS) or SpeechT5.
