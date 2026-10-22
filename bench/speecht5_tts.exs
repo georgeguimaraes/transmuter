@@ -1,5 +1,7 @@
-# Text to speech with SpeechT5 on EMLX: the encoder, one decoder step for each two frames, and the vocoder.
-# Usage: mix run bench/speecht5_tts.exs [repeats]
+# Text to speech with SpeechT5: the encoder, one decoder step for each two frames, and the vocoder.
+# Usage: mix run bench/speecht5_tts.exs [repeats] [emlx|exla]
+#
+# emlx (the default) runs on the GPU of a Mac, and exla runs on the host client.
 #
 # The serving runs in its own process, so the compiled shapes stay between calls. The first call compiles,
 # and the later calls show the time of a warm serving. The telemetry of the decoder gives the number of
@@ -8,15 +10,27 @@
 repo = "Xenova/speecht5_tts"
 text = "Hello, my dog is cute. It likes to play in the park."
 seed = 42
-repeats = String.to_integer(List.first(System.argv(), "3"))
+{repeats, compiler} =
+  case System.argv() do
+    [] -> {3, "emlx"}
+    [repeats] -> {String.to_integer(repeats), "emlx"}
+    [repeats, compiler] -> {String.to_integer(repeats), compiler}
+  end
+
+{backend, defn_options} =
+  case compiler do
+    "emlx" -> {{EMLX.Backend, device: :gpu}, [compiler: EMLX, device: :gpu]}
+    "exla" -> {{EXLA.Backend, client: :host}, [compiler: EXLA, client: :host]}
+  end
+
 speaker = Nx.from_binary(File.read!("test/fixtures/speaker_embeddings.f32"), :f32)
 
 serving =
   Transmuter.Audio.text_to_speech({:hf, repo},
     speaker_embedding: speaker,
     seed: seed,
-    backend: {EMLX.Backend, device: :gpu},
-    defn_options: [compiler: EMLX, device: :gpu]
+    backend: backend,
+    defn_options: defn_options
   )
 
 table = :ets.new(:speecht5_bench, [:public, :duplicate_bag])
