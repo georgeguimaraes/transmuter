@@ -16,6 +16,31 @@ long = "the quick brown fox jumps over the lazy dog " * 60
 embedding = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu").encode([long])[0]
 print("all-MiniLM-L6-v2, 541 tokens", [round(float(x), 4) for x in embedding[:4]])
 
+# EmbeddingGemma without a prompt. Transmuter runs onnx-community/embeddinggemma-300m-ONNX,
+# whose output sentence_embedding includes the Dense layers and the normalization. The
+# reference is ONNX Runtime on that export, because the export differs from sentence-transformers
+# on google/embeddinggemma-300m: by up to 5.6e-4 on the short text, and by up to 0.027 (cosine
+# 0.983) on the 543 tokens of the long text. The export has no sliding window of 512 tokens:
+# sentence-transformers with sliding_window 4096 is 1.3e-3 from it. The script prints both.
+# google/embeddinggemma-300m is gated: accept its license on the Hub and log in with hf auth login.
+import tempfile
+
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
+
+repo = "onnx-community/embeddinggemma-300m-ONNX"
+gemma = SentenceTransformer("google/embeddinggemma-300m", device="cpu")
+tokenizer = AutoTokenizer.from_pretrained(repo)
+directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx*"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+for name, text in [("short", "The cat sat on the mat."), ("543 tokens", long)]:
+    inputs = {k: v.astype(np.int64) for k, v in tokenizer([text], return_tensors="np").items()}
+    embedding = session.run(["sentence_embedding"], inputs)[0][0]
+    print("embeddinggemma onnxruntime", name, [round(float(x), 4) for x in embedding[:4]])
+    print("embeddinggemma sentence-transformers", name, [round(float(x), 4) for x in gemma.encode([text])[0][:4]])
+
 rerank = pipeline("text-classification", model="cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 query = "How many people live in Berlin?"
 for passage in ["Berlin has a population of 3,520,031 registered inhabitants.", "New York City is famous for the Metropolitan Museum of Art."]:

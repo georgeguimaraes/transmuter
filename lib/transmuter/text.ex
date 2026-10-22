@@ -45,7 +45,9 @@ defmodule Transmuter.Text do
 
   The input is a string or a list of strings. The result is `%{embedding: tensor}`, or a list of them for a list.
 
-  A sentence-transformers model gives its pooling and normalization in `1_Pooling/config.json` and `modules.json`. When the repository does not have these files, they come from the `base_model` in its model card. Without them, the embedding is the mean of the token embeddings.
+  When the graph has the output `sentence_embedding`, as the sentence-transformers exports of EmbeddingGemma do, the embedding is that output. It includes the pooling, the Dense layers and the normalization of the model. Set `:output_pool` or `:embedding_processor` to pool the token embeddings instead.
+
+  Else, a sentence-transformers model gives its pooling and normalization in `1_Pooling/config.json` and `modules.json`. When the repository does not have these files, they come from the `base_model` in its model card. When the Hub denies the base model, such as a gated model without a token, the serving logs a warning and does not use it. Without these files, the embedding is the mean of the token embeddings.
 
   ## Options
 

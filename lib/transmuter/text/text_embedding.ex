@@ -3,7 +3,9 @@ defmodule Transmuter.Text.TextEmbedding do
   The text embedding task. See `Transmuter.Text.text_embedding/2`.
   """
 
-  alias Transmuter.{Hub, Serving}
+  alias Transmuter.{Hub, HubError, Serving}
+
+  require Logger
 
   @pools %{
     "pooling_mode_cls_token" => :cls_token_pooling,
@@ -16,9 +18,15 @@ defmodule Transmuter.Text.TextEmbedding do
     opts = Keyword.validate!(opts, Serving.options() ++ [:output_pool, :embedding_processor])
 
     {repo, model, tokenizer} =
-      Serving.load!(source, [outputs: ["last_hidden_state"]] ++ opts, :fp32)
+      Serving.load!(source, [outputs: &[output(&1, opts)]] ++ opts, :fp32)
 
-    opts = Keyword.merge(sentence_transformers(repo, opts), opts)
+    output = output(model.outputs, opts)
+
+    opts =
+      if output == "sentence_embedding",
+        do: opts,
+        else: Keyword.merge(sentence_transformers(repo, opts), opts)
+
     pool = opts[:output_pool]
     processor = opts[:embedding_processor]
 
@@ -28,11 +36,22 @@ defmodule Transmuter.Text.TextEmbedding do
       tokenizer,
       opts,
       fn outputs, inputs ->
-        hidden = outputs["last_hidden_state"]
+        hidden = outputs[output]
         %{embedding: hidden |> pool(pool, inputs["attention_mask"]) |> process(processor)}
       end,
       fn [%{embedding: embedding}], _items -> %{embedding: embedding} end
     )
+  end
+
+  # A sentence-transformers export can give the embedding of the whole model, with its
+  # pooling, Dense layers and normalization, as the output sentence_embedding. The serving
+  # uses it, unless the options set the pooling or the processing of the token embeddings.
+  defp output(outputs, opts) do
+    if "sentence_embedding" in outputs and
+         not Keyword.has_key?(opts, :output_pool) and
+         not Keyword.has_key?(opts, :embedding_processor),
+       do: "sentence_embedding",
+       else: "last_hidden_state"
   end
 
   @modules ~w(Transformer Pooling Normalize)
@@ -52,6 +71,25 @@ defmodule Transmuter.Text.TextEmbedding do
         )
   end
 
+  # The Hub denies a gated base model without a token, and a base model that does not
+  # exist. Then the serving uses the configuration that it has.
+  defp sentence_transformers_config(source, opts) do
+    config(source, opts)
+  rescue
+    error in HubError ->
+      if error.status in [401, 403, 404] do
+        Logger.warning(
+          "#{Exception.message(error)}. The text embedding cannot read the " <>
+            "sentence-transformers modules of #{inspect(source)}, so its pooling, " <>
+            "normalization and other modules, such as Dense layers, can differ from that model"
+        )
+
+        nil
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
   defp base_models(repo) do
     case get_in(Hub.info(repo.source, repo.opts) || %{}, ["cardData", "base_model"]) do
       [name | _] -> [{:hf, name}]
@@ -60,7 +98,7 @@ defmodule Transmuter.Text.TextEmbedding do
     end
   end
 
-  defp sentence_transformers_config(source, opts) do
+  defp config(source, opts) do
     if pooling = Hub.json(source, "1_Pooling/config.json", opts) do
       types = Enum.map(Hub.json(source, "modules.json", opts) || [], &module_type/1)
 

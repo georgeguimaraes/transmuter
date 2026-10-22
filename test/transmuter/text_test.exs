@@ -539,3 +539,50 @@ defmodule Transmuter.TextBatchTest do
     end
   end
 end
+
+# --only ci_partition:4 in CI would also include :large_model tests, because an included tag
+# wins over an excluded one. So these tests are in a module without a :ci_partition tag.
+defmodule Transmuter.TextLargeModelTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :hub
+  @moduletag timeout: 900_000
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  # The graph gives sentence_embedding, the result of the whole sentence-transformers model,
+  # so the serving does not read the gated base model google/embeddinggemma-300m. The fp32
+  # files are 1.2 GB. The reference is ONNX Runtime on the export, without a prompt. The
+  # export differs from sentence-transformers, see test/support/pipeline_references.py. The
+  # 543 tokens need the length 1024.
+  @tag :large_model
+  test "EmbeddingGemma gives the embedding of sentence-transformers" do
+    serving =
+      Transmuter.Text.text_embedding(
+        {:hf, "onnx-community/embeddinggemma-300m-ONNX"},
+        [compile: [sequence_length: [16, 1024]]] ++ @opts
+      )
+
+    long = String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
+
+    for {text, expected} <- [
+          {"The cat sat on the mat.", [-0.131, 0.0266, 0.0, 0.0388]},
+          {long, [-0.0525, 0.0364, 0.0458, -0.0258]}
+        ] do
+      %{embedding: embedding} = Nx.Serving.run(serving, text)
+      assert Nx.shape(embedding) == {768}
+      assert_all_close(embedding[0..3], expected)
+    end
+  end
+
+  defp assert_all_close(tensor, expected) do
+    expected = Nx.tensor(expected)
+
+    assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
+             Nx.tensor(1, type: :u8),
+           "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end
