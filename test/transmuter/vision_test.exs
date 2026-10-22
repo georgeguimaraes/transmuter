@@ -445,6 +445,7 @@ defmodule Transmuter.VisionTest do
       got =
         Enum.reduce(result.segments, Nx.broadcast(Nx.tensor(0, type: :u8), expected), fn
           %{label: label, score: nil, mask: mask}, got ->
+            assert Nx.type(mask) == {:u, 8}
             assert MapSet.new(Nx.to_flat_list(mask)) == MapSet.new([0, 255])
             Nx.select(mask, ids[label], got)
         end)
