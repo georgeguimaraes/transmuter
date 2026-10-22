@@ -114,6 +114,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.DepthEstimation,
           Transmuter.Vision.ImageSegmentation,
           Transmuter.Vision.BackgroundRemoval,
+          Transmuter.Vision.MaskGeneration,
           Transmuter.Vision.Idefics3Processor,
           Transmuter.Vision.Qwen2VLProcessor,
           Transmuter.Audio.SpeechToText,

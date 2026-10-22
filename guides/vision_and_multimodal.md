@@ -127,7 +127,7 @@ Check `model.inputs` and `model.outputs` for the exact tensor names in your expo
 
 [SAM 2.1](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) generates masks from point or box prompts. Its export has two ONNX files: a vision encoder and a prompt encoder with mask decoder.
 
-The tested version gives masks with IoU 1.0 compared with ONNX Runtime for prompts of 1 point, 3 points, a box, and a box with a point.
+The tested version gives masks with IoU 1.0 compared with ONNX Runtime for prompts of 1 point, 3 points, a box, and a box with a point. `Transmuter.Vision.mask_generation/2` runs both files as a serving, with the image processor and the mask post-processing of Python transformers. See the [Pipelines guide](pipelines.md). To run the files yourself, load them:
 
 ```elixir
 vision_encoder = Transmuter.load!(

@@ -289,14 +289,15 @@ image = StbImage.read_file!("cats.jpg")
 | `depth_estimation/2` | image | `%{predicted_depth: tensor, depth: tensor}` |
 | `image_segmentation/2` | image | `%{segments: [%{label: label, score: nil, mask: tensor}]}` |
 | `background_removal/2` | image | `%{mask: tensor}` |
+| `mask_generation/2` | `%{image: image, prompts: prompts}` | `%{masks: [[tensor]], iou_scores: [[score]]}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow. For `mask_generation/2`, the masks are those of `SamModel` and `Sam2Model` of Python transformers with `post_process_masks`, except for at most a few pixels at the edges, where the logits are near 0, and the scores agree within 1.0e-4.
 
 ### Image preprocessing
 
 `Transmuter.Featurizer` reads `preprocessor_config.json` and prepares the images as the image processors of Python transformers do. It converts the image to RGB, resizes it, crops the center, rescales the values and normalizes them. The result is a tensor of shape `{batch, 3, height, width}` and type `:f32`.
 
-The resize gives the same pixels as Pillow, for all `resample` filters of Pillow. With the hamming filter, a small number of pixels can differ by 1. The scores of a model change when the pixels change, so this match is important. The serving resizes on the `:backend` of the task, because the resize is slow on `Nx.BinaryBackend`.
+The resize gives the same pixels as Pillow, for all `resample` filters of Pillow. With the hamming filter, a small number of pixels can differ by 1. A fast image processor, whose `image_processor_type` ends in `Fast`, resizes with torchvision in Python, so the featurizer uses the weights of torchvision for it. These weights have fewer bits, and a pixel can be one step away from Pillow when the image gets smaller. The scores of a model change when the pixels change, so this match is important. The serving resizes on the `:backend` of the task, because the resize is slow on `Nx.BinaryBackend`.
 
 The serving compiles the model for one image size, which comes from `size` or `crop_size` in `preprocessor_config.json`. When the size depends on the image, for example with `shortest_edge` and no crop, the serving runs each image alone, and the model compiles each new image size on its first call. Then the batch size must be 1. `image_to_text/2` raises an error for these sizes.
 
@@ -403,6 +404,26 @@ serving = Transmuter.Vision.background_removal({:hf, "onnx-community/ormbg-ONNX"
 ```
 
 Python transformers has no pipeline for this task, so the serving follows the `background-removal` pipeline of transformers.js. The mask is the first output of the model, with a sigmoid when a value is outside 0..1, as 8 bits. The bilinear resize of Pillow gives the mask the size of the image. transformers.js resizes with sharp in Node, which does not filter when the image gets smaller, so its mask can be different at the edges of the foreground. The ONNX file of `onnx-community/ormbg-ONNX` has a fixed batch size of 1. See `Transmuter.Vision.background_removal/2` for an example that makes an image with an alpha channel.
+
+### Mask generation
+
+```elixir
+serving = Transmuter.Vision.mask_generation({:hf, "onnx-community/sam2.1-hiera-tiny-ONNX"})
+
+prompts = [
+  %{points: [[80, 120]]},
+  %{points: [[80, 120], [150, 200]], labels: [1, 0]},
+  %{box: [40, 60, 200, 230]}
+]
+
+%{masks: masks, iou_scores: scores} = Nx.Serving.run(serving, %{image: image, prompts: prompts})
+```
+
+The serving runs the SAM and SAM 2 exports of transformers.js, such as `Xenova/slimsam-77-uniform` and `onnx-community/sam2.1-hiera-tiny-ONNX`, with prompts of points and boxes. A point with the label 1 is on the object, and a point with the label 0 is not on the object. The default label is 1. A box is `[x1, y1, x2, y2]`. Only an export whose decoder has a box input, such as SAM 2.1, takes boxes. Each prompt gives 3 masks of different sizes and the score that the model predicts for each mask. A mask has 255 for the pixels of the object and 0 for the other pixels.
+
+The vision encoder runs once for each image, and the decoder runs once for each prompt. Python transformers pads the points of the prompts of a batch to one length, and the padding changes the masks, so the serving runs each prompt alone, as one call of Python with one prompt. The decoder compiles once for each number of points, with or without a box. The `mask-generation` pipeline of Python transformers segments the whole image with a grid of points. The serving does not do that yet.
+
+SAM 2.1 has only a fast image processor, which resizes with torchvision. torchvision gives the weights of an 8-bit resize fewer bits than Pillow, so the featurizer does the same for each `image_processor_type` that ends in `Fast`. When the image gets smaller, a pixel of Pillow can be one step away.
 
 ### Image-text-to-text
 

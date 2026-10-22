@@ -599,3 +599,67 @@ for name, picture in pictures:
         result = processor.post_process_object_detection(outputs, threshold=0.1, target_sizes=[(picture.height, picture.width)])[0]
         detections += [{"label": label, "score": float(s), "box": dict(zip(["xmin", "ymin", "xmax", "ymax"], b.tolist()))} for s, b in zip(result["scores"], result["boxes"])]
     print_detections(f"grounding-dino onnxruntime {name}", sorted(detections, key=lambda d: d["score"], reverse=True))
+
+# Mask generation with prompts. The mask-generation pipeline of Python transformers segments
+# the whole image with a grid of points, so the reference is the PyTorch model with the
+# processor and post_process_masks, one prompt for each call, with the 3 masks of
+# multimask_output. SAM 1 (nielsr/slimsam-77-uniform, the model of the Xenova export) uses the
+# slow SamImageProcessor. SAM 2.1 (facebook/sam2.1-hiera-tiny) has only Sam2ImageProcessorFast,
+# which resizes 8-bit images with torchvision. The script prints pixel_values[0] at (channel,
+# y, x) and the mean of the absolute values, for the wide image and, for SAM 2.1, for the 6x6
+# tile (1920x1440), and the SHA-256 of the 8-bit image of the tile after the resize, from the
+# pixel values. Then, for each image and prompt, it prints the iou_scores, and writes the
+# masks to test/fixtures/sam_<model>_<image>.png, the 3 masks of each prompt one below the
+# other, with 0 and 255. The Xenova export of SAM 1 has no box input. The script also prints
+# the largest number of mask pixels that differ when ONNX Runtime runs the exports with the
+# same processors.
+from transformers import Sam2Model, Sam2Processor, SamModel, SamProcessor
+
+prompts = [
+    {"points": [[80, 120]], "labels": [1]},
+    {"points": [[80, 120], [200, 60], [150, 200]], "labels": [1, 1, 0]},
+    {"box": [40, 60, 200, 230]},
+    {"points": [[80, 120]], "labels": [1], "box": [40, 60, 200, 230]},
+]
+
+for name, export, processor, model in [
+    ("slimsam", "Xenova/slimsam-77-uniform", SamProcessor.from_pretrained("Xenova/slimsam-77-uniform"), SamModel.from_pretrained("nielsr/slimsam-77-uniform")),
+    ("sam2", "onnx-community/sam2.1-hiera-tiny-ONNX", Sam2Processor.from_pretrained("onnx-community/sam2.1-hiera-tiny-ONNX"), Sam2Model.from_pretrained("facebook/sam2.1-hiera-tiny")),
+]:
+    for picture_name, picture in [("wide", image), ("tile", tile)][: 2 if name == "sam2" else 1]:
+        values = processor(images=picture, return_tensors="pt")["pixel_values"][0].numpy()
+        print(name, picture_name, "pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+        if picture_name == "tile":
+            mean, std = (np.array(processor.image_processor.image_mean)[:, None, None], np.array(processor.image_processor.image_std)[:, None, None])
+            resized = np.round((values * std + mean) * 255).astype(np.uint8)
+            print(name, "tile, SHA-256 of the 8-bit resized image", hashlib.sha256(resized.tobytes()).hexdigest())
+    directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp())
+    encoder = ort.InferenceSession(f"{directory}/onnx/vision_encoder.onnx", providers=["CPUExecutionProvider"])
+    decoder = ort.InferenceSession(f"{directory}/onnx/prompt_encoder_mask_decoder.onnx", providers=["CPUExecutionProvider"])
+    for picture_name, picture in pictures:
+        masks, ort_differences = [], 0
+        for prompt in prompts[: 4 if name == "sam2" else 2]:
+            kwargs = {}
+            if "points" in prompt:
+                kwargs.update(input_points=[[prompt["points"]]], input_labels=[[prompt["labels"]]])
+            if "box" in prompt:
+                kwargs.update(input_boxes=[[prompt["box"]]])
+            inputs = processor(images=picture, return_tensors="pt", **kwargs)
+            sizes = [inputs["original_sizes"]] + ([inputs["reshaped_input_sizes"]] if name == "slimsam" else [])
+            with torch.no_grad():
+                output = model(**{k: v.clone() for k, v in inputs.items() if k not in ("original_sizes", "reshaped_input_sizes")}, multimask_output=True)
+            mask = processor.post_process_masks(output.pred_masks, *sizes)[0][0].numpy()
+            masks.append(mask)
+            print(name, picture_name, prompt, "iou_scores", [round(float(x), 5) for x in output.iou_scores[0, 0]])
+
+            embeddings = dict(zip([o.name for o in encoder.get_outputs()], encoder.run(None, {"pixel_values": inputs["pixel_values"].numpy()})))
+            feeds = {k: v for k, v in embeddings.items() if k in [i.name for i in decoder.get_inputs()]}
+            feeds["input_points"] = inputs["input_points"].numpy().astype(np.float32) if "points" in prompt else np.zeros((1, 1, 0, 2), np.float32)
+            feeds["input_labels"] = inputs["input_labels"].numpy() if "points" in prompt else np.zeros((1, 1, 0), np.int64)
+            if name == "sam2":
+                feeds["input_boxes"] = inputs["input_boxes"].numpy() if "box" in prompt else np.zeros((1, 0, 4), np.float32)
+            ort_masks = decoder.run(["pred_masks"], feeds)[0]
+            ort_mask = processor.post_process_masks(torch.from_numpy(ort_masks), *sizes)[0][0].numpy()
+            ort_differences = max(ort_differences, int((ort_mask != mask).sum(axis=(1, 2)).max()))
+        Image.fromarray(np.concatenate([m.reshape(-1, m.shape[-1]) for m in masks]).astype(np.uint8) * 255).save(f"test/fixtures/sam_{name}_{picture_name}.png")
+        print(name, picture_name, "largest number of different pixels in a mask of ONNX Runtime", ort_differences)

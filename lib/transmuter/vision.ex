@@ -216,6 +216,33 @@ defmodule Transmuter.Vision do
   defdelegate background_removal(source, opts \\ []), to: Transmuter.Vision.BackgroundRemoval
 
   @doc """
+  Builds a serving that gives the masks of the objects at prompts of points and boxes, with SAM or SAM 2.
+
+  The input is `%{image: image, prompts: prompts}` or a list of them. Each prompt is a map:
+
+    * `:points` - a list of `[x, y]` in pixels of the image.
+
+    * `:labels` - a list with one label for each point: `1` for a point on the object and `0` for a point that is not on the object. The default is `1` for each point.
+
+    * `:box` - `[x1, y1, x2, y2]` in pixels of the image, the corners of a box around the object. Only a model whose decoder has the input `input_boxes`, such as SAM 2.1, takes a box.
+
+  A prompt must have points or a box. The result is `%{masks: masks, iou_scores: scores}`, with one list for each prompt. For each prompt, the model gives 3 masks of different sizes and the score that it predicts for each mask, as the default `multimask_output` of Python transformers. Each mask is a `:u8` tensor of shape `{height, width}` of the input image, with 255 for the pixels of the object and 0 for the other pixels.
+
+      serving = Transmuter.Vision.mask_generation({:hf, "Xenova/slimsam-77-uniform"})
+      Nx.Serving.run(serving, %{image: image, prompts: [%{points: [[80, 120]]}]})
+      #=> %{masks: [[#Nx.Tensor<u8[240][320]>, ...]], iou_scores: [[0.878, 0.868, 0.61]]}
+
+  The repository must have `onnx/vision_encoder.onnx` and `onnx/prompt_encoder_mask_decoder.onnx`, as the SAM exports of transformers.js. The default variant is fp32. The encoder runs once for each image, and the decoder runs once for each prompt. The results match `SamModel` and `Sam2Model` of Python transformers with the processor and `post_process_masks`, for each prompt alone. A pixel whose logit is near 0 can be different. The masks are the outputs of the decoder, resized to the image with the bilinear `torch.nn.functional.interpolate` (see `Transmuter.Serving.interpolate/3`), and the pixels above 0. When `preprocessor_config.json` has a `pad_size`, as in SAM, the masks first get that size and lose the padding. The `mask-generation` pipeline of Python transformers segments the whole image with a grid of points, which this serving does not do.
+
+  ## Options
+
+    * `:compile` - `:batch_size` must be `1`, the default. The masks have the size of the image, so each image is a batch of its own.
+
+  The other options are those of the module documentation, but `:model` does not apply, because the task has two models.
+  """
+  defdelegate mask_generation(source, opts \\ []), to: Transmuter.Vision.MaskGeneration
+
+  @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.

@@ -19,7 +19,7 @@ defmodule Transmuter.VisionTest do
   @labels ["cats", "dogs", "a remote control", "a couch"]
   @detection_labels ["cat", "remote control", "couch"]
 
-  test "the featurizer gives the pixel values of the Pillow image processors" do
+  test "the featurizer gives the pixel values of the image processors" do
     # ViT resizes to 224x224 with bilinear. CLIP resizes the short side to 224 with bicubic
     # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic. Segformer
     # resizes to 512x512 with bilinear. OWL-ViT resizes to 768x768 with bicubic. OWLv2 pads
@@ -27,7 +27,11 @@ defmodule Transmuter.VisionTest do
     # blurs the 6x6 tile of the image (1920x1440) with sigma 0.5 before it interpolates.
     # Grounding DINO with shortest_edge 800 resizes as DETR. The 259x100 crop of the image
     # gets 515x1333, with the short side rounded half to even. The rule of shortest_edge
-    # alone gives 514x1333.
+    # alone gives 514x1333. DETR pads to its pad_size with a pixel mask, so the featurizer
+    # gives no padding for DETR. SAM resizes the long side to 1024 and pads to 1024x1024 with
+    # zeros. SAM 2.1 resizes to 1024x1024 with torchvision, whose 8-bit weights have fewer
+    # fraction bits than those of Pillow. On the tile, 27177 values of Pillow are one step
+    # away.
     tile = Nx.tile(StbImage.to_nx(@image), [6, 6, 1])
     crop = Nx.slice(StbImage.to_nx(@image), [0, 0, 0], [100, 259, 3])
 
@@ -35,6 +39,16 @@ defmodule Transmuter.VisionTest do
       Featurizer.new(%{
         "image_processor_type" => "GroundingDinoImageProcessor",
         "size" => %{"shortest_edge" => 800, "longest_edge" => 1333},
+        "image_mean" => [0.485, 0.456, 0.406],
+        "image_std" => [0.229, 0.224, 0.225]
+      })
+
+    detr =
+      Featurizer.new(%{
+        "image_processor_type" => "DetrImageProcessor",
+        "size" => %{"shortest_edge" => 800, "longest_edge" => 1333},
+        "do_pad" => true,
+        "pad_size" => %{"height" => 1333, "width" => 1333},
         "image_mean" => [0.485, 0.456, 0.406],
         "image_std" => [0.229, 0.224, 0.225]
       })
@@ -54,7 +68,14 @@ defmodule Transmuter.VisionTest do
            [0.2986, -1.527, 1.3496, 0.198, 1.4762], 0.7126},
           {"Xenova/owlv2-base-patch16-ensemble", tile, {960, 960},
            [0.3245, -0.2768, 0.8887, 0.9414, -0.7501], 0.7012},
-          {grounding_dino, crop, {515, 1333}, [0.2967, -1.9132, 2.1868, 0.6734, -1.8256], 0.9977}
+          {grounding_dino, crop, {515, 1333}, [0.2967, -1.9132, 2.1868, 0.6734, -1.8256], 0.9977},
+          {detr, crop, {515, 1333}, [0.2967, -1.9132, 2.1868, 0.6734, -1.8256], 0.9977},
+          {"Xenova/slimsam-77-uniform", @image, {1024, 1024},
+           [0.2967, -1.8782, 1.3328, 0.2624, 1.063], 0.7873},
+          {"onnx-community/sam2.1-hiera-tiny-ONNX", @image, {1024, 1024},
+           [0.2967, -2.0357, -1.5256, 0.6392, -1.6856], 1.0497},
+          {"onnx-community/sam2.1-hiera-tiny-ONNX", tile, {1024, 1024},
+           [0.3652, 0.8704, -0.2532, 1.6324, -0.3025], 1.0332}
         ] do
       featurizer =
         if is_binary(featurizer), do: Featurizer.load!({:hf, featurizer}), else: featurizer
@@ -71,6 +92,23 @@ defmodule Transmuter.VisionTest do
       assert_all_close(got, expected)
       assert_in_delta Nx.to_number(Nx.mean(Nx.abs(values))), mean, 1.0e-4
     end
+
+    # The 8-bit image of the tile after the resize, from the pixel values of SAM 2.1.
+    featurizer = Featurizer.load!({:hf, "onnx-community/sam2.1-hiera-tiny-ONNX"})
+    {mean, std} = featurizer.normalize
+
+    resized =
+      featurizer
+      |> Featurizer.process([tile], backend: @opts[:backend])
+      |> Nx.backend_transfer(Nx.BinaryBackend)
+      |> Nx.multiply(Nx.reshape(Nx.tensor(std), {1, 3, 1, 1}))
+      |> Nx.add(Nx.reshape(Nx.tensor(mean), {1, 3, 1, 1}))
+      |> Nx.multiply(255)
+      |> Nx.round()
+      |> Nx.as_type(:u8)
+
+    assert Base.encode16(:crypto.hash(:sha256, Nx.to_binary(resized)), case: :lower) ==
+             "f88aa51e6de09c5b1eb3810433b6583ec3933dc6e49938abf71d0bef2f1f0289"
   end
 
   @tag :smoke
@@ -567,6 +605,76 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The reference is SamModel of transformers with SamProcessor and post_process_masks, one
+  # prompt for each call. The export has no box input.
+  test "mask generation with SAM matches transformers" do
+    serving = Vision.mask_generation({:hf, "Xenova/slimsam-77-uniform"}, @opts)
+
+    assert_masks(
+      serving,
+      "slimsam",
+      Enum.take(sam_prompts(), 2),
+      {
+        [[0.87823, 0.86798, 0.60964], [0.98281, 0.94075, 0.90734]],
+        [[0.81632, 0.80129, 0.68658], [0.91979, 0.93776, 0.89779]]
+      }
+    )
+
+    for {prompt, message} <- [
+          {%{box: [40, 60, 200, 230]}, ~r/has no input_boxes/},
+          {%{points: [[80, 120]], labels: [2]}, ~r/must be a list of 0 and 1/},
+          {%{points: [[80, 120]], labels: [1, 0]}, ~r/one label for each point/},
+          {%{labels: []}, ~r/must have points or a box/}
+        ] do
+      assert_raise ArgumentError, message, fn ->
+        Nx.Serving.run(serving, %{image: @image, prompts: [prompt]})
+      end
+    end
+  end
+
+  @doc """
+  The prompts of the SAM tests: a point with the default label, three points, a box, and a box with a point.
+  """
+  def sam_prompts do
+    [
+      %{points: [[80, 120]]},
+      %{points: [[80, 120], [200, 60], [150, 200]], labels: [1, 1, 0]},
+      %{box: [40, 60, 200, 230]},
+      %{points: [[80, 120]], labels: [1], box: [40, 60, 200, 230]}
+    ]
+  end
+
+  @doc """
+  Runs `serving` on the wide and the tall image with `prompts`, and compares the masks with the fixtures `sam_<name>_wide.png` and `sam_<name>_tall.png`, which have the 3 masks of each prompt one below the other. The scores must be within 1e-4. The logits of the decoder differ from PyTorch by about 1e-4, also in ONNX Runtime, and up to 5 pixels of a mask of the test have a resized logit within 1e-4 of 0. So a mask can have up to 5 pixels that are not in the fixture.
+  """
+  def assert_masks(serving, name, prompts, {wide, tall}) do
+    tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    results =
+      Nx.Serving.run(serving, [
+        %{image: @image, prompts: prompts},
+        %{image: tall_image, prompts: prompts}
+      ])
+
+    for {result, picture, scores} <- Enum.zip([results, ["wide", "tall"], [wide, tall]]) do
+      expected = fixture("sam_#{name}_#{picture}.png")
+      {_, width} = Nx.shape(expected)
+      expected = Nx.reshape(expected, {length(prompts), 3, :auto, width})
+
+      for {{masks, mask_scores}, i} <- Enum.with_index(Enum.zip(result.masks, result.iou_scores)) do
+        assert_all_close(mask_scores, Enum.at(scores, i))
+
+        for {mask, j} <- Enum.with_index(masks) do
+          assert Nx.type(mask) == {:u, 8}
+          different = Nx.to_number(Nx.sum(Nx.not_equal(mask, expected[i][j])))
+
+          assert different <= 5,
+                 "#{name} #{picture} prompt #{i} mask #{j}: #{different} pixels"
+        end
+      end
+    end
+  end
+
   defp fixture(name) do
     Path.expand("../fixtures/#{name}", __DIR__)
     |> StbImage.read_file!()
@@ -688,6 +796,32 @@ defmodule Transmuter.VisionLargeModelTest do
     assert_raise ArgumentError, ~r/cannot have "." or "\?"/, fn ->
       Vision.zero_shot_object_detection(dino, ["cat. dog"], [model: %{}] ++ @opts)
     end
+  end
+
+  # The reference is Sam2Model of transformers with Sam2Processor and post_process_masks, one
+  # prompt for each call. A prompt without points or without a box gives a zero-size input
+  # to the decoder.
+  @tag :large_model
+  test "mask generation with SAM 2.1 matches transformers" do
+    serving = Vision.mask_generation({:hf, "onnx-community/sam2.1-hiera-tiny-ONNX"}, @opts)
+
+    VisionTest.assert_masks(
+      serving,
+      "sam2",
+      VisionTest.sam_prompts(),
+      {[
+         [0.58498, 0.10027, 0.97088],
+         [0.93111, 0.53209, 0.88527],
+         [0.21746, 0.26922, 0.44355],
+         [0.63941, 0.26945, 0.80429]
+       ],
+       [
+         [0.89877, 0.08282, 0.8433],
+         [0.92574, 0.36652, 0.7604],
+         [0.59683, 0.23924, 0.81182],
+         [0.57428, 0.50855, 0.82845]
+       ]}
+    )
   end
 
   # The reference is ONNX Runtime on the same files: the q4 vision encoder and decoder and
