@@ -126,7 +126,7 @@ defmodule Transmuter.Serving do
 
   The featurizer turns the images into `"pixel_values"` on the `:backend` of `opts`. When the model has a `"pixel_mask"` input, each image also gets a mask of ones. The mask has the shape that the model declares, such as 64x64 in the DETR exports of Xenova, or else the size of the image. The images of a batch have one size, so no pixel is padding. `inputs` are other inputs of the model that are the same for all images, such as the text of the labels in zero-shot classification. Their first axis is not the batch.
 
-  When the featurizer gives one image size, the serving compiles that shape, and the images go into batches of the `:batch_size` of `:compile`. When the size depends on the image, such as with the `shortest_edge` and `longest_edge` of DETR, the batch size must be 1. Each image is then a batch, and the compiled model compiles each new image size on its first call. It keeps up to #{@image_sizes} sizes.
+  When the featurizer gives one image size, the serving compiles that shape, and the images go into batches of the `:batch_size` of `:compile`. When the ONNX file declares a fixed size of the batch axis of `pixel_values`, the batch size must be that size. When the size depends on the image, such as with the `shortest_edge` and `longest_edge` of DETR, the batch size must be 1. Each image is then a batch, and the compiled model compiles each new image size on its first call. It keeps up to #{@image_sizes} sizes.
 
   `fun` and `postprocess` are as in `text/7`. The tensors of `fun` must have the same shape for all image sizes. An image is one row, so `postprocess` takes a list of one row and a list of one image tensor.
   """
@@ -134,6 +134,7 @@ defmodule Transmuter.Serving do
     compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
     size = Featurizer.size(featurizer)
     batch_size = image_batch_size!(size, compile[:batch_size])
+    declared_batch_size!(model, batch_size)
     key = {:image_size, size}
     {height, width} = compile_size(featurizer)
     template = image_inputs(model, zeros({batch_size, 3, height, width}, :f32))
@@ -182,6 +183,19 @@ defmodule Transmuter.Serving do
       )
 
   defp image_batch_size!(_size, batch_size), do: batch_size
+
+  # Some exports, such as onnx-community/ormbg-ONNX, have a fixed batch size in the shapes
+  # of their graph. ONNX Runtime rejects other batch sizes too.
+  defp declared_batch_size!(model, batch_size) do
+    case model.input_types["pixel_values"] do
+      {_type, [declared | _]} when is_integer(declared) and declared != batch_size ->
+        raise ArgumentError,
+              "the ONNX file has a fixed batch size of #{declared} on the first axis of pixel_values. Use batch_size: #{declared}"
+
+      _type ->
+        :ok
+    end
+  end
 
   defp image_inputs(model, pixels) do
     if "pixel_mask" in model.inputs do

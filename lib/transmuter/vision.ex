@@ -160,6 +160,30 @@ defmodule Transmuter.Vision do
   defdelegate image_segmentation(source, opts \\ []), to: Transmuter.Vision.ImageSegmentation
 
   @doc """
+  Builds a serving that gives the mask of the foreground of an image, with a model such as ORMBG.
+
+  The input is an image or a list of images. The result is `%{mask: tensor}`, a `:u8` tensor of shape `{height, width}` of the input image. A pixel of the foreground is near 255, and a pixel of the background is near 0.
+
+      serving = Transmuter.Vision.background_removal({:hf, "onnx-community/ormbg-ONNX"})
+      %{mask: mask} = Nx.Serving.run(serving, image)
+
+  Python transformers has no pipeline for this task, so the serving follows the `background-removal` pipeline of transformers.js. The mask is the first output of the model. When a value of the output is outside 0..1 by more than 1.0e-5, the mask is the sigmoid of the output. The mask is 255 times the value, truncated to 8 bits. Then the bilinear resize of Pillow (see `Transmuter.Featurizer.resize/3`) gives the mask the size of the image. In Node, transformers.js resizes with the affine bilinear of sharp, which does not filter when the image gets smaller. So on the same output, its mask can be different at the edges of the foreground. On a 320x240 image and the 1024x1024 output of ORMBG, the difference is up to 100 steps.
+
+  The pipeline of transformers.js gives an image with an alpha channel. To make this image, add the mask to the pixels as the fourth channel:
+
+      pixels = image |> StbImage.to_nx() |> Transmuter.Featurizer.rgb()
+      rgba = Nx.concatenate([pixels, Nx.new_axis(mask, 2)], axis: 2)
+      StbImage.write_file!(StbImage.from_nx(rgba), "cats.png")
+
+  ## Options
+
+    * `:compile` - `:batch_size`. The default is `1`. The ONNX file of `onnx-community/ormbg-ONNX` has a fixed batch size of 1, so the batch size must be `1`.
+
+  See the module documentation for the other options.
+  """
+  defdelegate background_removal(source, opts \\ []), to: Transmuter.Vision.BackgroundRemoval
+
+  @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.

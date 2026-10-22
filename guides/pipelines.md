@@ -287,8 +287,9 @@ image = StbImage.read_file!("cats.jpg")
 | `object_detection/2` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
 | `depth_estimation/2` | image | `%{predicted_depth: tensor, depth: tensor}` |
 | `image_segmentation/2` | image | `%{segments: [%{label: label, score: nil, mask: tensor}]}` |
+| `background_removal/2` | image | `%{mask: tensor}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow.
 
 ### Image preprocessing
 
@@ -377,6 +378,15 @@ Nx.Serving.run(serving, image)
 ```
 
 The serving runs semantic segmentation models, such as the Segformer exports of Xenova. As in the `image-segmentation` pipeline of Python transformers, the logits are resized to the size of the image with the bilinear interpolation of PyTorch, and each pixel gets the label with the highest logit. Each label that is present gives one segment, in the order of the label ids. A mask has 255 for the pixels of its label and 0 for the other pixels. The score is `nil`, because semantic segmentation gives no scores. Panoptic and instance segmentation models, such as DETR and Mask2Former, are not supported yet.
+
+### Background removal
+
+```elixir
+serving = Transmuter.Vision.background_removal({:hf, "onnx-community/ormbg-ONNX"})
+%{mask: mask} = Nx.Serving.run(serving, image)
+```
+
+Python transformers has no pipeline for this task, so the serving follows the `background-removal` pipeline of transformers.js. The mask is the first output of the model, with a sigmoid when a value is outside 0..1, as 8 bits. The bilinear resize of Pillow gives the mask the size of the image. transformers.js resizes with sharp in Node, which does not filter when the image gets smaller, so its mask can be different at the edges of the foreground. The ONNX file of `onnx-community/ormbg-ONNX` has a fixed batch size of 1. See `Transmuter.Vision.background_removal/2` for an example that makes an image with an alpha channel.
 
 ### Image-text-to-text
 

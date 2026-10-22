@@ -507,3 +507,24 @@ for name, picture in pictures:
         labels[np.array(s["mask"]) == 255] = label2id[s["label"]]
     Image.fromarray(labels).save(f"test/fixtures/cats_segformer_{name}.png")
     print("segformer", name, [(s["label"], s["score"], int((np.array(s["mask"]) == 255).sum())) for s in segments])
+
+# Background removal. Python transformers has no background-removal pipeline, so the
+# reference is ONNX Runtime with the slow image processor and the post-processing of the
+# BackgroundRemovalPipeline of transformers.js: a sigmoid when a value is farther than 1e-5
+# from 0..1, then 255 times the value, truncated to 8 bits. Then Pillow resizes the mask to
+# the image with bilinear, as Transmuter does. transformers.js resizes with sharp in Node,
+# whose affine bilinear does not filter a smaller image and does not center the pixels, or
+# with the canvas in the browser. The script writes the masks to test/fixtures/cats_ormbg_wide.png
+# and cats_ormbg_tall.png and prints the mask at (y, x) and its mean.
+processor = AutoImageProcessor.from_pretrained("onnx-community/ormbg-ONNX", use_fast=False)
+directory = snapshot_download("onnx-community/ormbg-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+for name, picture in pictures:
+    alphas = session.run(None, {"pixel_values": processor(picture, return_tensors="np")["pixel_values"]})[0][0]
+    if ((alphas < -1e-5) | (alphas > 1 + 1e-5)).any():
+        alphas = torch.from_numpy(alphas).sigmoid().numpy()
+    mask = Image.fromarray((alphas[0] * np.float32(255)).astype(np.uint8))
+    mask = mask.resize((picture.width, picture.height), Image.Resampling.BILINEAR)
+    mask.save(f"test/fixtures/cats_ormbg_{name}.png")
+    values = np.array(mask)
+    print("ormbg", name, values.shape, [int(values[p]) for p in [(0, 0), (100, 37), (57, 190), (150, 120), (239, 239)]], round(float(values.mean()), 4))

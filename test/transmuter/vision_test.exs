@@ -453,6 +453,31 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The reference is ONNX Runtime with the post-processing of transformers.js and the
+  # bilinear resize of Pillow. The mask truncates to 8 bits, so a value can be one step away.
+  # The ONNX file has a fixed batch size of 1.
+  test "background removal matches the post-processing of transformers.js" do
+    repo = {:hf, "onnx-community/ormbg-ONNX"}
+    serving = Vision.background_removal(repo, @opts)
+
+    assert_raise ArgumentError, ~r/fixed batch size of 1/, fn ->
+      Vision.background_removal(repo, [compile: [batch_size: 2]] ++ @opts)
+    end
+
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+    [wide_result, tall_result] = Nx.Serving.run(serving, [@image, tall])
+    assert Nx.Serving.run(serving, tall) == tall_result
+
+    for {%{mask: mask}, name} <- [{wide_result, "wide"}, {tall_result, "tall"}] do
+      expected = fixture("cats_ormbg_#{name}.png")
+      assert {Nx.shape(mask), Nx.type(mask)} == {Nx.shape(expected), {:u, 8}}
+      difference = Nx.abs(Nx.subtract(Nx.as_type(mask, :s16), Nx.as_type(expected, :s16)))
+
+      assert Nx.to_number(Nx.reduce_max(difference)) <= 1, name
+      assert Nx.to_number(Nx.sum(difference)) <= 10, name
+    end
+  end
+
   defp fixture(name) do
     Path.expand("../fixtures/#{name}", __DIR__)
     |> StbImage.read_file!()
