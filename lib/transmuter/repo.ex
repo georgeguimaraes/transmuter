@@ -50,12 +50,13 @@ defmodule Transmuter.Repo do
     Hub.info(source, [refresh: true] ++ opts)
     json = &Hub.json(source, &1, opts)
     tokenizer_config = json.("tokenizer_config.json") || %{}
+    config = json.("config.json") || %{}
 
     %__MODULE__{
       source: source,
       files: Hub.files(source, opts),
-      config: json.("config.json") || %{},
-      generation_config: json.("generation_config.json") || %{},
+      config: config,
+      generation_config: json.("generation_config.json") || from_model_config(config),
       tokenizer_config: tokenizer_config,
       special_tokens: json.("special_tokens_map.json") || %{},
       chat_template: chat_template(source, tokenizer_config, opts),
@@ -149,6 +150,46 @@ defmodule Transmuter.Repo do
   defp dtype_variant(dtype) do
     Enum.find(Keyword.keys(@variants), &(Atom.to_string(&1) == dtype)) ||
       raise ArgumentError, "unknown transformers.js dtype #{inspect(dtype)}"
+  end
+
+  # The defaults of GenerationConfig in Python transformers that are not None, from
+  # _get_global_generation_defaults.
+  @generation_defaults %{
+    "max_length" => 20,
+    "min_length" => 0,
+    "do_sample" => false,
+    "early_stopping" => false,
+    "num_beams" => 1,
+    "temperature" => 1.0,
+    "top_k" => 50,
+    "top_p" => 1.0,
+    "typical_p" => 1.0,
+    "repetition_penalty" => 1.0,
+    "length_penalty" => 1.0,
+    "no_repeat_ngram_size" => 0,
+    "encoder_no_repeat_ngram_size" => 0,
+    "num_return_sequences" => 1,
+    "output_scores" => false,
+    "return_dict_in_generate" => false,
+    "remove_invalid_values" => false,
+    "num_beam_groups" => 1,
+    "diversity_penalty" => 0.0
+  }
+
+  # GenerationConfig.from_model_config of Python transformers, for a repository without
+  # generation_config.json: the keys of config.json that are not null. The configuration of
+  # the decoder gives the keys that config.json does not set or sets to their default.
+  defp from_model_config(config) do
+    outer = for {key, value} <- config, value != nil, into: %{}, do: {key, value}
+    decoder = Enum.find_value(~w(decoder generator text_config), %{}, &config[&1])
+
+    Enum.reduce(decoder, outer, fn {key, value}, generation ->
+      default = @generation_defaults[key]
+
+      if Map.get(generation, key, default) == default,
+        do: Map.put(generation, key, value),
+        else: generation
+    end)
   end
 
   # chat_template.jinja, then tokenizer_config.json (a string, or a list of named

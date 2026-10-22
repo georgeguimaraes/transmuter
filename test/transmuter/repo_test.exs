@@ -71,4 +71,25 @@ defmodule Transmuter.RepoTest do
 
     assert repo(dir, %{"chat_template.jinja" => "J"}).chat_template == "J"
   end
+
+  # GenerationConfig.from_model_config of transformers: config.json without its null keys, and
+  # the decoder for the keys that config.json leaves at their default.
+  test "without generation_config.json, the generation settings come from config.json", %{
+    tmp_dir: dir
+  } do
+    config = %{
+      "no_repeat_ngram_size" => 3,
+      "min_length" => 0,
+      "forced_bos_token_id" => nil,
+      "decoder" => %{"no_repeat_ngram_size" => 2, "min_length" => 5, "forced_bos_token_id" => 7}
+    }
+
+    generation = repo(dir, %{"config.json" => config}).generation_config
+    assert generation["no_repeat_ngram_size"] == 3
+    assert generation["min_length"] == 5
+    assert generation["forced_bos_token_id"] == 7
+
+    File.write!(Path.join(dir, "generation_config.json"), JSON.encode!(%{"min_length" => 1}))
+    assert repo(dir, %{}).generation_config == %{"min_length" => 1}
+  end
 end
