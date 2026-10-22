@@ -3,6 +3,8 @@ defmodule Transmuter.Hub do
   Reads the files of a model repository on the Hugging Face Hub or in a local directory.
 
   A source is `{:hf, repo}` or the path of a local directory. Hub files download once into the cache directory and come from there later. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option. Set the `HF_TOKEN` environment variable for private repositories.
+
+  A large download shows a progress bar on the standard output. To disable it, set `config :transmuter, progress_bar_enabled: false`.
   """
 
   @doc """
@@ -119,15 +121,54 @@ defmodule Transmuter.Hub do
       part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
 
       try do
-        Req.get!(
-          "https://huggingface.co/#{repo}/resolve/main/#{file}",
-          req_options(into: File.stream!(part), http_errors: :raise)
-        )
+        File.open!(part, [:write, :binary], fn device ->
+          Req.get!(
+            "https://huggingface.co/#{repo}/resolve/main/#{file}",
+            req_options(into: &write(device, file, &1, &2), http_errors: :raise)
+          )
+        end)
 
         File.rename!(part, target)
       after
         File.rm(part)
       end
+    end
+  end
+
+  # A retry gives a new response, so the first chunk of a response truncates the part file.
+  defp write(device, file, chunk, {request, response})
+       when not is_map_key(response.private, :progress) do
+    {:ok, 0} = :file.position(device, 0)
+    :ok = :file.truncate(device)
+    response = Req.Response.put_private(response, :progress, {0, content_length(response)})
+    write(device, file, chunk, {request, response})
+  end
+
+  defp write(device, file, {:data, data}, {request, response}) do
+    {size, total} = response.private.progress
+    IO.binwrite(device, data)
+    progress(file, size, size + byte_size(data), total)
+
+    {:cont,
+     {request, Req.Response.put_private(response, :progress, {size + byte_size(data), total})}}
+  end
+
+  defp content_length(response) do
+    case Req.Response.get_header(response, "content-length") do
+      [length] when response.status == 200 -> String.to_integer(length)
+      _other -> nil
+    end
+  end
+
+  # Draws the bar when the percent changes. A file in one chunk gets no bar, as in Bumblebee.
+  defp progress(file, before, size, total) do
+    if Application.get_env(:transmuter, :progress_bar_enabled, true) and
+         total not in [nil, size - before] and div(100 * size, total) != div(100 * before, total) do
+      done = div(30 * size, total)
+      bar = String.duplicate("=", done) <> String.duplicate(" ", 30 - done)
+      megabytes = :io_lib.format("~.1f/~.1f MB", [size / 1.0e6, total / 1.0e6])
+      IO.write(["\r#{file} |#{bar}| #{div(100 * size, total)}% (", megabytes, ")"])
+      if size == total, do: IO.write("\n")
     end
   end
 
