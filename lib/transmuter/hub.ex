@@ -2,7 +2,7 @@ defmodule Transmuter.Hub do
   @moduledoc """
   Reads the files of a model repository on the Hugging Face Hub or in a local directory.
 
-  A source is `{:hf, repo}` or the path of a local directory. Hub files download into the cache directory and come from there later. When the metadata of the repository gives a new ETag for a file, the file downloads again. Each download must match its ETag. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option.
+  A source is `{:hf, repo}` or the path of a local directory. Hub files download into the cache directory and come from there later. When the metadata of the repository gives a new ETag for a file, the file downloads again. Each download must match its ETag. The cache directory is `~/.cache/transmuter`, or the `:cache_dir` option. An error status of the Hub, such as 401 for a gated repository without a token, raises `Transmuter.HubError`.
 
   ## Environment
 
@@ -135,9 +135,7 @@ defmodule Transmuter.Hub do
             raise ArgumentError, "#{repo} has no revision #{opts[:revision]}"
 
           {:ok, %{status: status, body: body}} ->
-            raise ArgumentError,
-                  "the Hugging Face Hub gave status #{status} for #{repo}: #{inspect(body)}. " <>
-                    "Set HF_TOKEN or run hf auth login for a private or gated repository"
+            raise Transmuter.HubError, repo: repo, status: status, details: inspect(body)
 
           {:error, error} ->
             raise ArgumentError,
@@ -182,11 +180,13 @@ defmodule Transmuter.Hub do
               Req.get!(
                 request(
                   url: "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
-                  into: &write(device, file, hash, &1, &2),
-                  http_errors: :raise
+                  into: &write(device, file, hash, &1, &2)
                 )
               )
             end)
+
+          if response.status != 200,
+            do: raise(Transmuter.HubError, repo: repo, status: response.status, details: file)
 
           if etag && digest(Req.Response.get_private(response, :hash, hash)) != etag,
             do: raise(ArgumentError, "the download of #{file} of #{repo} does not match its ETag")

@@ -88,6 +88,7 @@ defmodule Transmuter.MixProject do
           Transmuter,
           Transmuter.EMLX,
           Transmuter.Hub,
+          Transmuter.HubError,
           Transmuter.Repo,
           Transmuter.Telemetry,
           Transmuter.Telemetry.Logger,

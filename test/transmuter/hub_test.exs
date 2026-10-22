@@ -6,7 +6,7 @@ defmodule Transmuter.HubTest do
 
   test "an error from the Hub raises and is not saved", %{tmp_dir: dir} do
     # The Hub gives 404 with a token and 401 without one.
-    assert_raise ArgumentError, ~r/gave status 40[14]/, fn ->
+    assert_raise Transmuter.HubError, ~r/gave status 40[14]/, fn ->
       Transmuter.Hub.files({:hf, "Xenova/no-such-repository"}, cache_dir: dir)
     end
 
