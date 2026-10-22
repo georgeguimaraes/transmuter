@@ -122,6 +122,38 @@ defmodule Transmuter.Vision do
   defdelegate object_detection(source, opts \\ []), to: Transmuter.Vision.ObjectDetection
 
   @doc """
+  Builds a serving that finds objects in images with labels that you give, such as OWL-ViT, OWLv2 and Grounding DINO.
+
+  `labels` is a list of strings. The input is an image or a list of images. The result is `%{detections: [%{label: label, score: score, box: box}]}`, from the highest score, as the `zero-shot-object-detection` pipeline of Python transformers gives. A box is `%{xmin: x, ymin: y, xmax: x, ymax: y}`, in pixels of the input image. The coordinates are floats. The pipeline of Python transformers truncates them to integers.
+
+      serving = Transmuter.Vision.zero_shot_object_detection({:hf, "Xenova/owlv2-base-patch16-ensemble"}, ["cat", "remote control"])
+      Nx.Serving.run(serving, image)
+      #=> %{detections: [%{label: "remote control", score: 0.747, box: %{xmin: 167.3, ymin: 38.5, xmax: 185.0, ymax: 93.7}}, ...]}
+
+  The pipeline of Python transformers runs the model once for each label. The score of a box for a label is the sigmoid of the highest logit of the box, and each box with a score higher than `:threshold` is a detection. So one box can be a detection of more than one label. `model_type` in `config.json` selects how the serving runs the model:
+
+    * `"owlvit"` and `"owlv2"` - the labels are the text queries of one model run. Each query gets its own logit for each box, so the scores are the same as with one run for each label. The images go into batches. OWLv2 pads the image to a square, and its boxes are relative to that square, as in Python transformers.
+
+    * `"grounding-dino"` - the text and the image go through the same layers, so the model runs once for each label and image. The ONNX exports of Grounding DINO compute the phrases of the text for one phrase and a period. So the text of a label is the label without spaces at the ends, in lowercase, and a period, as `GroundingDinoProcessor` of Python transformers makes it for a list of labels. The pipeline of Python transformers with the PyTorch model gives the label alone, without the period, so its scores and boxes are different. A label cannot have `"."` or `"?"`. The score of a box is the sigmoid of its highest logit over the tokens of the text.
+
+  The featurizer prepares the images as the image processors of Python transformers, see `Transmuter.Featurizer`. OWLv2 rescales the image, pads it to a square with gray, and resizes it with a gaussian blur and a linear interpolation.
+
+  ## Options
+
+    * `:threshold` - the minimum score of a detection. A detection has a higher score than the threshold. The default is `0.1`, as in Python transformers.
+
+    * `:top_k` - the number of detections with the highest scores to keep, or `nil` for all. The default is `nil`.
+
+    * `:compile` - `:batch_size`. The default is `1`. Grounding DINO runs each image alone, so its batch size must be `1`.
+
+    * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
+
+  The text needs the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps. See the module documentation for the other options.
+  """
+  defdelegate zero_shot_object_detection(source, labels, opts \\ []),
+    to: Transmuter.Vision.ZeroShotObjectDetection
+
+  @doc """
   Builds a serving that estimates the depth of each pixel of an image, such as Depth Anything.
 
   The input is an image or a list of images. The result is `%{predicted_depth: tensor, depth: tensor}`, as the `depth-estimation` pipeline of Python transformers gives. Both tensors have the shape `{height, width}` of the input image.

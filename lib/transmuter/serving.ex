@@ -198,7 +198,10 @@ defmodule Transmuter.Serving do
     end
   end
 
-  defp image_inputs(model, pixels) do
+  @doc """
+  Returns the image inputs of `model` for `pixels` of shape `{batch, channels, height, width}`: `"pixel_values"` and, when the model has a `"pixel_mask"` input, a mask of ones. The mask has the shape that the model declares, or else the size of the images.
+  """
+  def image_inputs(model, pixels) do
     if "pixel_mask" in model.inputs do
       {type, [_batch, mask_height, mask_width]} = model.input_types["pixel_mask"]
       {batch, _channels, height, width} = Nx.shape(pixels)

@@ -17,6 +17,8 @@ defmodule Transmuter.Featurizer do
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
 
+  The OWLv2 image processor (`Owlv2ImageProcessor`) does the steps in another order, and the featurizer reads `image_processor_type` and does the same. It rescales the image, pads it to a square on the bottom and the right with the value 0.5 (`do_pad`), resizes it with the `:gaussian_linear` method of `resize/3`, and normalizes it.
+
   The result has the shape `{batch, channels, height, width}` and the type `:f32`.
   """
 
@@ -24,7 +26,7 @@ defmodule Transmuter.Featurizer do
 
   alias Transmuter.{Hub, Repo}
 
-  defstruct [:resize, :crop, :rescale, :normalize, resample: :bilinear, rgb: true]
+  defstruct [:resize, :crop, :rescale, :normalize, :pad, resample: :bilinear, rgb: true]
 
   # The resample codes of Pillow.
   @resamples %{
@@ -63,15 +65,23 @@ defmodule Transmuter.Featurizer do
     size = detr_size(config["image_processor_type"], size)
     size = dpt_size(config, size)
 
-    %__MODULE__{
+    owlv2(config, %__MODULE__{
       resize: if(Map.get(config, "do_resize", true), do: size),
       resample: Map.fetch!(@resamples, config["resample"] || 2),
       crop: crop,
       rescale: if(Map.get(config, "do_rescale", true), do: config["rescale_factor"] || 1 / 255),
       normalize: if(Map.get(config, "do_normalize", true), do: mean_std(config)),
       rgb: Map.get(config, "do_convert_rgb", true)
-    }
+    })
   end
+
+  # Owlv2ImageProcessor of Python transformers ignores resample.
+  defp owlv2(config = %{"image_processor_type" => "Owlv2ImageProcessor"}, featurizer) do
+    pad = if Map.get(config, "do_pad", true), do: 0.5
+    %{featurizer | resample: :gaussian_linear, pad: pad}
+  end
+
+  defp owlv2(_config, featurizer), do: featurizer
 
   defp config_size(%{"height" => height, "width" => width}, _crops?), do: {height, width}
 
@@ -175,18 +185,38 @@ defmodule Transmuter.Featurizer do
       end
 
     image = if featurizer.rgb, do: rgb(image), else: image
-    {height, width, _channels} = Nx.shape(image)
 
     image =
-      if featurizer.resize,
-        do: resize(image, output_size(featurizer.resize, {height, width}), featurizer.resample),
-        else: image
+      if featurizer.resample == :gaussian_linear do
+        image |> rescale(featurizer) |> pad_square(featurizer.pad) |> resize_step(featurizer)
+      else
+        image |> resize_step(featurizer) |> center_crop(featurizer.crop) |> rescale(featurizer)
+      end
 
-    image = if featurizer.crop, do: center_crop(image, featurizer.crop), else: image
-    image = Nx.as_type(image, :f32)
-    image = if featurizer.rescale, do: Nx.multiply(image, featurizer.rescale), else: image
     image = if featurizer.normalize, do: normalize(image, featurizer.normalize), else: image
     Nx.transpose(image, axes: [2, 0, 1])
+  end
+
+  defp resize_step(image, %{resize: nil}), do: image
+
+  defp resize_step(image, featurizer) do
+    {height, width, _channels} = Nx.shape(image)
+    resize(image, output_size(featurizer.resize, {height, width}), featurizer.resample)
+  end
+
+  defp rescale(image, featurizer) do
+    image = Nx.as_type(image, :f32)
+    if featurizer.rescale, do: Nx.multiply(image, featurizer.rescale), else: image
+  end
+
+  # As pad of Owlv2ImageProcessor of Python transformers.
+  defp pad_square(image, nil), do: image
+
+  defp pad_square(image, value) do
+    {height, width, _channels} = Nx.shape(image)
+    side = max(height, width)
+    padding = [{0, side - height, 0}, {0, side - width, 0}, {0, 0, 0}]
+    Nx.pad(image, Nx.tensor(value, type: Nx.type(image)), padding)
   end
 
   @doc """
@@ -268,6 +298,8 @@ defmodule Transmuter.Featurizer do
   end
 
   # As center_crop of Python transformers: an image smaller than the crop is padded with zeros.
+  defp center_crop(image, nil), do: image
+
   defp center_crop(image, {height, width}) do
     image |> crop_axis(0, height) |> crop_axis(1, width)
   end
@@ -302,9 +334,21 @@ defmodule Transmuter.Featurizer do
   `method` is `:nearest`, `:box`, `:bilinear`, `:hamming`, `:bicubic` or `:lanczos`. The filters other than `:nearest` widen when the image gets smaller, so they also remove aliasing. The width changes first and the height second.
 
   A `:u8` image gives a `:u8` image. As in Pillow, the weights are fixed-point numbers with 22 fraction bits, and each pass rounds to `:u8`. An image of another type is resized in `:f32`.
+
+  `:gaussian_linear` is the resize of the OWLv2 image processor of Python transformers, which is `skimage.transform.resize` with anti-aliasing. On each axis, a gaussian blur with sigma `max(0, (scale - 1) / 2)` comes first, where `scale` is the input size divided by the output size. Then a linear interpolation between the pixel centers gives the output. Both steps reflect the image at its edges, as the `"mirror"` mode of `scipy.ndimage`. The result is clipped to the minimum and the maximum of the image.
   """
-  def resize(image, {height, width}, method) do
+  def resize(image, size, :gaussian_linear) do
+    image = Nx.as_type(image, :f32)
+    resized = resize_pillow(image, size, :gaussian_linear)
+    Nx.clip(resized, Nx.reduce_min(image), Nx.reduce_max(image))
+  end
+
+  def resize(image, size, method) do
     image = if Nx.type(image) == {:u, 8}, do: image, else: Nx.as_type(image, :f32)
+    resize_pillow(image, size, method)
+  end
+
+  defp resize_pillow(image, {height, width}, method) do
     image |> resize_axis(1, width, method) |> resize_axis(0, height, method)
   end
 
@@ -374,6 +418,29 @@ defmodule Transmuter.Featurizer do
     |> Enum.map(&[{min(trunc(&1), in_size - 1), 1.0}])
   end
 
+  # As the gaussian_filter and the zoom with grid_mode of scipy.ndimage, in the "mirror" mode.
+  # The zoom interpolates at (i + 0.5) * scale - 0.5 between the blurred pixels, and each
+  # blurred pixel is a sum of the pixels around it, so the taps of both steps multiply.
+  defp taps(in_size, out_size, :gaussian_linear) do
+    scale = in_size / out_size
+    blur = gaussian(max(0, (scale - 1) / 2))
+
+    for i <- 0..(out_size - 1) do
+      x = (i + 0.5) * scale - 0.5
+      low = floor(x)
+      t = x - low
+
+      taps =
+        for {j, weight} <- [{low, 1 - t}, {low + 1, t}],
+            {offset, blur_weight} <- blur,
+            do: {mirror(mirror(j, in_size) + offset, in_size), weight * blur_weight}
+
+      taps
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Enum.map(fn {j, weights} -> {j, Enum.sum(weights)} end)
+    end
+  end
+
   # As precompute_coeffs of Pillow.
   defp taps(in_size, out_size, method) do
     {support, filter} = filter(method)
@@ -390,6 +457,25 @@ defmodule Transmuter.Featurizer do
       total = taps |> Enum.map(&elem(&1, 1)) |> Enum.sum()
       if total == 0, do: taps, else: Enum.map(taps, fn {j, w} -> {j, w / total} end)
     end
+  end
+
+  # As _gaussian_kernel1d of scipy.ndimage, with a radius of 4 sigma. gaussian_filter does not
+  # filter an axis whose sigma is not more than 1.0e-15.
+  defp gaussian(sigma) when sigma <= 1.0e-15, do: [{0, 1.0}]
+
+  defp gaussian(sigma) do
+    radius = trunc(4 * sigma + 0.5)
+    weights = for x <- -radius..radius, do: {x, :math.exp(-0.5 / (sigma * sigma) * x * x)}
+    total = weights |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+    Enum.map(weights, fn {x, weight} -> {x, weight / total} end)
+  end
+
+  # The "mirror" mode of scipy.ndimage reflects about the edge pixels: d c b | a b c d | c b a.
+  defp mirror(_index, 1), do: 0
+
+  defp mirror(index, size) do
+    index = Integer.mod(index, 2 * (size - 1))
+    if index < size, do: index, else: 2 * (size - 1) - index
   end
 
   defp filter(:box), do: {0.5, &if(&1 > -0.5 and &1 <= 0.5, do: 1.0, else: 0.0)}

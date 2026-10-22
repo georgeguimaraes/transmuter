@@ -80,8 +80,10 @@ defmodule Transmuter.Vision.ObjectDetection do
     }
   end
 
-  # As center_to_corners_format of Python transformers.
-  defp corners(boxes) do
+  @doc """
+  Turns boxes of shape `{batch, boxes, 4}` from `(center_x, center_y, width, height)` into `(xmin, ymin, xmax, ymax)`, as `center_to_corners_format` of Python transformers.
+  """
+  def corners(boxes) do
     [center_x, center_y, width, height] =
       for i <- 0..3, do: Nx.slice_along_axis(boxes, i, 1, axis: 2)
 

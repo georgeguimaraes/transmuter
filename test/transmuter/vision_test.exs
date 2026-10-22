@@ -17,23 +17,34 @@ defmodule Transmuter.VisionTest do
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @labels ["cats", "dogs", "a remote control", "a couch"]
+  @detection_labels ["cat", "remote control", "couch"]
 
   test "the featurizer gives the pixel values of the Pillow image processors" do
     # ViT resizes to 224x224 with bilinear. CLIP resizes the short side to 224 with bicubic
     # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic. Segformer
-    # resizes to 512x512 with bilinear.
-    for {repo, {height, width}, expected, mean} <- [
-          {"Xenova/vit-base-patch16-224", {224, 224}, [0.1137, 0.2941, -0.5608, 0.4902, -0.2863],
-           0.4666},
-          {"Xenova/clip-vit-base-patch32", {224, 224}, [0.6165, -0.8516, 0.8519, -0.639, -0.4314],
-           0.8819},
-          {"onnx-community/depth-anything-v2-small", {392, 518},
+    # resizes to 512x512 with bilinear. OWL-ViT resizes to 768x768 with bicubic. OWLv2 pads
+    # the image to a square and resizes it to 960x960 with the resize of scikit-image, which
+    # blurs the 6x6 tile of the image (1920x1440) with sigma 0.5 before it interpolates.
+    tile = Nx.tile(StbImage.to_nx(@image), [6, 6, 1])
+
+    for {repo, image, {height, width}, expected, mean} <- [
+          {"Xenova/vit-base-patch16-224", @image, {224, 224},
+           [0.1137, 0.2941, -0.5608, 0.4902, -0.2863], 0.4666},
+          {"Xenova/clip-vit-base-patch32", @image, {224, 224},
+           [0.6165, -0.8516, 0.8519, -0.639, -0.4314], 0.8819},
+          {"onnx-community/depth-anything-v2-small", @image, {392, 518},
            [0.2967, -1.3179, 1.1934, 1.4269, 0.9055], 1.0595},
-          {"Xenova/segformer-b0-finetuned-ade-512-512", {512, 512},
-           [0.2967, 1.6758, -1.8044, -0.902, 0.8704], 1.0497}
+          {"Xenova/segformer-b0-finetuned-ade-512-512", @image, {512, 512},
+           [0.2967, 1.6758, -1.8044, -0.902, 0.8704], 1.0497},
+          {"Xenova/owlvit-base-patch32", @image, {768, 768},
+           [0.2661, -1.617, 0.3399, 0.1201, 1.6547], 0.8948},
+          {"Xenova/owlv2-base-patch16-ensemble", @image, {960, 960},
+           [0.2986, -1.527, 1.3496, 0.198, 1.4762], 0.7126},
+          {"Xenova/owlv2-base-patch16-ensemble", tile, {960, 960},
+           [0.3245, -0.2768, 0.8887, 0.9414, -0.7501], 0.7012}
         ] do
       featurizer = Featurizer.load!({:hf, repo})
-      values = Featurizer.process(featurizer, [@image], backend: @opts[:backend])
+      values = Featurizer.process(featurizer, [image], backend: @opts[:backend])
       values = Nx.backend_transfer(values, Nx.BinaryBackend)
 
       assert Nx.shape(values) == {1, 3, height, width}
@@ -371,6 +382,68 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The reference is the zero-shot-object-detection pipeline of transformers, which runs the
+  # model once for each label. The serving runs the labels as the text queries of one run.
+  # On the Metal GPU, the batch of 2 changes the score of one box by 1.1e-4, so the scores
+  # have a tolerance of 2e-4.
+  test "zero-shot object detection with OWL-ViT matches the pipeline" do
+    serving =
+      Vision.zero_shot_object_detection(
+        {:hf, "Xenova/owlvit-base-patch32"},
+        @detection_labels,
+        [compile: [batch_size: 2]] ++ @opts
+      )
+
+    wide = [
+      {"remote control", 0.233325, [19.3323, 35.9036, 89.429, 58.3903]},
+      {"cat", 0.230558, [3.6999, 26.5906, 157.97, 234.9424]},
+      {"cat", 0.171058, [168.0633, 12.8512, 316.6584, 182.1349]}
+    ]
+
+    tall = [
+      {"cat", 0.521507, [13.008, 167.1858, 183.7693, 320.0486]},
+      {"remote control", 0.511203, [35.5097, 18.7584, 58.6417, 85.7964]},
+      {"cat", 0.484385, [26.2655, 2.954, 237.4741, 149.898]},
+      {"remote control", 0.317606, [40.8807, 168.3273, 100.3745, 186.2379]},
+      {"couch", 0.228428, [0.5833, 0.7704, 239.8784, 319.3692]},
+      {"remote control", 0.19914, [39.5121, 167.4139, 96.1983, 186.4206]},
+      {"remote control", 0.129362, [25.6609, 9.7424, 72.2205, 179.5552]},
+      {"remote control", 0.121832, [24.6725, -0.1015, 67.9243, 86.3368]}
+    ]
+
+    assert_zero_shot_detections(serving, wide, tall, 2.0e-4)
+  end
+
+  @doc """
+  Runs `serving` on the wide image, its tensor and the tall image in one list, and on the tall image alone. A tensor and a `StbImage` give the same result, and so does an image alone.
+
+  The detections come from the highest score. Grounding DINO can swap two detections with near scores, so the comparison with the reference sorts the detections by label and `xmin`. The boxes have a tolerance of 1e-3 of the side of the image, 0.32 pixels.
+  """
+  def assert_zero_shot_detections(serving, wide, tall, score_delta) do
+    tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    [image, tensor, tall_result] =
+      Nx.Serving.run(serving, [@image, StbImage.to_nx(@image), tall_image])
+
+    assert image == tensor
+    assert Nx.Serving.run(serving, tall_image) == tall_result
+
+    for {%{detections: detections}, expected} <- [{image, wide}, {tall_result, tall}] do
+      assert Enum.sort_by(detections, & &1.score, :desc) == detections
+      got = Enum.sort_by(detections, &{&1.label, &1.box.xmin})
+      expected = Enum.sort_by(expected, fn {label, _score, [xmin | _]} -> {label, xmin} end)
+      assert Enum.map(got, & &1.label) == Enum.map(expected, &elem(&1, 0))
+
+      for {detection, {_label, score, box}} <- Enum.zip(got, expected) do
+        assert_in_delta detection.score, score, score_delta, inspect(detection)
+        %{xmin: xmin, ymin: ymin, xmax: xmax, ymax: ymax} = detection.box
+
+        for {g, e} <- Enum.zip([xmin, ymin, xmax, ymax], box),
+            do: assert_in_delta(g, e, 0.32, inspect(detection))
+      end
+    end
+  end
+
   # The reference of Depth Anything V2 is the depth-estimation pipeline of transformers. The
   # ONNX file of Xenova/depth-anything-small-hf gives a depth up to 0.9% away from its PyTorch
   # model, so its reference is ONNX Runtime with the post-processing of the pipeline. Each row
@@ -528,11 +601,79 @@ defmodule Transmuter.VisionLargeModelTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
-  alias Transmuter.Vision
+  alias Transmuter.{Vision, VisionTest}
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
+
+  # The reference of OWLv2 is the zero-shot-object-detection pipeline of transformers. On the
+  # Linux runner, OWLv2 runs a ViT of 3600 patches for each image, so CI leaves this test out.
+  # The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline,
+  # and the text of each label is the label and a period, see
+  # test/support/pipeline_references.py. Grounding DINO selects 900 of 13294 boxes with TopK.
+  # In ONNX Runtime, a change of 1e-7 in the pixel values changes its scores by up to 5e-4, so
+  # its scores have a tolerance of 1e-3.
+  @tag :large_model
+  test "zero-shot object detection with OWLv2 and Grounding DINO matches the references" do
+    labels = ["cat", "remote control", "couch"]
+    dino = {:hf, "onnx-community/grounding-dino-tiny-ONNX"}
+
+    for {repo, compile, wide, tall, score_delta} <- [
+          {{:hf, "Xenova/owlv2-base-patch16-ensemble"}, [batch_size: 2],
+           [
+             {"remote control", 0.747254, [167.3377, 38.4727, 185.0484, 93.7467]},
+             {"remote control", 0.734983, [19.3393, 36.3176, 88.0444, 58.4288]},
+             {"cat", 0.687935, [2.9749, 26.82, 159.7625, 240.4006]},
+             {"cat", 0.635032, [171.2533, 10.9012, 321.0749, 184.4348]},
+             {"couch", 0.502501, [2.5106, 1.0772, 319.8392, 241.2461]},
+             {"remote control", 0.135166, [134.4929, 98.0621, 150.8824, 119.7911]}
+           ],
+           [
+             {"remote control", 0.720599, [38.6238, 167.0137, 93.768, 184.777]},
+             {"cat", 0.644321, [27.5364, 3.5487, 238.057, 157.1026]},
+             {"remote control", 0.622598, [36.3688, 20.3372, 58.93, 88.0172]},
+             {"cat", 0.62235, [12.1107, 171.5322, 185.6642, 321.4313]},
+             {"couch", 0.400949, [1.6723, 4.3198, 239.3741, 320.0118]},
+             {"couch", 0.137685, [1.0749, 4.5949, 64.3031, 318.7564]},
+             {"cat", 0.100644, [27.771, 87.9667, 119.2509, 157.6453]}
+           ], 1.0e-4},
+          {dino, [batch_size: 1],
+           [
+             {"couch", 0.885685, [0.0104, 0.033, 320.0104, 240.0329]},
+             {"cat", 0.760616, [4.0827, 26.7547, 158.4818, 237.3714]},
+             {"cat", 0.722298, [172.7025, 11.7282, 320.021, 186.0622]},
+             {"remote control", 0.443257, [19.0494, 35.2339, 88.6779, 58.9769]},
+             {"remote control", 0.241131, [165.9793, 37.3847, 185.2825, 93.6804]},
+             {"remote control", 0.222448, [10.4043, 28.5515, 99.0912, 65.8146]},
+             {"remote control", 0.203506, [160.3972, 34.5093, 191.4096, 95.9579]},
+             {"remote control", 0.168397, [169.5572, 11.0481, 319.8499, 186.3529]},
+             {"remote control", 0.145843, [4.1858, 25.7082, 158.8907, 235.9273]},
+             {"remote control", 0.108425, [3.5725, 21.0415, 112.5312, 75.9585]},
+             {"remote control", 0.101172, [150.7831, 28.8857, 202.0638, 103.9519]}
+           ],
+           [
+             {"couch", 0.902724, [0.0258, 0.0261, 240.0258, 320.0261]},
+             {"cat", 0.765693, [12.2327, 172.6787, 186.1916, 320.0205]},
+             {"cat", 0.765443, [26.9563, 5.2032, 237.2716, 158.719]},
+             {"remote control", 0.452206, [35.4916, 18.5911, 59.0669, 88.5096]},
+             {"remote control", 0.237786, [37.9201, 165.442, 93.7996, 185.4498]},
+             {"remote control", 0.225241, [26.6928, 12.765, 67.9435, 95.7055]},
+             {"remote control", 0.205441, [26.7666, 4.7704, 237.7252, 158.7924]},
+             {"remote control", 0.162937, [33.1304, 158.4051, 99.3104, 191.4754]},
+             {"cat", 0.116407, [12.134, 4.8482, 237.6781, 319.4389]},
+             {"remote control", 0.111291, [12.2848, 165.5046, 186.8294, 319.4321]}
+           ], 1.0e-3}
+        ] do
+      serving = Vision.zero_shot_object_detection(repo, labels, [compile: compile] ++ @opts)
+      VisionTest.assert_zero_shot_detections(serving, wide, tall, score_delta)
+    end
+
+    # A period ends a phrase of Grounding DINO.
+    assert_raise ArgumentError, ~r/cannot have "." or "\?"/, fn ->
+      Vision.zero_shot_object_detection(dino, ["cat. dog"], [model: %{}] ++ @opts)
+    end
+  end
 
   # The reference is ONNX Runtime on the same files: the q4 vision encoder and decoder and
   # the 8-bit embeddings. The batch has rows of 13, 13 and 22 tiles and a row without images.

@@ -285,11 +285,12 @@ image = StbImage.read_file!("cats.jpg")
 | `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
 | `image_text_to_text/2` | `%{messages: messages}` with image parts | `%{results: [%{text: text, token_summary: summary}]}` |
 | `object_detection/2` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
+| `zero_shot_object_detection/3` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
 | `depth_estimation/2` | image | `%{predicted_depth: tensor, depth: tensor}` |
 | `image_segmentation/2` | image | `%{segments: [%{label: label, score: nil, mask: tensor}]}` |
 | `background_removal/2` | image | `%{mask: tensor}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow.
 
 ### Image preprocessing
 
@@ -354,6 +355,21 @@ The serving runs DETR, YOLOS, RT-DETR and RF-DETR exports, such as `Xenova/detr-
 `model_type` in `config.json` selects the scores. DETR and YOLOS take the softmax over the classes, without the last class, which is "no object". Each query gives one detection, in the order of the queries. RT-DETR and RF-DETR take a sigmoid of each pair of a query and a class, and keep the `:top_k` pairs with the highest scores. The default `:top_k` is the number of queries.
 
 DETR and YOLOS resize the short side to `shortest_edge`, so each image has its own size. The serving runs each image alone, and the model compiles each new image size on its first call. Use `batch_size: 1` with these models. RF-DETR resizes each image to 384x384, so its images go into batches.
+
+### Zero-shot object detection
+
+```elixir
+labels = ["cat", "remote control", "couch"]
+serving = Transmuter.Vision.zero_shot_object_detection({:hf, "Xenova/owlv2-base-patch16-ensemble"}, labels)
+Nx.Serving.run(serving, image)
+#=> %{detections: [%{label: "remote control", score: 0.747, box: %{xmin: 167.3, ymin: 38.5, xmax: 185.0, ymax: 93.7}}, ...]}
+```
+
+The serving runs OWL-ViT, OWLv2 and Grounding DINO exports, such as `Xenova/owlvit-base-patch32`, `Xenova/owlv2-base-patch16-ensemble` and `onnx-community/grounding-dino-tiny-ONNX`. You give the labels when you build the serving. As in the `zero-shot-object-detection` pipeline of Python transformers, the score of a box for a label is the sigmoid of the highest logit of the box. The serving keeps each box with a score higher than `threshold` for each label, so one box can be a detection of more than one label. The default threshold is 0.1. The boxes are floats in pixels of the input image.
+
+OWL-ViT and OWLv2 score each text query alone, so the serving runs all labels as the text queries of one model run, and the images go into batches. The scores are the same as with one run for each label, as in Python. OWLv2 pads the image to a square with gray before it resizes it. Its resize is the one of scikit-image: a gaussian blur when the image gets smaller, then a linear interpolation.
+
+Grounding DINO reads the text and the image together, so the model runs once for each label and image. The ONNX exports of Grounding DINO compute the phrases of the text for one phrase and a period, so the text of a label is the label in lowercase and a period, as `GroundingDinoProcessor` of Python transformers makes it for a list of labels. The pipeline of Python transformers with the PyTorch model gives the label alone, so its detections are different. A label cannot have `"."` or `"?"`, because these characters end a phrase. The scores of Grounding DINO change by up to 5.0e-4 when the pixel values change by 1.0e-7, also in ONNX Runtime, because the model keeps 900 of 13294 boxes with `TopK`.
 
 ### Depth estimation
 

@@ -528,3 +528,67 @@ for name, picture in pictures:
     mask.save(f"test/fixtures/cats_ormbg_{name}.png")
     values = np.array(mask)
     print("ormbg", name, values.shape, [int(values[p]) for p in [(0, 0), (100, 37), (57, 190), (150, 120), (239, 239)]], round(float(values.mean()), 4))
+
+# Zero-shot object detection with the labels "cat", "remote control" and "couch", on the wide
+# and the tall image. The script prints pixel_values[0] of the slow OWL-ViT and OWLv2 image
+# processors of the Xenova exports at (channel, y, x) and the mean of the absolute values,
+# for the wide image and, for OWLv2, for a 6x6 tile of it (1920x1440). The resize of OWLv2
+# blurs that tile with sigma 0.5 before it interpolates.
+# OWL-ViT and OWLv2: the zero-shot-object-detection pipeline with the PyTorch models and the
+# threshold of the pipeline, 0.1. The pipeline runs the model once for each label and
+# truncates the boxes to integers, so here _get_bounding_box keeps the floats. The script
+# also prints the largest difference of the scores between one run with all labels as text
+# queries, as Transmuter does, and one run for each label.
+# Grounding DINO: the ONNX export computes the phrases of the text (the attention mask and
+# the positions between the special tokens) for one phrase and a period. The pipeline with
+# the PyTorch model tokenizes the label alone, such as "cat", and ONNX Runtime fails on that
+# text. So the text of a label is the label in lowercase and a period, as
+# _merge_candidate_labels_text of GroundingDinoProcessor makes it for a list of one label.
+# The export selects 900 of 13294 boxes with TopK, and its scores differ from PyTorch by up
+# to 6e-4, so the reference is ONNX Runtime with the post-processing of the pipeline: the
+# sigmoid of the highest logit over the tokens, the boxes times the size of the image, the
+# threshold 0.1, and a stable sort by score.
+from transformers import AutoModelForZeroShotObjectDetection, AutoTokenizer
+from transformers.models.grounding_dino.processing_grounding_dino import _merge_candidate_labels_text
+from transformers.pipelines.zero_shot_object_detection import ZeroShotObjectDetectionPipeline
+
+image = Image.open("test/fixtures/cats.png")
+pictures = [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]
+labels = ["cat", "remote control", "couch"]
+ZeroShotObjectDetectionPipeline._get_bounding_box = lambda self, box: dict(zip(["xmin", "ymin", "xmax", "ymax"], box.tolist()))
+
+
+def print_detections(name, detections):
+    print(name, [(d["label"], round(d["score"], 6), [round(x, 4) for x in d["box"].values()]) for d in detections])
+
+
+tile = Image.fromarray(np.tile(np.array(image), (6, 6, 1)))
+for repo, export in [("google/owlvit-base-patch32", "Xenova/owlvit-base-patch32"), ("google/owlv2-base-patch16-ensemble", "Xenova/owlv2-base-patch16-ensemble")]:
+    processor = AutoImageProcessor.from_pretrained(export, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(export)
+    for name, picture in [("wide", image), ("tile", tile)][: 2 if "owlv2" in repo else 1]:
+        values = processor(picture, return_tensors="np")["pixel_values"][0]
+        print(export, name, "pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(repo)
+    detect = pipeline("zero-shot-object-detection", model=model, tokenizer=tokenizer, image_processor=processor, device="cpu")
+    for name, picture in pictures:
+        print_detections(f"{export} {name}", detect(picture, candidate_labels=labels))
+        pixel_values = processor(picture, return_tensors="pt")["pixel_values"]
+        with torch.no_grad():
+            one_run = model(pixel_values=pixel_values, **tokenizer(labels, padding=True, return_tensors="pt")).logits[0]
+            each = torch.stack([model(pixel_values=pixel_values, **tokenizer(label, return_tensors="pt")).logits[0, :, 0] for label in labels], 1)
+        print(export, name, "one run and one run for each label, largest score difference", float((one_run.sigmoid() - each.sigmoid()).abs().max()))
+
+processor = AutoImageProcessor.from_pretrained("onnx-community/grounding-dino-tiny-ONNX", use_fast=False)
+tokenizer = AutoTokenizer.from_pretrained("onnx-community/grounding-dino-tiny-ONNX")
+directory = snapshot_download("onnx-community/grounding-dino-tiny-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
+for name, picture in pictures:
+    inputs = {k: v.numpy() for k, v in processor(picture, return_tensors="pt").items()}
+    detections = []
+    for label in labels:
+        logits, boxes = session.run(["logits", "pred_boxes"], {**inputs, **tokenizer(_merge_candidate_labels_text([label]), return_tensors="np")})
+        outputs = SimpleNamespace(logits=torch.from_numpy(logits), pred_boxes=torch.from_numpy(boxes))
+        result = processor.post_process_object_detection(outputs, threshold=0.1, target_sizes=[(picture.height, picture.width)])[0]
+        detections += [{"label": label, "score": float(s), "box": dict(zip(["xmin", "ymin", "xmax", "ymax"], b.tolist()))} for s, b in zip(result["scores"], result["boxes"])]
+    print_detections(f"grounding-dino onnxruntime {name}", sorted(detections, key=lambda d: d["score"], reverse=True))

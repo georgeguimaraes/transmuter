@@ -110,6 +110,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Vision.ImageToText,
           Transmuter.Vision.ImageTextToText,
           Transmuter.Vision.ObjectDetection,
+          Transmuter.Vision.ZeroShotObjectDetection,
           Transmuter.Vision.DepthEstimation,
           Transmuter.Vision.ImageSegmentation,
           Transmuter.Vision.BackgroundRemoval,
