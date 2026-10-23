@@ -894,6 +894,14 @@ case("Break_NonZero_cross_segment",
      {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
      outputs=[g, "tail"])
 
+# A scatter with reduction max reads its coordinates on the host, which it computes from the
+# indices. The indices come from the positions, and the data from the device.
+case("Break_NonZero_scatter_max",
+     positions + [node("Mul", ["g0", "two"], ["updates"]), node("Expand", ["idx", "cols"], ["idx_cols"]),
+                  node("Transpose", ["idx_cols"], ["idx2"]),
+                  node("ScatterElements", ["data", "idx2", "updates"], ["y"], axis=0, reduction="max")],
+     {"x": x_positions, "data": data}, {**positions_init, "two": np.array(2.0, np.float32), "cols": np.array([4, 1], np.int64)})
+
 # The Loop body reads a position as an outer value and expands to it, so it computes the
 # shape that it reads on the host. Its state comes from the device.
 positions_body = helper.make_graph(

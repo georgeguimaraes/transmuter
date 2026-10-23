@@ -188,6 +188,20 @@ defmodule Transmuter.TelemetryTest do
     assert "nz" in host_values
   end
 
+  # The ScatterElements also computes its coordinates from the positions. With static
+  # positions it still breaks, because its coordinates leave the host, as before the
+  # positions were arguments. So the trace with static positions gives the break back, and
+  # the positions stay arguments.
+  test "a node that still breaks with static positions keeps them arguments" do
+    model = load_fixture("Break_NonZero_scatter_max")
+    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+
+    assert [
+             %{breaks: ["NonZero", "ScatterElements"], host_values: []},
+             %{breaks: ["NonZero", "ScatterElements"], host_values: []}
+           ] = calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [0, 1, 0, 1, 0, 1, 0, 0]])
+  end
+
   defp model_breaks("Break_NonZero_gather"), do: ["NonZero"]
   defp model_breaks("Break_NonZero_Range"), do: ["NonZero", "Range"]
 
