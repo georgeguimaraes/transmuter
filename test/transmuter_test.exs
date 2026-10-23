@@ -399,35 +399,6 @@ defmodule TransmuterTest do
     assert compiles.([1]) == 1
   end
 
-  # The Range reads its start from the positions and its limit from the device. The first
-  # build traces it with static positions, and the Range still breaks, so the break is real.
-  # A later miss with these shapes traces each segment once.
-  test "a real break traces once on a later miss" do
-    model = load_fixture("Break_NonZero_Range")
-
-    input = fn x ->
-      %{
-        "x" => Nx.tensor(x, type: :f32, backend: @backend),
-        "data" => Nx.iota({8, 4}, type: :f32, backend: @backend),
-        "n" => Nx.tensor(5, backend: @backend)
-      }
-    end
-
-    compiled =
-      Transmuter.compile(
-        model,
-        input.([1, 1, 1, 0, 0, 0, 0, 0]),
-        [cache_size: 1] ++ @counting_compiler
-      )
-
-    compiled.(input.([1, 1, 1, 0, 0, 0, 0, 0]))
-    compiled.(input.([1, 1, 1, 1, 0, 0, 0, 0]))
-    flush_compiles(0)
-
-    compiled.(input.([0, 1, 1, 1, 0, 0, 0, 0]))
-    assert flush_compiles(0) == 2
-  end
-
   defp flush_compiles(count) do
     receive do
       :compiled -> flush_compiles(count + 1)
