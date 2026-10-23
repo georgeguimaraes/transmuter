@@ -175,6 +175,19 @@ defmodule Transmuter.TelemetryTest do
              calls(compiled, model, [[0, 1, 1, 1, 0, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
   end
 
+  # The Loop body expands to a position that it reads as an outer value, so the value that
+  # it reads on the host is not an input of the Loop. Its state comes from the device. The
+  # positions become static for one more trace, and the Loop does not break.
+  test "a node that reads a value that it computed from positions keeps them static" do
+    model = load_fixture("Break_NonZero_Loop_outer")
+    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+
+    assert [%{breaks: ["NonZero"], host_values: host_values}, %{breaks: ["NonZero"]}] =
+             calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [0, 1, 0, 1, 0, 1, 0, 0]])
+
+    assert "nz" in host_values
+  end
+
   defp model_breaks("Break_NonZero_gather"), do: ["NonZero"]
   defp model_breaks("Break_NonZero_Range"), do: ["NonZero", "Range"]
 
@@ -183,7 +196,8 @@ defmodule Transmuter.TelemetryTest do
       %{
         "x" => Nx.tensor(x, type: :f32, backend: @backend),
         "data" => Nx.iota({8, 4}, type: :f32, backend: @backend) |> Nx.divide(8),
-        "n" => Nx.tensor(5, backend: @backend)
+        "n" => Nx.tensor(5, backend: @backend),
+        "v0" => Nx.tensor([0.5, -0.5], backend: @backend)
       },
       model.inputs
     )

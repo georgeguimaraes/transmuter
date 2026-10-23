@@ -452,21 +452,33 @@ defmodule Transmuter.GraphBreaks do
   #     the values static in later calls.
   #
   # A value that follows from an input, a parameter or a device value of a break node makes
-  # the break real. A trace without a context, such as a trace of EMLX in a call, breaks.
+  # the break real. When the node read a value that it computed from its inputs, the trace
+  # cannot tell which input it came from. Then the inputs that follow from arguments become
+  # static for one more trace, and the break is real when the node still breaks. A trace
+  # without a context, such as a trace of EMLX in a call, breaks.
   defp unknown(plan, env, i, e, ref) do
     context = Process.get({ref, :context})
 
     if context && not MapSet.member?(context.real, i) do
-      origins = Enum.map(needed(elem(plan.nodes, i), env, e), &origin(plan, context, &1))
+      {found?, inputs} = needed(elem(plan.nodes, i), env, e)
+      origins = Enum.map(inputs, &origin(plan, context, &1))
+      device? = :device in origins
 
-      if :device in origins do
-        if i in context.tried, do: throw({ref, :real, i})
-      else
-        names = Enum.reduce(origins, MapSet.new(), &MapSet.union/2)
+      names =
+        origins |> Enum.reject(&(&1 == :device)) |> Enum.reduce(MapSet.new(), &MapSet.union/2)
 
-        if Enum.any?(context.arguments, &MapSet.member?(names, &1)),
-          do: throw({ref, :induced, i, names}),
-          else: Process.put({ref, :later}, names)
+      cond do
+        device? and i in context.tried ->
+          throw({ref, :real, i})
+
+        Enum.any?(context.arguments, &MapSet.member?(names, &1)) and not (device? and found?) ->
+          throw({ref, :induced, i, names})
+
+        not device? ->
+          Process.put({ref, :later}, names)
+
+        true ->
+          :real
       end
     end
   end
@@ -480,8 +492,8 @@ defmodule Transmuter.GraphBreaks do
           do: name
 
     case Enum.filter(traced, &match?(%Nx.Tensor{data: %{id: id}} when id == e.expr, env[&1])) do
-      [] -> traced
-      read -> read
+      [] -> {false, traced}
+      read -> {true, read}
     end
   end
 

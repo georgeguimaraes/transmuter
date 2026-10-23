@@ -894,6 +894,22 @@ case("Break_NonZero_cross_segment",
      {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
      outputs=[g, "tail"])
 
+# The Loop body reads a position as an outer value and expands to it, so it computes the
+# shape that it reads on the host. Its state comes from the device.
+positions_body = helper.make_graph(
+    [node("Gather", ["sizes", "i"], ["size"]), node("Unsqueeze", ["size", "axis0"], ["size_1"]),
+     node("Expand", ["one_f", "size_1"], ["ones"]), node("ReduceSum", ["ones"], ["count"], keepdims=0),
+     node("Add", ["v_in", "count"], ["v_out"]), node("Identity", ["cond_in"], ["cond_out"])],
+    "positions_body",
+    [helper.make_tensor_value_info("i", INT64, []), helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+     helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2])],
+    [helper.make_tensor_value_info("cond_out", TensorProto.BOOL, []), helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2])])
+case("Break_NonZero_Loop_outer",
+     positions[:3] +
+     [node("Add", ["idx", "one"], ["sizes"]), node("Loop", ["trips", "", "v0"], ["y"], body=positions_body)],
+     {"x": x_positions, "v0": r.standard_normal(2).astype(np.float32)},
+     {**positions_init, "one": np.array(1, np.int64), "one_f": np.array(1.0, np.float32), "trips": np.array(2, np.int64)})
+
 # ---------- long recurrences and loops ----------
 
 # More than 16 steps, so a compiled model runs these as a while loop.
