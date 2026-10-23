@@ -35,6 +35,8 @@ defmodule Transmuter do
 
   @random_key "transmuter.random_key"
   @fold_memo {__MODULE__, :fold_memo}
+  @record {__MODULE__, :record}
+  @control_ops ["If", "Loop", "Scan", "SequenceMap"]
 
   @doc """
   Loads an ONNX model.
@@ -546,30 +548,15 @@ defmodule Transmuter do
   def run_nodes(nodes, env, ctx) do
     Enum.reduce(nodes, env, fn node, env ->
       inputs = Enum.map(node.input, &input!(env, &1, node))
+      placement = placement(node, inputs, &static_value?/1)
 
       outputs =
         try do
-          cond do
-            node.op_type == "If" ->
-              run_if(node, inputs, env, ctx)
-
-            node.op_type == "Loop" ->
-              run_loop(node, inputs, env, ctx)
-
-            node.op_type == "Scan" ->
-              run_scan(node, inputs, env, ctx)
-
-            node.op_type == "SequenceMap" ->
-              run_sequence_map(node, inputs, env, ctx)
-
-            node.op_type in Random.op_types() ->
-              Random.apply(node, inputs, ctx.key)
-
-            Enum.all?(inputs, &(&1 == nil or Ops.static?(&1))) ->
-              node |> fold(inputs, ctx) |> unfold(node, inputs, ctx)
-
-            true ->
-              apply_on_backend(node, inputs, ctx)
+          case placement do
+            :control -> run_control(node, inputs, env, ctx)
+            :random -> Random.apply(node, inputs, ctx.key)
+            :host -> node |> fold(inputs, ctx) |> unfold(node, inputs, ctx)
+            :device -> apply_on_backend(node, inputs, ctx)
           end
           |> Enum.map(&upcast(&1, ctx.compute_type))
         rescue
@@ -592,8 +579,90 @@ defmodule Transmuter do
             reraise RuntimeError, message, without_arguments(__STACKTRACE__)
         end
 
+      record(node, placement, inputs, outputs, ctx)
       Map.merge(env, Map.new(Enum.zip(node.output, outputs)))
     end)
+  end
+
+  @doc group: "Internals"
+  @doc """
+  Returns where `run/4` runs `node`.
+
+  `inputs` has one entry for each input of the node, and `static?` tells whether the value of an entry is static. By default, the entries are booleans. `run/4` gives the input values with a function of `Transmuter.Ops.static?/1`, in which a missing optional input counts as static, so it checks the inputs only up to the first value that is not static.
+
+    * `:control` - `If`, `Loop`, `Scan` and `SequenceMap` run their subgraphs.
+    * `:random` - a random operator draws from the random key.
+    * `:host` - all inputs are static, so the node folds on the host. In a traced function, an output of more than #{@fold_max_size} elements is computed again on the device from the static inputs.
+    * `:device` - the node runs on the backend. In a traced function, its static inputs are literals of the trace.
+  """
+  def placement(node, inputs, static? \\ & &1) do
+    cond do
+      node.op_type in @control_ops -> :control
+      node.op_type in Random.op_types() -> :random
+      Enum.all?(inputs, static?) -> :host
+      true -> :device
+    end
+  end
+
+  defp static_value?(value), do: value == nil or Ops.static?(value)
+
+  defp run_control(node = %{op_type: "If"}, inputs, env, ctx), do: run_if(node, inputs, env, ctx)
+
+  defp run_control(node = %{op_type: "Loop"}, inputs, env, ctx),
+    do: run_loop(node, inputs, env, in_subgraph(ctx, node, "body"))
+
+  defp run_control(node = %{op_type: "Scan"}, inputs, env, ctx),
+    do: run_scan(node, inputs, env, in_subgraph(ctx, node, "body"))
+
+  defp run_control(node = %{op_type: "SequenceMap"}, inputs, env, ctx),
+    do: run_sequence_map(node, inputs, env, in_subgraph(ctx, node, "body"))
+
+  # The path of a subgraph is the list of the nodes and attributes that hold it, from the
+  # main graph. The outputs of a node name it in its graph.
+  defp in_subgraph(ctx, node, attribute),
+    do: Map.put(ctx, :path, Map.get(ctx, :path, []) ++ [{node.output, attribute}])
+
+  defp shape_type(t = %Nx.Tensor{}),
+    do: %{shape: Tuple.to_list(Nx.shape(t)), type: Nx.Type.to_string(Nx.type(t))}
+
+  defp shape_type({:empty, shape}), do: %{shape: Tuple.to_list(shape), type: nil}
+  defp shape_type({:strings, shape, _values}), do: %{shape: Tuple.to_list(shape), type: "string"}
+  defp shape_type(_value), do: nil
+
+  @doc false
+  # The key of the record of a node: the path of its subgraph and its outputs. The branches of
+  # an If can hold equal nodes, and the path tells them apart.
+  def record_key(path, node), do: {path, node.output}
+
+  # In with_record/1, each node that runs records its placement, the static flags of its
+  # inputs, whether it runs in a traced function, whether its outputs are static and the
+  # shapes and types of its outputs.
+  defp record(node, placement, inputs, outputs, ctx) do
+    if records = Process.get(@record) do
+      record = {
+        placement,
+        Enum.map(inputs, &static_value?/1),
+        Compiler.current() != nil,
+        Enum.all?(outputs, &Ops.static?/1),
+        Enum.map(outputs, &shape_type/1)
+      }
+
+      key = record_key(Map.get(ctx, :path, []), node)
+      Process.put(@record, Map.put(records, key, record))
+    end
+  end
+
+  @doc false
+  # Runs fun and returns its result with the records of the nodes that ran in this process.
+  def with_record(fun) do
+    Process.put(@record, %{})
+
+    try do
+      result = fun.()
+      {result, Process.get(@record)}
+    after
+      Process.delete(@record)
+    end
   end
 
   # Operators build constants, such as the positions of a causal mask, on the default
@@ -731,11 +800,13 @@ defmodule Transmuter do
   end
 
   defp run_if(node, [condition], env, ctx) do
-    branch =
+    name =
       if Nx.to_number(Nx.any(Ops.known!(condition, "the If condition"))) == 1,
-        do: Ops.attr(node, "then_branch"),
-        else: Ops.attr(node, "else_branch")
+        do: "then_branch",
+        else: "else_branch"
 
+    branch = Ops.attr(node, name)
+    ctx = in_subgraph(ctx, node, name)
     env = put_initializers(env, branch, ctx)
     env = run_nodes(branch.node, env, ctx)
     Enum.map(branch.output, &Map.fetch!(env, &1.name))
