@@ -12,7 +12,7 @@ defmodule Transmuter.TextTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
-  alias Transmuter.Text.TextToText
+  alias Transmuter.Text.{TextRanking, TextToText}
   alias Transmuter.Tokenizer
 
   test "the tokenizer pads to the smallest length that fits and truncates to the largest" do
@@ -68,6 +68,66 @@ defmodule Transmuter.TextTest do
     assert [%{label: "LABEL_0", score: score}] = relevant.predictions
     assert_in_delta score, 0.99984, 1.0e-4
     assert_in_delta hd(other.predictions).score, 1.3065e-5, 1.0e-6
+  end
+
+  # The reference is CrossEncoder.rank of sentence-transformers, see
+  # test/support/ranking_references.py. config.json has the activation Identity, so the
+  # scores are the logits.
+  test "text ranking gives the scores of a cross-encoder, from the highest score" do
+    serving = Transmuter.Text.text_ranking({:hf, "Xenova/ms-marco-MiniLM-L-6-v2"}, @opts)
+
+    %{results: [first, second]} =
+      Nx.Serving.run(serving, %{
+        query: "How many people live in Berlin?",
+        documents: [
+          "New York City is famous for the Metropolitan Museum of Art.",
+          "Berlin has a population of 3,520,031 registered inhabitants."
+        ]
+      })
+
+    assert {first.index, second.index} == {1, 0}
+    assert_in_delta first.score, 8.7619, 1.0e-3
+    assert_in_delta second.score, -11.2456, 1.0e-3
+  end
+
+  # The token ids of the preprocessing of sentence-transformers, see
+  # test/support/ranking_references.py. The text has the instruction of the default prompt.
+  # Truncation at 128 tokens cuts the long document, and the end of the chat template
+  # replaces the last tokens.
+  test "text ranking gives the text of a reranker as sentence-transformers" do
+    repo = Transmuter.Repo.load!({:hf, "onnx-community/Qwen3-Reranker-0.6B-ONNX"})
+    tokenizer = Tokenizer.load!(repo)
+    ranking = TextRanking.ranking(repo, tokenizer, [])
+
+    # The system message, the instruction, the query and "<Document>:".
+    prefix =
+      [151_644, 8948, 198, 60_256, 3425, 279, 11_789, 20_027, 279, 8502, 3118, 389, 279] ++
+        [11_361, 323, 279, 758, 1235, 3897, 13, 7036, 429, 279, 4226, 646, 1172, 387, 330] ++
+        [9693, 1, 476, 330, 2152, 3263, 151_645, 198, 151_644, 872, 198, 27, 641, 1235] ++
+        [26_818, 16_246, 264, 3482, 2711, 3239, 11, 17_179, 9760, 46_769, 429, 4226, 279] ++
+        [3239, 198, 27, 2859, 26_818, 2585, 1657, 1251, 3887, 304, 19_846, 5267, 75_692] ++
+        [26_818]
+
+    suffix = [151_645, 198, 151_644, 77_091, 198, 151_667, 271, 151_668, 271]
+    # " the quick brown fox jumps over the lazy dog"
+    sentence = [279, 3974, 13_876, 38_835, 34_208, 916, 279, 15_678, 5562]
+    long = String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
+
+    for {document, length, document_ids} <- [
+          {"Berlin is the capital of Germany.", nil, [19_846, 374, 279, 6722, 315, 9856, 13]},
+          {long, 128, Enum.take(Enum.concat(List.duplicate(sentence, 6)), 50)}
+        ] do
+      text = ranking.sequence.("How many people live in Berlin?", document)
+      tokenizer = Tokenizer.configure(tokenizer, length: length)
+      {%{"input_ids" => ids}, _} = Tokenizer.encode(tokenizer, [text], ranking.encode_options)
+      assert Nx.to_flat_list(ids) == prefix ++ document_ids ++ suffix
+    end
+  end
+
+  test "text ranking raises when the chat template cannot carry a query and a document" do
+    assert_raise ArgumentError, ~r/cannot carry a query and a document/, fn ->
+      Transmuter.Text.text_ranking({:hf, "onnx-community/Qwen3-0.6B-ONNX"}, @opts)
+    end
   end
 
   test "word aggregation gives each word one label before grouping" do
@@ -558,6 +618,36 @@ defmodule Transmuter.TextLargeModelTest do
       assert Nx.shape(embedding) == {768}
       assert_all_close(embedding[0..3], expected)
     end
+  end
+
+  # The scores are those of ONNX Runtime on the q4 export with the token ids of
+  # sentence-transformers, and the order is that of sentence-transformers on PyTorch, see
+  # test/support/ranking_references.py. The texts have at most 128 tokens, so truncation cuts
+  # the long document. The model file is 995 MB. On the EXLA CPU, the scores were within
+  # 1.1e-4 of ONNX Runtime, the rounding of the reference.
+  @tag :large_model
+  test "Qwen3-Reranker ranks documents as sentence-transformers" do
+    serving =
+      Transmuter.Text.text_ranking(
+        {:hf, "onnx-community/Qwen3-Reranker-0.6B-ONNX"},
+        [variant: :q4, compile: [batch_size: 2, sequence_length: 128]] ++ @opts
+      )
+
+    %{results: results} =
+      Nx.Serving.run(serving, %{
+        query: "How many people live in Berlin?",
+        documents: [
+          "New York City is famous for the Metropolitan Museum of Art.",
+          "Berlin has a population of 3,520,031 registered inhabitants.",
+          "Berlin is the capital of Germany.",
+          String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
+        ]
+      })
+
+    assert Enum.map(results, & &1.index) == [1, 2, 0, 3]
+
+    for {result, expected} <- Enum.zip(results, [6.5081, -4.5089, -10.0807, -10.8879]),
+        do: assert_in_delta(result.score, expected, 1.0e-3)
   end
 
   defp assert_all_close(tensor, expected) do

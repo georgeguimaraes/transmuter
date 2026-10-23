@@ -79,6 +79,31 @@ defmodule Transmuter.Text do
   defdelegate text_classification(source, opts \\ []), to: Transmuter.Text.TextClassification
 
   @doc """
+  Builds a serving that ranks documents by their relevance to a query, with a cross-encoder or a reranker, as `CrossEncoder.rank` of sentence-transformers.
+
+  The input is `%{query: query, documents: documents}` or a list of them. Each document is one row of `:batch_size`. The result is `%{results: [%{index: index, score: score}]}`, from the highest score. `index` is the position of the document in `documents`.
+
+  The serving reads the sentence-transformers files of the model: `config_sentence_transformers.json`, `modules.json`, the configuration of each module and `chat_template.jinja`. When the repository does not have a `config_sentence_transformers.json` with the model type `CrossEncoder`, these files come from the `base_model` in its model card, as in `text_embedding/2`.
+
+    * A sequence classification model, such as `Xenova/ms-marco-MiniLM-L-6-v2`, scores the pair of the query and the document. The model must have one label.
+
+    * A causal language model with a `LogitScore` module, such as `onnx-community/Qwen3-Reranker-0.6B-ONNX`, scores a text from its chat template. The query and the document are messages with the roles `"query"` and `"document"`, after the prompt as a `"system"` message. The score is the logit of the true token minus the logit of the false token, at the last token of the text. When truncation cuts a text, the end of the template replaces its last tokens. A causal language model without these files scores the tokens `"yes"` and `"no"` with the chat template of the repository. The serving raises when the template does not put the query and the document in the text.
+
+  The model gives the logits of all positions, because the ONNX exports have no input to keep only the last position. For Qwen3-Reranker, a row of 512 tokens has 512 × 151,669 logits of type f32, which is 311 MB. Keep `:batch_size` and `:sequence_length` small for these models.
+
+  ## Options
+
+    * `:prompt` - the instruction before the query. The default is the prompt of `default_prompt_name` in `config_sentence_transformers.json`, else no prompt. A sequence classification model gets it at the start of the query, and a causal language model as the system message.
+
+    * `:scores_function` - `:sigmoid` or `:none` for the logits. The default is `activation_fn` in `config_sentence_transformers.json`, else `sbert_ce_default_activation_function` in `config.json`, else `:sigmoid`.
+
+    * `:top_k` - the number of results, or `nil` (the default) for all.
+
+  See the module documentation for the other options.
+  """
+  defdelegate text_ranking(source, opts \\ []), to: Transmuter.Text.TextRanking
+
+  @doc """
   Builds a serving that classifies text with labels that you give, with a natural language inference (NLI) model.
 
   The model compares the text with one hypothesis for each label, such as "This example is sports.". The score of a label comes from the entailment class of the model. The input is a string or a list of strings. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.

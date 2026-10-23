@@ -2,7 +2,7 @@
 
 Usage: uv run --with "transformers<5" --with sentence-transformers --with torch --with onnxruntime --with onnx --with pillow --with sentencepiece --with protobuf --with sacremoses --with "datasets<4" --with soundfile --with librosa --with torchvision --with timm python -I test/support/pipeline_references.py
 
-Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The processor of Qwen2-VL loads a video processor, which needs torchvision. DETR needs timm.
+Transformers 5 removed the question answering pipeline, so the script uses transformers 4. The text ranking references need sentence-transformers 6.2.0 and transformers 5, so they are in test/support/ranking_references.py. The processor of Qwen2-VL loads a video processor, which needs torchvision. DETR needs timm.
 """
 
 from sentence_transformers import SentenceTransformer

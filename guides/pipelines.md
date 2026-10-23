@@ -47,6 +47,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 |---|---|---|
 | `text_embedding/2` | text | `%{embedding: tensor}` |
 | `text_classification/2` | text, or a `{text, text_pair}` tuple | `%{predictions: [%{label: label, score: score}]}` |
+| `text_ranking/2` | `%{query: query, documents: documents}` | `%{results: [%{index: index, score: score}]}` |
 | `zero_shot_classification/3` | text | `%{predictions: [%{label: label, score: score}]}` |
 | `token_classification/2` | text | `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}` |
 | `fill_mask/2` | text with `[MASK]` | `%{predictions: [%{score: score, token: token}]}` |
@@ -83,6 +84,23 @@ Nx.Serving.run(serving, [
 ```
 
 The labels come from `id2label` in `config.json`. The scores are a softmax, a sigmoid for a model with one label or with multi-label classification, and the logits for regression.
+
+### Reranking
+
+```elixir
+serving = Transmuter.Text.text_ranking({:hf, "Xenova/ms-marco-MiniLM-L-6-v2"})
+
+Nx.Serving.run(serving, %{
+  query: "How many people live in Berlin?",
+  documents: [
+    "New York City is famous for the Metropolitan Museum of Art.",
+    "Berlin has a population of 3,520,031 registered inhabitants."
+  ]
+})
+#=> %{results: [%{index: 1, score: 8.76}, %{index: 0, score: -11.25}]}
+```
+
+The scores are those of `CrossEncoder.rank` of sentence-transformers. The serving reads the sentence-transformers files of the model, or of the `base_model` in the model card, as for embeddings. A causal language model with a `LogitScore` module, such as `onnx-community/Qwen3-Reranker-0.6B-ONNX`, scores the text of its chat template with the logits of "yes" and "no". These models give the logits of all positions, so use a small `:batch_size` and `:sequence_length`.
 
 ### Zero-shot classification
 
