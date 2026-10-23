@@ -117,9 +117,7 @@ jobs:
         with:
           otp-version: "29"
           elixir-version: "1.20"
-      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF. ~/.cache/libmlx keeps the
-      # MLX archive. Credo compiles the deps in the dev environment, and the build of emlx
-      # downloads the MLX archive from GitHub when this directory does not have it.
+      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -127,10 +125,34 @@ jobs:
             deps
             _build
             ~/.cache/xla
-            ~/.cache/libmlx
           key: ${{ runner.os }}-mix-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
+      # A build of emlx downloads the MLX archive from GitHub with httpc, and the redirect of
+      # GitHub has a header longer than the limit of httpc (header_too_long). So curl downloads
+      # the archive, and MLX_ARCHIVE_PATH gives it to the build, which then does not download.
+      # The archive is not in ~/.cache/libmlx, because `mix compile --force` deletes that
+      # directory.
+      - name: Find the MLX version
+        id: mlx
+        run: |
+          version=$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MLX_ARCHIVE_PATH=$HOME/mlx/mlx-$version-x86_64-linux-gnu.tar.gz" >> "$GITHUB_ENV"
+      - name: Restore MLX archive
+        id: mlx-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/mlx
+          key: ${{ runner.os }}-mlx-${{ steps.mlx.outputs.version }}
+      - name: Download MLX archive
+        if: steps.mlx-cache.outputs.cache-hit != 'true'
+        run: |
+          url="https://github.com/cocoa-xu/mlx-build/releases/download/v${{ steps.mlx.outputs.version }}/mlx-x86_64-linux-gnu.tar.gz"
+          mkdir -p ~/mlx
+          curl -fsSL --retry 5 --retry-all-errors -o "$MLX_ARCHIVE_PATH" "$url"
+          sum=$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)
+          echo "$sum  $MLX_ARCHIVE_PATH" | sha256sum -c
       # Elixir and OTP are pinned in these jobs only, so the version-dependent checks run here,
       # in the first partition.
       - name: Check formatting
