@@ -404,6 +404,62 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
+
+  # Qwen3-VL has Qwen2VLImageProcessorFast with patches of 16x16 pixels, and the bicubic
+  # resample of the class, which preprocessor_config.json leaves out. The 320x240 image gets
+  # 256x320: 240 / 32 is 7.5, which rounds half to even. The last two values are one step
+  # away with the weights of Pillow, so they check the weights of torchvision.
+  @tag ci_partition: 15
+  test "the Qwen2-VL processor gives the patches, the prompt and the positions of Qwen3-VL" do
+    repo = Transmuter.Repo.load!(@qwen3_vl)
+    processor = Qwen2VLProcessor.load!(repo, ["pixel_values", "image_grid_thw"])
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+    prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+    for {image, grid, expected, positions} <- [
+          {image, [1, 16, 20], [0.1059, 0.2706, -0.6471, 0.4902, -0.9059, -0.9529],
+           [[3, 4, 4, 14, 25], [3, 4, 11, 14, 25], [3, 4, 13, 14, 25]]},
+          {Nx.transpose(image, axes: [1, 0, 2]), [1, 20, 16],
+           [0.1059, -0.5137, -0.6471, 0.4902, -0.9529, -0.9059],
+           [[3, 4, 4, 14, 25], [3, 4, 13, 14, 25], [3, 4, 11, 14, 25]]}
+        ] do
+      {tensors, text} = Qwen2VLProcessor.process(processor, image, @opts[:backend])
+      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {320, 1536}
+      assert Nx.to_list(tensors["image_grid_thw"]) == [grid]
+
+      got =
+        for index <- [[0, 0], [1, 100], [-1, 1535], [200, 777], [3, 684], [3, 714]],
+            do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), 0.4751, 1.0e-4
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(
+          tokenizer.native,
+          String.replace(prompt, "<|image_pad|>", text)
+        )
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {96, "2d3d86af50ec4850"}
+
+      # The positions of <|vision_start|>, the first and the last image token,
+      # <|vision_end|> and the last token, on each axis.
+      got =
+        for axis <- Qwen2VLProcessor.positions(processor, ids, [grid]),
+            do: Enum.map([3, 4, 83, 84, 95], &Enum.at(axis, &1))
+
+      assert got == positions
+    end
+  end
+
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
     # A long side over longest_edge gives the short side longest_edge times the aspect ratio,
     # rounded half to even: 1333 * 400 / 800 is 666.5. YOLOS rounds each side down to a

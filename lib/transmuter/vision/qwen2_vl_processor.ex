@@ -1,15 +1,15 @@
 defmodule Transmuter.Vision.Qwen2VLProcessor do
   @moduledoc """
-  Prepares the images and the prompt of Qwen2-VL, as `Qwen2VLImageProcessor` and `Qwen2VLProcessor` of Python transformers do. `Transmuter.Vision.image_text_to_text/2` uses it.
+  Prepares the images and the prompt of Qwen2-VL and Qwen3-VL, as `Qwen2VLImageProcessor`, `Qwen2VLImageProcessorFast`, `Qwen2VLProcessor` and `Qwen3VLProcessor` of Python transformers do for images. `Transmuter.Vision.image_text_to_text/2` uses it.
 
   The steps for each image are:
 
     1. The image gets 3 channels, as in `Transmuter.Featurizer.rgb/1`.
-    2. Each side gets the nearest multiple of `patch_size * merge_size` (28) pixels. When the image then has more than `max_pixels` or fewer than `min_pixels` pixels, the sides get smaller or larger with the same aspect ratio, as `smart_resize` of Python transformers. The resize uses the `resample` filter of the configuration on the 8-bit image, as Pillow does.
+    2. Each side gets the nearest multiple of `patch_size * merge_size` pixels: 28 for Qwen2-VL and 32 for Qwen3-VL. When the image then has more than `max_pixels` or fewer than `min_pixels` pixels, the sides get smaller or larger with the same aspect ratio, as `smart_resize` of Python transformers. The resize uses the `resample` filter of the configuration, bicubic by default, on the 8-bit image. The weights are those of Pillow, or of torchvision for `Qwen2VLImageProcessorFast`, see `Transmuter.Featurizer.resize/4`.
     3. The image is rescaled and normalized, as in `Transmuter.Featurizer`.
-    4. The image is repeated `temporal_patch_size` (2) times, as a video of 2 frames, and splits into patches of 14x14 pixels. Each patch is one row of `3 * 2 * 14 * 14` values. Each group of 2x2 patches, which the vision encoder merges into one feature, comes in consecutive rows.
+    4. The image is repeated `temporal_patch_size` (2) times, as a video of 2 frames, and splits into patches of `patch_size` pixels (14x14 for Qwen2-VL). Each patch is one row of `3 * 2 * patch_size * patch_size` values. Each group of 2x2 patches, which the vision encoder merges into one feature, comes in consecutive rows.
 
-  The grid of an image is `[1, height / 14, width / 14]`, as `image_grid_thw` of Python transformers. In the prompt, each image is a placeholder `<|image_pad|>`, which becomes one `<|image_pad|>` for each feature: the number of patches divided by 4.
+  The grid of an image is `[1, height / patch_size, width / patch_size]`, as `image_grid_thw` of Python transformers. In the prompt, each image is a placeholder `<|image_pad|>`, which becomes one `<|image_pad|>` for each feature: the number of patches divided by 4.
 
   The image tokens of the prompt take 3-D positions for M-RoPE, as `get_rope_index` of Python transformers. The text tokens have the same position on the 3 axes. The image tokens of an image have the positions of their frame, row and column after the text before them, and the text after the image continues from the largest of these positions.
   """
@@ -40,8 +40,9 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
 
-    # The defaults are those of Python transformers. min_pixels and max_pixels take
-    # precedence over the size.
+    # The defaults are those of Python transformers, also the bicubic resample of
+    # Qwen2VLImageProcessor. min_pixels and max_pixels take precedence over the size.
+    config = Map.put_new(config, "resample", 3)
     size = config["size"] || %{}
 
     %__MODULE__{
@@ -65,7 +66,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   @doc """
   Turns an image into patches and gives the text of the image in the prompt.
 
-  Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{patches, 1176}` and type `:f32` on `backend`, and `"image_grid_thw"` of shape `{1, 3}` and type `:s64`.
+  Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{patches, 3 * 2 * patch_size * patch_size}` (1176 for Qwen2-VL) and type `:f32` on `backend`, and `"image_grid_thw"` of shape `{1, 3}` and type `:s64`.
   """
   def process(processor, image, backend) do
     {:ok, image} = Featurizer.tensor(image)
@@ -78,7 +79,8 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
         do: smart_resize(height, width, factor, processor.min_pixels, processor.max_pixels),
         else: {height, width}
 
-    image = Featurizer.resize(image, {height, width}, processor.featurizer.resample)
+    %{resample: resample, weights: weights} = processor.featurizer
+    image = Featurizer.resize(image, {height, width}, resample, weights)
     frames = Featurizer.process(processor.featurizer, [image], backend: backend)
     {patches, grid} = patches(processor, frames)
     count = div(Enum.product(grid), processor.merge_size ** 2)
@@ -108,9 +110,9 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.
 
-  `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 1176}`, and the `"image_grid_thw"` of each row, of shape `{batch, rows, 3}`. Rows of zeros follow the patches and the grids of the images. `prompts` are the token ids of each row.
+  `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, values}`, and the `"image_grid_thw"` of each row, of shape `{batch, rows, 3}`. Rows of zeros follow the patches and the grids of the images. `prompts` are the token ids of each row.
 
-  The export of the vision encoder computes the rotary positions of the patches for one image, so each image runs alone. Returns `%{image_features: features, position_ids: positions}`: the features of the images of all rows, in order, and the 3-D positions of each prompt.
+  The export of the vision encoder of Qwen2-VL computes the rotary positions of the patches for one image, so each image runs alone. Returns `%{image_features: features, position_ids: positions}`: the features of the images of all rows, in order, and the 3-D positions of each prompt.
   """
   def encode(processor, encode, tensors, prompts, _backend) do
     %{"pixel_values" => pixels, "image_grid_thw" => grids} = tensors

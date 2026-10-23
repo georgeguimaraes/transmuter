@@ -59,7 +59,7 @@ The tasks:
   - [`image_embedding`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_embedding/2): CLIP, SigLIP and SigLIP2
   - [`zero_shot_image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_image_classification/3): CLIP, SigLIP and SigLIP2
   - [`image_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_text/2): ViT-GPT2, TrOCR and Florence-2
-  - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM and Qwen2-VL
+  - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM, Qwen2-VL and Qwen3-VL
   - [`object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#object_detection/2): DETR, YOLOS, RT-DETR and RF-DETR
   - [`zero_shot_object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_object_detection/3): OWL-ViT, OWLv2 and Grounding DINO
   - [`depth_estimation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#depth_estimation/2): Depth Anything

@@ -1,6 +1,6 @@
 defmodule Transmuter.Vision.ImageTextToText do
   @moduledoc """
-  The image-text-to-text task of decoder-only vision language models, such as SmolVLM and Qwen2-VL. See `Transmuter.Vision.image_text_to_text/2`.
+  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL and Qwen3-VL. See `Transmuter.Vision.image_text_to_text/2`.
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
@@ -103,7 +103,8 @@ defmodule Transmuter.Vision.ImageTextToText do
   defp processor!(repo, vision) do
     processors = %{
       "Idefics3ImageProcessor" => Idefics3Processor,
-      "Qwen2VLImageProcessor" => Qwen2VLProcessor
+      "Qwen2VLImageProcessor" => Qwen2VLProcessor,
+      "Qwen2VLImageProcessorFast" => Qwen2VLProcessor
     }
 
     config = Hub.json(repo.source, "preprocessor_config.json", repo.opts) || %{}
