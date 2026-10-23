@@ -117,7 +117,7 @@ jobs:
         with:
           otp-version: "29"
           elixir-version: "1.20"
-      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF.
+      # ~/.cache/xla keeps the compiled EXLA NIF.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -125,35 +125,15 @@ jobs:
             deps
             _build
             ~/.cache/xla
-          key: ${{ runner.os }}-mix-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
+            ~/release-files
+          key: ${{ runner.os }}-mix-v2-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
-      # A build of emlx downloads the MLX archive from GitHub with httpc, and the redirect of
-      # GitHub has a header longer than the limit of httpc (header_too_long). So curl downloads
-      # the archive, and MLX_ARCHIVE_PATH gives it to the build, which then does not download.
-      # The archive is not in ~/.cache/libmlx, because `mix compile --force` deletes that
-      # directory.
-      - name: Find the MLX archive
-        id: mlx
-        run: |
-          version=$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)
-          archive=mlx-x86_64-linux-gnu.tar.gz
-          echo "url=https://github.com/cocoa-xu/mlx-build/releases/download/v$version/$archive" >> "$GITHUB_OUTPUT"
-          echo "MLX_ARCHIVE_PATH=$HOME/mlx/$version-$archive" >> "$GITHUB_ENV"
-      - name: Restore MLX archive
-        id: mlx-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/mlx
-          key: mlx-${{ steps.mlx.outputs.url }}
-      - name: Download MLX archive
-        if: steps.mlx-cache.outputs.cache-hit != 'true'
-        run: |
-          url="${{ steps.mlx.outputs.url }}"
-          mkdir -p ~/mlx
-          curl -fsSL --retry 5 --retry-all-errors -o "$MLX_ARCHIVE_PATH" "$url"
-          sum=$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)
-          echo "$sum  $MLX_ARCHIVE_PATH" | sha256sum -c
+      # When the deps compile, some deps download GitHub release files with httpc, which fails
+      # on the redirect of GitHub (header_too_long). So this script downloads these files with
+      # curl into ~/release-files, which the cache keeps, and gives them to the deps.
+      - name: Download the release files of the deps
+        run: .github/fetch-release-files.sh
       # Elixir and OTP are pinned in these jobs only, so the version-dependent checks run here,
       # in the first partition.
       - name: Check formatting
@@ -200,7 +180,7 @@ jobs:
           echo "version=$(elixir -e 'IO.write(System.version() <> "-otp" <> System.otp_release())')" >> "$GITHUB_OUTPUT"
           mix local.hex --force
           mix local.rebar --force
-      # The Library/Caches directories keep the MLX and XLA archives and the compiled NIFs.
+      # The Library/Caches directories keep MLX and the compiled EXLA NIF.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -209,33 +189,15 @@ jobs:
             _build
             ~/Library/Caches/libmlx
             ~/Library/Caches/xla
-          key: ${{ runner.os }}-mix-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
+            ~/release-files
+          key: ${{ runner.os }}-mix-v2-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
-      # The MLX archive comes from curl, as in the exla job. The archive of macOS has the
-      # deployment target of emlx in its name.
-      - name: Find the MLX archive
-        id: mlx
-        run: |
-          version=$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)
-          target=$(sed -n 's/^  @macos_deployment_target_latest "\(.*\)"$/\1/p' deps/emlx/mix.exs)
-          archive=mlx-arm64-apple-darwin-$target.tar.gz
-          echo "url=https://github.com/cocoa-xu/mlx-build/releases/download/v$version/$archive" >> "$GITHUB_OUTPUT"
-          echo "MLX_ARCHIVE_PATH=$HOME/mlx/$version-$archive" >> "$GITHUB_ENV"
-      - name: Restore MLX archive
-        id: mlx-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/mlx
-          key: mlx-${{ steps.mlx.outputs.url }}
-      - name: Download MLX archive
-        if: steps.mlx-cache.outputs.cache-hit != 'true'
-        run: |
-          url="${{ steps.mlx.outputs.url }}"
-          mkdir -p ~/mlx
-          curl -fsSL --retry 5 --retry-all-errors -o "$MLX_ARCHIVE_PATH" "$url"
-          sum=$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)
-          echo "$sum  $MLX_ARCHIVE_PATH" | shasum -a 256 -c
+      # When the deps compile, some deps download GitHub release files with httpc, which fails
+      # on the redirect of GitHub (header_too_long). So this script downloads these files with
+      # curl into ~/release-files, which the cache keeps, and gives them to the deps.
+      - name: Download the release files of the deps
+        run: .github/fetch-release-files.sh
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: emlx
