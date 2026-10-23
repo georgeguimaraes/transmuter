@@ -148,14 +148,17 @@ defmodule Transmuter.TelemetryTest do
   # positions go into the next segment as arguments, and other positions of the same count
   # compile nothing new.
   test "positions that no node reads on the host are not in the key of a segment" do
-    for name <- ["Break_NonZero_gather", "Break_NonZero_Range"] do
+    for {name, breaks} <- [
+          {"Break_NonZero_gather", ["NonZero"]},
+          {"Break_NonZero_Range", ["NonZero", "Range"]}
+        ] do
       model = load_fixture(name)
       compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
       calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
 
       assert calls(compiled, model, [[0, 1, 0, 1, 0, 1, 0, 0], [1, 0, 0, 0, 0, 1, 1, 0]]) == [
-               %{compiled: 0, breaks: ["NonZero" | tl(model_breaks(name))], host_values: []},
-               %{compiled: 0, breaks: ["NonZero" | tl(model_breaks(name))], host_values: []}
+               %{compiled: 0, breaks: breaks, host_values: []},
+               %{compiled: 0, breaks: breaks, host_values: []}
              ],
              name
     end
@@ -176,6 +179,24 @@ defmodule Transmuter.TelemetryTest do
              %{compiled: 0, breaks: ["NonZero", "Range"], host_values: []},
              %{compiled: 1, breaks: ["NonZero", "Range"], host_values: []}
            ] = calls(compiled, model, [[1, 0, 1, 0, 1, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
+  end
+
+  # A short text learns that the segment after the Range reads the first position on the
+  # host. A text of 5000 values has a NonZero input too large for the host, so its positions
+  # are device data. Then the first position stays an argument and the Slice breaks, so a
+  # new first position does not compile that segment again.
+  test "a learned host value of device data stays an argument" do
+    model = load_fixture("Break_NonZero_cross_segment")
+    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+
+    assert [%{host_values: ["first"]}] = calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
+
+    long = fn first ->
+      List.duplicate(0, first) ++ [1, 0, 1, 0, 1] ++ List.duplicate(0, 4995 - first)
+    end
+
+    assert [%{breaks: ["NonZero", "Range", "Slice"]}, %{compiled: 0}] =
+             calls(compiled, model, [long.(0), long.(1)])
   end
 
   # A short segment reads the first position on the host and runs eagerly. It gets the
@@ -243,14 +264,11 @@ defmodule Transmuter.TelemetryTest do
            ] = calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [0, 1, 0, 1, 0, 1, 0, 0]])
   end
 
-  defp model_breaks("Break_NonZero_gather"), do: ["NonZero"]
-  defp model_breaks("Break_NonZero_Range"), do: ["NonZero", "Range"]
-
   defp positions(model, x) do
     Map.take(
       %{
         "x" => Nx.tensor(x, type: :f32, backend: @backend),
-        "data" => Nx.iota({8, 4}, type: :f32, backend: @backend) |> Nx.divide(8),
+        "data" => Nx.iota({length(x), 4}, type: :f32, backend: @backend) |> Nx.divide(8),
         "n" => Nx.tensor(5, backend: @backend),
         "v0" => Nx.tensor([0.5, -0.5], backend: @backend),
         "w" => Nx.iota({8}, type: :f32, backend: @backend)
