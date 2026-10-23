@@ -174,7 +174,7 @@ With the random values of ONNX Runtime, the model gives the same audio length an
 [Whisper](https://huggingface.co/onnx-community/whisper-base) is a speech recognition model. `Transmuter.Audio.speech_to_text/2` runs it from PCM samples to text:
 
 ```elixir
-# 16 kHz mono f32 samples, for example from ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32
+# 16 kHz mono f32 samples, or {:file, "speech.mp3"}, which ffmpeg decodes to 16 kHz.
 audio = Nx.from_binary(File.read!("speech.f32"), :f32)
 
 serving =
@@ -215,6 +215,20 @@ The options map to the pipeline of transformers as follows:
 `:chunk_num_seconds` must be 30 s or less and more than two times `:context_num_seconds`.
 
 On 62.5 s of speech, with greedy selection, the text is the same as the pipeline of transformers with `chunk_length_s=30` for `whisper-tiny.en` and `whisper-base`.
+
+### Streams of audio
+
+The input can be a stream of tensors of PCM samples, such as the parts of a long recording. The client cuts the stream into the windows of `chunk_iter` when the tensors come. A full window waits for the next sample, which tells that the window is not the last. The windows are the same for each size of the tensors, so the result of a stream is the result of its whole audio:
+
+```elixir
+stream =
+  File.stream!("speech.f32", 16_000 * 4)
+  |> Stream.map(&Nx.from_binary(&1, :f32))
+
+Nx.Serving.run(serving, stream)
+```
+
+The serving transcribes the windows before the stream ends, and merges them when it ends. The windows of a stream go into batches of `compile: [batch_size: n]`, so a batch waits until it has `n` windows or the stream ends. Nx.Serving reads the stream in a process of its own.
 
 ### Timestamps
 

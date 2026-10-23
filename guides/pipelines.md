@@ -54,9 +54,9 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
 | `text_to_text/2` | text | `%{results: [%{text: text, token_summary: summary}]}` |
-| `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
-| `Transmuter.Audio.audio_classification/2` | PCM samples at 16 kHz | `%{predictions: [%{label: label, score: score}]}` |
-| `Transmuter.Audio.zero_shot_audio_classification/3` | PCM samples at 48 kHz | `%{predictions: [%{label: label, score: score}]}` |
+| `Transmuter.Audio.speech_to_text/2` | PCM samples at 16 kHz, a file or a stream | `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}` |
+| `Transmuter.Audio.audio_classification/2` | PCM samples at 16 kHz, a file or a stream | `%{predictions: [%{label: label, score: score}]}` |
+| `Transmuter.Audio.zero_shot_audio_classification/3` | PCM samples at 48 kHz, a file or a stream | `%{predictions: [%{label: label, score: score}]}` |
 | `Transmuter.Audio.text_to_speech/2` | text, or `%{text: text, seed: seed}` | `%{audio: tensor, sampling_rate: rate}` |
 
 Each function also takes a list of inputs and then gives a list of results. The results have the shapes of Bumblebee. Bumblebee has no text-to-speech, so `text_to_speech/2` gives the shape of the pipeline of Python transformers. Their values match the pipelines of Python transformers and sentence-transformers, and the tests of Transmuter check this for each task. The audio of text-to-speech depends on a random seed, so the tests compare the audio without noise.
@@ -266,7 +266,13 @@ Nx.Serving.run(serving, audio)
 #=> %{chunks: [%{text: " Mr. Quilter is the apostle of the middle classes, ...", ...}]}
 ```
 
-`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. Convert other audio before you run it, for example with `ffmpeg -i speech.mp3 -ac 1 -ar 16000 -f f32le speech.f32`.
+`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. For an audio file, give `{:file, path}`: ffmpeg decodes it and changes its sampling rate to 16 kHz. The `ffmpeg` executable must be in the `PATH`.
+
+```elixir
+Nx.Serving.run(serving, {:file, "speech.mp3"})
+```
+
+The input can also be a stream of tensors of PCM samples, such as the parts of a long recording. The serving transcribes the windows of the stream when they are complete, and gives the result of the whole audio when the stream ends. See `Transmuter.Audio` for the inputs.
 
 The audio can have any length. The serving splits audio longer than 30 s into windows that overlap, as the pipeline of transformers with `chunk_length_s=30`. It transcribes each window and merges the texts at the overlaps. The `:chunk_num_seconds` and `:context_num_seconds` options set the windows.
 
@@ -315,7 +321,7 @@ Nx.Serving.run(serving, audio)
 #=> %{predictions: [%{label: "a man speaking", score: 0.95}, %{label: "music", score: 0.047}, ...]}
 ```
 
-`Transmuter.Audio.zero_shot_audio_classification/3` runs CLAP on PCM samples at 48 kHz, the sampling rate of the model. Resample other audio before the serving, for example with `ffmpeg -i speech.wav -f f32le -ar 48000 -ac 1 speech_48k.f32`. Each label goes into the hypothesis template `"This is a sound of {}."`, and the scores are a softmax of `logits_per_audio` over the labels, as in the `zero-shot-audio-classification` pipeline of Python transformers.
+`Transmuter.Audio.zero_shot_audio_classification/3` runs CLAP on PCM samples at 48 kHz, the sampling rate of the model. For an audio file at another sampling rate, give `{:file, path}`, and ffmpeg changes the sampling rate to 48 kHz. Each label goes into the hypothesis template `"This is a sound of {}."`, and the scores are a softmax of `logits_per_audio` over the labels, as in the `zero-shot-audio-classification` pipeline of Python transformers.
 
 `Transmuter.Audio.Featurizer` gives the log-mel features of `ClapFeatureExtractor`. CLAP takes 10 s of audio. Shorter audio repeats and gets zeros at the end, so the audio goes into batches of `compile: [batch_size: n]`. For longer audio, Python transformers takes 10 s at a random position, and the serving takes the first 10 s.
 
