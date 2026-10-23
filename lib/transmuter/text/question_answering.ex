@@ -40,7 +40,14 @@ defmodule Transmuter.Text.QuestionAnswering do
           rows
           |> Enum.zip(items)
           |> Enum.flat_map(fn {row, {{_question, context}, encoding}} ->
-            candidates(row, context, encoding, cls_id, opts[:max_answer_length])
+            candidates(
+              row,
+              context,
+              encoding,
+              Tokenizer.ids(tokenizer, encoding),
+              cls_id,
+              opts[:max_answer_length]
+            )
           end)
           |> Enum.group_by(&String.downcase(&1.text))
           |> Enum.map(fn {_text, [first | _] = same} ->
@@ -60,13 +67,13 @@ defmodule Transmuter.Text.QuestionAnswering do
     )
   end
 
-  defp candidates(row, context, encoding, cls_id, max_answer_length) do
+  defp candidates(row, context, encoding, ids, cls_id, max_answer_length) do
     # The answer is in the context. The CLS token also stays, as in Python transformers,
     # because some models point to it when the context has no answer.
     context? =
       Enum.zip_with(
         Encoding.get_sequence_ids(encoding),
-        Encoding.get_ids(encoding),
+        ids,
         &(&1 == 1 or &2 == cls_id)
       )
 

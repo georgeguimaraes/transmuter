@@ -95,7 +95,7 @@ defmodule Transmuter.Text.Generation do
     {:ok, encoding} =
       Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: special?)
 
-    case Tokenizers.Encoding.get_ids(encoding) do
+    case Tokenizer.ids(tokenizer, encoding) do
       [] ->
         [bos || raise(ArgumentError, "the prompt is empty, and the model has no bos_token_id")]
 

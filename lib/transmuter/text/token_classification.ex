@@ -54,7 +54,7 @@ defmodule Transmuter.Text.TokenClassification do
           for {scores, id, token, {start, stop}, 0} <-
                 Enum.zip([
                   Nx.to_list(scores),
-                  Encoding.get_ids(encoding),
+                  Tokenizer.ids(tokenizer, encoding),
                   Encoding.get_tokens(encoding),
                   Encoding.get_offsets(encoding),
                   Encoding.get_special_tokens_mask(encoding)

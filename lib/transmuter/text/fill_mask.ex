@@ -32,7 +32,7 @@ defmodule Transmuter.Text.FillMask do
         %{scores: scores, ids: ids}
       end,
       fn [%{scores: scores, ids: ids}], [{text, encoding}] ->
-        masks = Enum.count(Tokenizers.Encoding.get_ids(encoding), &(&1 == mask_id))
+        masks = Enum.count(Tokenizer.ids(tokenizer, encoding), &(&1 == mask_id))
 
         unless masks == 1 do
           raise ArgumentError,

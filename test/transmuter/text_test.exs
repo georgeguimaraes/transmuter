@@ -427,7 +427,8 @@ defmodule Transmuter.TextTest do
 
   # The test downloads only the tokenizer and the configuration files. M2M100 has only the
   # slow tokenizer in Python, and its tokenizer.json has merges of pieces that are not in
-  # its vocabulary.
+  # its vocabulary. A bare language code, such as "fr", is an ordinary piece of the
+  # vocabulary, so it raises.
   test "the language tokens of NLLB and M2M100 give the ids and the forced bos token of transformers" do
     text = "La vie est belle et le soleil brille sur la ville."
 
@@ -455,11 +456,16 @@ defmodule Transmuter.TextTest do
            128_020}
         ] do
       repo = Transmuter.Repo.load!({:hf, repo})
+      base = Tokenizer.load!(repo)
       opts = [source_language_token: source, target_language_token: target]
-      {tokenizer, opts} = TextToText.languages(repo, Tokenizer.load!(repo), opts)
+      {tokenizer, opts} = TextToText.languages(repo, base, opts)
       {%{"input_ids" => input_ids}, _encodings} = Tokenizer.encode(tokenizer, [text])
       assert Nx.to_flat_list(input_ids) == ids
       assert opts[:forced_bos_token_id] == forced
+
+      assert_raise ArgumentError, ~r/a special token of the tokenizer/, fn ->
+        TextToText.languages(repo, base, target_language_token: "fr")
+      end
     end
   end
 

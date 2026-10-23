@@ -200,7 +200,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     {:ok, encoding} =
       Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: true)
 
-    Tokenizers.Encoding.get_ids(encoding)
+    Tokenizer.ids(tokenizer, encoding)
   end
 
   defp validate(input = %{messages: [_ | _] = messages}) do

@@ -18,7 +18,7 @@ defmodule Transmuter.Tokenizer do
     :native,
     :special_tokens,
     :canonicalize,
-    :vocab_size,
+    :unknown,
     length: nil,
     pad_direction: :right,
     truncation: :longest_first,
@@ -52,7 +52,7 @@ defmodule Transmuter.Tokenizer do
 
     path = Hub.fetch!(repo.source, "tokenizer.json", repo.opts)
 
-    {{:ok, native}, vocab_size} =
+    {{:ok, native}, unknown} =
       case Hub.fetch(repo.source, "source.spm", repo.opts) do
         {:ok, spm} ->
           native =
@@ -74,8 +74,8 @@ defmodule Transmuter.Tokenizer do
             {{:ok, native}, nil}
           else
             _unreadable ->
-              {json, vocab_size} = json |> JSON.decode!() |> readable(repo)
-              {json |> JSON.encode!() |> Tokenizer.from_buffer(), vocab_size}
+              {json, unknown} = json |> JSON.decode!() |> readable(repo)
+              {json |> JSON.encode!() |> Tokenizer.from_buffer(), unknown}
           end
       end
 
@@ -86,7 +86,7 @@ defmodule Transmuter.Tokenizer do
       native: native,
       special_tokens: special_tokens(repo),
       canonicalize: canonicalize(repo.tokenizer_config),
-      vocab_size: vocab_size
+      unknown: unknown
     }
 
     configure(tokenizer, opts)
@@ -158,22 +158,30 @@ defmodule Transmuter.Tokenizer do
   # the type and the unknown token. A Precompiled normalizer without a charsmap, such as in
   # SpeechT5, changes no character in Python, and the library panics on it.
   defp readable(json, repo) do
-    {model, vocab_size} = json["model"] |> typed_model(repo) |> merged_pieces()
+    {model, unknown} =
+      json["model"] |> typed_model(repo) |> merged_pieces(json["added_tokens"] || [])
 
     json =
       json
       |> Map.put("model", model)
       |> Map.update("normalizer", nil, &charsmap/1)
 
-    {json, vocab_size}
+    {json, unknown}
   end
 
   # The BPE model of M2M100 merges pieces that its vocabulary does not have, because its
   # merges come from a SentencePiece model with more pieces. In Python transformers and
   # transformers.js, such a piece is a step of the merges, and it is the unknown token when
   # no merge follows. The library needs each piece of a merge in the vocabulary, so these
-  # pieces get the ids after the vocabulary, and encode/3 gives them the unknown token.
-  defp merged_pieces(model = %{"type" => "BPE", "merges" => merges, "vocab" => vocab}) do
+  # pieces get the ids after all other ids, and ids/2 gives them the unknown token. Returns
+  # the model and {the first id of these pieces, the id of the unknown token}.
+  #
+  # The library gives an added token that the vocabulary does not have the next free id, not
+  # its id in tokenizer.json. So the added tokens go into the vocabulary with their ids
+  # first, and the pieces do not take their ids.
+  defp merged_pieces(model = %{"type" => "BPE", "merges" => merges, "vocab" => vocab}, added) do
+    vocab = Map.merge(Map.new(added, &{&1["content"], &1["id"]}), vocab)
+
     pieces =
       for merge <- merges,
           [left, right] =
@@ -188,12 +196,19 @@ defmodule Transmuter.Tokenizer do
         {model, nil}
 
       pieces ->
-        size = Enum.max(Map.values(vocab)) + 1
-        {%{model | "vocab" => Map.merge(vocab, Map.new(Enum.with_index(pieces, size)))}, size}
+        first = Enum.max(Map.values(vocab)) + 1
+
+        unknown =
+          vocab[model["unk_token"]] ||
+            raise ArgumentError,
+                  "the BPE model of tokenizer.json merges pieces that its vocabulary does not have, and it has no unk_token for them"
+
+        vocab = Map.merge(vocab, Map.new(Enum.with_index(pieces, first)))
+        {%{model | "vocab" => vocab}, {first, unknown}}
     end
   end
 
-  defp merged_pieces(model), do: {model, nil}
+  defp merged_pieces(model, _added), do: {model, nil}
 
   defp typed_model(model = %{"vocab" => vocab}, repo)
        when is_map(vocab) and not is_map_key(model, "type"),
@@ -254,7 +269,7 @@ defmodule Transmuter.Tokenizer do
   @doc """
   Encodes `inputs`, a list of strings or `{text, text_pair}` tuples.
 
-  Returns the input tensors and, for each input, the list of its `Tokenizers.Encoding`, one for each row of the tensors. An input has one row, or one row for each window with `:stride`. An encoding has the offsets, the word ids and the special tokens mask. The tensors are `"input_ids"`, `"attention_mask"` and `"token_type_ids"`, of type `:s64` on `Nx.BinaryBackend`. In the BPE model of M2M100, the merges go through pieces that the vocabulary does not have. Such a piece is the unknown token in `"input_ids"`, but its encoding keeps an id after the vocabulary.
+  Returns the input tensors and, for each input, the list of its `Tokenizers.Encoding`, one for each row of the tensors. An input has one row, or one row for each window with `:stride`. An encoding has the offsets, the word ids and the special tokens mask. The tensors are `"input_ids"`, `"attention_mask"` and `"token_type_ids"`, of type `:s64` on `Nx.BinaryBackend`. `"input_ids"` has the ids of `ids/2`. Read the ids of an encoding with `ids/2`, not with `Tokenizers.Encoding.get_ids/1`.
 
   ## Options
 
@@ -301,7 +316,7 @@ defmodule Transmuter.Tokenizer do
     tensor = &Nx.tensor(Enum.map(rows, &1), type: :s64, backend: Nx.BinaryBackend)
 
     tensors = %{
-      "input_ids" => tensor.(&known_ids(tokenizer, Encoding.get_ids(&1))),
+      "input_ids" => tensor.(&ids(tokenizer, &1)),
       "attention_mask" => tensor.(&Encoding.get_attention_mask/1),
       "token_type_ids" => tensor.(&Encoding.get_type_ids/1)
     }
@@ -312,13 +327,13 @@ defmodule Transmuter.Tokenizer do
     {tensors, encodings}
   end
 
-  # The pieces after the vocabulary are the unknown token, see merged_pieces/1.
-  defp known_ids(%{vocab_size: nil}, ids), do: ids
+  @doc """
+  Returns the token ids of `encoding`, a `Tokenizers.Encoding` of `tokenizer`. The BPE model of M2M100 merges pieces that its vocabulary does not have, and such a piece is the unknown token, as in Python transformers. The other ids are those of the encoding.
+  """
+  def ids(%{unknown: nil}, encoding), do: Encoding.get_ids(encoding)
 
-  defp known_ids(tokenizer, ids) do
-    unknown = token_to_id(tokenizer, tokenizer.special_tokens.unk)
-    Enum.map(ids, &if(&1 < tokenizer.vocab_size, do: &1, else: unknown))
-  end
+  def ids(%{unknown: {first, unknown}}, encoding),
+    do: Enum.map(Encoding.get_ids(encoding), &if(&1 < first, do: &1, else: unknown))
 
   defp canonical({text, pair}, opts), do: {canonical(text, opts), canonical(pair, opts)}
 

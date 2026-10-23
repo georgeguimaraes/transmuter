@@ -112,43 +112,53 @@ defmodule Transmuter.Text.TextToText do
   # token in :forced_bos_token_id, as src_lang and tgt_lang of the translation pipeline of
   # transformers for NLLB and M2M100.
   def languages(repo, tokenizer, opts) do
-    tokenizer =
-      case opts[:source_language_token] do
-        nil -> tokenizer
-        token -> source_language(repo, tokenizer, token)
-      end
+    source = opts[:source_language_token]
+    target = opts[:target_language_token]
 
-    opts =
-      case opts[:target_language_token] do
-        nil -> opts
-        token -> Keyword.put(opts, :forced_bos_token_id, id!(tokenizer, token))
-      end
+    if source == nil and target == nil do
+      {tokenizer, opts}
+    else
+      json =
+        repo.source |> Hub.fetch!("tokenizer.json", repo.opts) |> File.read!() |> JSON.decode!()
 
-    {tokenizer, opts}
+      {single, pair, language} = template!(json, repo)
+      special = for %{"special" => true, "content" => token} <- json["added_tokens"], do: token
+      id! = &language_id!(tokenizer, special, language, &1)
+
+      tokenizer =
+        if source,
+          do: source_language(tokenizer, single, pair, language, source, id!),
+          else: tokenizer
+
+      opts = if target, do: Keyword.put(opts, :forced_bos_token_id, id!.(target)), else: opts
+      {tokenizer, opts}
+    end
   end
 
-  # The template of the post-processor in tokenizer.json has the language token of the
-  # default source language, such as "eng_Latn $A </s>", and the source language token
-  # takes its place.
-  defp source_language(repo, tokenizer, token) do
-    %{"post_processor" => post} =
-      repo.source |> Hub.fetch!("tokenizer.json", repo.opts) |> File.read!() |> JSON.decode!()
-
+  # The template of the post-processor in tokenizer.json, and its language token: the
+  # special token that is not eos, such as "eng_Latn" in "eng_Latn $A </s>".
+  defp template!(json, repo) do
     {single, pair} =
-      case post do
+      case json["post_processor"] do
         %{"type" => "TemplateProcessing", "single" => single, "pair" => pair} -> {single, pair}
         _other -> {[], []}
       end
 
     eos = Repo.special_token(repo, "eos")
-    language = for %{"SpecialToken" => %{"id" => id}} <- single, id != eos, uniq: true, do: id
 
-    unless match?([_], language) do
-      raise ArgumentError,
-            "expected one language token in the template of the post-processor of tokenizer.json, got: #{inspect(language)}"
+    case for(%{"SpecialToken" => %{"id" => id}} <- single, id != eos, uniq: true, do: id) do
+      [language] ->
+        {single, pair, language}
+
+      other ->
+        raise ArgumentError,
+              "expected one language token in the template of the post-processor of tokenizer.json, got: #{inspect(other)}"
     end
+  end
 
-    replace = &if(&1 in language, do: token, else: &1)
+  # The source language token takes the place of the language token of the template.
+  defp source_language(tokenizer, single, pair, language, token, id!) do
+    replace = &if(&1 == language, do: token, else: &1)
 
     template = fn pieces ->
       Enum.map_join(pieces, " ", fn
@@ -160,7 +170,7 @@ defmodule Transmuter.Text.TextToText do
     special_tokens =
       for %{"SpecialToken" => %{"id" => id}} <- single ++ pair,
           uniq: true,
-          do: {replace.(id), id!(tokenizer, replace.(id))}
+          do: {replace.(id), id!.(replace.(id))}
 
     processor =
       PostProcessor.template(
@@ -172,9 +182,15 @@ defmodule Transmuter.Text.TextToText do
     %{tokenizer | native: Tokenizers.Tokenizer.set_post_processor(tokenizer.native, processor)}
   end
 
-  defp id!(tokenizer, token) do
-    Tokenizer.token_to_id(tokenizer, token) ||
-      raise ArgumentError, "the tokenizer has no token #{inspect(token)}"
+  # A language token is a special token of tokenizer.json. A bare code, such as "fr" for
+  # M2M100, is an ordinary piece of the vocabulary, so it raises.
+  defp language_id!(tokenizer, special, language, token) do
+    unless token in special do
+      raise ArgumentError,
+            "expected a language token, a special token of the tokenizer such as #{inspect(language)}, got: #{inspect(token)}"
+    end
+
+    Tokenizer.token_to_id(tokenizer, token)
   end
 
   defp validate(text) when is_binary(text), do: {:ok, %{text: text}}
