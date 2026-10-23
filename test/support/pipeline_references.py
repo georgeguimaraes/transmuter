@@ -855,3 +855,92 @@ timestamps = [WhisperTimeStampLogitsProcessor(config, begin_index=1)]
 sequences, margins = beams(model, {"input_features": features, "decoder_input_ids": prompt, "logits_processor": timestamps}, num_beams=3, max_new_tokens=447)
 print("whisper-tiny.en timestamps beams", repr(processor.decode(sequences[0], decode_with_timestamps=True)), margins)
 print("whisper-tiny.en timestamps generate", repr(processor.batch_decode(model.generate(features, do_sample=False, num_beams=3, return_timestamps=True), decode_with_timestamps=True)[0]))
+
+# Florence-2: beam search with the generation_config.json of the export (3 beams, early_stopping,
+# no_repeat_ngram_size 3, forced bos and eos) and 256 new tokens, then post_process_generation.
+# The model is Florence2ForConditionalGeneration of florence-community/Florence-2-base-ft in
+# fp32. Its text embeddings, encoder and decoder give the outputs of the ONNX export within
+# 4.1e-4. Its lm_head has 39 more rows than the export, so the script cuts it to the 51289 rows
+# of the export. With all rows, the ids are the same for the 6 cases. The image features come
+# from vision_encoder.onnx of onnx-community/Florence-2-base-ft in ONNX Runtime, because the
+# export gives other features than PyTorch: it computes the scale of each channel attention for
+# a 224x224 input (see the README). The PyTorch features give another text for all 6 cases, and
+# the export with the scales of a 768x768 input gives the text of PyTorch. The tokenizer is the
+# fast one, which decodes as Transmuter does: the slow one puts spaces between the special
+# tokens, and post_process_generation then finds no locations. The coordinates are those of
+# dequantize before it truncates them to integers. The script writes the ids, the text and the
+# result of each case to test/fixtures/florence2.json.
+import json
+
+from transformers import Florence2ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
+
+processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base-ft")
+processor.image_processor = AutoImageProcessor.from_pretrained("florence-community/Florence-2-base-ft", use_fast=False)
+processor.post_processor.dequantize = lambda bins, size: (bins + 0.5) * torch.tensor([size[0] / 1000, size[1] / 1000] * (bins.shape[-1] // 2))
+model = Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-base-ft", dtype=torch.float32, attn_implementation="eager").eval()
+head = torch.nn.Linear(768, 51289, bias=False)
+head.weight = torch.nn.Parameter(model.lm_head.weight[:51289].detach().clone())
+model.lm_head = head
+model.config.text_config.vocab_size = 51289
+
+path = snapshot_download("onnx-community/Florence-2-base-ft", allow_patterns=["onnx/vision_encoder.onnx"])
+export = ort.InferenceSession(f"{path}/onnx/vision_encoder.onnx", providers=["CPUExecutionProvider"])
+patched = onnx.load(f"{path}/onnx/vision_encoder.onnx")
+initializers = {i.name: i for i in patched.graph.initializer}
+for node in patched.graph.node:
+    if node.op_type == "Mul" and "channel_attn/fn/Mul" in node.name:
+        stage = int(node.name.split("/blocks.")[1].split("/")[0])
+        initializers[node.input[1]].CopyFrom(numpy_helper.from_array(np.array(1 / (192 // 2**stage), dtype=np.float32), node.input[1]))
+patched = ort.InferenceSession(patched.SerializeToString(), providers=["CPUExecutionProvider"])
+
+def florence(image, prompt, features):
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    ids = inputs["input_ids"]
+    with torch.no_grad():
+        if features == "pytorch":
+            image_features = model.get_image_features(inputs["pixel_values"])
+        else:
+            image_features = torch.from_numpy(features.run(None, {"pixel_values": inputs["pixel_values"].numpy()})[0])
+        embeds = torch.cat([image_features, model.get_input_embeddings()(ids[ids != processor.image_token_id][None])], dim=1)
+        mask = torch.ones(embeds.shape[:2], dtype=torch.long)
+        hidden = model.get_encoder()(inputs_embeds=embeds, attention_mask=mask).last_hidden_state
+        sequences, margins = beams(model, {"encoder_outputs": BaseModelOutput(last_hidden_state=hidden), "attention_mask": mask}, num_beams=3, max_new_tokens=256)
+    # beams() gives the other beams too, so a shorter best beam has padding after its eos token.
+    ids = sequences[0, 1:].tolist()
+    return ids[: ids.index(model.generation_config.eos_token_id) + 1], margins
+
+cases = []
+for name, task, text in [("cats.png", "<CAPTION>", None), ("cats.png", "<MORE_DETAILED_CAPTION>", None), ("cats.png", "<OD>", None), ("cats.png", "<CAPTION_TO_PHRASE_GROUNDING>", "two cats"), ("cats.png", "<REFERRING_EXPRESSION_SEGMENTATION>", "a cat"), ("handwriting.png", "<OCR_WITH_REGION>", None)]:
+    image = Image.open(f"test/fixtures/{name}").convert("RGB")
+    ids, margins = florence(image, task + (text or ""), export)
+    decoded = processor.batch_decode([ids], skip_special_tokens=False)[0]
+    result = processor.post_process_generation(decoded, task=task, image_size=(image.width, image.height))[task]
+    cases.append({"image": name, "task": task, "text": text, "ids": ids, "decoded": decoded, "result": result})
+    pytorch = processor.batch_decode([florence(image, task + (text or ""), "pytorch")[0]], skip_special_tokens=False)[0]
+    fixed = processor.batch_decode([florence(image, task + (text or ""), patched)[0]], skip_special_tokens=False)[0]
+    print("florence", name, task, repr(text), repr(decoded), margins, "PyTorch features:", repr(pytorch), "patched export gives it:", fixed == pytorch)
+with open("test/fixtures/florence2.json", "w") as file:
+    json.dump(cases, file)
+
+# The Xenova tiny export of Florence-2 has a zero lm_head and zero image features, so its
+# logits are 0 for each input. No transformers model has its weights. ONNX Runtime with a
+# greedy loop and the logits processors of transformers gives the ids of the argmax of zero
+# logits: the lowest id, changed by the processors.
+from transformers.generation.logits_process import ForcedBOSTokenLogitsProcessor, ForcedEOSTokenLogitsProcessor, LogitsProcessorList, NoRepeatNGramLogitsProcessor
+
+path = snapshot_download("Xenova/tiny-random-Florence2ForConditionalGeneration", allow_patterns=["onnx/vision_encoder.onnx", "onnx/embed_tokens.onnx", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx", "*.json"])
+tiny = {name: ort.InferenceSession(f"{path}/onnx/{name}.onnx", providers=["CPUExecutionProvider"]) for name in ["vision_encoder", "embed_tokens", "encoder_model", "decoder_model"]}
+pixels = AutoImageProcessor.from_pretrained(path, use_fast=False)(Image.open("test/fixtures/cats.png").convert("RGB"), return_tensors="np")["pixel_values"]
+prompt = AutoTokenizer.from_pretrained(path)("Locate the objects with category name in the image.", return_tensors="np")["input_ids"]
+(features,) = tiny["vision_encoder"].run(None, {"pixel_values": pixels})
+embeds = np.concatenate([features, tiny["embed_tokens"].run(None, {"input_ids": prompt})[0]], axis=1)
+mask = np.ones(embeds.shape[:2], dtype=np.int64)
+(hidden,) = tiny["encoder_model"].run(None, {"inputs_embeds": embeds, "attention_mask": mask})
+processors = LogitsProcessorList([NoRepeatNGramLogitsProcessor(3), ForcedBOSTokenLogitsProcessor(0), ForcedEOSTokenLogitsProcessor(21, 2)])
+tokens = [2]
+while len(tokens) < 21 and (len(tokens) == 1 or tokens[-1] != 2):
+    (step,) = tiny["embed_tokens"].run(None, {"input_ids": np.array([tokens])})
+    logits = tiny["decoder_model"].run(["logits"], {"inputs_embeds": step, "encoder_hidden_states": hidden, "encoder_attention_mask": mask})[0][:, -1]
+    tokens.append(int(processors(torch.tensor([tokens]), torch.from_numpy(logits)).argmax(-1)))
+print("florence tiny <OD> ids", tokens[1:], "largest absolute logit", float(np.abs(logits).max()))

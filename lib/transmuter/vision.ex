@@ -266,7 +266,7 @@ defmodule Transmuter.Vision do
   defdelegate image_to_image(source, opts \\ []), to: Transmuter.Vision.ImageToImage
 
   @doc """
-  Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
+  Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text. With Florence-2, it also gives the boxes, quad boxes or polygons of the location tasks.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.
 
@@ -278,17 +278,29 @@ defmodule Transmuter.Vision do
 
   The settings of generation come from `generation_config.json`, as in `Transmuter.Text.generation/2`, with beam search when the configuration has `num_beams`.
 
+  ## Florence-2
+
+  A repository whose encoder takes `inputs_embeds`, such as `onnx-community/Florence-2-base-ft`, also has `onnx/vision_encoder.onnx` and `onnx/embed_tokens.onnx`. The encoder reads the features of the image and the embeddings of the prompt of a task. The input can give the task: `%{image: image, task: task, text: text, seed: seed}`. A task is a task token, such as `"<CAPTION>"`, `"<MORE_DETAILED_CAPTION>"`, `"<OD>"` or `"<OCR_WITH_REGION>"`. `:text` is the input of a task that takes one, such as `"<CAPTION_TO_PHRASE_GROUNDING>"`. `preprocessor_config.json` lists the tasks. The result has `:text` and the keys of the task, as `post_process_generation` of Python transformers gives them: `:boxes`, `:quad_boxes` or `:polygons`, and `:labels`. `<OPEN_VOCABULARY_DETECTION>` gives `:boxes`, `:box_labels`, `:polygons` and `:polygon_labels`. See `Transmuter.Vision.Florence2Processor.parse/4`:
+
+      serving = Transmuter.Vision.image_to_text({:hf, "onnx-community/Florence-2-base-ft"})
+      Nx.Serving.run(serving, %{image: image, task: "<OD>"})
+      #=> %{results: [%{text: "cat<loc_11>...", boxes: [%{xmin: 3.68, ymin: 27.96, xmax: 158.88, ymax: 237.0}, ...], labels: ["cat", ...]}]}
+
+  The boxes are in pixels of the input image, and the coordinates are floats. Python transformers truncates them to integers. The configuration of Florence-2 does beam search with 3 beams, so `stream: true` needs `num_beams: 1`. The vision encoder of `onnx-community/Florence-2-base-ft` gives other features than the PyTorch model, so the text can differ from PyTorch. See the README.
+
   ## Options
 
     * `:max_new_tokens` - the maximum number of new tokens. The default is that of the `image-to-text` pipeline of transformers (see `Transmuter.Generation.max_new_tokens/3`): `max_new_tokens` of `generation_config.json`, else 256 when `max_length` is not in the configuration or is 20, else `max_length` minus 1 for the start token. So the default for ViT-GPT2 and TrOCR is 256 new tokens.
 
-    * `:compile` - `:batch_size`, the number of images that generate together. The default is `1`.
+    * `:compile` - `:batch_size`, the number of images that generate together. The default is `1`. With Florence-2, also `:sequence_length`, the lengths that the prompt pads to. For Florence-2 base, the default is `[32, 128, 447]`: the encoder has 1024 positions, and the image takes 577 of them. The prompts of the tasks without input have up to 14 tokens.
+
+    * `:task` - with Florence-2, the task of the inputs that do not give one. The default is `"<CAPTION>"`.
 
     * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 
-  The text needs the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps. The other options are those of the module documentation, but `:model` does not apply, because the task has two models.
+  The text needs the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps. The other options are those of the module documentation, but `:model` does not apply, because the task has two or more models.
   """
   defdelegate image_to_text(source, opts \\ []), to: Transmuter.Vision.ImageToText
 

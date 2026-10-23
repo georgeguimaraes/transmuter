@@ -13,7 +13,7 @@ defmodule Transmuter.VisionTest do
   ]
 
   alias Transmuter.{ChatTemplate, Featurizer, Tokenizer, Vision}
-  alias Transmuter.Vision.{Idefics3Processor, Qwen2VLProcessor}
+  alias Transmuter.Vision.{Florence2Processor, Idefics3Processor, Qwen2VLProcessor}
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @labels ["cats", "dogs", "a remote control", "a couch"]
@@ -219,6 +219,97 @@ defmodule Transmuter.VisionTest do
     stream = Vision.image_to_text(@trocr, [stream: true] ++ opts)
     assert Enum.join(Nx.Serving.run(stream, @handwriting)) == text
   end
+
+  @florence_tiny {:hf, "Xenova/tiny-random-Florence2ForConditionalGeneration"}
+
+  # The ids of test/fixtures/florence2.json come from the beam search of transformers on the
+  # base model, see test/support/pipeline_references.py. The tiny export has the tokenizer and
+  # the task tables of the base model. Generation gives the ids without the eos token.
+  test "the Florence-2 processor parses the answers as post_process_generation" do
+    repo = Transmuter.Repo.load!(@florence_tiny)
+    processor = Florence2Processor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+
+    for {input, ids, expected} <- florence_cases() do
+      text = Tokenizer.decode(tokenizer, Enum.drop(ids, -1), skip_special_tokens: false)
+      {height, width, _channels} = Nx.shape(StbImage.to_nx(input.image))
+      result = Florence2Processor.parse(processor, input.task, text, {height, width})
+      assert_florence(result, expected)
+    end
+  end
+
+  # The tiny export has a zero lm_head and zero image features, so its logits are 0 for each
+  # input, and the ids are those of the processors and the lowest id of a tie. So the test
+  # checks that the four models run together, alone and in a batch with two tasks, and not
+  # their values. Without a task, the task is "<CAPTION>". The ids [0, 0, 0, 1, 0, 0] are
+  # those of ONNX Runtime with the processors of transformers, as text "<s><s><s><pad><s><s>".
+  test "Florence-2 runs the vision encoder, the embeddings, the encoder and the decoder" do
+    opts = [num_beams: 1, max_new_tokens: 20] ++ @opts
+
+    inputs = [
+      @image,
+      %{image: @image, task: "<OD>"},
+      %{image: @image, task: "<CAPTION_TO_PHRASE_GROUNDING>", text: "two cats"}
+    ]
+
+    expected = [
+      %{results: [%{text: "<pad>"}]},
+      %{results: [%{text: "<pad>", boxes: [], labels: []}]},
+      %{results: [%{text: "<pad>", boxes: [], labels: []}]}
+    ]
+
+    assert Nx.Serving.run(Vision.image_to_text(@florence_tiny, opts), inputs) == expected
+    batched = Vision.image_to_text(@florence_tiny, [compile: [batch_size: 2]] ++ opts)
+    assert Nx.Serving.run(batched, inputs) == expected
+
+    assert_raise ArgumentError, ~r/the task <CAPTION> takes no :text/, fn ->
+      Nx.Serving.run(Vision.image_to_text(@florence_tiny, opts), %{image: @image, text: "cats"})
+    end
+  end
+
+  @doc false
+  def florence_cases do
+    "../fixtures/florence2.json"
+    |> Path.expand(__DIR__)
+    |> File.read!()
+    |> JSON.decode!()
+    |> Enum.map(fn case ->
+      image = StbImage.read_file!(Path.expand("../fixtures/#{case["image"]}", __DIR__))
+      input = %{image: image, task: case["task"], text: case["text"]}
+      text = case["decoded"] |> String.replace(["<s>", "</s>"], "") |> String.trim()
+      {input, case["ids"], florence_result(text, case["result"])}
+    end)
+  end
+
+  defp florence_result(_text, text) when is_binary(text), do: %{text: text}
+
+  defp florence_result(text, %{"bboxes" => boxes, "labels" => labels}) do
+    boxes = for [x1, y1, x2, y2] <- boxes, do: %{xmin: x1, ymin: y1, xmax: x2, ymax: y2}
+    %{text: text, boxes: boxes, labels: labels}
+  end
+
+  defp florence_result(text, %{"quad_boxes" => boxes, "labels" => labels}),
+    do: %{text: text, quad_boxes: boxes, labels: labels}
+
+  defp florence_result(text, %{"polygons" => polygons, "labels" => labels}),
+    do: %{text: text, polygons: polygons, labels: labels}
+
+  # Python rounds the coordinates to f32, so they agree within 1e-6 relative.
+  @doc false
+  def assert_florence(got, expected) when is_map(got) and not is_struct(got) do
+    assert Map.keys(got) == Map.keys(expected)
+    for {key, value} <- got, do: assert_florence(value, expected[key])
+  end
+
+  def assert_florence(got, expected) when is_list(got) do
+    assert length(got) == length(expected)
+    Enum.zip_with(got, expected, &assert_florence/2)
+  end
+
+  def assert_florence(got, expected) when is_float(got),
+    do: assert_in_delta(got, expected, 1.0e-6 * abs(expected))
+
+  def assert_florence(got, expected), do: assert(got == expected)
 
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
 
@@ -729,6 +820,31 @@ defmodule Transmuter.VisionLargeModelTest do
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
+
+  # The reference is the beam search of transformers on the export's image features, see
+  # test/support/pipeline_references.py. Python runs each prompt without padding, and the
+  # serving pads it to 32 tokens. The fp32 files have 1.1 GB, so CI leaves this test out.
+  @tag :large_model
+  test "Florence-2 matches generate and post_process_generation of transformers" do
+    cases = VisionTest.florence_cases()
+    inputs = Enum.map(cases, &elem(&1, 0))
+    serving = Vision.image_to_text({:hf, "onnx-community/Florence-2-base-ft"}, @opts)
+    results = Nx.Serving.run(serving, inputs)
+
+    for {%{results: [result]}, {_input, _ids, expected}} <- Enum.zip(results, cases),
+        do: VisionTest.assert_florence(result, expected)
+
+    # The <OD> and the grounding prompts pad to the same length, so they run in one batch.
+    two = Enum.slice(inputs, 2, 2)
+
+    batched =
+      Vision.image_to_text(
+        {:hf, "onnx-community/Florence-2-base-ft"},
+        [compile: [batch_size: 2]] ++ @opts
+      )
+
+    assert Nx.Serving.run(batched, two) == Enum.slice(results, 2, 2)
+  end
 
   # The reference of OWLv2 is the zero-shot-object-detection pipeline of transformers. On the
   # Linux runner, OWLv2 runs a ViT of 3600 patches for each image, so CI leaves this test out.

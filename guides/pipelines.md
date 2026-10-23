@@ -340,7 +340,7 @@ image = StbImage.read_file!("cats.jpg")
 | `image_classification/2` | image | `%{predictions: [%{label: label, score: score}]}` |
 | `image_embedding/2` | image | `%{embedding: tensor}` |
 | `zero_shot_image_classification/3` | image | `%{predictions: [%{label: label, score: score}]}` |
-| `image_to_text/2` | image, or `%{image: image, seed: seed}` | `%{results: [%{text: text}]}` |
+| `image_to_text/2` | image, or `%{image: image, seed: seed}`. Florence-2 also takes `:task` and `:text` | `%{results: [%{text: text}]}`. Florence-2 adds the keys of the task, such as `:boxes` and `:labels` |
 | `image_text_to_text/2` | `%{messages: messages}` with image parts | `%{results: [%{text: text, token_summary: summary}]}` |
 | `object_detection/2` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
 | `zero_shot_object_detection/3` | image | `%{detections: [%{label: label, score: score, box: box}]}` |
@@ -350,7 +350,7 @@ image = StbImage.read_file!("cats.jpg")
 | `mask_generation/2` | `%{image: image, prompts: prompts}` | `%{masks: [[tensor]], iou_scores: [[score]]}` |
 | `image_to_image/2` | image | `%{image: tensor}` |
 
-Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow. For `mask_generation/2`, the masks are those of `SamModel` and `Sam2Model` of Python transformers with `post_process_masks`, except for at most a few pixels at the edges, where the logits are near 0, and the scores agree within 1.0e-4.
+Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For Florence-2, the text is the same as the beam search of Python transformers on the image features of the export, and the coordinates are those of `post_process_generation` before it truncates them to integers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow. For `mask_generation/2`, the masks are those of `SamModel` and `Sam2Model` of Python transformers with `post_process_masks`, except for at most a few pixels at the edges, where the logits are near 0, and the scores agree within 1.0e-4.
 
 ### Image preprocessing
 
@@ -401,6 +401,16 @@ Nx.Serving.run(serving, image)
 ```
 
 The serving runs encoder-decoder exports of `VisionEncoderDecoderModel`, such as ViT-GPT2 for captions and TrOCR for handwritten text. The encoder reads the image once, and the decoder generates the text. The settings come from `generation_config.json`, so ViT-GPT2 and TrOCR use greedy selection. When the configuration has no `max_length`, the text has at most 256 new tokens, as in the `image-to-text` pipeline of Python transformers. Use `:max_new_tokens` to change this limit. The serving takes the options of generation, such as `:compile`, `:stream` and `:strategy`.
+
+The serving also runs Florence-2, whose encoder reads the image features and the embeddings of a prompt. Give the task in the input:
+
+```elixir
+serving = Transmuter.Vision.image_to_text({:hf, "onnx-community/Florence-2-base-ft"})
+Nx.Serving.run(serving, %{image: image, task: "<CAPTION_TO_PHRASE_GROUNDING>", text: "two cats"})
+#=> %{results: [%{text: "two cats<loc_11>...", boxes: [%{xmin: 3.68, ymin: 11.16, xmax: 319.52, ymax: 235.32}, ...], labels: ["two cats", ...]}]}
+```
+
+A task is a task token of `preprocessor_config.json`, such as `"<CAPTION>"`, `"<OD>"` or `"<OCR_WITH_REGION>"`. The default is `"<CAPTION>"`, and the `:task` option changes it. The result has the keys of `post_process_generation` of Python transformers: `:boxes` (as in `object_detection/2`), `:quad_boxes` or `:polygons`, and `:labels`. `<OPEN_VOCABULARY_DETECTION>` gives `:boxes`, `:box_labels`, `:polygons` and `:polygon_labels`. The coordinates are floats in pixels of the input image. The generation config of Florence-2 does beam search with 3 beams. The vision encoder of `onnx-community/Florence-2-base-ft` gives other features than PyTorch, so the text can differ from the PyTorch model (see the README).
 
 ### Object detection
 
