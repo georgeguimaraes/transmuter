@@ -16,6 +16,7 @@ defmodule Transmuter.VisionTest do
 
   alias Transmuter.Vision.{
     Florence2Processor,
+    Gemma3Processor,
     Idefics3Processor,
     PixtralProcessor,
     Qwen2VLProcessor
@@ -617,6 +618,30 @@ defmodule Transmuter.VisionTest do
 
     %{image_features: features} = PixtralProcessor.encode(processor, encode, batch, [], nil)
     assert features == Nx.concatenate(Enum.map(tensors, & &1["pixel_values"]))
+  end
+
+  # The batch gives each row the images of its chat and rows of zeros up to the batch key. The
+  # encoder runs only on the images of the chats, and the features of each row follow those of
+  # the rows before it. The fake encoder gives each image the features of its first pixel.
+  @tag ci_partition: 15
+  test "the Gemma 3 processor encodes only the images of each chat, in order" do
+    processor = %Gemma3Processor{image_seq_len: 2, image_token: 9}
+
+    pixels =
+      Nx.tensor([[1.0, 2.0, 3.0, 0.0], [4.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+      |> Nx.reshape({3, 4, 1, 1, 1})
+
+    prompts = [[2, 9, 9, 5, 9, 9, 9, 9, 7], [2, 9, 9, 7], []]
+
+    encode = fn %{"pixel_values" => image} ->
+      assert Nx.shape(image) == {1, 1, 1, 1}
+      %{"image_features" => Nx.broadcast(Nx.reshape(image, {1, 1, 1}), {1, 2, 3})}
+    end
+
+    %{image_features: features} =
+      Gemma3Processor.encode(processor, encode, %{"pixel_values" => pixels}, prompts, nil)
+
+    assert Nx.to_list(features[[.., 0]]) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
   end
 
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
