@@ -10,7 +10,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
 
   Then the entities go from the highest score to the lowest. An entity stays when it does not overlap an entity that stayed before it.
 
-  The inputs of the model are those of gliner, with one change for the compiler. The word axis of the model is the largest word count of the batch, and the model finds the first token of each word with NonZero on the words mask. So the shapes after these nodes depend on the word counts, and each new word count would compile segments again. The serving gives each batch a word axis from its bucket instead: a power of two from 16 up to `max_len` of `gliner_config.json`, and one spare word. The first padding row of the batch has this word count. A full batch has no padding row, so it runs one more row, which costs as much as one more text. Each token that is not the first token of a word, such as the prompt, the special tokens and the padding, points to the spare word, so NonZero always finds all tokens. The spare word comes after the words of each row, and the model reads only the words of a row, so the results of the rows do not change. Then the shapes of a batch depend only on its sequence length, its bucket, its label count and whether it is full. The compiled model of each sequence length keeps the segments of 8 label counts for each bucket, for full batches and for batches with padding rows. Within these, a new text with the same shapes compiles nothing.
+  The inputs of the model are those of gliner, with one change for the compiler. The word axis of the model is the largest word count of the batch, and the model finds the first token of each word with NonZero on the words mask. So the shapes after these nodes depend on the word counts, and each new word count would compile segments again. The serving gives each batch a word axis from its bucket instead: a power of two from 16 up to `max_len` of `gliner_config.json`, and one spare word. The first padding row of the batch has this word count. A full batch has no padding row, so it runs one more row, which costs as much as one more text. With a batch size of 1, each request runs 2 rows. Each token that is not the first token of a word, such as the prompt, the special tokens and the padding, points to the spare word, so NonZero always finds all tokens. The spare word comes after the words of each row, and the model reads only the words of a row, so the results of the rows do not change. Then the shapes of a batch depend only on its sequence length, its bucket, its label count and whether it is full. The compiled model of each sequence length keeps the segments of 8 label counts for each bucket, for full batches and, with a batch size of more than 1, for batches with padding rows. Within these, a new text with the same shapes compiles nothing.
 
   """
 
@@ -48,7 +48,9 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
     lengths = Enum.sort(List.wrap(compile[:sequence_length]))
     encoder = encoder(tokenizer, config, List.last(lengths))
     kind = if config["span_mode"] == "token_level", do: :token, else: :span
-    buckets = buckets(min(config["max_len"], List.last(lengths)))
+    # As in gliner, the word count includes words without tokens, so it can be more than the
+    # sequence length, but not more than max_len.
+    buckets = buckets(config["max_len"])
     types = Map.new(model.input_types, fn {name, {type, _dims}} -> {name, type} end)
 
     templates =
@@ -82,8 +84,9 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
       inputs: %{},
       prepare: &prepare(&1, &2, kind, types, buckets, config["max_width"]),
       streaming: true,
-      # A full batch and a batch with padding rows have different shapes.
-      cache_size: 2 * length(buckets) * @label_counts
+      # With a batch size of 1, all batches are full. With more, a full batch and a batch
+      # with padding rows have different shapes.
+      cache_size: min(compile[:batch_size], 2) * length(buckets) * @label_counts
     }
 
     Serving.new(
@@ -299,18 +302,19 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
-  # The scores of the words and the labels of the row. The model gives each row at least one
-  # word.
-  defp row_scores(scores, words, labels) do
-    {_words, width, _labels} = Nx.shape(scores)
-    Nx.slice(scores, [0, 0, 0], [max(words, 1), width, labels])
+  # The scores of the words and the labels of the row, on its label axis. The model gives each
+  # row at least one word.
+  defp row_scores(scores, words, labels, label_axis) do
+    scores
+    |> Nx.slice_along_axis(0, max(words, 1), axis: 0)
+    |> Nx.slice_along_axis(0, labels, axis: label_axis)
   end
 
   defp candidates(scores, :span, words, labels, threshold) do
     {_words, width, _labels} = Nx.shape(scores)
 
     for {score, index} <-
-          scores |> row_scores(words, labels) |> Nx.to_flat_list() |> Enum.with_index(),
+          scores |> row_scores(words, labels, 2) |> Nx.to_flat_list() |> Enum.with_index(),
         score > threshold,
         start = div(index, width * labels),
         stop = start + rem(div(index, labels), width),
@@ -322,7 +326,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
     scores =
       for {row, word} <-
             scores
-            |> Nx.slice([0, 0, 0], [max(words, 1), labels, 3])
+            |> row_scores(words, labels, 1)
             |> Nx.to_list()
             |> Enum.take(words)
             |> Enum.with_index(),

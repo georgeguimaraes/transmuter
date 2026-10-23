@@ -27,6 +27,9 @@ cases = [
     ("José Müller visitó São Paulo y Zürich en 2023.", ["person", "city", "person"]),
     ("The state-of-the-art e-mail_server runs at well-known sites.", ["phone number", "software"]),
     ("東京タワーは東京都港区にあります。Apple发布了iPhone 15。", ["organization", "location"]),
+    # DEL is a word without DeBERTa tokens. gliner counts it in text_lengths, and the words
+    # after it get lower numbers in words_mask.
+    ("Pay\x7f Ana Lima \x7f today.", ["person"]),
 ]
 
 fixtures = {}

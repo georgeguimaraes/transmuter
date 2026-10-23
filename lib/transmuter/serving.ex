@@ -310,7 +310,7 @@ defmodule Transmuter.Serving do
 
     * `:steps` - optional, the inputs and the static inputs of a step of a decoder for each batch key (see `Transmuter.Generation.prompt_inputs/3`).
 
-    * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and the number of rows that are not padding. It returns the inputs of the batch for the model, such as inputs whose shapes depend on the values of the batch. The fixed inputs and the inputs of the steps join them after this function. The serving compiles the model for the templates through this function too, as a full batch. The rows of the batch stay first. The serving gives the outputs of the rows that are not padding to the client.
+    * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and the number of rows that are not padding. It returns the inputs of the batch for the model, such as inputs whose shapes depend on the values of the batch. The fixed inputs and the inputs of the steps join them after this function. The serving compiles the model for the templates through this function too, as a full batch. The rows of the batch stay first. `fun` gets the outputs of the prepared batch, which can have one more row than the inputs. The serving gives the outputs of the rows that are not padding to the client.
 
     * `:streaming` - optional, `true` when the outputs of a batch can have other shapes than those of another batch, such as with `:prepare`. The serving then streams the outputs of each batch to the client, so that Nx.Serving does not join them.
 

@@ -188,6 +188,20 @@ defmodule Transmuter.TextGLiNERModelTest do
     assert_entities(alone, Enum.at(expected, 2), 2.0e-3)
   end
 
+  # DEL has no DeBERTa token, but gliner counts it as a word, so a text can have more words
+  # than tokens.
+  test "a text with more words than the largest sequence length runs" do
+    serving =
+      Transmuter.Text.zero_shot_entity_recognition(
+        {:hf, "onnx-community/gliner_small-v2.1"},
+        [variant: :fp16, compile: [sequence_length: [32]]] ++ @opts
+      )
+
+    text = "Cristiano Ronaldo plays for Al Nassr." <> String.duplicate(" \x7f", 40)
+    %{entities: entities} = Nx.Serving.run(serving, %{text: text, labels: ["person"]})
+    assert [%{phrase: "Cristiano Ronaldo"}] = entities
+  end
+
   test "a token model gives the entities of gliner" do
     serving =
       Transmuter.Text.zero_shot_entity_recognition(
