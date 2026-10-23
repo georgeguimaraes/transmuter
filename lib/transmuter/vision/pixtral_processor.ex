@@ -25,6 +25,14 @@ defmodule Transmuter.Vision.PixtralProcessor do
 
   @placeholder "[IMG]"
 
+  # The defaults of PixtralImageProcessor and PixtralImageProcessorFast of Python
+  # transformers, which are the same. They also take the place of a null value.
+  @defaults %{
+    "resample" => 3,
+    "image_mean" => [0.48145466, 0.4578275, 0.40821073],
+    "image_std" => [0.26862954, 0.26130258, 0.27577711]
+  }
+
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json` and `processor_config.json`.
   """
@@ -33,6 +41,7 @@ defmodule Transmuter.Vision.PixtralProcessor do
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
 
+    config = Map.merge(@defaults, config, fn _key, default, value -> value || default end)
     processor = Hub.json(repo.source, "processor_config.json", repo.opts) || %{}
 
     # The defaults are those of Python transformers. PixtralProcessor gives the image
