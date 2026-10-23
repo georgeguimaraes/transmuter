@@ -15,6 +15,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   """
 
   alias Transmuter.{Featurizer, Hub}
+  alias Transmuter.Vision.ImageTextToText
 
   defstruct [
     :featurizer,
@@ -62,7 +63,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       patch_size: config["patch_size"] || 14,
       merge_size: config["merge_size"] || 2,
       temporal_patch_size: config["temporal_patch_size"] || 2,
-      image_token: repo.config["image_token_id"],
+      image_token: ImageTextToText.image_token(repo),
       grid_input: grid_input
     }
   end
@@ -125,19 +126,19 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   """
   def encode(processor, encode, tensors, prompts, _backend) do
     %{"pixel_values" => pixels, "image_grid_thw" => grids} = tensors
-    grids = for rows <- Nx.to_list(grids), do: Enum.filter(rows, fn [t | _] -> t > 0 end)
+    images = ImageTextToText.images(pixels, grids, &Enum.product/1)
 
     features =
-      for {images, row} <- Enum.with_index(grids),
-          {grid, start} <-
-            images |> Enum.map_reduce(0, &{{&1, &2}, &2 + Enum.product(&1)}) |> elem(0) do
+      for row <- images, {grid, pixels} <- row do
         inputs = %{
-          "pixel_values" => Nx.slice_along_axis(pixels[row], start, Enum.product(grid), axis: 0),
+          "pixel_values" => pixels,
           processor.grid_input => Nx.tensor([grid], type: :s64, backend: Nx.BinaryBackend)
         }
 
         encode.(inputs)["image_features"]
       end
+
+    grids = Enum.map(images, fn row -> Enum.map(row, &elem(&1, 0)) end)
 
     %{
       image_features: Nx.concatenate(features),

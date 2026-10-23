@@ -13,6 +13,7 @@ defmodule Transmuter.Vision.PixtralProcessor do
   """
 
   alias Transmuter.{Featurizer, Hub}
+  alias Transmuter.Vision.ImageTextToText
 
   defstruct [
     :featurizer,
@@ -111,16 +112,9 @@ defmodule Transmuter.Vision.PixtralProcessor do
   def encode(processor, encode, tensors, _prompts, _backend) do
     %{"pixel_values" => pixels, "image_sizes" => sizes} = tensors
 
-    sizes =
-      for rows <- Nx.to_list(sizes), do: Enum.filter(rows, fn [height | _] -> height > 0 end)
-
     features =
-      for {images, row} <- Enum.with_index(sizes),
-          {[height, width], start} <-
-            images |> Enum.map_reduce(0, &{{&1, &2}, &2 + count(processor, &1)}) |> elem(0) do
-        blocks =
-          Nx.slice_along_axis(pixels[row], start, count(processor, [height, width]), axis: 0)
-
+      for row <- ImageTextToText.images(pixels, sizes, &count(processor, &1)),
+          {[_height, width], blocks} <- row do
         image = image(blocks, processor.block, div(width, processor.block))
         encode.(%{"pixel_values" => image})["image_features"] |> Nx.squeeze(axes: [0])
       end

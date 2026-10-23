@@ -1,18 +1,20 @@
 defmodule Transmuter.Vision.ImageTextToText do
   @moduledoc """
-  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL and Qwen3-VL. See `Transmuter.Vision.image_text_to_text/2`.
+  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL, Qwen3-VL and Ministral 3. See `Transmuter.Vision.image_text_to_text/2`.
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
-  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor` or `Transmuter.Vision.Qwen2VLProcessor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles or patches) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor`, `Transmuter.Vision.Qwen2VLProcessor` or `Transmuter.Vision.PixtralProcessor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles, patches or blocks) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+
+  The tokenizer adds its special tokens to the rendered prompt, unless the prompt starts with the bos token, as `apply_chat_template` of the processors of Python transformers.
   """
 
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
 
   alias Transmuter.{ChatTemplate, Featurizer, Generation, Hub, Repo, Serving, Tokenizer}
-  alias Transmuter.Vision.{Idefics3Processor, Qwen2VLProcessor}
+  alias Transmuter.Vision.{Idefics3Processor, PixtralProcessor, Qwen2VLProcessor}
 
-  # The batch keys: the number of rows of the pixel values of a chat (tiles or patches),
+  # The batch keys: the number of rows of the pixel values of a chat (tiles, patches or blocks),
   # rounded up to a power of two, or 0 for a chat without images.
   @buckets [0 | for(exponent <- 0..16, do: 2 ** exponent)]
 
@@ -57,8 +59,10 @@ defmodule Transmuter.Vision.ImageTextToText do
     {module, processor} = processor!(repo, vision)
     backend = opts[:backend] || Nx.default_backend()
 
-    image_token = repo.config["image_token_id"]
-    ctx = Generation.context(repo, decoder, [embed: embed, image_token: image_token] ++ opts)
+    ctx =
+      Generation.context(repo, decoder, [embed: embed, image_token: image_token(repo)] ++ opts)
+
+    bos = Repo.special_token(repo, "bos")
 
     init = fn defn_options ->
       template = module.template(processor, compile[:batch_size])
@@ -81,7 +85,7 @@ defmodule Transmuter.Vision.ImageTextToText do
         expand!({module, processor}, text, images, backend)
 
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
-      ids = token_ids(tokenizer, text)
+      ids = token_ids(tokenizer, text, bos)
       summary = %{input: length(ids), padding: 0}
       [%{prompt: ids, seed: seed, tensors: tensors, key: key, summary: summary}]
     end
@@ -103,11 +107,14 @@ defmodule Transmuter.Vision.ImageTextToText do
   # Idefics3ImageProcessor, because torchvision has no lanczos for tensors.
   defp processor!(repo, vision) do
     qwen2_vl = fn -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)} end
+    pixtral = fn -> {PixtralProcessor, PixtralProcessor.load!(repo)} end
 
     processors = %{
       "Idefics3ImageProcessor" => fn -> {Idefics3Processor, Idefics3Processor.load!(repo)} end,
       "Qwen2VLImageProcessor" => qwen2_vl,
-      "Qwen2VLImageProcessorFast" => qwen2_vl
+      "Qwen2VLImageProcessorFast" => qwen2_vl,
+      "PixtralImageProcessor" => pixtral,
+      "PixtralImageProcessorFast" => pixtral
     }
 
     config = Hub.json(repo.source, "preprocessor_config.json", repo.opts) || %{}
@@ -201,12 +208,36 @@ defmodule Transmuter.Vision.ImageTextToText do
     %{prompt: prompt, tensors: tensors, key: key}
   end
 
-  # As Idefics3Processor of Python transformers, the tokenizer adds its special tokens.
-  defp token_ids(tokenizer, text) do
+  # As apply_chat_template of ProcessorMixin of Python transformers: a prompt that starts
+  # with the bos token, such as that of Ministral 3, gets no more special tokens.
+  defp token_ids(tokenizer, text, bos) do
+    special? = not (is_binary(bos) and String.starts_with?(text, bos))
+
     {:ok, encoding} =
-      Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: true)
+      Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: special?)
 
     Tokenizer.ids(tokenizer, encoding)
+  end
+
+  @doc false
+  # The id of the image token. As the attribute_map of Mistral3Config and LlavaConfig of
+  # Python transformers, image_token_index is another name of image_token_id.
+  def image_token(repo), do: repo.config["image_token_id"] || repo.config["image_token_index"]
+
+  @doc false
+  # The images of each row of a batch, before the rows of zeros, as {size, pixels}: a row
+  # of `sizes` (such as the grid of the image) and the `count.(size)` rows of `pixels` of the
+  # image. A size of zeros is padding.
+  def images(pixels, sizes, count) do
+    for {sizes, row} <- sizes |> Nx.to_list() |> Enum.with_index() do
+      sizes
+      |> Enum.filter(fn [first | _] -> first > 0 end)
+      |> Enum.map_reduce(0, fn size, start ->
+        {{size, Nx.slice_along_axis(pixels[row], start, count.(size), axis: 0)},
+         start + count.(size)}
+      end)
+      |> elem(0)
+    end
   end
 
   defp validate(input = %{messages: [_ | _] = messages}) do

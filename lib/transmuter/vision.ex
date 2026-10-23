@@ -305,7 +305,7 @@ defmodule Transmuter.Vision do
   defdelegate image_to_text(source, opts \\ []), to: Transmuter.Vision.ImageToText
 
   @doc """
-  Builds a serving that answers a chat about images with a decoder-only vision language model, such as SmolVLM, Qwen2-VL or Qwen3-VL.
+  Builds a serving that answers a chat about images with a decoder-only vision language model, such as SmolVLM, Qwen2-VL, Qwen3-VL or Ministral 3.
 
   The input is `%{messages: messages}` or a list of them. Each message has `:role` and `:content`, as in the chat format of Python transformers. The content is a list of parts: `%{type: "image", image: image}` and `%{type: "text", text: text}`. Give a list of parts also for a message without images, because the chat template of SmolVLM reads the type of the first part. The input can have `:seed`. The result is `%{results: [%{text: text, token_summary: summary}]}`, as in `Transmuter.Text.generation/2`.
 
@@ -328,11 +328,13 @@ defmodule Transmuter.Vision do
 
     * `Qwen2VLImageProcessorFast`, such as Qwen3-VL. `Transmuter.Vision.Qwen2VLProcessor` resizes each image to multiples of 32 pixels with the weights of torchvision, and splits it into patches of 16x16 pixels. The export of `onnx-community/Qwen3-VL-2B-Instruct-ONNX` has no deepstack features, so its text can differ from the PyTorch model. The default variants of this repository are the q4 vision encoder and the 8-bit embeddings, and no test compares them with ONNX Runtime. With `variant: %{vision_encoder: :fp32, embed_tokens: :q4}`, the serving gives the text of ONNX Runtime.
 
+    * `PixtralImageProcessorFast` and `PixtralImageProcessor`, such as Ministral 3. `Transmuter.Vision.PixtralProcessor` makes each image smaller to at most `longest_edge` pixels (1540 for Ministral 3), rounds each side up to a multiple of 28 pixels, and splits it into blocks of 28x28 pixels, one for each feature. Each row of blocks ends with `[IMG_BREAK]` in the prompt, and the last row with `[IMG_END]`. The vision encoder compiles for each image size.
+
   The chat template renders each image as a placeholder, and the processor replaces it with the image tokens of the image. The vision encoder turns the pixel values of the images into features, and the features replace the embeddings of the image tokens in the prompt. Then the decoder generates as in `Transmuter.Text.generation/2`. A chat that ends with an assistant message continues that message.
 
   ## Options
 
-    * `:compile` - `:batch_size`, the number of chats that generate together. The default is `1`. Chats go into one batch when the number of their tiles (SmolVLM) or patches (Qwen2-VL and Qwen3-VL) rounds up to the same power of two. A chat can have up to 65536 tiles or patches. An image of SmolVLM gives up to 17 tiles, and an image of Qwen2-VL or Qwen3-VL gives up to `max_pixels / patch_size^2` patches.
+    * `:compile` - `:batch_size`, the number of chats that generate together. The default is `1`. Chats go into one batch when the number of their tiles (SmolVLM), patches (Qwen2-VL and Qwen3-VL) or blocks (Ministral 3) rounds up to the same power of two. A chat can have up to 65536 tiles, patches or blocks. An image of SmolVLM gives up to 17 tiles, an image of Qwen2-VL or Qwen3-VL gives up to `max_pixels / patch_size^2` patches, and an image of Ministral 3 gives up to 3025 blocks.
 
     * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:token_logprobs`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 

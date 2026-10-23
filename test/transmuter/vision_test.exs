@@ -408,6 +408,40 @@ defmodule Transmuter.VisionTest do
       assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
                {126, "5879c4bd9e8deede"}
     end
+
+    # Two batch rows with one image each and rows of zeros after it. The encoder gets each
+    # image alone, and each prompt gets the positions of the grid of its own image. Here the
+    # encoder gives the patches as the features.
+    rows =
+      for image <- [image, Nx.transpose(image, axes: [1, 0, 2])] do
+        {tensors, _text} = Qwen2VLProcessor.process(processor, image, Nx.BinaryBackend)
+
+        Map.new(tensors, fn {name, tensor} ->
+          {name, Nx.pad(tensor, 0, [{0, 512 - Nx.axis_size(tensor, 0), 0}, {0, 0, 0}])}
+        end)
+      end
+
+    batch =
+      Map.new(
+        ["pixel_values", "image_grid_thw"],
+        &{&1, Nx.stack(Enum.map(rows, fn row -> row[&1] end))}
+      )
+
+    encode = fn %{"pixel_values" => patches} -> %{"image_features" => patches} end
+    prompt = [1, 2 | List.duplicate(processor.image_token, 99)] ++ [3]
+
+    %{image_features: features, position_ids: positions} =
+      Qwen2VLProcessor.encode(processor, encode, batch, [prompt, prompt], nil)
+
+    assert features ==
+             Nx.concatenate(
+               Enum.map(rows, &Nx.slice_along_axis(&1["pixel_values"], 0, 396, axis: 0))
+             )
+
+    assert positions == [
+             Qwen2VLProcessor.positions(processor, prompt, [[1, 18, 22]]),
+             Qwen2VLProcessor.positions(processor, prompt, [[1, 22, 18]])
+           ]
   end
 
   @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
