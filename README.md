@@ -41,7 +41,7 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian, and NLLB and M2M100 for translation between many languages). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2 and TrOCR), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL), `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR), `zero_shot_object_detection` (OWL-ViT, OWLv2 and Grounding DINO), `depth_estimation` (Depth Anything), `image_segmentation` (Segformer), `background_removal` (ORMBG) and `mask_generation` (SAM and SAM 2 with point and box prompts) and `image_to_image` (Swin2SR super resolution). `Transmuter.Audio` gives `speech_to_text` (Whisper), `audio_classification` (AST and wav2vec2), `zero_shot_audio_classification` (CLAP) and `text_to_speech` (VITS and SpeechT5). Their results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
+The text tasks are `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian, and NLLB and M2M100 for translation between many languages). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2, TrOCR and Florence-2), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL), `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR), `zero_shot_object_detection` (OWL-ViT, OWLv2 and Grounding DINO), `depth_estimation` (Depth Anything), `image_segmentation` (Segformer), `background_removal` (ORMBG) and `mask_generation` (SAM and SAM 2 with point and box prompts) and `image_to_image` (Swin2SR super resolution). `Transmuter.Audio` gives `speech_to_text` (Whisper), `audio_classification` (AST and wav2vec2), `zero_shot_audio_classification` (CLAP) and `text_to_speech` (VITS and SpeechT5). Their results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 
@@ -173,7 +173,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | [Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export) | The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter |
 | [wav2vec2 base 960h](https://huggingface.co/Xenova/wav2vec2-base-960h) | The same CTC transcripts for 2 s, 6 s and 15 s of speech |
 | [Piper en_US lessac medium](https://huggingface.co/rhasspy/piper-voices) | The same audio length and a waveform within 1.3e-5, with the noise scales at 0 |
-| [Florence-2 base](https://huggingface.co/onnx-community/Florence-2-base-ft) | The same tokens for the caption, detailed caption and object detection tasks |
+| [Florence-2 base](https://huggingface.co/onnx-community/Florence-2-base-ft) | `image_to_text` gives the tokens of the beam search of Python transformers on the image features of the export, for 6 tasks. The vision encoder of the export differs from PyTorch, see [The Florence-2 vision encoder](#the-florence-2-vision-encoder) |
 | [SmolVLM 256M](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | The same 100 tokens for an image with 13 tiles |
 | [EmbeddingGemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) | `text_embedding` within 9.3e-7 of ONNX Runtime for 9 and 543 tokens. The export attends to all tokens, but the model has a sliding window of 512 tokens. So a text of more than 512 tokens differs from sentence-transformers (cosine 0.983 at 543 tokens), and a short text differs by up to 5.6e-4 |
 | [Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct) | With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes. The fp32 vision encoder is within 2e-5. With the fp32 vision encoder, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a chat without images |
@@ -186,6 +186,23 @@ These models also ran from input to final result, and the result agrees with ONN
 | Qwen3-0.6B with YaRN rope scaling, exported | The same 30 tokens, compiled and without compilation |
 | FaceNet (InceptionResnetV1), exported | Embeddings within 1e-7 |
 | ControlNet scribble and the SD 1.5 UNet with ControlNet inputs, exported | ControlNet residuals within 3.8e-5, then a scribble-to-image run |
+
+### The Florence-2 vision encoder
+
+The `vision_encoder.onnx` of `onnx-community/Florence-2-base-ft` gives other image features than PyTorch. Transmuter gives the features of ONNX Runtime, so its text is that of the export. The channel attention of DaViT multiplies the queries by `tokens ** -0.5`. The export computed this scale for a 224x224 input and stored it as a constant: the 12 `Mul` nodes `/blocks.N/blocks.N.M/channel_block/channel_attn/fn/Mul` have 1/56 (stage 0), 1/28 (stage 1), 1/14 (the 9 blocks of stage 2) and 1/7 (stage 3). The image processor resizes each image to 768x768, so the correct values are 1/192, 1/96, 1/48 and 1/24. The softmax of each channel attention is thus 3.43 times too sharp. The export of `Xenova/tiny-random-Florence2ForConditionalGeneration` has the same constants. On `test/fixtures/cats.png`, the image features differ from PyTorch by up to 6.1 (mean 0.44). With the correct constants, they differ by up to 1.9e-4.
+
+The text changes for all 6 tasks of the tests (beam search with 3 beams):
+
+| Task | Export | PyTorch |
+|---|---|---|
+| `<CAPTION>` | A couple of cats laying on top of a pink blanket. | Two cats laying on a pink blanket next to remotes. |
+| `<MORE_DETAILED_CAPTION>` | There are two cats laying on top of a pink blanket. There is a white remote next to the cats. ... | There are two cats laying on a pink blanket. There are remotes next to the cats on the blanket. ... |
+| `<OD>` | 2 cats and 2 remotes | Also a bed. The other boxes move by up to 7 bins of 1/1000 of the image |
+| `<CAPTION_TO_PHRASE_GROUNDING>` "two cats" | 3 boxes | The same 3 boxes, moved by up to 3 bins |
+| `<REFERRING_EXPRESSION_SEGMENTATION>` "a cat" | A polygon around the left cat, with repeated points | A polygon around the right cat |
+| `<OCR_WITH_REGION>` (`test/fixtures/handwriting.png`) | Meet the at the station at noon. | Meet me at the station 'at noon. |
+
+With the correct constants, the export gives the text of PyTorch for all 6 tasks. To get it, change the 12 initializers of the `Mul` nodes to `tokens ** -0.5` for a 768x768 input, as `test/support/pipeline_references.py` does, and save the file.
 
 <details>
 <summary>All tested models</summary>
