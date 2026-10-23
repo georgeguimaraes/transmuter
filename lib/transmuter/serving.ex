@@ -310,9 +310,11 @@ defmodule Transmuter.Serving do
 
     * `:steps` - optional, the inputs and the static inputs of a step of a decoder for each batch key (see `Transmuter.Generation.prompt_inputs/3`).
 
-    * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and returns the inputs of the model. Use it for inputs whose shapes depend on the values of the batch. The serving compiles the model for the templates through this function too. The outputs of a batch can then have other shapes than those of another batch, so the serving streams the outputs of each batch to the client.
+    * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and the number of rows that are not padding. It returns the inputs of the batch for the model, such as inputs whose shapes depend on the values of the batch. The fixed inputs and the inputs of the steps join them after this function. The serving compiles the model for the templates through this function too, as a full batch. The rows of the batch stay first. The serving gives the outputs of the rows that are not padding to the client.
 
-  `validate` gives the sequences of each input. `preprocess` takes the sequences of all inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each sequence the list of its rows. The rows of the batches are those of the sequences, in order. `fun` and `postprocess` are as in `text/7`. `fun` takes the inputs of the batch before `:prepare`.
+    * `:streaming` - optional, `true` when the outputs of a batch can have other shapes than those of another batch, such as with `:prepare`. The serving then streams the outputs of each batch to the client, so that Nx.Serving does not join them.
+
+  `validate` gives the sequences of each input. `preprocess` takes the sequences of all inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each sequence the list of its rows. The rows of the batches are those of the sequences, in order. `fun` and `postprocess` are as in `text/7`.
   """
   def new(model, opts, shapes, preprocess, fun, postprocess, validate) do
     %{batch_size: batch_size, templates: templates} = shapes
@@ -320,7 +322,7 @@ defmodule Transmuter.Serving do
     compile_options = shapes |> Map.take([:cache_size]) |> Map.to_list()
     steps = Map.get(shapes, :steps, %{})
     step = &Map.get(steps, &1, {%{}, %{}})
-    prepare = Map.get(shapes, :prepare, & &1)
+    prepare = Map.get(shapes, :prepare, fn inputs, _size -> inputs end)
 
     given =
       for {_key, {inputs, static}} <- steps,
@@ -329,8 +331,8 @@ defmodule Transmuter.Serving do
           do: name
 
     # The client does not give the inputs that :prepare adds.
-    template = Map.merge(fixed, templates |> Map.values() |> hd())
-    given = given ++ (Map.keys(prepare.(template)) -- Map.keys(template))
+    template = templates |> Map.values() |> hd()
+    given = given ++ (Map.keys(prepare.(template, batch_size)) -- Map.keys(template))
 
     Nx.Serving.new(
       __MODULE__,
@@ -341,19 +343,20 @@ defmodule Transmuter.Serving do
         runs =
           Map.new(keys, fn key ->
             {inputs, static} = step.(key)
-            templates = fixed |> Map.merge(templates[key]) |> Map.merge(inputs) |> prepare.()
-            run = Transmuter.compile(model, templates, [static_inputs: static] ++ defn_options)
-            {key, &run.(prepare.(Map.merge(&1, inputs)))}
+            model_inputs = &(&1 |> prepare.(&2) |> Map.merge(fixed) |> Map.merge(inputs))
+            template = model_inputs.(templates[key], batch_size)
+            run = Transmuter.compile(model, template, [static_inputs: static] ++ defn_options)
+            {key, &run.(model_inputs.(&1, &2))}
           end)
 
         fn batch ->
           run = runs[batch.key]
-          batch = Nx.Batch.pad(batch, batch_size - batch.size)
+          size = batch.size
+          batch = Nx.Batch.pad(batch, batch_size - size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
 
-          fixed
-          |> Map.merge(inputs)
-          |> run.()
+          inputs
+          |> run.(size)
           |> fun.(inputs)
           |> Nx.backend_transfer(Nx.BinaryBackend)
         end
@@ -362,7 +365,7 @@ defmodule Transmuter.Serving do
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
-    |> then(&if(Map.has_key?(shapes, :prepare), do: Nx.Serving.streaming(&1), else: &1))
+    |> then(&if(shapes[:streaming], do: Nx.Serving.streaming(&1), else: &1))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
       {groups, rows} = preprocess.(Enum.concat(inputs))
@@ -461,8 +464,9 @@ defmodule Transmuter.Serving do
   # Nx.Serving runs each batch of a serving process in a new process, which copies the
   # function of the batch and all that it holds, such as the compiled models. So a serving
   # process keeps the functions in a scope of Transmuter.Shared, and each batch reads them
-  # without a copy. Nx.Serving.run/2 runs init in the caller, which keeps the functions only
-  # as long as it needs them.
+  # without a copy. Nx.Serving.run/2 runs init in the caller, or for a streaming serving in a
+  # process that it starts for the call, which keeps the functions only as long as it needs
+  # them.
   @doc false
   @impl Nx.Serving
   def init(type, init, partitions) do

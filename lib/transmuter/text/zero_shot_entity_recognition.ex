@@ -10,19 +10,23 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
 
   Then the entities go from the highest score to the lowest. An entity stays when it does not overlap an entity that stayed before it.
 
-  The inputs of the model are those of gliner, with one change for the compiler. The word axis of the model is the largest word count of the batch, and the model finds the first token of each word with NonZero on the words mask. So the shapes after these nodes depend on the word counts, and each new word count would compile segments again. The serving gives each batch a word axis from its bucket instead: a power of two from 16 up to `max_len` of `gliner_config.json`, and one spare word. One more row has this word count. Each token that is not the first token of a word, such as the prompt, the special tokens and the padding, points to the spare word, so NonZero always finds all tokens. The spare word comes after the words of each row, and the model reads only the words of a row, so the results of the rows do not change. Then the shapes of a batch depend only on its sequence length, its bucket and its labels, and a new text with the same shapes compiles nothing.
+  The inputs of the model are those of gliner, with one change for the compiler. The word axis of the model is the largest word count of the batch, and the model finds the first token of each word with NonZero on the words mask. So the shapes after these nodes depend on the word counts, and each new word count would compile segments again. The serving gives each batch a word axis from its bucket instead: a power of two from 16 up to `max_len` of `gliner_config.json`, and one spare word. The first padding row of the batch has this word count. A full batch has no padding row, so it runs one more row, which costs as much as one more text. Each token that is not the first token of a word, such as the prompt, the special tokens and the padding, points to the spare word, so NonZero always finds all tokens. The spare word comes after the words of each row, and the model reads only the words of a row, so the results of the rows do not change. Then the shapes of a batch depend only on its sequence length, its bucket, its label count and whether it is full. The compiled model of each sequence length keeps the segments of 8 label counts for each bucket, for full batches and for batches with padding rows. Within these, a new text with the same shapes compiles nothing.
 
   """
 
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
 
   alias Tokenizers.Encoding
-  alias Transmuter.{Hub, Repo, Serving, Tokenizer}
+  alias Transmuter.{Hub, Serving, Tokenizer}
 
   # The whitespace splitter of gliner, \w+(?:[-_]\w+)*|\S in Python: a word of letters,
   # digits and underscores, with single hyphens or underscores inside, or any other character
   # that is not a space. The classes are those of \w and \s in Python.
   @words ~r/[\p{L}\p{N}_]+(?:[-_][\p{L}\p{N}_]+)*|[^\t\n\x{0b}\f\r\x{1c}-\x{1f} \x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}]/u
+
+  # The compiled model keeps its segments for this many label counts of each bucket, as the
+  # module documentation says.
+  @label_counts 8
 
   @doc false
   def zero_shot_entity_recognition(source, opts) do
@@ -32,18 +36,8 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
         Serving.options() ++ [threshold: 0.5, flat_ner: true, multi_label: false]
       )
 
-    repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
+    {repo, model, tokenizer} = Serving.load!(source, [outputs: ["logits"]] ++ opts, :fp32)
     config = config!(repo)
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
-
-    model =
-      opts[:model] ||
-        Repo.load_component!(
-          repo,
-          "model",
-          :fp32,
-          [outputs: ["logits"]] ++ Keyword.take(opts, [:backend, :compute_type])
-        )
 
     compile =
       Keyword.validate!(opts[:compile] || [],
@@ -54,7 +48,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
     lengths = Enum.sort(List.wrap(compile[:sequence_length]))
     encoder = encoder(tokenizer, config, List.last(lengths))
     kind = if config["span_mode"] == "token_level", do: :token, else: :span
-    buckets = buckets(config["max_len"])
+    buckets = buckets(min(config["max_len"], List.last(lengths)))
     types = Map.new(model.input_types, fn {name, {type, _dims}} -> {name, type} end)
 
     templates =
@@ -70,19 +64,26 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
         {{:sequence_length, length}, tensors}
       end)
 
-    preprocess = fn inputs ->
-      rows = Enum.map(inputs, &encode(encoder, &1))
-      longest = rows |> Enum.map(&length(&1.ids)) |> Enum.max()
-      length = Enum.find(lengths, &(&1 >= longest))
-      tensors = tensors(types, rows, length, encoder.pad_id)
-      {[{tensors, {:sequence_length, length}}], Enum.map(rows, &[&1])}
+    preprocess = fn
+      [] ->
+        {[], []}
+
+      inputs ->
+        rows = Enum.map(inputs, &encode(encoder, &1))
+        longest = rows |> Enum.map(&length(&1.ids)) |> Enum.max()
+        length = Enum.find(lengths, &(&1 >= longest))
+        tensors = tensors(types, rows, length, encoder.pad_id)
+        {[{tensors, {:sequence_length, length}}], Enum.map(rows, &[&1])}
     end
 
     shapes = %{
       batch_size: compile[:batch_size],
       templates: templates,
       inputs: %{},
-      prepare: &prepare(&1, kind, types, buckets, config["max_width"])
+      prepare: &prepare(&1, &2, kind, types, buckets, config["max_width"]),
+      streaming: true,
+      # A full batch and a batch with padding rows have different shapes.
+      cache_size: 2 * length(buckets) * @label_counts
     }
 
     Serving.new(
@@ -90,11 +91,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
       opts,
       shapes,
       preprocess,
-      fn outputs, inputs ->
-        rows = Nx.axis_size(inputs["input_ids"], 0)
-        scores = outputs["logits"] |> Nx.as_type(:f32) |> Nx.sigmoid()
-        %{scores: Nx.slice_along_axis(scores, 0, rows, axis: 0)}
-      end,
+      fn outputs, _inputs -> %{scores: outputs["logits"] |> Nx.as_type(:f32) |> Nx.sigmoid()} end,
       fn [%{scores: scores}], [row] ->
         spans = decode(scores, kind, row.text_length, length(row.labels), opts)
         %{entities: Enum.map(spans, &entity(&1, row))}
@@ -244,19 +241,20 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
   end
 
   # The inputs that depend on the word count of the batch: the bucket row and the spare word
-  # of the module documentation. Each row has at least one word, as in gliner.
-  defp prepare(inputs, kind, types, buckets, max_width) do
+  # of the module documentation. The bucket row is the first padding row, and a full batch
+  # gets one more row for it. Each row has at least one word, as in gliner.
+  defp prepare(inputs, size, kind, types, buckets, max_width) do
     words = Enum.find(buckets, &(&1 >= Nx.to_number(Nx.reduce_max(inputs["text_lengths"])))) + 1
+    extra = size + 1 - Nx.axis_size(inputs["text_lengths"], 0)
 
     inputs =
       Map.new(inputs, fn {name, tensor} ->
         [_batch | axes] = List.duplicate({0, 0, 0}, Nx.rank(tensor))
-        {name, Nx.pad(tensor, 0, [{0, 1, 0} | axes])}
+        {name, Nx.pad(tensor, 0, [{0, max(extra, 0), 0} | axes])}
       end)
 
-    rows = Nx.axis_size(inputs["text_lengths"], 0)
-    last = Nx.tensor([[words]], type: types["text_lengths"])
-    text_lengths = inputs["text_lengths"] |> Nx.put_slice([rows - 1, 0], last) |> Nx.max(1)
+    bucket = Nx.tensor([[words]], type: types["text_lengths"])
+    text_lengths = inputs["text_lengths"] |> Nx.put_slice([size, 0], bucket) |> Nx.max(1)
     words_mask = Nx.select(inputs["words_mask"], inputs["words_mask"], words)
     inputs = %{inputs | "text_lengths" => text_lengths, "words_mask" => words_mask}
     spans(inputs, kind, types, words, max_width)
@@ -301,22 +299,34 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
-  defp candidates(scores, :span, words, labels, threshold) do
-    {_words, width, classes} = Nx.shape(scores)
+  # The scores of the words and the labels of the row. The model gives each row at least one
+  # word.
+  defp row_scores(scores, words, labels) do
+    {_words, width, _labels} = Nx.shape(scores)
+    Nx.slice(scores, [0, 0, 0], [max(words, 1), width, labels])
+  end
 
-    for {score, index} <- scores |> Nx.to_flat_list() |> Enum.with_index(),
+  defp candidates(scores, :span, words, labels, threshold) do
+    {_words, width, _labels} = Nx.shape(scores)
+
+    for {score, index} <-
+          scores |> row_scores(words, labels) |> Nx.to_flat_list() |> Enum.with_index(),
         score > threshold,
-        start = div(index, width * classes),
-        stop = start + rem(div(index, classes), width),
-        label = rem(index, classes),
-        stop < words and label < labels,
-        do: {start, stop, label, score}
+        start = div(index, width * labels),
+        stop = start + rem(div(index, labels), width),
+        stop < words,
+        do: {start, stop, rem(index, labels), score}
   end
 
   defp candidates(scores, :token, words, labels, threshold) do
     scores =
-      for {row, word} <- scores |> Nx.to_list() |> Enum.take(words) |> Enum.with_index(),
-          {[start, stop, inside], label} <- row |> Enum.take(labels) |> Enum.with_index(),
+      for {row, word} <-
+            scores
+            |> Nx.slice([0, 0, 0], [max(words, 1), labels, 3])
+            |> Nx.to_list()
+            |> Enum.take(words)
+            |> Enum.with_index(),
+          {[start, stop, inside], label} <- Enum.with_index(row),
           do: {word, label, start, stop, inside}
 
     inside =

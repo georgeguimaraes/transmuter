@@ -176,6 +176,16 @@ defmodule Transmuter.TextGLiNERModelTest do
 
     for {result, expected} <- Enum.zip(results, expected),
         do: assert_entities(result, expected, 2.0e-3)
+
+    # The two batches above are full, so each runs one more row for the word count of its
+    # bucket. Alone, a text leaves a padding row, which gets that word count.
+    alone =
+      Nx.Serving.run(serving, %{
+        text: "Cristiano Ronaldo plays for Al Nassr.",
+        labels: ["person", "organization"]
+      })
+
+    assert_entities(alone, Enum.at(expected, 2), 2.0e-3)
   end
 
   test "a token model gives the entities of gliner" do
@@ -202,6 +212,8 @@ defmodule Transmuter.TextGLiNERModelTest do
       ],
       1.0e-4
     )
+
+    assert Nx.Serving.run(serving, []) == []
   end
 
   test "a started serving compiles nothing for a new text of the same sequence length and word bucket" do
