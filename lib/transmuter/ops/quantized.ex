@@ -263,8 +263,13 @@ defmodule Transmuter.Ops.Quantized do
     end
   end
 
-  defp f32_host(t),
-    do: t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.as_type(:f32) |> Nx.reshape({})
+  defp f32_host(t) do
+    t
+    |> Transmuter.Ops.known!("a QLinearAdd scale")
+    |> Nx.backend_copy(Nx.BinaryBackend)
+    |> Nx.as_type(:f32)
+    |> Nx.reshape({})
+  end
 
   defp round_even(x) do
     rounded = round(x)

@@ -316,6 +316,10 @@ defmodule Transmuter.Ops do
   def known!(%Nx.Tensor{data: %Nx.Defn.Expr{op: :tensor, args: [value]}}, _description),
     do: value
 
+  # A literal scalar of a traced function is a :constant expression, which holds the number.
+  def known!(t = %Nx.Tensor{data: %Nx.Defn.Expr{op: :constant, args: [number]}}, _description),
+    do: Nx.broadcast(Nx.tensor(number, type: t.type, backend: Nx.BinaryBackend), t.shape)
+
   def known!(
         %Nx.Tensor{data: %Nx.Defn.Expr{op: :metadata, args: [_, %{transmuter_value: value}]}},
         _description
@@ -330,7 +334,7 @@ defmodule Transmuter.Ops do
   @doc """
   Returns whether the host can read a value.
 
-  Concrete values can be read on the host: static ones, literals of a traced function, large values that it folds from static values, and every tensor when the model runs eagerly. Other values inside a traced function are unknown.
+  Concrete values can be read on the host: static ones, literals and constants of a traced function, large values that it folds from static values, and every tensor when the model runs eagerly. Other values inside a traced function are unknown.
   """
   def known?({:empty, _shape}), do: true
   def known?(:none), do: true
@@ -340,7 +344,7 @@ defmodule Transmuter.Ops do
   def known?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :metadata, args: [_, %{transmuter_value: _}]}}),
     do: true
 
-  def known?(%Nx.Tensor{data: %Nx.Defn.Expr{op: op}}), do: op == :tensor
+  def known?(%Nx.Tensor{data: %Nx.Defn.Expr{op: op}}), do: op in [:tensor, :constant]
   def known?(%Nx.Tensor{}), do: true
 
   @doc false

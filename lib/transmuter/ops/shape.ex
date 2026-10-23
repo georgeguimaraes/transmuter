@@ -11,6 +11,7 @@ defmodule Transmuter.Ops.Shape do
       dtype: 1,
       empty?: 1,
       known!: 2,
+      known?: 1,
       normalize_axis: 2,
       on_axis: 3,
       scalar!: 1,
@@ -295,7 +296,15 @@ defmodule Transmuter.Ops.Shape do
        when scatter in ["ScatterElements", "Scatter"] do
     rank = Nx.rank(data)
     axis = normalize_axis(attr(node, "axis", 0), rank)
-    # Static indices make static coordinates, which a reduction can read.
+    # A reduction other than add reads the coordinates on the host, so known indices make
+    # static coordinates.
+    reduction = attr(node, "reduction", "none")
+
+    indices =
+      if reduction not in ["none", "add"] and known?(indices),
+        do: known!(indices, "the scatter indices"),
+        else: indices
+
     iota_opts = if static?(indices), do: [backend: Nx.BinaryBackend], else: []
     indices = wrap_negative(indices, Nx.axis_size(data, axis))
     shape = Nx.shape(indices)
@@ -309,7 +318,7 @@ defmodule Transmuter.Ops.Shape do
       |> Nx.stack(axis: -1)
       |> Nx.reshape({:auto, rank})
 
-    scatter(data, coords, Nx.reshape(updates, {:auto}), attr(node, "reduction", "none"), [])
+    scatter(data, coords, Nx.reshape(updates, {:auto}), reduction, [])
   end
 
   defp op(node = %{op_type: "GatherND"}, [data, indices]) do

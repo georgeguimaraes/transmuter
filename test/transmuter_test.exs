@@ -136,8 +136,15 @@ defmodule TransmuterTest do
       })
     end
 
+    # The total length of GroupQueryAttention is a static scalar. The trace takes it as a
+    # constant, which the host still reads, so the graph has no break.
+    handler = make_ref()
+    :telemetry.attach(handler, [:transmuter, :break, :stop], &__MODULE__.graph_break/4, self())
+
     prefill = Transmuter.compile(model, step_inputs.(prompt, 0, cache), @compiler)
     decode = Transmuter.compile(model, step_inputs.([0], length(prompt), cache), @compiler)
+    :telemetry.detach(handler)
+    refute_received :graph_break
 
     next_cache = fn out ->
       for {"present." <> rest, t} <- out, into: %{}, do: {"past_key_values." <> rest, t}
@@ -155,6 +162,10 @@ defmodule TransmuterTest do
 
     assert Enum.reverse(tokens) == [504, 6376, 4541, 4461, 975, 260, 2591, 506]
   end
+
+  # Other tests run at the same time, so the handler forwards only the breaks of the test.
+  def graph_break(_event, _measurements, _metadata, pid),
+    do: if(self() == pid, do: send(pid, :graph_break))
 
   # The BERT pooler gathers the first token on axis 1, a path whose gradient EMLX 0.5
   # scatters to the wrong place. Autodiff must match central finite differences.
@@ -396,6 +407,8 @@ defmodule TransmuterTest do
     end
   end
 
+  alias Nx.Defn.{Expr, Tree}
+
   alias Transmuter.Onnx.{
     AttributeProto,
     GraphProto,
@@ -576,6 +589,94 @@ defmodule TransmuterTest do
       )
     end
   end
+
+  # Where broadcasts its inputs. In a traced function, the static scalar is a literal, so
+  # the trace broadcasts it, and the program holds no literal of the 8192 elements of x.
+  test "a traced node expands its static inputs in the trace" do
+    scalar = &%TensorProto{name: "", dims: [], data_type: 1, float_data: [&1]}
+
+    constant =
+      &node("Constant", [], [&1],
+        attribute: [%AttributeProto{name: "value", type: :TENSOR, t: scalar.(&2)}]
+      )
+
+    graph = %GraphProto{
+      input: [value("x", [8, 32, 32])],
+      output: [value("y")],
+      node: [
+        constant.("zero", 0.0),
+        constant.("low", -100.0),
+        node("Greater", ["x", "zero"], ["positive"]),
+        node("Where", ["positive", "low", "x"], ["y"])
+      ]
+    }
+
+    model = graph |> write_model() |> Transmuter.load!(backend: @backend)
+    x = Nx.subtract(pattern({8, 32, 32}), 0.25)
+    expr = Nx.Defn.debug_expr(&Transmuter.run(model, &1, &2)).(model.params, %{"x" => x})
+    {_expr, {sizes, _seen}} = literal_sizes(expr["y"], {[], MapSet.new()})
+    assert Enum.max(sizes, fn -> 0 end) <= 1
+
+    assert_all_close(
+      run(model, %{"x" => x})["y"],
+      Nx.select(Nx.greater(x, 0), -100.0, x)
+    )
+  end
+
+  # Grounding DINO masks with a static -inf in Where. A scalar literal of one element
+  # compiles on EMLX, where a :constant of an infinity does not. The axis of CumSum is a
+  # static scalar that the host reads, so the graph has no break.
+  test "a traced node takes a static infinity and reads a static scalar on the host" do
+    float = &%TensorProto{name: "", dims: [], data_type: 1, float_data: [&1]}
+    int = &%TensorProto{name: "", dims: [], data_type: 7, int64_data: [&1]}
+
+    constant =
+      &node("Constant", [], [&1],
+        attribute: [%AttributeProto{name: "value", type: :TENSOR, t: &2}]
+      )
+
+    graph = %GraphProto{
+      input: [value("x", [8, 32, 32])],
+      output: [value("masked"), value("sum")],
+      node: [
+        constant.("zero", float.(0.0)),
+        constant.("low", %{float.(0.0) | float_data: [], raw_data: <<0, 0, 0x80, 0xFF>>}),
+        constant.("axis", int.(2)),
+        node("Greater", ["x", "zero"], ["positive"]),
+        node("Where", ["positive", "low", "x"], ["masked"]),
+        node("CumSum", ["x", "axis"], ["sum"])
+      ]
+    }
+
+    model = graph |> write_model() |> Transmuter.load!(backend: @backend)
+    x = Nx.subtract(pattern({8, 32, 32}), 0.25)
+    handler = make_ref()
+    :telemetry.attach(handler, [:transmuter, :break, :stop], &__MODULE__.graph_break/4, self())
+    outputs = run(model, %{"x" => x})
+    :telemetry.detach(handler)
+    refute_received :graph_break
+
+    masked = Nx.backend_copy(outputs["masked"], Nx.BinaryBackend)
+    expected = Nx.select(Nx.greater(x, 0), Nx.Constants.neg_infinity(:f32), x)
+
+    assert Nx.to_number(Nx.all(Nx.equal(masked, Nx.backend_copy(expected, Nx.BinaryBackend)))) ==
+             1
+
+    assert_all_close(outputs["sum"], Nx.cumulative_sum(x, axis: 2))
+  end
+
+  defp literal_sizes(t = %Nx.Tensor{data: %Expr{id: id, op: op}}, {sizes, seen}) do
+    if MapSet.member?(seen, id) do
+      {t, {sizes, seen}}
+    else
+      sizes = if op == :tensor, do: [Nx.size(t) | sizes], else: sizes
+      acc = {sizes, MapSet.put(seen, id)}
+      {_args, acc} = Tree.apply_args(t, :all, acc, &literal_sizes/2)
+      {t, acc}
+    end
+  end
+
+  defp literal_sizes(t, acc), do: {t, acc}
 
   # Each Add reads its input twice, so the expression of x16 is a graph with 16 levels and
   # 2^16 paths. An error that kept it would copy all paths when it leaves the process.

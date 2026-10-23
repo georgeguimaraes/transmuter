@@ -599,11 +599,31 @@ defmodule Transmuter do
   # Operators build constants, such as the positions of a causal mask, on the default
   # backend. A traced function makes them part of the graph. An eager run makes them on the
   # backend of the model, as its other values, and not on Nx.BinaryBackend in Elixir.
+  #
+  # In a traced function, the static inputs of the node are literals of the trace. So an
+  # operator that expands a static input, such as the Nx.broadcast of a scalar in Where,
+  # builds the large value on the device, and the program holds only the small literal.
+  # EXLA writes each literal into the program as text: the 36 window masks of Swin2SR
+  # (63x64x64 at 72x56 pixels) took 11.5 s of the 14 s compile on the EXLA CPU.
   defp apply_on_backend(node, inputs, ctx) do
     if Compiler.current(),
-      do: Ops.apply(node, inputs, ctx.opset),
+      do: Ops.apply(node, Enum.map(inputs, &literal/1), ctx.opset),
       else: Nx.with_default_backend(ctx.backend, fn -> Ops.apply(node, inputs, ctx.opset) end)
   end
+
+  # Nx makes a scalar literal a :constant with the number, which is an atom for an infinity
+  # or NaN, and EMLX cannot compile such a constant. So a scalar is a literal of one
+  # element, reshaped in the trace. Its metadata keeps the host value for Ops.known!/2.
+  defp literal(value = %Nx.Tensor{data: %Nx.BinaryBackend{}, shape: {}}) do
+    value
+    |> Nx.reshape({1})
+    |> Expr.tensor()
+    |> Nx.reshape({})
+    |> Expr.metadata(%{transmuter_value: value})
+  end
+
+  defp literal(value = %Nx.Tensor{data: %Nx.BinaryBackend{}}), do: Expr.tensor(value)
+  defp literal(value), do: value
 
   defp input!(_env, "", _node), do: nil
 
