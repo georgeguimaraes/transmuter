@@ -982,13 +982,20 @@ defmodule Transmuter do
       else: Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, backend)} end)
   end
 
-  # The type and the dimensions of a tensor input. A symbolic dimension is nil.
+  @doc false
+  # The size of a dimension of model.input_types, or default for a symbolic dimension.
+  def dim_size(size, _default) when is_integer(size), do: size
+  def dim_size(_symbolic, default), do: default
+
+  # The type and the dimensions of a tensor input. A symbolic dimension is its name, and a
+  # dimension with neither a size nor a name is nil.
   defp value_type(%{type: %{value: {:tensor_type, %{elem_type: elem_type, shape: shape}}}}) do
     dims =
       for d <- (shape && shape.dim) || [] do
         case d.value do
           {:dim_value, size} -> size
-          _symbolic -> nil
+          {:dim_param, name} -> name
+          nil -> nil
         end
       end
 

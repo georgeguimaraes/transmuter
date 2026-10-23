@@ -171,7 +171,8 @@ defmodule Transmuter.Audio.TextToSpeech do
       inputs =
         Map.new(decoder.inputs -- ["use_cache_branch"], fn name ->
           {_type, dims} = decoder.input_types[name]
-          {name, template(decoder, name, List.to_tuple(Enum.map(dims, &(&1 || 1))))}
+          shape = List.to_tuple(Enum.map(dims, &Transmuter.dim_size(&1, 1)))
+          {name, template(decoder, name, shape)}
         end)
 
       branches =

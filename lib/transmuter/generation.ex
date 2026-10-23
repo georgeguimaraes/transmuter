@@ -456,7 +456,12 @@ defmodule Transmuter.Generation do
     Map.new(names, fn name ->
       {type, [batch | dims]} = model.input_types[name]
       zero = Nx.tensor(0, type: type, backend: Nx.BinaryBackend)
-      shape = List.to_tuple([batch || batch_size | Enum.map(dims, &(&1 || 1))])
+
+      shape =
+        List.to_tuple([
+          Transmuter.dim_size(batch, batch_size) | Enum.map(dims, &Transmuter.dim_size(&1, 1))
+        ])
+
       {name, Nx.broadcast(zero, shape)}
     end)
   end

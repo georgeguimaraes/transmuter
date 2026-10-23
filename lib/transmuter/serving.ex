@@ -206,7 +206,11 @@ defmodule Transmuter.Serving do
       {type, [_batch, mask_height, mask_width]} = model.input_types["pixel_mask"]
       {batch, _channels, height, width} = Nx.shape(pixels)
       one = Nx.tensor(1, type: type, backend: Nx.BinaryBackend)
-      mask = Nx.broadcast(one, {batch, mask_height || height, mask_width || width})
+
+      shape =
+        {batch, Transmuter.dim_size(mask_height, height), Transmuter.dim_size(mask_width, width)}
+
+      mask = Nx.broadcast(one, shape)
       %{"pixel_values" => pixels, "pixel_mask" => mask}
     else
       %{"pixel_values" => pixels}
