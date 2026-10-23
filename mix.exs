@@ -52,6 +52,7 @@ defmodule Transmuter.MixProject do
   defp docs do
     [
       main: "Transmuter",
+      assets: %{"guides/assets" => "guides/assets"},
       extras: [
         "README.md": [title: "Overview"],
         "guides/getting_started.md": [title: "Getting started"],

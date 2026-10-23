@@ -106,6 +106,20 @@ Some graphs use a tensor value to set a shape or to select a branch. `Transmuter
 
 See the [Compiling and Graph Breaks guide](guides/graph_breaks.md) for a full explanation of graph breaks, static inputs, the `:cache_size` option, and how to read error messages. The [Backends and Performance guide](guides/backends_and_performance.md) explains EMLX memory management.
 
+## See the graph
+
+`Transmuter.Graph` shows the graph of a model with what Transmuter does to it. The fill of a node gives its segment, and a red node is a graph break with its reason. A node with static outputs has a dashed border, and a node that replaces fused nodes has a thick border. Click a node to see its details, such as the shapes of its outputs.
+
+![The graph of Kokoro with the encoder open. The red Range node breaks the graph between segment 0 (blue) and segment 1 (green).](guides/assets/graph_view.png)
+
+There are three ways to get the view:
+
+- In Livebook, call `Transmuter.Graph.as_graph(model, inputs: inputs)`. It needs the optional `kino` dependency.
+- Outside Livebook, call `Transmuter.Graph.to_html(model, "graph.html", inputs: inputs)` and open the file in a browser.
+- From the command line, run `mix transmuter.graph onnx-community/Kokoro-82M-v1.0-ONNX --run --open`. It calls the model once with inputs of ones.
+
+The view loads no file from the network. For the plain ONNX graph, use Netron: `uvx netron model.onnx`.
+
 ## Non-tensor values and random operators
 
 Nx tensors hold only numbers. Transmuter keeps string tensors, sequences, and empty optionals as Elixir terms. Give string and sequence inputs as `:static_inputs`. A compiled function returns only tensors. To read string or sequence outputs, call `Transmuter.run/4` without compilation. Random operators draw from `Nx.Random`, and each call of a compiled model draws new values. `ImageDecoder` needs the optional `stb_image` dependency.
