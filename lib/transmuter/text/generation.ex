@@ -46,6 +46,8 @@ defmodule Transmuter.Text.Generation do
     load_opts = [outputs: &Generation.outputs/1] ++ opts
     components = ["model", "decoder_model_merged"]
     {repo, model, tokenizer} = Serving.load!(source, load_opts, :q4, components)
+    # The text generation pipeline of Python transformers decodes with this value.
+    tokenizer = Tokenizer.configure(tokenizer, clean_up_tokenization_spaces: true)
 
     ctx = Generation.context(repo, model, opts)
     bos = ctx.bos

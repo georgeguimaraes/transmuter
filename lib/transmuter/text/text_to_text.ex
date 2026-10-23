@@ -53,7 +53,14 @@ defmodule Transmuter.Text.TextToText do
       )
 
     lengths = List.wrap(compile[:sequence_length])
-    tokenizer = Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), length: lengths)
+    # The text2text-generation pipeline of Python transformers decodes with
+    # clean_up_tokenization_spaces=False.
+    tokenizer =
+      Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo),
+        length: lengths,
+        clean_up_tokenization_spaces: false
+      )
+
     {tokenizer, opts} = languages(repo, tokenizer, opts)
 
     given = ~w(encoder_hidden_states encoder_attention_mask)
