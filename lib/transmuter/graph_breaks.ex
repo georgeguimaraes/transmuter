@@ -89,6 +89,7 @@ defmodule Transmuter.GraphBreaks do
       defined: defined(model),
       producers: producers(model),
       constant: constant(model),
+      shaped: shaped(model),
       static_inputs: MapSet.new(Map.keys(static_inputs)),
       key: make_ref(),
       opts: opts,
@@ -510,11 +511,11 @@ defmodule Transmuter.GraphBreaks do
       Map.has_key?(memo, name) ->
         {memo[name], memo}
 
-      Map.has_key?(context.static, name) and not MapSet.member?(plan.static_inputs, name) ->
-        {MapSet.new([name]), memo}
-
-      Map.has_key?(context.static, name) or Map.has_key?(plan.constant, name) ->
+      Map.has_key?(plan.shaped, name) or MapSet.member?(plan.static_inputs, name) ->
         {MapSet.new(), memo}
+
+      Map.has_key?(context.static, name) ->
+        {MapSet.new([name]), memo}
 
       true ->
         index = Map.get(plan.producers, name)
@@ -667,11 +668,12 @@ defmodule Transmuter.GraphBreaks do
   end
 
   # A value that the plan made static, such as a value that a break node read, goes into a
-  # segment as an argument, so that its digest is not in the key. A static input and a
-  # value whose host value a node needs stay static.
+  # segment as an argument, so that its digest is not in the key. A static input, a value
+  # that follows only from shapes and a value whose host value a node needs stay static.
   defp argument?(plan, state, host, name, value) do
     Map.has_key?(state.static, name) and device_value?(value) and
-      not MapSet.member?(host, name) and not MapSet.member?(plan.static_inputs, name)
+      not MapSet.member?(host, name) and not MapSet.member?(plan.static_inputs, name) and
+      not Map.has_key?(plan.shaped, name)
   end
 
   # The names of the values that a call has before pos and that nodes at pos or later read,
@@ -728,6 +730,18 @@ defmodule Transmuter.GraphBreaks do
            Enum.all?(Transmuter.dependencies(node), &(&1 == "" or Map.has_key?(constant, &1))),
          do: Enum.reduce(node.output, constant, &Map.put(&2, &1, true)),
          else: constant
+    end)
+  end
+
+  # The names whose values follow only from the static values of the model and from the
+  # shapes of other values, such as the targets of Reshape nodes. They change only with
+  # shapes, so a call keeps them static.
+  defp shaped(model) do
+    Enum.reduce(model.nodes, constant(model), fn node, shaped ->
+      if not Transmuter.random?([node]) and
+           Enum.all?(Transmuter.value_dependencies(node), &(&1 == "" or Map.has_key?(shaped, &1))),
+         do: Enum.reduce(node.output, shaped, &Map.put(&2, &1, true)),
+         else: shaped
     end)
   end
 
