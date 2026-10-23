@@ -59,7 +59,7 @@ The tasks:
   - [`image_embedding`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_embedding/2): CLIP, SigLIP and SigLIP2
   - [`zero_shot_image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_image_classification/3): CLIP, SigLIP and SigLIP2
   - [`image_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_text/2): ViT-GPT2, TrOCR and Florence-2
-  - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM, Qwen2-VL and Qwen3-VL
+  - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM, Qwen2-VL, Qwen3-VL and Ministral 3
   - [`object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#object_detection/2): DETR, YOLOS, RT-DETR and RF-DETR
   - [`zero_shot_object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_object_detection/3): OWL-ViT, OWLv2 and Grounding DINO
   - [`depth_estimation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#depth_estimation/2): Depth Anything
@@ -183,7 +183,7 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 | Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
-| Models that Bumblebee pull requests add: GLiNER, Nomic BERT, ColBERT, MPNet, Jina BERT v2, Swin, M2M100, NLLB, Llama 3.2, Phi-3.5, SmolLM3, Qwen3-VL, Gemma 4 and Ministral 3 | 18 of 21 files match. The Phi-3.5 q4f16 file is within noise. The Gemma 4 decoder differs, see below. The Ministral 3 vision encoder times out at its 1540x1540 input |
+| Models that Bumblebee pull requests add: GLiNER, Nomic BERT, ColBERT, MPNet, Jina BERT v2, Swin, M2M100, NLLB, Llama 3.2, Phi-3.5, SmolLM3, Qwen3-VL, Gemma 4 and Ministral 3 | 19 of 21 files match. The Phi-3.5 q4f16 file is within noise. The Gemma 4 decoder differs, see below |
 | Small language models: Granite 4.0-H (hybrid with Mamba-2 layers), LFM2-8B-A1B (mixture of experts), Gemma 3, Phi-4-mini, Qwen3, DeepSeek-R1-Distill, Falcon3, TinyLlama, MobileLLM-R1 and Baguettotron | 11 of 11 q4 files match |
 | SigLIP and SigLIP2: the full model, the vision model and the text model | 6 of 6 match |
 | One graph for each operator variant | 255 of 255 match |
@@ -214,6 +214,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | [EmbeddingGemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) | `text_embedding` within 9.3e-7 of ONNX Runtime for 9 and 543 tokens. The export attends to all tokens, but the model has a sliding window of 512 tokens. So a text of more than 512 tokens differs from sentence-transformers (cosine 0.983 at 543 tokens), and a short text differs by up to 5.6e-4 |
 | [Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct) | With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes. The fp32 vision encoder is within 2e-5. With the fp32 vision encoder, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a chat without images |
 | [Qwen3-VL 2B](https://huggingface.co/onnx-community/Qwen3-VL-2B-Instruct-ONNX) | The processor gives the patches of `Qwen2VLImageProcessorFast` within 1e-4 on 6 values and on the mean absolute value. Two of the values change with the weights of Pillow. It also gives the prompt and the 3-D positions of transformers. With the fp32 vision encoder and the q4 embeddings, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image, a chat with both images and a chat without images. The export has no deepstack features, so the text can differ from the PyTorch model |
+| [Ministral 3 3B](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-ONNX) | The processor gives the pixel values and the prompt of `PixtralImageProcessorFast` and `PixtralProcessor` for 3 image sizes. With the q4 files, `image_text_to_text` gives the greedy text of ONNX Runtime for a chat with an image and a text chat. The q4 vision encoder at 1540x1540 (12100 patches) is within 3.9e-5 of ONNX Runtime. Its coverage case takes 27 s on the GPU, with the load and the compilation |
 | [InsightFace buffalo_l](https://huggingface.co/WePrompt/buffalo_l) | SCRFD detection within 2.7e-5, and ArcFace embeddings with a cosine similarity of 1.0 to ONNX Runtime |
 | [RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR v4) | The same text for three lines of rendered text, after detection, cropping and recognition |
 | [Real-ESRGAN x4](https://huggingface.co/imgdesignart/realesrgan-x4-onnx) | The upscaled image within 1.3e-5 |
@@ -290,7 +291,7 @@ With the correct constants, the export gives the text of PyTorch for all 6 tasks
 | MaskRCNN-12 (ONNX Model Zoo) | image-segmentation | 44.4M | MaskRCNN-12 | matches |
 | [Xenova/tiny-random-Florence2ForConditionalGeneration](https://huggingface.co/Xenova/tiny-random-Florence2ForConditionalGeneration) | image-text-to-text | 5.16M | decoder_model, decoder_model_merged, decoder_with_past_model, embed_tokens, encoder_model, vision_encoder | matches |
 | [Xenova/tiny-random-LlavaForConditionalGeneration](https://huggingface.co/Xenova/tiny-random-LlavaForConditionalGeneration) | image-text-to-text | 9.44M | decoder_model, decoder_model_merged, decoder_with_past_model, embed_tokens, vision_encoder | matches |
-| [mistralai/Ministral-3-3B-Instruct-2512-ONNX](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-ONNX) | image-text-to-text | 4.29B | decoder_model_merged_q4, embed_tokens_q4, vision_encoder_q4 | decoder_model_merged_q4, embed_tokens_q4 match; vision_encoder_q4 times out |
+| [mistralai/Ministral-3-3B-Instruct-2512-ONNX](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-ONNX) | image-text-to-text | 4.29B | decoder_model_merged_q4, embed_tokens_q4, vision_encoder_q4 | matches |
 | [onnx-community/Qwen3-VL-2B-Instruct-ONNX](https://huggingface.co/onnx-community/Qwen3-VL-2B-Instruct-ONNX) | image-text-to-text | 2.37B | decoder_model_merged_q4, embed_tokens_q4, vision_encoder | matches |
 | [onnx-community/gemma-4-E2B-it-ONNX](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX) | image-text-to-text | 5.64B | audio_encoder_q4, decoder_model_merged_q4, embed_tokens_q4, vision_encoder | audio_encoder_q4, embed_tokens_q4, vision_encoder match; decoder_model_merged_q4 differ, see below |
 | [Xenova/swin2SR-classical-sr-x2-64](https://huggingface.co/Xenova/swin2SR-classical-sr-x2-64) | image-to-image | 12.1M | model | matches |
