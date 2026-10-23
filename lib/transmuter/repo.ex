@@ -12,7 +12,9 @@ defmodule Transmuter.Repo do
     4. fp32, then the other variants in the order of `@variants`
   """
 
-  alias Transmuter.Hub
+  alias Transmuter.{Hub, HubError}
+
+  require Logger
 
   defstruct [
     :source,
@@ -106,6 +108,39 @@ defmodule Transmuter.Repo do
       %{"content" => content} when is_binary(content) -> content
       content when is_binary(content) -> content
       _none -> nil
+    end
+  end
+
+  @doc """
+  Returns the first result of `read` that is not `nil`, on the source of `repo` and then on the base model in its model card. `read` takes a source and reads the sentence-transformers files of that source, such as `modules.json`. ONNX exports often leave these files out, and their base model has them.
+
+  When the Hub denies the base model, such as a gated model without a token or a model that does not exist, this function logs a warning and does not read it.
+  """
+  def sentence_transformers(repo, read) do
+    Enum.find_value([repo.source | base_models(repo)], fn source ->
+      try do
+        read.(source)
+      rescue
+        error in HubError ->
+          if error.status in [401, 403, 404] do
+            Logger.warning(
+              "#{Exception.message(error)}. Transmuter cannot read the sentence-transformers " <>
+                "files of #{inspect(source)}, such as its modules, so the result can differ from that model"
+            )
+
+            nil
+          else
+            reraise error, __STACKTRACE__
+          end
+      end
+    end)
+  end
+
+  defp base_models(repo) do
+    case get_in(Hub.info(repo.source, repo.opts) || %{}, ["cardData", "base_model"]) do
+      [name | _] -> [{:hf, name}]
+      name when is_binary(name) -> [{:hf, name}]
+      nil -> []
     end
   end
 

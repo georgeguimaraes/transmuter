@@ -3,9 +3,7 @@ defmodule Transmuter.Text.TextEmbedding do
   The text embedding task. See `Transmuter.Text.text_embedding/2`.
   """
 
-  alias Transmuter.{Hub, HubError, Serving}
-
-  require Logger
+  alias Transmuter.{Hub, Repo, Serving}
 
   @pools %{
     "pooling_mode_cls_token" => :cls_token_pooling,
@@ -57,45 +55,14 @@ defmodule Transmuter.Text.TextEmbedding do
   @modules ~w(Transformer Pooling Normalize)
 
   # The pooling, the normalization and the longest input of a sentence-transformers model,
-  # from its 1_Pooling/config.json, modules.json and sentence_bert_config.json, else from
-  # those of the base model in its card. ONNX exports often leave these files out. Without
+  # from its 1_Pooling/config.json, modules.json and sentence_bert_config.json. Without
   # them, the embedding is the mean of the token embeddings.
   defp sentence_transformers(repo, opts) do
     if Keyword.has_key?(opts, :output_pool) and Keyword.has_key?(opts, :embedding_processor),
       do: [],
       else:
-        Enum.find_value(
-          [repo.source | base_models(repo)],
-          [output_pool: :mean_pooling],
-          &sentence_transformers_config(&1, repo.opts)
-        )
-  end
-
-  # The Hub denies a gated base model without a token, and a base model that does not
-  # exist. Then the serving uses the configuration that it has.
-  defp sentence_transformers_config(source, opts) do
-    config(source, opts)
-  rescue
-    error in HubError ->
-      if error.status in [401, 403, 404] do
-        Logger.warning(
-          "#{Exception.message(error)}. The text embedding cannot read the " <>
-            "sentence-transformers modules of #{inspect(source)}, so its pooling, " <>
-            "normalization and other modules, such as Dense layers, can differ from that model"
-        )
-
-        nil
-      else
-        reraise error, __STACKTRACE__
-      end
-  end
-
-  defp base_models(repo) do
-    case get_in(Hub.info(repo.source, repo.opts) || %{}, ["cardData", "base_model"]) do
-      [name | _] -> [{:hf, name}]
-      name when is_binary(name) -> [{:hf, name}]
-      nil -> []
-    end
+        Repo.sentence_transformers(repo, &config(&1, repo.opts)) ||
+          [output_pool: :mean_pooling]
   end
 
   defp config(source, opts) do
