@@ -178,24 +178,34 @@ defmodule Transmuter.TelemetryTest do
            ] = calls(compiled, model, [[1, 0, 1, 0, 1, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
   end
 
-  # A short segment reads the first position on the host and runs eagerly. The compiled
-  # segment after the next break reads the positions on the device, so they stay its
-  # arguments.
+  # A short segment reads the first position on the host and runs eagerly. It gets the
+  # positions after a NonZero, or the first position from a compiled segment after a Range.
+  # The compiled segments read the positions on the device, so they stay their arguments.
+  # New positions with the same first position add no break and compile nothing.
   test "a segment that runs eagerly does not make the values of other segments static" do
-    model = load_fixture("Break_NonZero_eager_read")
-    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+    for name <- ["Break_NonZero_eager_read", "Break_NonZero_eager_cross"] do
+      model = load_fixture(name)
+      compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+      calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
 
-    assert [%{breaks: ["NonZero", "Range"], host_values: []}, %{compiled: 0}] =
-             calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [1, 0, 1, 0, 1, 0, 0, 0]])
+      assert [
+               %{compiled: 0, breaks: ["NonZero", "Range"]},
+               %{compiled: 0, breaks: ["NonZero", "Range"]}
+             ] = calls(compiled, model, [[1, 0, 1, 0, 1, 0, 0, 0], [1, 0, 0, 1, 1, 0, 0, 0]]),
+             name
+    end
   end
 
-  # A Slice reads a value that comes from the positions through a random node, or that the
-  # segment before the Range expands to 6000 values, more than the host takes. Both break
-  # as before, and the segment of the positions does not compile for new positions.
+  # A Slice reads a value that comes from the positions through a random node, or from a
+  # value of 6000 elements, more than the host takes, in a later segment or in the same
+  # segment. In the same segment, a trace with static positions still breaks, so the break
+  # is real. All break as before, and the segment of the positions does not compile for
+  # new positions.
   test "a break on a random or large value keeps the positions as arguments" do
     for {name, breaks} <- [
           {"Break_NonZero_random_read", ["NonZero", "Slice"]},
-          {"Break_NonZero_large_read", ["NonZero", "Range", "Slice"]}
+          {"Break_NonZero_large_read", ["NonZero", "Range", "Slice"]},
+          {"Break_NonZero_large_local", ["NonZero", "Slice"]}
         ] do
       model = load_fixture(name)
       compiled = Transmuter.compile(model, positions(model, [1, 0, 1, 1, 0, 0, 0, 0]), @compiler)

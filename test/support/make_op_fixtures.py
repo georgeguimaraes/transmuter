@@ -932,6 +932,15 @@ case("Break_NonZero_eager_read",
      {"x": x_positions, "data": data, "w": r.standard_normal(8).astype(np.float32), "n": np.array(5, np.int64)},
      {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
      outputs=["w_tail", "y"])
+# The compiled segment of the positions computes the first position, and a short segment
+# after the Range reads it as a Slice start and runs eagerly.
+case("Break_NonZero_eager_cross",
+     positions + gathered + after_chain +
+     [node("ReduceMin", ["idx"], ["first"], keepdims=1), node("Range", ["zero", "count", "one"], ["r"]),
+      node("Cast", ["r"], ["rf"], to=TensorProto.FLOAT), node("Slice", ["rf", "first", "end", "axis0"], ["tail"])],
+     {"x": x_positions, "data": data, "n": np.array(5, np.int64)},
+     {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
+     outputs=[g, "tail"])
 # The start of a Slice comes from the positions through a random node that adds zero. The
 # random value is not static, so the Slice breaks, and the positions stay arguments.
 case("Break_NonZero_random_read",
@@ -958,6 +967,18 @@ case("Break_NonZero_large_read",
      {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64),
       "axis1": np.array([1], np.int64), "wide": np.array([1, 2000], np.int64)},
      outputs=[g, "y"])
+
+# The segment of the positions expands them to 6000 values, more than the host takes, and a
+# Slice in the same segment reads their largest value. With static positions the large value
+# is still on the device, so the Slice breaks, as before, and the positions stay arguments.
+case("Break_NonZero_large_local",
+     positions + gathered +
+     [node("Unsqueeze", ["idx", "axis1"], ["idx_col"]), node("Expand", ["idx_col", "wide"], ["large"]),
+      node("ReduceMax", ["large"], ["last"], keepdims=0), node("Unsqueeze", ["last", "axis0"], ["last_1"]),
+      node("Slice", [g, "last_1", "end", "axis0"], ["y"])],
+     {"x": x_positions, "data": data},
+     {**positions_init, "end": np.array([8], np.int64), "axis1": np.array([1], np.int64),
+      "wide": np.array([1, 2000], np.int64)})
 
 # ---------- long recurrences and loops ----------
 
