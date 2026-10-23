@@ -83,19 +83,19 @@ defmodule Transmuter.Text do
 
   The input is `%{query: query, documents: documents}` or a list of them. Each document is one row of `:batch_size`. The result is `%{results: [%{index: index, score: score}]}`, from the highest score. `index` is the position of the document in `documents`.
 
-  The serving reads the sentence-transformers files of the model: `config_sentence_transformers.json`, `modules.json`, the configuration of each module and `chat_template.jinja`. When the repository does not have a `config_sentence_transformers.json` with the model type `CrossEncoder`, these files come from the `base_model` in its model card, as in `text_embedding/2`.
+  The serving reads the sentence-transformers files of the model: `config_sentence_transformers.json`, `modules.json`, `sentence_bert_config.json`, the configuration of each module and `chat_template.jinja`. When the repository does not have a `config_sentence_transformers.json` with the model type `CrossEncoder`, these files come from the `base_model` in its model card, as in `text_embedding/2`. The text and the score follow these files:
 
-    * A sequence classification model, such as `Xenova/ms-marco-MiniLM-L-6-v2`, scores the pair of the query and the document. The model must have one label.
+    * The text. A model takes the query and the document as a pair of texts, and the prompt goes before the query. A model takes them as chat messages when `modality_config` in `sentence_bert_config.json` has `"message"`, or, for a model without these files, when the repository has a chat template. The messages have the roles `"query"` and `"document"`, after the prompt as a `"system"` message, and the chat template adds the special tokens. The serving raises when the template does not put the query and the document in the text. When truncation cuts a text, the end of the template replaces its last tokens.
 
-    * A causal language model with a `LogitScore` module, such as `onnx-community/Qwen3-Reranker-0.6B-ONNX`, scores a text from its chat template. The query and the document are messages with the roles `"query"` and `"document"`, after the prompt as a `"system"` message. The score is the logit of the true token minus the logit of the false token, at the last token of the text. When truncation cuts a text, the end of the template replaces its last tokens. A causal language model without these files scores the tokens `"yes"` and `"no"` with the chat template of the repository. The serving raises when the template does not put the query and the document in the text.
+    * The score. A sequence classification model, such as `Xenova/ms-marco-MiniLM-L-6-v2`, gives the logit of its one label. A causal language model with a `LogitScore` module, such as `onnx-community/Qwen3-Reranker-0.6B-ONNX`, gives the logit of the true token minus the logit of the false token, at the last token of the text. A causal language model without these files scores the tokens `"yes"` and `"no"` with the chat template of the repository.
 
-  The model gives the logits of all positions, because the ONNX exports have no input to keep only the last position. For Qwen3-Reranker, a row of 512 tokens has 512 × 151,669 logits of type f32, which is 311 MB. Keep `:batch_size` and `:sequence_length` small for these models.
+  The model gives the logits of all positions, because the ONNX exports have no input to keep only the last position. For Qwen3-Reranker, a row of 512 tokens has 512 × 151,669 logits of type f32, which is 311 MB. Keep `:batch_size` and `:sequence_length` small for these models. The default sequence lengths truncate a text at 512 tokens. sentence-transformers truncates Qwen3-Reranker only at 40,960 tokens, so a longer text gets a different score.
 
   ## Options
 
     * `:prompt` - the instruction before the query. The default is the prompt of `default_prompt_name` in `config_sentence_transformers.json`, else no prompt. A sequence classification model gets it at the start of the query, and a causal language model as the system message.
 
-    * `:scores_function` - `:sigmoid` or `:none` for the logits. The default is `activation_fn` in `config_sentence_transformers.json`, else `sbert_ce_default_activation_function` in `config.json`, else `:sigmoid`.
+    * `:scores_function` - `:sigmoid` or `:none` for the logits. The default is `activation_fn` in `config_sentence_transformers.json`, else `sentence_transformers.activation_fn` or `sbert_ce_default_activation_function` in `config.json`, else `:sigmoid`.
 
     * `:top_k` - the number of results, or `nil` (the default) for all.
 

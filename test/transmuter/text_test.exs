@@ -93,10 +93,11 @@ defmodule Transmuter.TextTest do
   # The token ids of the preprocessing of sentence-transformers, see
   # test/support/ranking_references.py. The text has the instruction of the default prompt.
   # Truncation at 128 tokens cuts the long document, and the end of the chat template
-  # replaces the last tokens.
+  # replaces the last tokens. The tokenizer pads to 128 tokens, and the end of the template
+  # does not depend on it. A length that leaves no tokens for the text raises.
   test "text ranking gives the text of a reranker as sentence-transformers" do
     repo = Transmuter.Repo.load!({:hf, "onnx-community/Qwen3-Reranker-0.6B-ONNX"})
-    tokenizer = Tokenizer.load!(repo)
+    tokenizer = Tokenizer.load!(repo, length: 128)
     ranking = TextRanking.ranking(repo, tokenizer, [])
 
     # The system message, the instruction, the query and "<Document>:".
@@ -113,20 +114,65 @@ defmodule Transmuter.TextTest do
     sentence = [279, 3974, 13_876, 38_835, 34_208, 916, 279, 15_678, 5562]
     long = String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
 
-    for {document, length, document_ids} <- [
-          {"Berlin is the capital of Germany.", nil, [19_846, 374, 279, 6722, 315, 9856, 13]},
-          {long, 128, Enum.take(Enum.concat(List.duplicate(sentence, 6)), 50)}
+    for {document, length, expected} <- [
+          {"Berlin is the capital of Germany.", nil,
+           prefix ++ [19_846, 374, 279, 6722, 315, 9856, 13] ++ suffix},
+          {long, 128, prefix ++ Enum.take(Enum.concat(List.duplicate(sentence, 6)), 50) ++ suffix}
         ] do
       text = ranking.sequence.("How many people live in Berlin?", document)
       tokenizer = Tokenizer.configure(tokenizer, length: length)
       {%{"input_ids" => ids}, _} = Tokenizer.encode(tokenizer, [text], ranking.encode_options)
-      assert Nx.to_flat_list(ids) == prefix ++ document_ids ++ suffix
+      assert Nx.to_flat_list(ids) == expected
+    end
+
+    assert_raise ArgumentError, ~r/the suffix of 9 tokens leaves no tokens/, fn ->
+      Tokenizer.encode(
+        Tokenizer.configure(tokenizer, length: 9),
+        ["text"],
+        ranking.encode_options
+      )
     end
   end
 
   test "text ranking raises when the chat template cannot carry a query and a document" do
     assert_raise ArgumentError, ~r/cannot carry a query and a document/, fn ->
       Transmuter.Text.text_ranking({:hf, "onnx-community/Qwen3-0.6B-ONNX"}, @opts)
+    end
+  end
+
+  # A model without sentence-transformers files takes the pair as chat messages when it has a
+  # chat template, as sentence-transformers infers the "message" modality. An empty prompt is
+  # no prompt, and a template without the roles raises.
+  @tag :tmp_dir
+  test "text ranking gives the pair to the chat template of a classifier", %{tmp_dir: dir} do
+    for file <- ~w(config.json tokenizer.json tokenizer_config.json) do
+      {:hf, "Xenova/ms-marco-MiniLM-L-6-v2"}
+      |> Transmuter.Hub.fetch!(file)
+      |> File.cp!(Path.join(dir, file))
+    end
+
+    ranking = fn template, opts ->
+      File.write!(Path.join(dir, "chat_template.jinja"), template)
+      repo = Transmuter.Repo.load!(dir)
+      TextRanking.ranking(repo, Tokenizer.load!(repo), opts)
+    end
+
+    roles = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}"
+
+    for {prompt, expected} <- [
+          {"Rank.", "system: Rank.\nquery: q\ndocument: d\n"},
+          {"", "query: q\ndocument: d\n"}
+        ] do
+      ranking = ranking.(roles, prompt: prompt)
+      assert ranking.sequence.("q", "d") == expected
+      assert ranking.encode_options[:add_special_tokens] == false
+    end
+
+    assert_raise ArgumentError, ~r/the query and document content does not reach/, fn ->
+      ranking.(
+        "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}{% endif %}{% endfor %}",
+        []
+      )
     end
   end
 

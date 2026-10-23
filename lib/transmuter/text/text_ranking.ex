@@ -2,7 +2,7 @@ defmodule Transmuter.Text.TextRanking do
   @moduledoc """
   The text ranking task. See `Transmuter.Text.text_ranking/2`.
 
-  The scores follow `CrossEncoder.rank` of sentence-transformers. A sequence classification model scores the pair of the query and the document. A causal language model, such as Qwen3-Reranker, scores the text of its chat template with the `LogitScore` module: the logit of a "yes" token minus the logit of a "no" token, at the last token of the text.
+  The scores follow `CrossEncoder.rank` of sentence-transformers. The query and the document are a pair of texts, or messages of the chat template. A sequence classification model scores the text with its one label. A causal language model, such as Qwen3-Reranker, scores it with the `LogitScore` module: the logit of a "yes" token minus the logit of a "no" token, at the last token of the text.
   """
 
   alias Transmuter.{ChatTemplate, Hub, Repo, Serving, Tokenizer}
@@ -17,7 +17,8 @@ defmodule Transmuter.Text.TextRanking do
   def text_ranking(source, opts) do
     opts = Keyword.validate!(opts, Serving.options() ++ [:prompt, :scores_function, :top_k])
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    # Each document is one row, so the tokenizer does not split a text into windows.
+    tokenizer = Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), stride: nil)
     ranking = ranking(repo, tokenizer, opts)
 
     model =
@@ -59,29 +60,46 @@ defmodule Transmuter.Text.TextRanking do
   # sequence to encode with `:encode_options`, and `:score` takes the logits and the attention
   # mask of a batch and gives the score of each row, before `:scores_function`.
   def ranking(repo, tokenizer, opts) do
-    config = Repo.sentence_transformers(repo, &cross_encoder(&1, repo.opts)) || %{}
+    config = Repo.sentence_transformers(repo, &cross_encoder(&1, repo.opts))
     prompt = Keyword.get(opts, :prompt, config[:prompt])
 
-    logit_score =
+    # As sentence-transformers, a CrossEncoder takes messages when its modality_config has
+    # them, and a model without its files when the tokenizer has a chat template.
+    {chat?, logit_score} =
       cond do
-        config != %{} ->
-          config.logit_score
+        config ->
+          {config.chat?, config.logit_score}
 
         causal?(repo) ->
-          %{"true_token_id" => id!(tokenizer, "yes"), "false_token_id" => id!(tokenizer, "no")}
+          {true,
+           %{"true_token_id" => id!(tokenizer, "yes"), "false_token_id" => id!(tokenizer, "no")}}
 
         true ->
-          nil
+          {repo.chat_template != nil, nil}
       end
 
-    steps =
-      if logit_score,
-        do: logit_score(repo, tokenizer, config[:template], logit_score, prompt),
-        else: classifier(repo, prompt)
+    input =
+      if chat?,
+        do:
+          chat(
+            %{repo | chat_template: config[:template] || repo.chat_template},
+            tokenizer,
+            prompt
+          ),
+        else: pair(prompt)
 
-    Map.merge(steps, %{
-      scores_function:
-        Keyword.get_lazy(opts, :scores_function, fn -> scores_function(repo, config) end),
+    # The score of a row has no classes, so a softmax does not apply.
+    scores_function =
+      Keyword.get_lazy(opts, :scores_function, fn -> scores_function(repo, config) end)
+
+    unless scores_function in [:sigmoid, :none] do
+      raise ArgumentError,
+            "expected :scores_function to be :sigmoid or :none, got: #{inspect(scores_function)}"
+    end
+
+    Map.merge(input, %{
+      score: if(logit_score, do: logit_score(logit_score), else: classifier(repo)),
+      scores_function: scores_function,
       max_length: config[:max_length]
     })
   end
@@ -100,6 +118,7 @@ defmodule Transmuter.Text.TextRanking do
         end
 
         logit_score = Enum.find(modules, &(module_type(&1) == "LogitScore"))
+        transformer = Hub.json(source, "sentence_bert_config.json", opts) || %{}
 
         template =
           case Hub.fetch(source, "chat_template.jinja", opts) do
@@ -108,13 +127,13 @@ defmodule Transmuter.Text.TextRanking do
           end
 
         %{
+          chat?: Map.has_key?(transformer["modality_config"] || %{}, "message"),
           logit_score:
             logit_score && Hub.json(source, Path.join(logit_score["path"], "config.json"), opts),
           template: template,
           prompt: Map.get(config["prompts"] || %{}, config["default_prompt_name"]),
           activation: config["activation_fn"],
-          max_length:
-            (Hub.json(source, "sentence_bert_config.json", opts) || %{})["max_seq_length"]
+          max_length: transformer["max_seq_length"]
         }
 
       _other ->
@@ -134,30 +153,15 @@ defmodule Transmuter.Text.TextRanking do
   end
 
   # As sentence-transformers, a prompt goes before the query.
-  defp classifier(repo, prompt) do
-    labels = map_size(repo.config["id2label"] || %{"0" => "LABEL_0"})
-
-    unless labels == 1 do
-      raise ArgumentError,
-            "text ranking needs a model with one label, as CrossEncoder.rank of sentence-transformers, " <>
-              "got #{labels} labels in id2label of config.json"
-    end
-
-    %{
-      sequence: &{"#{prompt}#{&1}", &2},
-      encode_options: [],
-      score: fn logits, _mask -> logits[[.., 0]] end
-    }
-  end
+  defp pair(prompt), do: %{sequence: &{"#{prompt}#{&1}", &2}, encode_options: []}
 
   # As sentence-transformers, the query and the document are messages with the roles "query"
   # and "document", after the prompt as a system message. The chat template adds the special
   # tokens. When truncation cuts a text, the end of the template replaces its last tokens.
-  defp logit_score(repo, tokenizer, template, config, prompt) do
-    repo = %{repo | chat_template: template || repo.chat_template}
-
+  defp chat(repo, tokenizer, prompt) do
     render = fn prompt, query, document ->
-      system = if prompt, do: [%{role: "system", content: prompt}], else: []
+      # As in Python, an empty prompt is no prompt.
+      system = if prompt in [nil, ""], do: [], else: [%{role: "system", content: prompt}]
 
       messages =
         system ++ [%{role: "query", content: query}, %{role: "document", content: document}]
@@ -177,29 +181,48 @@ defmodule Transmuter.Text.TextRanking do
               "the #{Enum.join(dropped, " and ")} content does not reach the text"
     end
 
-    yes = config["true_token_id"]
-    no = config["false_token_id"]
-
     %{
       sequence: &render.(prompt, &1, &2),
-      encode_options: [add_special_tokens: false, suffix: suffix(tokenizer, render, prompt)],
-      score: fn logits, mask ->
-        scores =
-          if no,
-            do: Nx.subtract(logits[[.., .., yes]], logits[[.., .., no]]),
-            else: logits[[.., .., yes]]
-
-        last =
-          Nx.subtract(Nx.axis_size(mask, 1) - 1, Nx.argmax(Nx.reverse(mask, axes: [1]), axis: 1))
-
-        scores |> Nx.take_along_axis(Nx.new_axis(last, 1), axis: 1) |> Nx.squeeze(axes: [1])
-      end
+      encode_options: [add_special_tokens: false, suffix: suffix(tokenizer, render, prompt)]
     }
   end
 
+  defp classifier(repo) do
+    # transformers gives 2 labels to a configuration without id2label.
+    labels = map_size(repo.config["id2label"] || %{"0" => "LABEL_0", "1" => "LABEL_1"})
+
+    unless labels == 1 do
+      raise ArgumentError,
+            "text ranking needs a model with one label, as CrossEncoder.rank of sentence-transformers, " <>
+              "got #{labels} labels in id2label of config.json"
+    end
+
+    fn logits, _mask -> logits[[.., 0]] end
+  end
+
+  # The LogitScore module: the logit of the true token minus the logit of the false token, at
+  # the last token of each row.
+  defp logit_score(config = %{"true_token_id" => yes}) do
+    no = config["false_token_id"]
+
+    fn logits, mask ->
+      scores =
+        if no,
+          do: Nx.subtract(logits[[.., .., yes]], logits[[.., .., no]]),
+          else: logits[[.., .., yes]]
+
+      last =
+        Nx.subtract(Nx.axis_size(mask, 1) - 1, Nx.argmax(Nx.reverse(mask, axes: [1]), axis: 1))
+
+      scores |> Nx.take_along_axis(Nx.new_axis(last, 1), axis: 1) |> Nx.squeeze(axes: [1])
+    end
+  end
+
   # The end of the template: the tokens that two texts with different fillers have in common
-  # at their end, as sentence-transformers finds it.
+  # at their end, as sentence-transformers finds it, without padding or truncation.
   defp suffix(tokenizer, render, prompt) do
+    tokenizer = Tokenizer.configure(tokenizer, length: nil, stride: nil)
+
     [first, second] =
       for filler <- ["0", "1 2 3 4"] do
         {_tensors, [[encoding]]} =
@@ -219,9 +242,11 @@ defmodule Transmuter.Text.TextRanking do
   end
 
   # As sentence-transformers: the activation_fn of the CrossEncoder, else the activation in
-  # config.json of older versions, else a sigmoid for the one label.
+  # config.json, from version 4 or from older versions, else a sigmoid for the one label.
   defp scores_function(repo, config) do
-    case config[:activation] || repo.config["sbert_ce_default_activation_function"] do
+    case config[:activation] ||
+           get_in(repo.config, ["sentence_transformers", "activation_fn"]) ||
+           repo.config["sbert_ce_default_activation_function"] do
       nil ->
         :sigmoid
 
