@@ -15,7 +15,7 @@ defmodule Transmuter.Audio.SpeechToText do
 
   Long audio follows `AutomaticSpeechRecognitionPipeline` of transformers with `chunk_length_s` and `stride_length_s`:
 
-    1. The client splits the audio into windows (`chunk_iter`). Each window is one row of a batch of the serving.
+    1. The client splits the audio into windows (`chunk_iter`). It cuts the chunks of a stream into the same windows as the whole audio, because a window waits for the first sample after it, which tells that it is not the last. Each window is one row of a batch of the serving, with its stride.
     2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again. When these timestamps are at the start of the features, the window is done with all its tokens, as when the tokens have no two timestamps together.
     3. The client merges the tokens of the windows as `_decode_asr` of the Whisper tokenizer does. It removes the timestamps in the context of each window, and joins the overlap of two token sequences at the middle of their best alignment (`_find_longest_common_sequence`).
 
@@ -24,6 +24,9 @@ defmodule Transmuter.Audio.SpeechToText do
 
   alias Transmuter.Audio.{Featurizer, WordTimestamps}
   alias Transmuter.{Generation, GraphBreaks, Hub, Serving, Tokenizer}
+
+  # The bytes of an f32 sample of Featurizer.audio/2.
+  @bytes 4
 
   @doc false
   def speech_to_text(source, opts) do
@@ -108,10 +111,14 @@ defmodule Transmuter.Audio.SpeechToText do
         %{"encoder_hidden_states" => hidden}
       end
 
-      # Each token of a row goes out with its end time in feature frames, as two ids.
-      fn %{"audio" => audio, "frames" => frames}, prompts, generate ->
+      # A row goes out as its stride, then each token with its end time in feature frames,
+      # as ids. The frames of the audio are the frames of the attention mask of
+      # WhisperFeatureExtractor, which word timestamps read.
+      fn %{"audio" => audio, "stride" => strides}, prompts, generate ->
         features = features.(audio, featurizer.filters, featurizer.window)
-        frames = Nx.to_flat_list(frames)
+        strides = Nx.to_list(strides)
+        hop = featurizer.hop_length
+        frames = for [size, _left, _right] <- strides, do: div(size + hop - 1, hop)
         seeks = Enum.map(prompts, fn _ -> 0 end)
 
         pass = fn input, prompts, seeks ->
@@ -121,29 +128,29 @@ defmodule Transmuter.Audio.SpeechToText do
           Enum.zip_with(tokens, times, &Enum.zip/2)
         end
 
-        for row <- transcribe(features, prompts, seeks, settings, pass),
-            do: Enum.flat_map(row, &Tuple.to_list/1)
+        for {row, stride} <-
+              Enum.zip(transcribe(features, prompts, seeks, settings, pass), strides),
+            do: stride ++ Enum.flat_map(row, &Tuple.to_list/1)
       end
     end
 
-    # Nx.slice and Nx.pad on Nx.BinaryBackend go through a list of the samples, so the
-    # windows are cut from the binary. Zero bits are the zero of each type.
-    preprocess = fn audio ->
+    # Zero bits are the zero of f32.
+    preprocess = fn chunks ->
       seed = opts[:seed] || :rand.uniform(2 ** 32)
-      type = {_kind, bits} = Nx.type(audio)
-      samples = Nx.to_binary(audio)
 
-      for {start, stride = {size, _left, _right}} <- windows(Nx.size(audio), settings) do
-        {skip, take, padding} = {start * bits, size * bits, (featurizer.n_samples - size) * bits}
-        <<_::bitstring-size(^skip), window::bitstring-size(^take), _::bitstring>> = samples
-        window = Nx.from_binary(<<window::bitstring, 0::size(padding)>>, type)
+      chunks
+      |> windows(settings.chunk, settings.context)
+      |> Stream.map(fn {samples, stride = {size, _left, _right}} ->
+        padding = (featurizer.n_samples - size) * @bytes
 
-        # The feature frames of the audio: the frames of the attention mask of
-        # WhisperFeatureExtractor, which word timestamps read.
-        frames = Nx.tensor(div(size + featurizer.hop_length - 1, featurizer.hop_length))
-        tensors = %{"audio" => window, "frames" => frames}
-        %{prompt: prompt, seed: seed, tensors: tensors, stride: stride}
-      end
+        audio =
+          Nx.from_binary(<<samples::binary, 0::size(padding)-unit(8)>>, :f32,
+            backend: Nx.BinaryBackend
+          )
+
+        stride = Nx.tensor(Tuple.to_list(stride), backend: Nx.BinaryBackend)
+        %{prompt: prompt, seed: seed, tensors: %{"audio" => audio, "stride" => stride}}
+      end)
     end
 
     frame_seconds = settings.precision / settings.frames_per_timestamp
@@ -153,22 +160,20 @@ defmodule Transmuter.Audio.SpeechToText do
         do: opts[:language] || "en",
         else: "en"
 
-    postprocess = fn windows, runs ->
-      strides =
-        Enum.map(runs, fn %{stride: stride} ->
-          stride |> Tuple.to_list() |> Enum.map(&(&1 / featurizer.sampling_rate))
-        end)
-
+    postprocess = fn rows, _runs ->
       windows =
-        for ids <- windows,
-            do: for([token, time] <- Enum.chunk_every(ids, 2), do: {token, time * frame_seconds})
+        for [size, left, right | ids] <- rows do
+          tokens =
+            for [token, time] <- Enum.chunk_every(ids, 2), do: {token, time * frame_seconds}
 
-      chunks = windows |> Enum.zip(strides) |> merge(settings)
-      %{chunks: result(mode, chunks, tokenizer, language)}
+          {tokens, Enum.map([size, left, right], &(&1 / featurizer.sampling_rate))}
+        end
+
+      %{chunks: result(mode, merge(windows, settings), tokenizer, language)}
     end
 
     task = %{
-      validate: &Featurizer.tensor/1,
+      validate: &Featurizer.audio(&1, featurizer.sampling_rate),
       preprocess: preprocess,
       init: init,
       postprocess: postprocess
@@ -248,25 +253,43 @@ defmodule Transmuter.Audio.SpeechToText do
     }
   end
 
-  # chunk_iter of transformers: windows of `chunk` samples every `chunk - 2 * context` samples,
-  # as {start, {size, left context, right context}}. The first window has no left context
-  # and the last has no right context.
-  defp windows(samples, settings), do: windows(samples, 0, settings)
+  @doc false
+  # chunk_iter of transformers on the chunks of the audio: windows of `chunk` samples every
+  # `chunk - 2 * context` samples, as {samples, {size, left context, right context}}. The
+  # first window has no left context and the last has no right context. A window is not the
+  # last when a sample follows it, so a full window waits for the next sample. At the end,
+  # the samples that are left are the last window when they are more than its left context.
+  # The state is the samples from the start of the next window, their count and the left
+  # context of that window.
+  def windows(chunks, chunk, context) do
+    Stream.transform(
+      chunks,
+      fn -> {[], 0, 0} end,
+      fn audio, {pending, count, left} ->
+        pending = [pending | Nx.to_binary(audio)]
+        count = count + Nx.size(audio)
 
-  defp windows(samples, start, %{chunk: chunk, context: context} = settings)
-       when start < samples do
-    last? = start + chunk >= samples
-    size = min(chunk, samples - start)
-    left = if start == 0, do: 0, else: context
-    stride = {size, left, if(last?, do: 0, else: context)}
-    window = if size > left, do: [{start, stride}], else: []
-
-    if last?,
-      do: window,
-      else: window ++ windows(samples, start + chunk - 2 * context, settings)
+        if count > chunk,
+          do: cut(IO.iodata_to_binary(pending), count, left, chunk, context, []),
+          else: {[], {pending, count, left}}
+      end,
+      fn state = {pending, count, left} ->
+        last = if count > left, do: [{IO.iodata_to_binary(pending), {count, left, 0}}], else: []
+        {last, state}
+      end,
+      fn _state -> :ok end
+    )
   end
 
-  defp windows(_samples, _start, _settings), do: []
+  defp cut(samples, count, left, chunk, context, windows) when count > chunk do
+    step = chunk - 2 * context
+    window = {binary_part(samples, 0, chunk * @bytes), {chunk, left, context}}
+    rest = binary_part(samples, step * @bytes, (count - step) * @bytes)
+    cut(rest, count - step, context, chunk, context, [window | windows])
+  end
+
+  defp cut(samples, count, left, _chunk, _context, windows),
+    do: {Enum.reverse(windows), {samples, count, left}}
 
   @doc false
   # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of the window

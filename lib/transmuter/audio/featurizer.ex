@@ -415,11 +415,57 @@ defmodule Transmuter.Audio.Featurizer do
   defp mel_to_hz(mel, :slaney), do: 200.0 * mel / 3.0
 
   @doc """
-  Accepts a tensor of PCM samples `{samples}` as one audio, and moves it to `Nx.BinaryBackend`.
-  """
-  def tensor(audio = %Nx.Tensor{shape: {_samples}}),
-    do: {:ok, Nx.backend_transfer(audio, Nx.BinaryBackend)}
+  Accepts one audio at `sampling_rate` in Hz, and returns `{:ok, chunks}` or `{:error, message}`. The chunks are an enumerable of f32 tensors of PCM samples `{samples}` on `Nx.BinaryBackend`, in the order of time. The audio can be:
 
-  def tensor(input),
-    do: {:error, "expected a tensor of PCM samples {samples}, got: #{inspect(input)}"}
+    * A tensor of PCM samples `{samples}` at `sampling_rate`, of any float type. It is one chunk.
+
+    * `{:file, path}` - an audio or video file, which `ffmpeg` decodes into one chunk. The `ffmpeg` executable must be in the `PATH`. As `ffmpeg_read` of Python transformers, ffmpeg takes the first audio stream, mixes its channels into one, and changes its sampling rate to `sampling_rate`. A file that does not exist gives an error. A file that ffmpeg cannot decode raises.
+
+    * An enumerable of tensors `{samples}` that is not a list, such as a `Stream`. The tensors are the chunks, which come when the enumerable gives them. A chunk that is not a tensor `{samples}` raises when it comes. A list is not a stream, because a list of inputs is a batch.
+  """
+  def audio(input, sampling_rate)
+
+  def audio(audio = %Nx.Tensor{shape: {_samples}}, _sampling_rate), do: {:ok, [chunk!(audio)]}
+
+  def audio({:file, path}, sampling_rate) when is_binary(path) do
+    cond do
+      not File.regular?(path) -> {:error, "the file #{inspect(path)} does not exist"}
+      ffmpeg = System.find_executable("ffmpeg") -> {:ok, [decode!(ffmpeg, path, sampling_rate)]}
+      true -> {:error, "a file input needs ffmpeg, which is not in the PATH"}
+    end
+  end
+
+  def audio(input, _sampling_rate) do
+    if Enumerable.impl_for(input) && not is_list(input),
+      do: {:ok, Stream.map(input, &chunk!/1)},
+      else:
+        {:error,
+         "expected a tensor of PCM samples {samples}, {:file, path} or a stream of tensors, got: #{inspect(input)}"}
+  end
+
+  defp chunk!(audio = %Nx.Tensor{shape: {_samples}}),
+    do: audio |> Nx.backend_transfer(Nx.BinaryBackend) |> Nx.as_type(:f32)
+
+  defp chunk!(chunk) do
+    raise ArgumentError,
+          "expected each chunk of an audio stream to be a tensor of PCM samples {samples}, got: #{inspect(chunk)}"
+  end
+
+  # The command of Python transformers, with the samples in the byte order of this machine,
+  # which Nx.from_binary/2 reads. "file:" keeps ffmpeg from reading the path as a URL.
+  defp decode!(ffmpeg, path, sampling_rate) do
+    format = if System.endianness() == :little, do: "f32le", else: "f32be"
+
+    args =
+      ["-nostdin", "-hide_banner", "-loglevel", "quiet", "-i", "file:" <> Path.expand(path)] ++
+        ["-ac", "1", "-ar", "#{sampling_rate}", "-f", format, "pipe:1"]
+
+    case System.cmd(ffmpeg, args) do
+      {samples, 0} when samples != "" ->
+        Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)
+
+      {_samples, status} ->
+        raise "ffmpeg did not decode audio from #{inspect(path)}, exit status: #{status}"
+    end
+  end
 end

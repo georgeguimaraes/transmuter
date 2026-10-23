@@ -48,4 +48,9 @@ if Transmuter.TestBackend.compiler() == EMLX do
   Nx.Defn.jit(&Nx.add(&1, 1), Transmuter.TestBackend.compiler_opts()).(Nx.tensor(1.0))
 end
 
-ExUnit.start(exclude: if(Transmuter.TestBackend.compiler() == EXLA, do: [], else: [:exla]))
+# Tests that read audio files need ffmpeg, which CI does not install.
+exclude =
+  if(Transmuter.TestBackend.compiler() == EXLA, do: [], else: [:exla]) ++
+    if System.find_executable("ffmpeg"), do: [], else: [:ffmpeg]
+
+ExUnit.start(exclude: exclude)

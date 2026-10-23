@@ -231,6 +231,8 @@ defmodule Transmuter.Serving do
 
   The featurizer (`Transmuter.Audio.Featurizer`) turns the audio into the input of `Transmuter.Audio.Featurizer.input_name/1`, such as `"input_values"`, on the `:backend` of `opts`. When the features of all audio have one shape, such as the 1024 frames of AST, the serving compiles that shape, and the audio goes into batches of the `:batch_size` of `:compile`. When the shape depends on the length of the audio, such as the samples of wav2vec2, the batch size must be 1. Each audio is then a batch, and the compiled model compiles each new length on its first call. It keeps up to #{@audio_lengths} lengths.
 
+  The input is an audio of `Transmuter.Audio.Featurizer.audio/2`. The serving joins the chunks of a stream into one tensor.
+
   `fun` and `postprocess` are as in `text/7`. An audio is one row, so `postprocess` takes a list of one row and a list of one audio tensor. `inputs` are other inputs of the model that are the same for all audio, as in `image/6`.
   """
   def audio(model, featurizer, opts, fun, postprocess, inputs \\ %{}) do
@@ -256,8 +258,14 @@ defmodule Transmuter.Serving do
       {groups, Enum.map(audio, &[&1])}
     end
 
+    # The featurizer takes the whole audio, so the chunks of a stream go into one tensor.
     validate = fn input ->
-      with {:ok, audio} <- AudioFeaturizer.tensor(input), do: {:ok, [audio]}
+      with {:ok, chunks} <- AudioFeaturizer.audio(input, featurizer.sampling_rate) do
+        case chunks |> Enum.map(&Nx.to_binary/1) |> IO.iodata_to_binary() do
+          "" -> {:error, "the audio has no samples"}
+          samples -> {:ok, [Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)]}
+        end
+      end
     end
 
     shapes = %{

@@ -13,12 +13,33 @@ defmodule Transmuter.Audio do
   The tasks with text need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
 
   The options `:defn_options`, `:backend`, `:compute_type`, `:variant`, `:cache_dir`, `:revision`, `:offline` and `:tokenizer` are the same as in `Transmuter.Text`. Use `backend: EMLX.Backend, defn_options: [compiler: EMLX]` on Apple silicon, because `Nx.BinaryBackend` is very slow.
+
+  ## Audio input
+
+  `speech_to_text/2`, `audio_classification/2` and `zero_shot_audio_classification/3` take one audio or a list of them. An audio is one of these:
+
+    * A tensor of PCM samples `{samples}` at the sampling rate of the model, of any float type.
+
+    * `{:file, path}` - an audio or video file. As `ffmpeg_read` of Python transformers, ffmpeg decodes the file, mixes its channels into one and changes its sampling rate to the sampling rate of the model. The `ffmpeg` executable must be in the `PATH`. A file that does not exist raises an `ArgumentError`.
+
+    * A stream: an enumerable of tensors `{samples}` that is not a list, such as a `Stream`. Each tensor is the next part of the audio, at the sampling rate of the model. A list is not a stream, because a list is a batch of inputs.
+
+  ```elixir
+  serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"})
+  Nx.Serving.run(serving, {:file, "speech.mp3"})
+  ```
+
+  `speech_to_text/2` cuts a stream into windows when the tensors come, and transcribes each window before the stream ends. The windows are the same for each size of the tensors, so the result of a stream is the result of its audio in one tensor. The result comes when the stream ends. Nx.Serving reads the stream in a process of its own, so the stream must not depend on the process that calls the serving, for example to receive messages.
+
+  The classification tasks take the whole audio, so they join the tensors of a stream before they run. A stream that does not end gives no result.
+
+  `Transmuter.Audio.Featurizer.audio/2` reads these inputs. The samples become f32, as in Python transformers.
   """
 
   @doc """
   Builds a serving that turns speech into text with Whisper.
 
-  The input is a tensor of PCM samples at the sampling rate of the model (16 kHz for Whisper), of any float type, or a list of them. The result is `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}`, as in Bumblebee. The text starts with a space, as in Python transformers.
+  The input is an audio at 16 kHz, the sampling rate of Whisper, or a list of them. An audio is a tensor of PCM samples, `{:file, path}` or a stream of tensors (see the module documentation). The result is `%{chunks: [%{text: text, start_timestamp_seconds: start, end_timestamp_seconds: end}]}`, as in Bumblebee. The text starts with a space, as in Python transformers.
 
   Without timestamps, the result has one chunk with all the text, and its timestamps are `nil`. With `timestamps: :segments`, the result has one chunk for each segment of speech, with its start and end in seconds. The end of the last chunk is `nil` when the model does not predict it. With `timestamps: :words`, the result has one chunk for each word, with its start and end in seconds. The text of a word starts with its space, and has the punctuation next to it.
 
@@ -40,7 +61,7 @@ defmodule Transmuter.Audio do
 
     * `:timestamps` - `:segments` gives a chunk for each segment of speech, with timestamps, as `return_timestamps=True` in transformers. The decoder then predicts timestamp tokens with the rules of `WhisperTimeStampLogitsProcessor`. `:words` gives a chunk for each word, as `return_timestamps="word"` in transformers. The time of each token comes from the cross attentions of the `alignment_heads` of `generation_config.json`, with dynamic time warping (see `Transmuter.Audio.WordTimestamps`). The decoder must give the outputs `cross_attentions.N`, as `Xenova/whisper-tiny.en` and the `_timestamped` exports of onnx-community do, such as `onnx-community/whisper-tiny.en_timestamped`. `onnx-community/whisper-base` does not give them. In Chinese, Japanese, Thai, Lao, Burmese and Cantonese, a word is each piece of complete characters, as in OpenAI whisper and transformers.js. Other languages and translations split at spaces. The pipeline of transformers splits all languages at spaces. The default is `nil`, with no timestamps.
 
-    * `:compile` - `:batch_size`, the number of windows that the decoder transcribes together. The windows come from one long audio, from a list of audio, or from concurrent calls to `Nx.Serving.batched_run/2`. The default is `1`.
+    * `:compile` - `:batch_size`, the number of windows that the decoder transcribes together. The windows come from one long audio, from a list of audio, or from concurrent calls to `Nx.Serving.batched_run/2`. The windows of a stream wait until they fill a batch or the stream ends. The default is `1`.
 
     * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens` and `:seed` - as in `Transmuter.Text.generation/2`. The prompt of the decoder counts in `:min_length`. Python transformers makes the prompt of Whisper and its first suppressed tokens itself, so the serving does not take `:forced_bos_token_id` and `:forced_eos_token_id`. `:max_new_tokens` applies to each pass of the decoder over a window. Its default is `max_length` of `generation_config.json` (448 for Whisper) minus the length of the prompt, as in the pipeline of transformers.
 
@@ -53,7 +74,7 @@ defmodule Transmuter.Audio do
   @doc """
   Builds a serving that classifies audio, such as AST and wav2vec2 models.
 
-  The input is a tensor of PCM samples at the sampling rate of the model (16 kHz for AST and wav2vec2), of any float type, or a list of them. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
+  The input is an audio at the sampling rate of the model (16 kHz for AST and wav2vec2), or a list of them. An audio is a tensor of PCM samples, `{:file, path}` or a stream of tensors (see the module documentation). The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
 
       serving = Transmuter.Audio.audio_classification({:hf, "Xenova/ast-finetuned-audioset-10-10-0.4593"})
       Nx.Serving.run(serving, audio)
@@ -88,7 +109,7 @@ defmodule Transmuter.Audio do
   @doc """
   Builds a serving that classifies audio with labels that you give, such as CLAP.
 
-  `labels` is a list of strings. The input is a tensor of PCM samples at the sampling rate of the model (48 kHz for CLAP), of any float type, or a list of them. The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
+  `labels` is a list of strings. The input is an audio at the sampling rate of the model (48 kHz for CLAP), or a list of them. An audio is a tensor of PCM samples, `{:file, path}` or a stream of tensors (see the module documentation). The result is `%{predictions: [%{label: label, score: score}]}`, from the highest score.
 
       serving = Transmuter.Audio.zero_shot_audio_classification({:hf, "Xenova/clap-htsat-unfused"}, ["a man speaking", "music", "a dog barking"])
       Nx.Serving.run(serving, audio)

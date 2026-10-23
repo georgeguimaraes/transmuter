@@ -51,6 +51,23 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  # test/fixtures/librispeech_0.flac has the samples of librispeech_0.f32 in 16 bits, so
+  # ffmpeg decodes it to the same samples.
+  @tag :ffmpeg
+  test "a file gives the result of its samples" do
+    serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, @opts)
+    file = {:file, "test/fixtures/librispeech_0.flac"}
+    assert Nx.Serving.run(serving, file) == Nx.Serving.run(serving, @audio)
+  end
+
+  test "a file that does not exist raises" do
+    serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, @opts)
+
+    assert_raise ArgumentError, ~r/does not exist/, fn ->
+      Nx.Serving.run(serving, {:file, "test/fixtures/missing.flac"})
+    end
+  end
+
   test "a forced language changes the prompt of a multilingual model" do
     serving =
       Transmuter.Audio.speech_to_text(
@@ -391,17 +408,18 @@ defmodule Transmuter.AudioLongTest do
   # With timestamps, generate in transformers transcribes a window again from its last
   # timestamp when the last segment is not complete: 6 passes for whisper-tiny.en and 5 for
   # whisper-base.
+  @tiny_segments [
+    {0.0, 50.44,
+     "similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of rocky Ithaca. Linnell's pictures are a sort of up-gards and atom paintings, and Mason's exquisite idles are as national as a jingo poem. Mr. Birkett Foster's landscapes smile at one much in the same way that Mr. Carker used to"},
+    {50.44, 52.92, " flash his teeth."},
+    {52.92, 58.68,
+     " And Mr. John Collier gives his sitter a cheerful slap in the back, before he says, like"},
+    {58.68, 62.0, " a shampooer and a Turkish bath, next man!"}
+  ]
+
   test "long audio timestamps match the pipeline of transformers" do
     for {repo, expected} <- [
-          {"Xenova/whisper-tiny.en",
-           [
-             {0.0, 50.44,
-              "similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Layton's work is really Greek after all, and can discover in it but little of rocky Ithaca. Linnell's pictures are a sort of up-gards and atom paintings, and Mason's exquisite idles are as national as a jingo poem. Mr. Birkett Foster's landscapes smile at one much in the same way that Mr. Carker used to"},
-             {50.44, 52.92, " flash his teeth."},
-             {52.92, 58.68,
-              " And Mr. John Collier gives his sitter a cheerful slap in the back, before he says, like"},
-             {58.68, 62.0, " a shampooer and a Turkish bath, next man!"}
-           ]},
+          {"Xenova/whisper-tiny.en", @tiny_segments},
           {"onnx-community/whisper-base",
            [
              {0.0, 47.88,
@@ -423,6 +441,36 @@ defmodule Transmuter.AudioLongTest do
       assert Enum.map(chunks, &{&1.start_timestamp_seconds, &1.end_timestamp_seconds, &1.text}) ==
                [{start, stop, @long_text <> text} | rest]
     end
+  end
+
+  # The windows of a stream are the windows of its whole audio, so a stream in chunks of 7919
+  # samples gives the result of the tensor. Nx.Serving.batched_run/2 sends the batches of a
+  # stream one after the other.
+  test "long audio in a stream gives the timestamps of the whole audio" do
+    serving =
+      Transmuter.Audio.speech_to_text(
+        {:hf, "Xenova/whisper-tiny.en"},
+        [timestamps: :segments, compile: [batch_size: 2]] ++ @opts
+      )
+
+    start_supervised!({Nx.Serving, serving: serving, name: __MODULE__.Stream})
+
+    stream =
+      Stream.unfold(Nx.to_binary(@long), fn
+        "" ->
+          nil
+
+        samples ->
+          size = min(byte_size(samples), 7919 * 4)
+          <<chunk::binary-size(^size), rest::binary>> = samples
+          {Nx.from_binary(chunk, :f32), rest}
+      end)
+
+    %{chunks: chunks} = Nx.Serving.batched_run(__MODULE__.Stream, stream)
+    [{start, stop, text} | rest] = @tiny_segments
+
+    assert Enum.map(chunks, &{&1.start_timestamp_seconds, &1.end_timestamp_seconds, &1.text}) ==
+             [{start, stop, @long_text <> text} | rest]
   end
 
   # The 3 windows are one batch. They have different numbers of frames and of passes, so a
@@ -522,6 +570,61 @@ defmodule Transmuter.Audio.SpeechToTextTest do
 
     features = Nx.broadcast(0.0, {1, 1, 4})
     assert SpeechToText.transcribe(features, [[1]], [0], settings, pass) == [tokens]
+  end
+end
+
+defmodule Transmuter.Audio.WindowsTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Audio.SpeechToText
+
+  # The windows of a stream in chunks of each size are the windows of chunk_iter in
+  # transformers on the whole audio, with windows of 10 samples and a context of 2 or 0.
+  test "the windows of a stream are the windows of chunk_iter" do
+    for {chunk, context} <- [{10, 2}, {10, 0}],
+        step = chunk - 2 * context,
+        length <- [0, 5, chunk, chunk + 1, chunk + step, chunk + 2 * step, chunk + 2 * step + 1],
+        size <- [1, 3, 7, max(length, 1)] do
+      samples = Enum.map(0..(length - 1)//1, &(&1 * 1.0))
+      chunks = for part <- Enum.chunk_every(samples, size), do: Nx.tensor(part, type: :f32)
+
+      windows =
+        for {binary, stride} <- SpeechToText.windows(chunks, chunk, context),
+            do: {binary |> Nx.from_binary(:f32) |> Nx.to_list(), stride}
+
+      assert windows == chunk_iter(samples, chunk, context),
+             "length #{length}, chunks of #{size}, context #{context}"
+    end
+  end
+
+  # chunk_iter of the automatic-speech-recognition pipeline of transformers.
+  defp chunk_iter(samples, chunk, context) do
+    count = length(samples)
+
+    0..(count - 1)//(chunk - 2 * context)
+    |> Enum.reduce_while([], fn start, windows ->
+      window = Enum.slice(samples, start, chunk)
+      left = if start == 0, do: 0, else: context
+      last? = start + chunk >= count
+      stride = {length(window), left, if(last?, do: 0, else: context)}
+      windows = if length(window) > left, do: [{window, stride} | windows], else: windows
+      if last?, do: {:halt, windows}, else: {:cont, windows}
+    end)
+    |> Enum.reverse()
+  end
+end
+
+defmodule Transmuter.Audio.FeaturizerTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Audio.Featurizer
+
+  @moduletag :ffmpeg
+
+  test "ffmpeg decodes a file to its samples" do
+    file = {:file, "test/fixtures/librispeech_0.flac"}
+    assert {:ok, [audio]} = Featurizer.audio(file, 16_000)
+    assert Nx.to_binary(audio) == File.read!("test/fixtures/librispeech_0.f32")
   end
 end
 
