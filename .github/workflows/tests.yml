@@ -126,7 +126,7 @@ jobs:
             _build
             ~/.cache/xla
             ~/release-files
-          key: ${{ runner.os }}-mix-v2-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-mix-v3-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
       # When the deps compile, some deps download GitHub release files with httpc, which fails
@@ -190,7 +190,7 @@ jobs:
             ~/Library/Caches/libmlx
             ~/Library/Caches/xla
             ~/release-files
-          key: ${{ runner.os }}-mix-v2-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-mix-v3-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
       # When the deps compile, some deps download GitHub release files with httpc, which fails

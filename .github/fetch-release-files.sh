@@ -31,6 +31,10 @@ version() {
 
 # fetch URL SHA256: downloads URL into $dir when it is not there, and checks its SHA-256.
 fetch() {
+  if [ -z "$2" ]; then
+    echo "::error::$1 has no SHA-256 to check"
+    exit 1
+  fi
   file="$dir/$(basename "$1")"
   [ -f "$file" ] || curl -fsSL --retry 5 --retry-all-errors -o "$file" "$1"
   sum=$(shasum -a 256 "$file" | cut -d ' ' -f 1)
@@ -52,9 +56,12 @@ for spec in "xla elixir-nx/xla $xla" "tokenizers elixir-nx/tokenizers $nif" \
   done
 done
 
-# emlx has the SHA-256 of the MLX archive in a file next to the archive.
+# emlx has the SHA-256 of the MLX archive in a file next to the archive. The cache keeps that
+# file too, so a warm run needs no network here.
 url="https://github.com/cocoa-xu/mlx-build/releases/download/v$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)/$mlx.tar.gz"
-fetch "$url" "$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)"
+sums="$dir/$mlx.tar.gz.sha256"
+[ -f "$sums" ] || curl -fsSL --retry 5 --retry-all-errors -o "$sums" "$url.sha256"
+fetch "$url" "$(cut -d ' ' -f 1 "$sums")"
 
 {
   echo "XLA_ARCHIVE_PATH=$dir/xla_extension-$(version xla)-$xla.tar.gz"
