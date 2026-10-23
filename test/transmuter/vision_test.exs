@@ -325,7 +325,7 @@ defmodule Transmuter.VisionTest do
   @tag ci_partition: 15
   test "the Idefics3 processor gives the tiles and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@smolvlm)
-    processor = Idefics3Processor.load!(repo, ["pixel_values", "pixel_attention_mask"])
+    processor = Idefics3Processor.load!(repo)
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
@@ -368,7 +368,7 @@ defmodule Transmuter.VisionTest do
   @tag ci_partition: 15
   test "the Qwen2-VL processor gives the patches and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@qwen2_vl)
-    processor = Qwen2VLProcessor.load!(repo, ["pixel_values", "grid_thw"])
+    processor = Qwen2VLProcessor.load!(repo)
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
@@ -413,7 +413,7 @@ defmodule Transmuter.VisionTest do
   @tag ci_partition: 15
   test "the Qwen2-VL processor gives the patches, the prompt and the positions of Qwen3-VL" do
     repo = Transmuter.Repo.load!(@qwen3_vl)
-    processor = Qwen2VLProcessor.load!(repo, ["pixel_values", "image_grid_thw"])
+    processor = Qwen2VLProcessor.load!(repo)
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
@@ -1142,18 +1142,26 @@ defmodule Transmuter.VisionLargeModelTest do
               %{type: "image", image: tall},
               %{type: "text", text: "What animals are in the image?"}
             ],
-            [%{type: "text", text: "What is the capital of France?"}]
+            [%{type: "text", text: "What is the capital of France?"}],
+            [
+              %{type: "image", image: @image},
+              %{type: "image", image: tall},
+              %{type: "text", text: "What is different between the two images?"}
+            ]
           ],
           do: %{messages: [%{role: "user", content: content}]}
 
     expected = [
       "This is a cozy, casual photograph of two cats resting on a vibrant pink couch.\n\n- **The Cats**: There are",
       "Based on the image provided, the animals are two cats. They are both resting on a pink blanket or couch.",
-      "The capital of France is Paris."
+      "The capital of France is Paris.",
+      "The primary difference between the two images is the position of the cat on the right.\n\n- In the first image, the"
     ]
 
-    # The two chats with images have 320 patches each, so they go into one batch. The first
-    # chat also runs alone, with a padding row.
+    # The two chats with one image have 320 patches each, so they go into one batch. The chat
+    # with two images has 640 patches and runs with a padding row, as the first chat alone.
+    # ONNX Runtime encodes the two images in one call, and Transmuter encodes each image
+    # alone: the features differ by up to 1.3e-4, where the largest feature is 19.
     opts =
       [
         variant: %{vision_encoder: :fp32, embed_tokens: :q4},

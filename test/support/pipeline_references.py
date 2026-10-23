@@ -451,8 +451,12 @@ chats = {
     "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
     "tall image": ([image.transpose(Image.Transpose.TRANSPOSE)], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What animals are in the image?"}]}]),
     "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
+    "two images": ([image, image.transpose(Image.Transpose.TRANSPOSE)], [{"role": "user", "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "What is different between the two images?"}]}]),
 }
 
+# The vision encoder of the export takes all images of a chat in one call, with a mask that
+# keeps the attention of each image to its own patches. Transmuter runs each image alone, so
+# the script prints the largest difference between the two ways for the chat with two images.
 directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
 session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
 embed = session("embed_tokens_q4")
@@ -465,7 +469,11 @@ for name, (images, messages) in chats.items():
     embeds = embed.run(None, {"input_ids": ids})[0]
     grid = inputs.get("image_grid_thw")
     if images:
-        embeds[ids == config.image_token_id] = vision.run(None, {"pixel_values": inputs["pixel_values"], "image_grid_thw": grid})[0]
+        features = vision.run(None, {"pixel_values": inputs["pixel_values"], "image_grid_thw": grid})[0]
+        counts = np.cumsum([0] + [int(np.prod(g)) for g in grid])
+        alone = np.concatenate([vision.run(None, {"pixel_values": inputs["pixel_values"][counts[i] : counts[i + 1]], "image_grid_thw": grid[i : i + 1]})[0] for i in range(len(grid))])
+        print("qwen3-vl features", name, features.shape, float(np.abs(features - alone).max()), float(np.abs(features).max()))
+        embeds[ids == config.image_token_id] = features
     position_ids, delta = Qwen3VLModel.get_rope_index(rope, torch.tensor(ids), None if grid is None else torch.tensor(grid), None, None)
     prepared[name] = (embeds, position_ids.numpy(), int(delta[0, 0]))
 del vision
