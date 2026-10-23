@@ -117,7 +117,9 @@ jobs:
         with:
           otp-version: "29"
           elixir-version: "1.20"
-      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF.
+      # ~/.cache/xla keeps the XLA archive and the compiled EXLA NIF. ~/.cache/libmlx keeps the
+      # MLX archive. Credo compiles the deps in the dev environment, and the build of emlx
+      # downloads the MLX archive from GitHub when this directory does not have it.
       - name: Restore dependencies cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -125,6 +127,7 @@ jobs:
             deps
             _build
             ~/.cache/xla
+            ~/.cache/libmlx
           key: ${{ runner.os }}-mix-otp29-elixir1.20-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
