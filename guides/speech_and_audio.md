@@ -6,7 +6,7 @@ This guide shows how to run text-to-speech and speech recognition models with Tr
 
 [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) is a text-to-speech model. Its ONNX export runs in Transmuter with no static inputs. The predicted duration of each phoneme decides the length of the audio, so the graph has a break there. Compilation caches each audio length.
 
-Kokoro reads phonemes, not text. The Python and JavaScript versions make the phonemes with misaki or espeak-ng. Elixir has no phonemizer yet, so you must provide phonemes from an external tool or prepare them in advance.
+Kokoro reads phonemes, not text. The Python and JavaScript versions make the phonemes with misaki or espeak-ng. Elixir has no phonemizer yet, so you must provide phonemes from an external tool or prepare them in advance. `bench/kokoro_tts.exs` runs the full example with phonemes made in advance and writes a WAV file.
 
 To run Kokoro:
 

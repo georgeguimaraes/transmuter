@@ -100,16 +100,6 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 - Call it directly. Each operator runs immediately, one after the other. This is eager execution. It is slower, but the model can read values while it runs.
 - Give it to `Nx.Defn.jit/2` or `Nx.Defn.value_and_grad/2`. Nx then records the operators as one graph, and the backend compiles that graph.
 
-## Text to speech with Kokoro
-
-`bench/kokoro_tts.exs` runs [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) from its ONNX export and writes a WAV file. All operators of the export run in Transmuter. The example also shows how to round audio lengths to 200 ms buckets to limit recompilation.
-
-Kokoro reads phonemes, not text. Elixir has no phonemizer yet, so the example contains phonemes that were made in advance. See the [Speech and Audio guide](guides/speech_and_audio.md) for more models and patterns.
-
-`Transmuter.Audio.text_to_speech/2` speaks text with VITS (MMS-TTS) and SpeechT5. It does not run Kokoro, because Kokoro needs phonemes.
-
-The example also fixes one node of the export. The export computes the STFT phase with the `atan2` of `torch.onnx`, which gives -π for `atan2(0, x)` when x is negative. `torch.atan2` gives π, and the model was trained with π. Transmuter computes an exact STFT, so the imaginary part is 0 at DC and Nyquist, and the wrong phase in every frame adds a tone at 4.8 kHz. ONNX Runtime hides the error, because its STFT has small rounding errors at these bins. The example changes the `Greater` test of the `atan2` to `GreaterOrEqual`, as in `torch.atan2`.
-
 ## Installation
 
 ```elixir
