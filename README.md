@@ -55,8 +55,8 @@ The tasks:
   - [`text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_to_text/2): T5 and Marian, and NLLB and M2M100 for translation between many languages
 - [`Transmuter.Vision`](https://hexdocs.pm/transmuter/Transmuter.Vision.html)
   - [`image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_classification/2): ViT
-  - [`image_embedding`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_embedding/2): CLIP
-  - [`zero_shot_image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_image_classification/3): CLIP
+  - [`image_embedding`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_embedding/2): CLIP, SigLIP and SigLIP2
+  - [`zero_shot_image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_image_classification/3): CLIP, SigLIP and SigLIP2
   - [`image_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_text/2): ViT-GPT2, TrOCR and Florence-2
   - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM and Qwen2-VL
   - [`object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#object_detection/2): DETR, YOLOS, RT-DETR and RF-DETR
