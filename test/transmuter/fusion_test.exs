@@ -48,6 +48,21 @@ defmodule Transmuter.FusionTest do
     end
   end
 
+  test "a replacement lists the nodes that it replaces", %{tmp_dir: dir} do
+    nodes =
+      Enum.map(rms_norm(one_over_sqrt()), fn node ->
+        %{node | name: "/norm/#{node.op_type}_#{hd(node.output)}"}
+      end)
+
+    model = write(dir, nodes, @rms_constants, ["x"], ["y"])
+    [%{metadata_props: [entry]}] = Transmuter.load!(model).nodes
+
+    assert entry.key == "transmuter.fused"
+
+    assert entry.value |> String.split(", ") |> Enum.sort() ==
+             Enum.sort(Enum.map(nodes, &"#{&1.op_type} #{&1.name}"))
+  end
+
   test "LayerNorm becomes LayerNormalization", %{tmp_dir: dir} do
     # Opset 18 gives the axes of ReduceMean as an input.
     nodes = [

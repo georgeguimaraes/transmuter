@@ -10,6 +10,8 @@ defmodule Transmuter.Fusion do
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
+  Each replacement node has a `metadata_props` entry with the key `transmuter.fused`. Its value lists the op type and the name of each node that the replacement replaces, the anchor first, separated by ", ". `Transmuter.Graph` shows these lists.
+
   A subgraph matches only when the replacement computes the same function:
 
     * The exponent is 2, the numerator of `1 / sqrt` is 1, and eps and a `Mul` scale are constants with one value. A `Div` by a value that is not a constant becomes the divisor input of `AttentionCore`, which reads it when the graph runs.
@@ -22,8 +24,10 @@ defmodule Transmuter.Fusion do
   Without shapes at load time, `AttentionCore` checks the shapes when it runs and uses the fused kernel only for 4-D heads, or 3-D heads in the batch as in Whisper and TrOCR exports, with a softmax over the last axis. A `Reshape` pair of the probabilities, as in the Whisper exports of Xenova, must give back the shape of the probabilities. Else the core runs as the operators of the graph.
   """
 
-  alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Onnx.{AttributeProto, NodeProto, StringStringEntryProto}
   alias Transmuter.Ops
+
+  @metadata_key "transmuter.fused"
 
   # The ONNX types FLOAT, FLOAT16 and BFLOAT16.
   @float_types [1, 10, 16]
@@ -56,7 +60,7 @@ defmodule Transmuter.Fusion do
              {replacement, matched} <- match(ctx, node),
              true <- closed?(ctx, matched),
              true <- Enum.all?(matched, &(not MapSet.member?(removed, &1.output))) do
-          {Map.put(fused, node.output, replacement),
+          {Map.put(fused, node.output, record(replacement, matched)),
            Enum.reduce(matched, removed, &MapSet.put(&2, &1.output))}
         else
           _ -> {fused, removed}
@@ -73,6 +77,13 @@ defmodule Transmuter.Fusion do
       end)
 
     %{graph | node: nodes}
+  end
+
+  # The replacement lists the op type and the name of each node that it replaces, the
+  # anchor first, so a view of the graph can show what the fusion did.
+  defp record(replacement, matched) do
+    fused = Enum.map_join(matched, ", ", &String.trim_trailing("#{&1.op_type} #{&1.name}"))
+    %{replacement | metadata_props: [%StringStringEntryProto{key: @metadata_key, value: fused}]}
   end
 
   defp subgraphs(node, opset, constants) do
