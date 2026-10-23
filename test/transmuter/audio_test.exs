@@ -196,6 +196,20 @@ defmodule Transmuter.AudioTest do
     assert Nx.size(one.audio) in div(length, 2)..(length * 2), repo
   end
 
+  # A stream of the samples of `audio` in chunks of `size` samples.
+  @doc false
+  def stream(audio, size) do
+    Stream.unfold(Nx.to_binary(audio), fn
+      "" ->
+        nil
+
+      samples ->
+        bytes = min(byte_size(samples), size * 4)
+        <<chunk::binary-size(^bytes), rest::binary>> = samples
+        {Nx.from_binary(chunk, :f32), rest}
+    end)
+  end
+
   # The words are equal, and their times are within one step of 0.02 s.
   @doc false
   def assert_words(%{chunks: chunks}, expected) do
@@ -455,17 +469,7 @@ defmodule Transmuter.AudioLongTest do
 
     start_supervised!({Nx.Serving, serving: serving, name: __MODULE__.Stream})
 
-    stream =
-      Stream.unfold(Nx.to_binary(@long), fn
-        "" ->
-          nil
-
-        samples ->
-          size = min(byte_size(samples), 7919 * 4)
-          <<chunk::binary-size(^size), rest::binary>> = samples
-          {Nx.from_binary(chunk, :f32), rest}
-      end)
-
+    stream = Transmuter.AudioTest.stream(@long, 7919)
     %{chunks: chunks} = Nx.Serving.batched_run(__MODULE__.Stream, stream)
     [{start, stop, text} | rest] = @tiny_segments
 
@@ -505,9 +509,10 @@ defmodule Transmuter.AudioBatchTest do
 
   # The 3 windows of the long audio and the short audio are 4 rows: 2 batches of 2, or a
   # batch of 3 and a batch with 2 padding rows. With timestamps, the windows of the long
-  # audio have different numbers of passes.
+  # audio have different numbers of passes. The long audio in a stream gives the same rows
+  # and batches.
   test "a batch of windows gives the result of each audio alone" do
-    for {batch_size, timestamps} <- [{2, nil}, {3, :segments}] do
+    for {batch_size, timestamps, sizes} <- [{2, nil, [2, 2]}, {3, :segments, [3, 1]}] do
       opts = [timestamps: timestamps] ++ @opts
       single = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
 
@@ -518,7 +523,12 @@ defmodule Transmuter.AudioBatchTest do
         )
 
       alone = for audio <- [@long, @audio], do: Nx.Serving.run(single, audio)
-      assert Nx.Serving.run(batched, [@long, @audio]) == alone
+
+      for inputs <- [[@long, @audio], [Transmuter.AudioTest.stream(@long, 7919), @audio]] do
+        {batches, _info} = batched.client_preprocessing.(inputs)
+        assert Enum.map(batches, & &1.size) == sizes
+        assert Nx.Serving.run(batched, inputs) == alone
+      end
     end
   end
 end
