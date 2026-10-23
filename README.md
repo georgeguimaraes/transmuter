@@ -118,7 +118,7 @@ There are three ways to get the view:
 - Outside Livebook, call `Transmuter.Graph.to_html(model, "graph.html", inputs: inputs)` and open the file in a browser.
 - From the command line, run `mix transmuter.graph onnx-community/Kokoro-82M-v1.0-ONNX --run --open`. It calls the model once with inputs of ones.
 
-The view loads no file from the network. For the plain ONNX graph, use Netron: `uvx netron model.onnx`.
+The view loads no file from the network. For the graph as the exporter wrote it, without fusion and without a call, run `mix transmuter.graph onnx-community/Kokoro-82M-v1.0-ONNX --plain`.
 
 ## Non-tensor values and random operators
 

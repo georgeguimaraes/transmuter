@@ -2,7 +2,12 @@ defmodule Transmuter.Graph do
   @moduledoc """
   Shows the graph of a loaded model with what Transmuter does to it: where `Transmuter.compile/3` breaks the graph and why, which subgraphs `Transmuter.Fusion` replaced, and which values are static.
 
-  For the plain ONNX graph, open the file in Netron, for example with `uvx netron model.onnx`.
+  For the graph as the exporter wrote it, load the model with `fuse: false` and call `as_graph/2` or `to_html/3` without `:inputs`:
+
+      model = Transmuter.load!({:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"}, fuse: false)
+      Transmuter.Graph.to_html(model, "minilm.html")
+
+  `Transmuter.load!/2` makes the large `Constant` nodes params, so these values show as inputs without a producer node.
 
   In Livebook, `as_graph/2` shows an interactive view. It needs the optional `kino` dependency:
 

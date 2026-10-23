@@ -4,11 +4,13 @@ defmodule Mix.Tasks.Transmuter.Graph do
   @moduledoc """
   Writes the view of `Transmuter.Graph.to_html/3` for an ONNX model to an HTML file.
 
-      mix transmuter.graph REPO_OR_DIR [--file onnx/model.onnx] [--revision REV] [--out PATH] [--open] [--run] [--dim NAME=SIZE ...] [--backend exla|emlx|binary]
+      mix transmuter.graph REPO_OR_DIR [--file onnx/model.onnx] [--revision REV] [--out PATH] [--open] [--plain | --run] [--dim NAME=SIZE ...] [--backend exla|emlx|binary]
 
   `REPO_OR_DIR` is a repository on the Hugging Face Hub, such as `Xenova/all-MiniLM-L6-v2`, or a local directory, as in `Transmuter.Hub`.
 
   Without `--run`, the task writes the static view. It does not call the model.
+
+  With `--plain`, the task loads the model with `fuse: false` and does not call it, so the view shows the graph as the exporter wrote it. `Transmuter.load!/2` makes the large `Constant` nodes params, so these values show as inputs without a producer node. `--plain` and `--run` do not go together.
 
   With `--run`, the task calls the model once with inputs of ones. A one, unlike a zero, is not a degenerate value for a divisor or a scale, such as the `speed` input of Kokoro. Each input gets the type and the shape that the graph declares. A string input gets `"a"` for each element, and an input that is not a tensor, such as a sequence, gets an empty optional. A symbolic dimension gets its size from `--dim`, else 1. When the call fails, use `--dim` with the sizes that the model needs, or call `Transmuter.Graph.as_graph/2` in Livebook with real inputs.
 
@@ -18,6 +20,7 @@ defmodule Mix.Tasks.Transmuter.Graph do
     * `--revision` - the revision of a Hub repository. The default is `main`.
     * `--out` - the path of the HTML file. The default is the name of the repository with `.html`, in the current directory.
     * `--open` - opens the file with `open` on macOS or `xdg-open` on Linux. Without it, the task prints the path.
+    * `--plain` - shows the graph as the exporter wrote it, without fusion and without a call.
     * `--run` - calls the model once with inputs of ones, so the view shows the segments.
     * `--dim` - the size of a symbolic dimension, such as `--dim sequence_length=16`. Give it once for each dimension.
     * `--backend` - `exla` (the EXLA CPU), `emlx` (the EMLX CPU) or `binary` (`Nx.BinaryBackend`). The default is `exla` when EXLA is available, else `binary`.
@@ -31,6 +34,7 @@ defmodule Mix.Tasks.Transmuter.Graph do
     out: :string,
     open: :boolean,
     run: :boolean,
+    plain: :boolean,
     dim: :keep,
     backend: :string
   ]
@@ -45,6 +49,10 @@ defmodule Mix.Tasks.Transmuter.Graph do
         _other -> Mix.raise("Give one repository or directory, see mix help transmuter.graph")
       end
 
+    if opts[:plain] && opts[:run] do
+      Mix.raise("--plain shows the graph without a call, so it does not go together with --run")
+    end
+
     Mix.Task.run("app.start")
 
     file = Keyword.get(opts, :file, "onnx/model.onnx")
@@ -52,7 +60,7 @@ defmodule Mix.Tasks.Transmuter.Graph do
     {backend, compile_opts} = backend(opts[:backend] || default_backend())
 
     model_source = if File.dir?(source), do: Path.join(source, file), else: {:hf, source, file}
-    model = Transmuter.load!(model_source, [backend: backend] ++ hub_opts)
+    model = Transmuter.load!(model_source, [backend: backend, fuse: !opts[:plain]] ++ hub_opts)
     out = opts[:out] || Path.basename(source) <> ".html"
 
     html =

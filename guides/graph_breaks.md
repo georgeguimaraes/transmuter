@@ -97,7 +97,7 @@ Transmuter.Graph.to_html(model, "graph.html", inputs: inputs, compile: [compiler
 
 The view works without a network connection. Without `:inputs`, the view is static only and shows no segments.
 
-The `[:transmuter, :segment, :compile, :stop]` event also gives the reason of each break (see `Transmuter.Telemetry`). For the plain ONNX graph, use Netron: `uvx netron model.onnx`.
+The `[:transmuter, :segment, :compile, :stop]` event also gives the reason of each break (see `Transmuter.Telemetry`). For the graph as the exporter wrote it, load the model with `fuse: false` and call `Transmuter.Graph.to_html/3` without `:inputs`, or run `mix transmuter.graph REPO --plain`.
 
 ## Limit the number of compiled segments
 
