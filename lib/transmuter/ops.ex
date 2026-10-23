@@ -327,9 +327,14 @@ defmodule Transmuter.Ops do
       do: value
 
   def known!(value, description) do
-    unless known?(value), do: raise(Transmuter.UnknownValueError, value: description)
+    unless known?(value),
+      do: raise(Transmuter.UnknownValueError, value: description, expr: expr_id(value))
+
     value
   end
+
+  defp expr_id(%Nx.Tensor{data: %Nx.Defn.Expr{id: id}}), do: id
+  defp expr_id(_value), do: nil
 
   @doc """
   Returns whether the host can read a value.

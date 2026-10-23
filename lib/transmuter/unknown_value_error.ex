@@ -21,9 +21,10 @@ defmodule Transmuter.UnknownValueError do
     * `:value` - the name of the tensor whose value was needed
     * `:op_type` - the operator type that needed the value
     * `:node` - the node name in the graph, or `nil` when not available
+    * `:expr` - the id of the traced expression whose value was needed, or `nil`. `Transmuter.compile/3` finds the input of the node that it is.
   """
 
-  defexception [:value, :node, :op_type]
+  defexception [:value, :node, :op_type, :expr]
 
   @impl true
   def message(error) do
