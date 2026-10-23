@@ -578,6 +578,29 @@ for name, (images, messages) in chats.items():
         length += 1
     print("ministral onnxruntime", name, ids.shape[1], tokens, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
 
+# The Gemma 3 processor. preprocessor_config.json names the slow image processor, so the pixel
+# values are those of Transmuter. The chat template starts with the bos token, so
+# apply_chat_template of the processor tokenizes without special tokens. The pixel values of a
+# wide and a tall image at (image, channel, y, x), the mean of the absolute values, and the
+# number and a SHA-256 of the int64 input ids. Two images give two expanded image texts.
+# tokenizer_config.json has the format of transformers 5, which gives the image tokens in
+# model_specific_special_tokens. Transformers 4.57 reads them from extra_special_tokens, so the
+# script gives them to the tokenizer.
+repo = "onnx-community/gemma-3-4b-it-ONNX"
+image = Image.open("test/fixtures/cats.png")
+image_tokens = {"boi_token": "<start_of_image>", "eoi_token": "<end_of_image>", "image_token": "<image_soft_token>"}
+processor = AutoProcessor.from_pretrained(repo, tokenizer=AutoTokenizer.from_pretrained(repo, extra_special_tokens=image_tokens))
+positions = [(0, 0, 0, 0), (0, 1, 100, 37), (0, 2, 895, 895), (0, 0, 447, 600)]
+for name, pictures, text in [
+    ("wide", [image], "Can you describe this image?"),
+    ("tall", [image.transpose(Image.Transpose.TRANSPOSE)], "Can you describe this image?"),
+    ("two", [image, image.crop((0, 0, 320, 100))], "How are these two images different?"),
+]:
+    content = [{"type": "image", "image": picture} for picture in pictures] + [{"type": "text", "text": text}]
+    inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="np")
+    ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
+    print("gemma3", name, values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+
 # Object detection: the slow image processor, the PyTorch model and
 # post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
 # truncates the boxes to integers, so the script prints the boxes before that. DETR uses

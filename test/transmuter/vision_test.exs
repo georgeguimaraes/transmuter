@@ -620,6 +620,61 @@ defmodule Transmuter.VisionTest do
     assert features == Nx.concatenate(Enum.map(tensors, & &1["pixel_values"]))
   end
 
+  @gemma3 {:hf, "onnx-community/gemma-3-4b-it-ONNX"}
+
+  # The test reads only the configuration and the tokenizer of the repository. The chat
+  # template adds the bos token, so the prompt is tokenized without special tokens, as
+  # apply_chat_template of the Python processor does. The resize does not keep the aspect
+  # ratio, so the wide and the tall image have the same prompt.
+  @tag ci_partition: 15
+  test "the Gemma 3 processor gives the pixel values and the prompt of Python transformers" do
+    repo = Transmuter.Repo.load!(@gemma3)
+    processor = Gemma3Processor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    crop = image[0..99]
+
+    for {images, text, expected, mean, count, sha} <- [
+          {[image], "Can you describe this image?", [0.1059, -0.9451, -0.6392, 0.1059], 0.4695,
+           274, "15eebdfa906797ce"},
+          {[Nx.transpose(image, axes: [1, 0, 2])], "Can you describe this image?",
+           [0.1059, -0.749, -0.6392, 0.8431], 0.4695, 274, "15eebdfa906797ce"},
+          {[image, crop], "How are these two images different?",
+           [0.1059, -0.9451, -0.6392, 0.1059], 0.4755, 534, "69756c1de0729c2b"}
+        ] do
+      content = Enum.map(images, fn _ -> %{type: "image"} end) ++ [%{type: "text", text: text}]
+      prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+      {tensors, texts} =
+        images
+        |> Enum.map(&Gemma3Processor.process(processor, &1, @opts[:backend]))
+        |> Enum.unzip()
+
+      pixels = tensors |> Enum.map(& &1["pixel_values"]) |> Nx.concatenate()
+      pixels = Nx.backend_transfer(pixels, Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {length(images), 3, 896, 896}
+
+      got =
+        for index <- [[0, 0, 0, 0], [0, 1, 100, 37], [0, 2, 895, 895], [0, 0, 447, 600]],
+            do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
+
+      [first | rest] = String.split(prompt, Gemma3Processor.placeholder())
+      prompt = Enum.join([first | Enum.zip_with(texts, rest, &(&1 <> &2))])
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(tokenizer.native, prompt, add_special_tokens: false)
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {count, sha}
+    end
+  end
+
   # The batch gives each row the images of its chat and rows of zeros up to the batch key. The
   # encoder runs only on the images of the chats, and the features of each row follow those of
   # the rows before it. The fake encoder gives each image the features of its first pixel.
