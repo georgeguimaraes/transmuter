@@ -162,12 +162,12 @@ defmodule Transmuter.Audio.SpeechToText do
 
     postprocess = fn rows, _runs ->
       windows =
-        for [size, left, right | ids] <- rows do
+        Enum.map(rows, fn [size, left, right | ids] ->
           tokens =
             for [token, time] <- Enum.chunk_every(ids, 2), do: {token, time * frame_seconds}
 
           {tokens, Enum.map([size, left, right], &(&1 / featurizer.sampling_rate))}
-        end
+        end)
 
       %{chunks: result(mode, merge(windows, settings), tokenizer, language)}
     end
