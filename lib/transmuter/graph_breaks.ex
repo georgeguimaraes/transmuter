@@ -2,9 +2,9 @@ defmodule Transmuter.GraphBreaks do
   @moduledoc """
   Compiles a model whose graph needs values that are only known when it runs, such as the limit of a Range or the boxes of a NonMaxSuppression.
 
-  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. The small values that the break node reads (integer shapes, float scales) become static, also the outer values that its subgraphs read, so later segments fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
+  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. The small values that the break node reads (integer shapes, float scales) become static, also the outer values that its subgraphs read, so later segments can fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
 
-  Static values are those of the model, the static inputs, promoted values and values folded from them. Everything else enters a segment as an argument.
+  Static values are those of the model, the static inputs, promoted values and values folded from them. A promoted value, or a value folded from it, enters a segment as an argument, so that its value is not in the key, unless a node needs its host value. The plan learns these names from its traces: when a node needs the host value of an argument that follows only from static values of the call, the break is induced, and the names on the way stay static from then on. Everything else enters a segment as an argument.
   """
 
   alias Nx.Defn.{Compiler, Composite}
@@ -19,7 +19,7 @@ defmodule Transmuter.GraphBreaks do
     {opts, metadata} = options(model, opts)
 
     :telemetry.span([:transmuter, :compile], metadata, fn ->
-      plan = plan(model, opts)
+      plan = plan(model, opts, static_inputs)
       {call, graph_break} = start(plan, inputs, static_inputs)
       {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
     end)
@@ -31,7 +31,7 @@ defmodule Transmuter.GraphBreaks do
   # leaves no segment and no table behind, also when the call raises.
   def run_once(model, inputs, static_inputs, opts) do
     {opts, _metadata} = options(model, opts)
-    plan = plan(model, opts)
+    plan = plan(model, opts, static_inputs)
 
     try do
       {call, _graph_break} = start(plan, inputs, static_inputs)
@@ -76,7 +76,7 @@ defmodule Transmuter.GraphBreaks do
   # The plan keeps the nodes once, as a tuple. A copy of a closure, such as in a new process
   # or in :persistent_term, copies each reference to a term again. So the closure of a call
   # holds the plan once.
-  defp plan(model, opts) do
+  defp plan(model, opts, static_inputs) do
     {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
     {disk_cache, opts} = Keyword.pop(opts, :disk_cache)
 
@@ -87,7 +87,9 @@ defmodule Transmuter.GraphBreaks do
       nodes: List.to_tuple(model.nodes),
       last_use: last_use(model),
       defined: defined(model),
+      producers: producers(model),
       constant: constant(model),
+      static_inputs: MapSet.new(Map.keys(static_inputs)),
       key: make_ref(),
       opts: opts,
       backend: Nx.Defn.to_backend(opts),
@@ -144,7 +146,7 @@ defmodule Transmuter.GraphBreaks do
   # EMLX traces again in a call whose quantized params it has not compiled.
   defp whole(plan, entry, inputs, static_inputs) do
     state = initial(plan, inputs, static_inputs)
-    {args, _static_key, _statics} = live(plan, state, 0)
+    {args, _static_key, _statics} = live(plan, state, 0, host_names(plan))
     with_graph(plan, fn -> state |> merge(run_compiled(entry, encode(args))) |> outputs(plan) end)
   end
 
@@ -231,11 +233,9 @@ defmodule Transmuter.GraphBreaks do
   # Finds or builds the compiled segment that starts at pos for these values, and gives
   # its arguments.
   defp segment(plan, state, pos) do
-    {args, static_key, statics} = live(plan, state, pos)
-    shapes = Enum.map(args, fn {name, value} -> {name, template(value)} end)
-    key = {pos, shapes, static_key}
+    {key, args, _statics, _names} = key(plan, state, pos, host_names(plan))
+    {^pos, shapes, _static_key} = key
     metadata = %{source: plan.source, position: pos, shapes: shapes}
-    args = encode(args)
 
     case lookup(plan, key) do
       {:ok, entry} ->
@@ -244,29 +244,93 @@ defmodule Transmuter.GraphBreaks do
 
       :miss ->
         :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
-        {build(plan, key, statics.(), args, metadata), args}
+        build(plan, state, pos, metadata)
     end
   end
 
-  defp build(plan, key = {pos, _shapes, _static_key}, statics, args, metadata) do
-    entry =
-      :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
+  defp key(plan, state, pos, host) do
+    {args, static_key, statics} = live(plan, state, pos, host)
+    shapes = Enum.map(args, fn {name, value} -> {name, template(value)} end)
+    {{pos, shapes, static_key}, encode(args), statics, Enum.map(args, &elem(&1, 0))}
+  end
+
+  # The names whose host value a node needs. They stay static in each segment that they
+  # enter. A plan learns them from the induced breaks of its traces, so the set only grows.
+  defp host_names(plan), do: Shared.get(plan.scope, :host) || MapSet.new()
+
+  defp build(plan, state, pos, metadata) do
+    :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
+      known = host_names(plan)
+      {key, args, entry} = attempt(plan, state, pos, known, %{added: %{}, real: MapSet.new()})
+      added = MapSet.difference(host_names(plan), known)
+
+      {{classify(entry), args},
+       Map.merge(metadata, %{
+         shapes: elem(key, 1),
+         stop: entry.stop,
+         compiled: entry.compiled != nil,
+         reason: entry.reason,
+         host_values: Enum.sort(added)
+       })}
+    end)
+  end
+
+  # A trace stops at a node that reads the host value of an argument. When that value
+  # follows only from static values of the call, the break is induced: the names on the way
+  # join the set of the plan and the segment is traced again. When the node still breaks
+  # with these names static, the break is real, and the names leave the set again.
+  defp attempt(plan, state, pos, known, tried) do
+    tentative = tried.added |> Map.values() |> Enum.reduce(known, &MapSet.union/2)
+    {key, args, statics, names} = key(plan, state, pos, tentative)
+
+    case lookup(plan, key) do
+      {:ok, entry} ->
+        learn(plan, tentative)
+        {key, args, entry}
+
+      :miss ->
         ref = make_ref()
         plan_key = plan.key
+        statics = statics.()
         fun = fn args -> trace(plan_key, statics, args, pos, ref) end
-        entry = compile_segment(plan, key, fun, args, ref)
-        Process.delete(ref)
 
-        {entry,
-         Map.merge(metadata, %{
-           stop: entry.stop,
-           compiled: entry.compiled != nil,
-           reason: entry.reason
-         })}
-      end)
+        context = %{
+          static: state.static,
+          arguments: Enum.filter(names, &Map.has_key?(state.static, &1)),
+          real: tried.real,
+          tried: Map.keys(tried.added)
+        }
 
-    store(plan, key, entry)
-    classify(entry)
+        Process.put({ref, :context}, context)
+
+        try do
+          compile_segment(plan, key, fun, args, ref)
+        after
+          Process.delete(ref)
+          Process.delete({ref, :context})
+        end
+        |> case do
+          {:induced, node, names} ->
+            added = Map.update(tried.added, node, names, &MapSet.union(&1, names))
+            attempt(plan, state, pos, known, %{tried | added: added})
+
+          {:real, node} ->
+            tried = %{added: Map.delete(tried.added, node), real: MapSet.put(tried.real, node)}
+            attempt(plan, state, pos, known, tried)
+
+          entry ->
+            learn(plan, MapSet.union(tentative, entry.later))
+            store(plan, key, entry)
+            {key, args, entry}
+        end
+    end
+  end
+
+  defp learn(plan, names) do
+    host = host_names(plan)
+
+    unless MapSet.subset?(names, host),
+      do: Shared.put(plan.scope, :host, MapSet.union(host, names))
   end
 
   # The compiler traces the segment before it builds a program. A short segment after a
@@ -284,27 +348,35 @@ defmodule Transmuter.GraphBreaks do
       outputs
     end
 
-    compiled =
-      try do
-        compile_program(plan, key, bounded, args)
-      catch
-        {^ref, :eager} -> nil
-      end
+    try do
+      compiled =
+        try do
+          compile_program(plan, key, bounded, args)
+        catch
+          {^ref, :eager} -> nil
+        end
 
-    # A compiler that loads the program from its disk cache does not trace the segment.
-    # Then a trace gives where the segment stops and what it returns.
-    unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
+      # A compiler that loads the program from its disk cache does not trace the segment.
+      # Then a trace gives where the segment stops and what it returns.
+      unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
 
-    {stop, reason, out_names, produced} = Process.get(ref)
+      {stop, reason, out_names, produced} = Process.get(ref)
 
-    %{
-      compiled: compiled,
-      stop: stop,
-      reason: reason,
-      out_names: out_names,
-      produced: produced,
-      digests: digests(produced)
-    }
+      %{
+        compiled: compiled,
+        stop: stop,
+        reason: reason,
+        out_names: out_names,
+        produced: produced,
+        digests: digests(produced),
+        later: Process.get({ref, :later}, MapSet.new())
+      }
+    catch
+      {^ref, :induced, node, names} -> {:induced, node, names}
+      {^ref, :real, node} -> {:real, node}
+    after
+      Process.delete({ref, :later})
+    end
   end
 
   # The compiled function keeps its example arguments, so it gets templates. With the
@@ -342,7 +414,7 @@ defmodule Transmuter.GraphBreaks do
     %{} = plan = Process.get({__MODULE__, key})
     env = Map.merge(statics, decode(args))
     ctx = context(plan, env)
-    {env, stop, reason} = run_until_break(plan, env, ctx, pos)
+    {env, stop, reason} = run_until_break(plan, env, ctx, pos, ref)
     stop_index = if stop == :end, do: tuple_size(plan.nodes), else: stop
 
     live =
@@ -358,12 +430,100 @@ defmodule Transmuter.GraphBreaks do
   end
 
   # The reason of a break is the description of the value that the break node needs.
-  defp run_until_break(plan, env, ctx, pos) do
+  defp run_until_break(plan, env, ctx, pos, ref) do
     Enum.reduce_while(pos..(tuple_size(plan.nodes) - 1)//1, {env, :end, nil}, fn i, {env, _, _} ->
       try do
         {:cont, {Transmuter.run_nodes([elem(plan.nodes, i)], env, ctx), :end, nil}}
       rescue
-        e in UnknownValueError -> {:halt, {env, i, e.value}}
+        e in UnknownValueError ->
+          unknown(plan, env, i, e, ref)
+          {:halt, {env, i, e.value}}
+      end
+    end)
+  end
+
+  # Node i of a trace needs a value that is not known. When that value follows only from
+  # static values of the call, the plan could have known it, so the break is induced:
+  #
+  #   * When the way goes through arguments of this segment, the trace throws the names on
+  #     the way, and the segment is traced again with them static.
+  #   * When it goes only through earlier segments, those segments already ran with the
+  #     values as arguments. The segment breaks at node i for this call, and the names keep
+  #     the values static in later calls.
+  #
+  # A value that follows from an input, a parameter or a device value of a break node makes
+  # the break real. A trace without a context, such as a trace of EMLX in a call, breaks.
+  defp unknown(plan, env, i, e, ref) do
+    context = Process.get({ref, :context})
+
+    if context && not MapSet.member?(context.real, i) do
+      origins = Enum.map(needed(elem(plan.nodes, i), env, e), &origin(plan, context, &1))
+
+      if :device in origins do
+        if i in context.tried, do: throw({ref, :real, i})
+      else
+        names = Enum.reduce(origins, MapSet.new(), &MapSet.union/2)
+
+        if Enum.any?(context.arguments, &MapSet.member?(names, &1)),
+          do: throw({ref, :induced, i, names}),
+          else: Process.put({ref, :later}, names)
+      end
+    end
+  end
+
+  # The traced inputs of the node that the error names, or all of its traced inputs when
+  # the node read a value that it computed from them.
+  defp needed(node, env, e) do
+    traced =
+      for name <- Enum.uniq(Transmuter.value_dependencies(node)),
+          traced?(Map.get(env, name)),
+          do: name
+
+    case Enum.filter(traced, &match?(%Nx.Tensor{data: %{id: id}} when id == e.expr, env[&1])) do
+      [] -> traced
+      read -> read
+    end
+  end
+
+  # The names on the way from static values of the call to the value of name, or :device.
+  # The way stops at a break node, because the break gives its node host values.
+  defp origin(plan, context, name) do
+    breaks = Shared.get(plan.scope, :breaks) || MapSet.new()
+    {origin, _memo} = origin(plan, context, breaks, name, %{})
+    origin
+  end
+
+  defp origin(plan, context, breaks, name, memo) do
+    cond do
+      Map.has_key?(memo, name) ->
+        {memo[name], memo}
+
+      Map.has_key?(context.static, name) and not MapSet.member?(plan.static_inputs, name) ->
+        {MapSet.new([name]), memo}
+
+      Map.has_key?(context.static, name) or Map.has_key?(plan.constant, name) ->
+        {MapSet.new(), memo}
+
+      true ->
+        index = Map.get(plan.producers, name)
+
+        {origin, memo} =
+          if index == nil or MapSet.member?(breaks, index),
+            do: {:device, memo},
+            else: inputs_origin(plan, context, breaks, elem(plan.nodes, index), name, memo)
+
+        {origin, Map.put(memo, name, origin)}
+    end
+  end
+
+  defp inputs_origin(plan, context, breaks, node, name, memo) do
+    node
+    |> Transmuter.value_dependencies()
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.reduce_while({MapSet.new([name]), memo}, fn input, {names, memo} ->
+      case origin(plan, context, breaks, input, memo) do
+        {:device, memo} -> {:halt, {:device, memo}}
+        {found, memo} -> {:cont, {MapSet.union(names, found), memo}}
       end
     end)
   end
@@ -388,6 +548,11 @@ defmodule Transmuter.GraphBreaks do
   # sizes of the images of a Qwen2-VL encoder as an outer value.
   defp run_break(plan, state, index) do
     node = elem(plan.nodes, index)
+    breaks = Shared.get(plan.scope, :breaks) || MapSet.new()
+
+    unless MapSet.member?(breaks, index),
+      do: Shared.put(plan.scope, :breaks, MapSet.put(breaks, index))
+
     metadata = %{source: plan.source, position: index, node: node.name, op_type: node.op_type}
 
     :telemetry.span([:transmuter, :break], metadata, fn ->
@@ -460,7 +625,7 @@ defmodule Transmuter.GraphBreaks do
   # static values that can change between calls, and a function that gives the static
   # values that the segment captures. Zero-size values, strings and empty optionals hold no
   # device data, so they are captured like static values whatever their origin.
-  defp live(plan, state, pos) do
+  defp live(plan, state, pos, host) do
     {names, constants} = live_names(plan, state, pos)
 
     {args, statics, key} =
@@ -468,6 +633,9 @@ defmodule Transmuter.GraphBreaks do
         case state.env do
           %{^name => value} ->
             cond do
+              argument?(plan, state, host, name, value) ->
+                {[{name, to_backend(value, plan.backend)} | args], statics, key}
+
               digest = state.static[name] ->
                 {args, [{name, value} | statics], [{name, digest} | key]}
 
@@ -484,6 +652,14 @@ defmodule Transmuter.GraphBreaks do
       end)
 
     {args, key, fn -> Map.merge(Map.take(state.env, constants), Map.new(statics)) end}
+  end
+
+  # A value that the plan made static, such as a value that a break node read, goes into a
+  # segment as an argument, so that its digest is not in the key. A static input and a
+  # value whose host value a node needs stay static.
+  defp argument?(plan, state, host, name, value) do
+    Map.has_key?(state.static, name) and device_value?(value) and
+      not MapSet.member?(host, name) and not MapSet.member?(plan.static_inputs, name)
   end
 
   # The names of the values that a call has before pos and that nodes at pos or later read,
@@ -558,6 +734,15 @@ defmodule Transmuter.GraphBreaks do
         ),
       &elem(&1, 0)
     )
+  end
+
+  # The index of the node that computes each name.
+  defp producers(model) do
+    for {node, i} <- Enum.with_index(model.nodes),
+        name <- node.output,
+        name != "",
+        into: %{},
+        do: {name, i}
   end
 
   # A sequence crosses a segment boundary as a tuple of its tensors. Its other elements,

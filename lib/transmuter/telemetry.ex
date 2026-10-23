@@ -76,7 +76,7 @@ defmodule Transmuter.Telemetry do
       * Metadata: `%{source: term, position: integer, shapes: list}`
 
     * `[:transmuter, :segment, :compile, :stop]` - the segment is ready.
-      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean, reason: String.t() | nil}`
+      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean, reason: String.t() | nil, host_values: [String.t()]}`
 
     * `[:transmuter, :break, :start]` - a break node starts to run eagerly.
       * Metadata: `%{source: term, position: integer, node: String.t(), op_type: String.t()}`
@@ -85,6 +85,8 @@ defmodule Transmuter.Telemetry do
       * Metadata: `%{source: term, position: integer, node: String.t(), op_type: String.t()}`
 
   `:stop` is the position of the break node where the segment stops, or `:end`. `:reason` describes the value that the break node needs, such as `"the If condition"`. It is `nil` when `:stop` is `:end`. A segment of fewer than 20 nodes after a break is not compiled, and `:compiled` is `false`. Then its nodes run eagerly on each call.
+
+  `:host_values` are the names of the values that the trace of the segment found a host read for, such as the shape of a `Reshape` that comes from the positions of a `NonZero`. These values stay static from then on, so their values are in the cache key of each segment that they enter. The list is empty when the trace found no new name. The `:shapes` of the stop event are those of the arguments that the segment compiled for, which can have fewer values than the `:shapes` of the start event.
 
   A graph without breaks keeps its compiled function for the shapes of the inputs to `Transmuter.compile/3`. A call with these shapes does not use the cache, so it emits no cache events.
 
