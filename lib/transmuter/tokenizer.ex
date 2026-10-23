@@ -374,10 +374,11 @@ defmodule Transmuter.Tokenizer do
   def token_to_id(tokenizer, token), do: Tokenizer.token_to_id(tokenizer.native, token)
 
   @doc """
-  Decodes token ids into text, without the special tokens.
+  Decodes token ids into text, without the special tokens. With `skip_special_tokens: false`, the text keeps them, such as the location tokens of Florence-2.
   """
-  def decode(tokenizer, ids) do
-    {:ok, text} = Tokenizer.decode(tokenizer.native, ids, skip_special_tokens: true)
+  def decode(tokenizer, ids, opts \\ []) do
+    skip? = Keyword.get(opts, :skip_special_tokens, true)
+    {:ok, text} = Tokenizer.decode(tokenizer.native, ids, skip_special_tokens: skip?)
     text
   end
 end
