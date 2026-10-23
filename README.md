@@ -41,7 +41,31 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 #=>               token_summary: %{input: 15, output: 167, padding: 0}}]}
 ```
 
-The text tasks are `text_embedding`, `text_classification`, `text_ranking` (cross-encoders and rerankers such as Qwen3-Reranker), `zero_shot_classification`, `token_classification`, `fill_mask`, `question_answering`, `generation` and `text_to_text` (T5 and Marian, and NLLB and M2M100 for translation between many languages). `Transmuter.Vision` gives the image tasks `image_classification`, `image_embedding`, `zero_shot_image_classification`, `image_to_text` (ViT-GPT2, TrOCR and Florence-2), `image_text_to_text` (chats about images with SmolVLM and Qwen2-VL), `object_detection` (DETR, YOLOS, RT-DETR and RF-DETR), `zero_shot_object_detection` (OWL-ViT, OWLv2 and Grounding DINO), `depth_estimation` (Depth Anything), `image_segmentation` (Segformer), `background_removal` (ORMBG) and `mask_generation` (SAM and SAM 2 with point and box prompts) and `image_to_image` (Swin2SR super resolution). `Transmuter.Audio` gives `speech_to_text` (Whisper), `audio_classification` (AST and wav2vec2), `zero_shot_audio_classification` (CLAP) and `text_to_speech` (VITS and SpeechT5). Their results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
+The tasks:
+
+- `Transmuter.Text`
+  - `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask` and `question_answering`
+  - `text_ranking`: cross-encoders and rerankers such as Qwen3-Reranker
+  - `generation`
+  - `text_to_text`: T5 and Marian, and NLLB and M2M100 for translation between many languages
+- `Transmuter.Vision`
+  - `image_classification`, `image_embedding` and `zero_shot_image_classification`
+  - `image_to_text`: ViT-GPT2, TrOCR and Florence-2
+  - `image_text_to_text`: chats about images with SmolVLM and Qwen2-VL
+  - `object_detection`: DETR, YOLOS, RT-DETR and RF-DETR
+  - `zero_shot_object_detection`: OWL-ViT, OWLv2 and Grounding DINO
+  - `depth_estimation`: Depth Anything
+  - `image_segmentation`: Segformer
+  - `background_removal`: ORMBG
+  - `mask_generation`: SAM and SAM 2, with point and box prompts
+  - `image_to_image`: Swin2SR super resolution
+- `Transmuter.Audio`
+  - `speech_to_text`: Whisper
+  - `audio_classification`: AST and wav2vec2
+  - `zero_shot_audio_classification`: CLAP
+  - `text_to_speech`: VITS and SpeechT5
+
+The results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
 ## Tensors
 
