@@ -148,6 +148,84 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # The log-probabilities of the tokens, from the token log-probabilities sections of
+  # test/support/pipeline_references.py. ONNX Runtime on the same exports gives each value
+  # within 4.4e-5 for gpt2 and 1.2e-4 for whisper-tiny.en. compute_transition_scores of the
+  # PyTorch models with normalize_logits=True gives the same tokens, and values up to 2.4e-4
+  # (gpt2) and 4.6e-4 (whisper-tiny.en) from those of Transmuter. These differences are
+  # already in the first token and are the same for greedy selection and beams, which select
+  # in different functions, so they come from the logits. The log-softmax of EXLA is within
+  # 3e-6 of f64. Python also gives the value of the eos token, which the text does not have.
+  # Sampling takes the tokens of Transmuter on EXLA with seed 7, and Python gives their values
+  # after the temperature and top-k. A stream gives the values of all its tokens in the done
+  # event, so it needs stream_done: true.
+  @tag ci_partition: 10
+  test "token_logprobs match transformers for greedy selection, beams and sampling" do
+    prompt = "The history of the printing press begins"
+    gpt2 = [variant: :fp32, max_new_tokens: 8, token_logprobs: true] ++ @opts
+
+    greedy =
+      {[-0.722505, -0.811622, -2.300688, -0.463317, -1.118775, -1.638226, -1.721262, -0.92038],
+       [-0.722308, -0.811518, -2.300612, -0.463239, -1.118658, -1.638176, -1.721224, -0.920297]}
+
+    for {opts, text, expected} <- [
+          {[], " with the printing press. The first printing", greedy},
+          {[num_beams: 2], " with the invention of the printing press in",
+           {[-0.722505, -0.811622, -2.490965, -0.074146, -0.631518, -0.865999, -0.023429] ++
+              [-1.084662],
+            [-0.722321, -0.811528, -2.490889, -0.074013, -0.631451, -0.865934, -0.023328] ++
+              [-1.084462]}},
+          {[strategy: :sampling, temperature: 0.7, top_k: 5, seed: 7],
+           " with the first printing presses.\n\n",
+           {[-0.28989, -0.083239, -1.974234, -0.033321, -2.342517, -0.945498, -1.874403] ++
+              [-0.000142],
+            [-0.289905, -0.083239, -1.974146, -0.033321, -2.342534, -0.945499, -1.874423] ++
+              [-0.000142]}}
+        ] do
+      serving = Text.generation({:hf, "Xenova/gpt2"}, opts ++ gpt2)
+
+      assert %{results: [%{text: ^text, token_logprobs: logprobs}]} =
+               Nx.Serving.run(serving, prompt)
+
+      assert_logprobs(logprobs, expected)
+    end
+
+    serving = Text.generation({:hf, "Xenova/gpt2"}, [stream: true, stream_done: true] ++ gpt2)
+    assert {:done, %{token_logprobs: logprobs}} = serving |> Nx.Serving.run(prompt) |> Enum.at(-1)
+    assert_logprobs(logprobs, greedy)
+
+    assert_raise ArgumentError, ~r/needs stream_done: true/, fn ->
+      Text.generation({:hf, "Xenova/gpt2"}, [stream: true] ++ gpt2)
+    end
+
+    audio = Nx.from_binary(File.read!("test/fixtures/librispeech_0.f32"), :f32)
+
+    expected =
+      {[-0.075897, -0.032374, -0.283304, -0.085364, -0.007146, -0.008866, -0.005784] ++
+         [-0.221374, -0.002404, -0.003975, -0.262812, -0.069947, -0.599032, -0.00657] ++
+         [-0.002136, -0.270061, -0.002165, -0.003492, -0.001052, -0.026898, -0.464047] ++
+         [-0.125146],
+       [-0.075686, -0.03204, -0.28328, -0.085126, -0.006954, -0.008703, -0.005566] ++
+         [-0.221347, -0.002253, -0.003812, -0.262625, -0.069761, -0.598903, -0.006324] ++
+         [-0.002064, -0.26986, -0.002081, -0.00336, -0.001017, -0.026686, -0.463964] ++
+         [-0.124798]}
+
+    for num_beams <- [1, 2] do
+      opts = [num_beams: num_beams, token_logprobs: true] ++ @opts
+      serving = Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
+      assert %{chunks: [%{token_logprobs: logprobs}]} = Nx.Serving.run(serving, audio)
+      assert_logprobs(logprobs, expected, 2.0e-4)
+    end
+  end
+
+  # Within `tolerance` of ONNX Runtime and 1e-3 of PyTorch.
+  defp assert_logprobs(logprobs, {onnxruntime, pytorch}, tolerance \\ 1.0e-4) do
+    for {expected, tolerance} <- [{onnxruntime, tolerance}, {pytorch, 1.0e-3}] do
+      assert length(logprobs) == length(expected)
+      assert logprobs |> Enum.zip_with(expected, &abs(&1 - &2)) |> Enum.max() < tolerance
+    end
+  end
+
   test "beam search raises with sampling and with a stream" do
     repo = {:hf, "Xenova/gpt2"}
 
@@ -158,5 +236,29 @@ defmodule Transmuter.GenerationTest do
     assert_raise ArgumentError, ~r/stream: true/, fn ->
       Text.generation(repo, [variant: :fp32, num_beams: 3, stream: true] ++ @opts)
     end
+  end
+end
+
+defmodule Transmuter.GenerationBitsTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Generation
+
+  # The selection gives f32 values as the integers of their bits. NaN and the infinities have
+  # no float in Elixir, so they come back as the atoms of Nx.to_list/1.
+  test "from_bits/1 and to_bits/1 give every f32 value and its bits" do
+    for {bits, value} <- [
+          {0x3FC00000, 1.5},
+          {-0x40800000, -1.0},
+          {0x00000001, 1.401298464324817e-45},
+          {0x7F800000, :infinity},
+          {-0x800000, :neg_infinity},
+          {0x7FC00000, :nan}
+        ] do
+      assert Generation.from_bits(bits) == value
+      assert Generation.to_bits(value) == bits
+    end
+
+    assert Generation.from_bits([0x7F800001, -1]) == [:nan, :nan]
   end
 end

@@ -33,11 +33,13 @@ defmodule Transmuter.Vision.ImageToText do
           :early_stopping,
           :task,
           :seed,
+          token_logprobs: false,
           stream: false,
           stream_done: false,
           defn_options: []
         ] ++ Hub.options()
       )
+      |> Serving.generation_options!()
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
@@ -83,13 +85,11 @@ defmodule Transmuter.Vision.ImageToText do
       [%{prompt: prompt, seed: seed, tensors: tensors, summary: summary}]
     end
 
-    postprocess = fn [ids], _runs -> %{results: [%{text: Tokenizer.decode(tokenizer, ids)}]} end
-
     task = %{
       validate: &validate(&1, false),
       preprocess: preprocess,
       init: init,
-      postprocess: postprocess
+      postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
 
     {ctx, task, compile}
@@ -203,9 +203,11 @@ defmodule Transmuter.Vision.ImageToText do
       ]
     end
 
-    postprocess = fn [ids], [run] ->
+    postprocess = fn [integers], [run] ->
+      {ids, logprobs} = Serving.tokens(integers, ctx.token_logprobs?)
       text = Tokenizer.decode(tokenizer, ids, skip_special_tokens: false)
-      %{results: [Florence2Processor.parse(processor, run.task, text, run.size)]}
+      result = Florence2Processor.parse(processor, run.task, text, run.size)
+      %{results: [Serving.token_logprobs(result, logprobs, ctx.token_logprobs?)]}
     end
 
     task = %{

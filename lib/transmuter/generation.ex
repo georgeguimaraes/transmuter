@@ -43,6 +43,12 @@ defmodule Transmuter.Generation do
 
   The atoms `:bad_words` and `:suppress_tokens` in the list are the places of two masks that do not change between steps: the bad words of one token and `suppress_tokens`. Generation makes these masks once for each group of rows.
 
+  ## Log-probabilities
+
+  With `token_logprobs: true` in the options of `context/4`, each step also gives the log-probability of the token of each row: the log-softmax of the scores that the step selects from, at the token. This is the rule of `compute_transition_scores` of Python transformers with `normalize_logits=True`, for greedy selection, sampling and beam search (see `generate/5`). The compiled selection subtracts the log-sum-exp of the scores of the row from the score of the token. Without the option, the selection does not compute it.
+
+  The compiled selection gives one s32 output, because EMLX evaluates each output of a compiled function separately. The tokens and the indices of the candidates of beam search are integers in it, and the scores and log-probabilities are the bits of their f32 values (`Nx.bitcast/2`, see `from_bits/1`).
+
   ## Beam search
 
   With `num_beams` above 1, generation does the beam search of `_beam_search` in Python transformers 4.57. The beams of a prompt are rows of the batch: prompt `i` has the rows `i * num_beams` to `i * num_beams + num_beams - 1`, and its inputs, image features and positions repeat for each row. `compile/3` compiles the decoder for `batch_size * num_beams` rows. At the start, all beams of a prompt are equal, and only the first beam counts.
@@ -98,6 +104,7 @@ defmodule Transmuter.Generation do
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
       max_new_tokens: max_new_tokens,
       sampling?: sampling?,
+      token_logprobs?: Keyword.get(opts, :token_logprobs, false),
       temperature: opts[:temperature] || gen["temperature"] || 1.0,
       top_k: opts[:top_k] || gen["top_k"] || 50,
       top_p: opts[:top_p] || gen["top_p"] || 1.0,
@@ -433,7 +440,15 @@ defmodule Transmuter.Generation do
 
     settings =
       ctx
-      |> Map.take([:repetition_penalty, :renormalize?, :sampling?, :temperature, :top_k, :top_p])
+      |> Map.take([
+        :repetition_penalty,
+        :renormalize?,
+        :sampling?,
+        :temperature,
+        :top_k,
+        :top_p,
+        :token_logprobs?
+      ])
       |> Map.put(:num_beams, ctx.num_beams)
       |> Map.put(:candidates, candidates(ctx))
       |> Map.put(
@@ -517,9 +532,9 @@ defmodule Transmuter.Generation do
 
   `inputs` can also have the key `:position_ids`, a list with the positions of each prompt. The positions of a prompt are a list with the positions of each axis of the decoder's `position_ids`, one for each token. An empty list gives the default positions. See the module documentation.
 
-  `on_token` is `nil` or a function that receives `%{token: tensor, finished?: tensor}` after each step of a group, with one row for each prompt. `:token` is the new token of the row, or -1 when the row has no new token. `:finished?` is 1 when the row has no more tokens.
+  `on_token` is `nil` or a function that receives `%{token: tensor, finished?: tensor}` after each step of a group, with one row for each prompt. `:token` is the new token of the row, or -1 when the row has no new token. `:finished?` is 1 when the row has no more tokens. With `token_logprobs: true` in the options of `context/4`, the map also has `:logprob`, the log-probability of the new token, or NaN when the row has no new token.
 
-  Returns the new token ids of each row, without the eos token.
+  Returns the new tokens of each row, without the eos token. A token is the list of its values: `[id]`, or `[id, logprob]` with `token_logprobs: true` in the options of `context/4`. The log-probability of a token is the log-softmax of the scores that the step selects from, at the token. These scores are the logits after the processors, also after the temperature, top-k and top-p of sampling. For beam search, they are the scores of the step before the sum with the score of the beam. This is `compute_transition_scores` of Python transformers with `normalize_logits=True`.
   """
   def generate(ctx, prompts, seeds, inputs \\ %{}, on_token \\ nil) do
     {features, inputs} = Map.pop(inputs, :image_features)
@@ -540,12 +555,12 @@ defmodule Transmuter.Generation do
     ids =
       for prompts <- groups(ctx, prompts) do
         if ctx.num_beams == 1 do
-          notify = &notify(on_token, prompts, &1)
+          notify = &notify(on_token, prompts, &1, ctx.token_logprobs?)
 
           group =
             decode(ctx, start(ctx, prompts, seeds, inputs, extras), ctx.max_new_tokens, notify)
 
-          Enum.map(group.ids, &Enum.reverse/1)
+          Enum.zip_with(group.ids, group.logprobs, &tokens/2)
         else
           search(ctx, prompts, seeds, inputs, extras)
         end
@@ -604,6 +619,7 @@ defmodule Transmuter.Generation do
       keys: seeds |> Enum.map(&Nx.Random.key/1) |> Nx.stack() |> Nx.backend_transfer(ctx.backend),
       prompts: prompts,
       ids: Enum.map(prompts, fn _ -> [] end),
+      logprobs: Enum.map(prompts, fn _ -> [] end),
       new: [],
       done: Enum.map(prompts, &(&1 == []))
     }
@@ -622,12 +638,15 @@ defmodule Transmuter.Generation do
     %{logits: logits, index: index} = group.state
     states = processor_states(ctx, group, Nx.axis_size(logits, -1))
     step = Nx.tensor(ctx.max_new_tokens - remaining, type: :u32, backend: Nx.BinaryBackend)
-    tokens = ctx.select.(logits, index, group.seen, group.masks, states, group.keys, step)
+    selected = ctx.select.(logits, index, group.seen, group.masks, states, group.keys, step)
 
-    new =
-      Enum.zip_with(Nx.to_flat_list(tokens), group.done, fn token, done? ->
-        if done? or token in ctx.eos, do: nil, else: token
+    {new, logprobs} =
+      selected
+      |> Nx.to_list()
+      |> Enum.zip_with(group.done, fn [token | logprob], done? ->
+        if done? or token in ctx.eos, do: {nil, nil}, else: {token, from_bits(logprob)}
       end)
+      |> Enum.unzip()
 
     marks = for {token, i} <- Enum.with_index(new), token, do: [i, token]
 
@@ -636,7 +655,8 @@ defmodule Transmuter.Generation do
       | seen: mark(group.seen, marks),
         new: new,
         done: Enum.map(new, &(&1 == nil or remaining == 1)),
-        ids: Enum.zip_with(new, group.ids, &if(&1, do: [&1 | &2], else: &2))
+        ids: push(group.ids, new, new),
+        logprobs: push(group.logprobs, new, logprobs)
     }
   end
 
@@ -644,7 +664,7 @@ defmodule Transmuter.Generation do
   # `i * num_beams` to `i * num_beams + num_beams - 1`, and the inputs, the image features and
   # the positions of the prompt repeat for each of them. Each step selects the best
   # candidates of each prompt on the device, and the host keeps the beams, the finished
-  # hypotheses and their scores. Returns the token ids of the best hypothesis of each prompt.
+  # hypotheses and their scores. Returns the tokens of the best hypothesis of each prompt.
   defp search(ctx, prompts, seeds, inputs, extras) do
     beams = ctx.num_beams
     repeat = &Enum.flat_map(&1, fn value -> List.duplicate(value, beams) end)
@@ -663,7 +683,7 @@ defmodule Transmuter.Generation do
     for item <- items do
       case item.finished do
         [] -> []
-        [{_score, ids} | _] -> Enum.reverse(ids)
+        [{_score, ids, logprobs} | _] -> tokens(ids, logprobs)
       end
     end
   end
@@ -671,12 +691,6 @@ defmodule Transmuter.Generation do
   defp search_steps(ctx, group, items, scores, step) do
     %{logits: logits, index: index} = group.state
     vocab = Nx.axis_size(logits, -1)
-
-    if ctx.num_beams * vocab > 2 ** 24 do
-      raise ArgumentError,
-            "beam search takes num_beams * vocabulary size up to 2^24, got: #{ctx.num_beams * vocab}"
-    end
-
     states = processor_states(ctx, group, vocab)
     scores_tensor = Nx.tensor(scores, type: :f32, backend: Nx.BinaryBackend)
 
@@ -688,19 +702,23 @@ defmodule Transmuter.Generation do
       items
       |> Enum.zip(candidates)
       |> Enum.with_index()
-      |> Enum.map(fn {{item, [values, indices]}, i} ->
+      |> Enum.map(fn {{item, columns}, i} ->
         rows = Enum.to_list((i * ctx.num_beams)..(i * ctx.num_beams + ctx.num_beams - 1))
 
         if item.done? do
-          {item, Enum.map(rows, &{&1, nil, 0.0})}
+          {item, Enum.map(rows, &padding_beam/1)}
         else
           candidates =
-            Enum.zip_with(values, indices, fn score, flat ->
-              flat = trunc(flat)
-              %{score: score, row: hd(rows) + div(flat, vocab), token: rem(flat, vocab)}
+            columns
+            |> Enum.zip()
+            |> Enum.map(fn candidate ->
+              [score, flat | logprob] = Tuple.to_list(candidate)
+              row = hd(rows) + div(flat, vocab)
+              token = rem(flat, vocab)
+              %{score: from_bits(score), row: row, token: token, logprob: from_bits(logprob)}
             end)
 
-          beam_step(ctx, item, rows, candidates, group.ids, step)
+          beam_step(ctx, item, rows, candidates, group, step)
         end
       end)
       |> Enum.unzip()
@@ -709,19 +727,19 @@ defmodule Transmuter.Generation do
       %{items: items}
     else
       beams = Enum.concat(beams)
-      sources = Enum.map(beams, &elem(&1, 0))
-      group = reorder(ctx, group, sources)
-      new = Enum.map(beams, &elem(&1, 1))
+      group = reorder(ctx, group, Enum.map(beams, & &1.row))
+      new = Enum.map(beams, & &1.token)
       marks = for {token, i} <- Enum.with_index(new), token, do: [i, token]
 
       group = %{
         group
         | seen: mark(group.seen, marks),
-          ids: Enum.zip_with(new, group.ids, &if(&1, do: [&1 | &2], else: &2))
+          ids: push(group.ids, new, new),
+          logprobs: push(group.logprobs, new, Enum.map(beams, & &1.logprob))
       }
 
       group = %{group | state: step(ctx, group.state, Enum.map(new, &List.wrap/1))}
-      search_steps(ctx, group, items, Enum.map(beams, &elem(&1, 2)), step + 1)
+      search_steps(ctx, group, items, Enum.map(beams, & &1.score), step + 1)
     end
   end
 
@@ -729,8 +747,10 @@ defmodule Transmuter.Generation do
   # are the next beams. The candidates that end among the first num_beams are finished
   # hypotheses, scored by their sum of log-probabilities over their length (with the eos
   # token) to the power of length_penalty. The prompt keeps its best num_beams hypotheses.
-  # Returns the item and, for each row of the prompt, its source row, its token and its score.
-  defp beam_step(ctx, item, rows, candidates, ids, step) do
+  # A hypothesis keeps the log-probability of each token, without the eos token. Returns the
+  # item and, for each row of the prompt, its candidate: its source row, its token, its
+  # log-probability and its score.
+  defp beam_step(ctx, item, rows, candidates, group, step) do
     %{num_beams: beams, length_penalty: penalty, early_stopping: early_stopping} = ctx
     last? = step + 1 == ctx.max_new_tokens
     candidates = Enum.map(candidates, &Map.put(&1, :end?, last? or &1.token in ctx.eos))
@@ -738,9 +758,14 @@ defmodule Transmuter.Generation do
     added =
       if item.open? and not (early_stopping == true and length(item.finished) == beams) do
         for candidate <- Enum.take(candidates, beams), candidate.end? do
-          ids = Enum.at(ids, candidate.row)
-          ids = if candidate.token in ctx.eos, do: ids, else: [candidate.token | ids]
-          {f32(candidate.score / f32((step + 1) ** penalty)), ids}
+          [ids, logprobs] = Enum.map([group.ids, group.logprobs], &Enum.at(&1, candidate.row))
+
+          {ids, logprobs} =
+            if candidate.token in ctx.eos,
+              do: {ids, logprobs},
+              else: {[candidate.token | ids], [candidate.logprob | logprobs]}
+
+          {f32(candidate.score / f32((step + 1) ** penalty)), ids, logprobs}
         end
       else
         []
@@ -766,8 +791,50 @@ defmodule Transmuter.Generation do
     item = %{item | finished: finished, open?: open?, done?: done?}
 
     if done?,
-      do: {item, Enum.map(rows, &{&1, nil, 0.0})},
-      else: {item, Enum.map(running, &{&1.row, &1.token, &1.score})}
+      do: {item, Enum.map(rows, &padding_beam/1)},
+      else: {item, running}
+  end
+
+  # The beam of a row of a prompt that is done: the row keeps its cache and gets no token.
+  defp padding_beam(row), do: %{row: row, token: nil, logprob: [], score: 0.0}
+
+  # The tokens of a row from its ids and their log-probabilities, the last first. The
+  # log-probability of a token is a list: empty without token_logprobs.
+  defp tokens(ids, logprobs),
+    do: Enum.zip_with(Enum.reverse(ids), Enum.reverse(logprobs), &[&1 | &2])
+
+  # Puts the value of each row with a new token before the other values of the row.
+  defp push(lists, tokens, values) do
+    Enum.zip_with([lists, tokens, values], fn
+      [list, nil, _value] -> list
+      [list, _token, value] -> [value | list]
+    end)
+  end
+
+  @doc """
+  Returns the f32 value of `bits`, the signed 32-bit integer of its bits, as `Nx.to_list/1` gives an f32: a float, `:nan`, `:infinity` or `:neg_infinity`. A list gives the value of each element. The compiled selection gives its scores and log-probabilities in this form (see the module documentation).
+  """
+  def from_bits(bits) when is_list(bits), do: Enum.map(bits, &from_bits/1)
+
+  def from_bits(bits) do
+    case <<bits::signed-32>> do
+      <<value::float-32>> -> value
+      <<0::1, 0xFF::8, 0::23>> -> :infinity
+      <<1::1, 0xFF::8, 0::23>> -> :neg_infinity
+      _nan -> :nan
+    end
+  end
+
+  @doc """
+  Returns the signed 32-bit integer of the bits of `value` in f32, the inverse of `from_bits/1`. NaN is the quiet NaN with the sign bit 0.
+  """
+  def to_bits(:nan), do: 0x7FC00000
+  def to_bits(:infinity), do: 0x7F800000
+  def to_bits(:neg_infinity), do: -0x800000
+
+  def to_bits(value) do
+    <<bits::signed-32>> = <<value::float-32>>
+    bits
   end
 
   # The state of each processor for the rows of the group.
@@ -807,6 +874,7 @@ defmodule Transmuter.Generation do
         | state: state,
           prompts: take.(group.prompts),
           ids: take.(group.ids),
+          logprobs: take.(group.logprobs),
           seen: take_rows(group.seen, sources)
       }
     end
@@ -836,10 +904,11 @@ defmodule Transmuter.Generation do
     rounded
   end
 
-  # The rows of other groups have no token and are not finished.
-  defp notify(nil, _prompts, _group), do: :ok
+  # The rows of other groups have no token and are not finished. The log-probability of a new
+  # token is the first one of its row.
+  defp notify(nil, _prompts, _group, _logprobs?), do: :ok
 
-  defp notify(on_token, prompts, group) do
+  defp notify(on_token, prompts, group, logprobs?) do
     {tokens, finished} =
       Enum.zip_with([prompts, group.new, group.done], fn
         [[], _token, _done?] -> {-1, 0}
@@ -847,10 +916,25 @@ defmodule Transmuter.Generation do
       end)
       |> Enum.unzip()
 
-    on_token.(%{
+    event = %{
       token: Nx.tensor(tokens, type: :s64, backend: Nx.BinaryBackend),
       finished?: Nx.tensor(finished, type: :u8, backend: Nx.BinaryBackend)
-    })
+    }
+
+    event =
+      if logprobs? do
+        logprobs =
+          Enum.zip_with(group.new, group.logprobs, fn
+            nil, _logprobs -> :nan
+            _token, [[logprob] | _] -> logprob
+          end)
+
+        Map.put(event, :logprob, Nx.tensor(logprobs, type: :f32, backend: Nx.BinaryBackend))
+      else
+        event
+      end
+
+    on_token.(event)
   end
 
   defp advance(ctx, group),
@@ -1081,31 +1165,44 @@ defmodule Transmuter.Generation do
   # Selects the token of each row from its logits at `index`. The key of a step is the key
   # of the row folded with the number of the step. The serving compiles this function,
   # because eager random numbers over a large vocabulary are slow. EMLX evaluates each
-  # output of a compiled function separately, so the function gives only the tokens.
+  # output of a compiled function separately, so the function gives one s32 output: the token
+  # of each row, and with token_logprobs the bits of its log-probability.
   defp select_tokens(logits, index, seen, masks, states, keys, step, settings) do
     [logits, index, seen, keys | states] =
       Enum.map([logits, index, seen, keys | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
 
     logits = Nx.take(logits, index)
     key = Transmuter.Random.fold_in(keys, step)
-    token = select_token(logits, seen, masks, states, key, settings)
-    Nx.devectorize(token, keep_names: false)
+    {scores, token} = select_token(logits, seen, masks, states, key, settings)
+    token = Nx.as_type(token, :s32)
+
+    values =
+      if settings.token_logprobs?,
+        do: [token, bits(Nx.subtract(Nx.take(scores, token), Nx.logsumexp(scores)))],
+        else: [token]
+
+    values |> Nx.stack() |> Nx.devectorize(keep_names: false)
   end
+
+  defp bits(tensor), do: Nx.bitcast(tensor, :s32)
 
   # The logits processors of Python transformers: repetition penalty, the processors of the
   # context with the masks in their places, temperature, top-k, top-p. Removed tokens get the
-  # smallest finite value, because EMLX 0.5 does not compile infinite constants.
+  # smallest finite value, because EMLX 0.5 does not compile infinite constants. Returns the
+  # scores that the token comes from and the token.
   defp select_token(logits, seen, masks, states, key, settings) do
     logits = logits |> Nx.as_type(:f32) |> process(seen, masks, states, settings)
 
     if settings.sampling? do
-      logits
-      |> Nx.divide(settings.temperature)
-      |> top_k(settings.top_k)
-      |> top_p(settings.top_p)
-      |> sample(key)
+      scores =
+        logits
+        |> Nx.divide(settings.temperature)
+        |> top_k(settings.top_k)
+        |> top_p(settings.top_p)
+
+      {scores, sample(scores, key)}
     else
-      Nx.argmax(logits)
+      {logits, Nx.argmax(logits)}
     end
   end
 
@@ -1131,30 +1228,51 @@ defmodule Transmuter.Generation do
 
   defp log_softmax(logits), do: Nx.subtract(logits, Nx.logsumexp(logits))
 
-  # The candidates of beam search for each prompt, as {prompts, 2, candidates}: their scores
-  # and their indices in the scores of all beams of the prompt (beam * vocabulary + token),
-  # as f32 in one output. The score of a candidate is the log-softmax of the logits after the
-  # processors, plus the score of its beam, as in _beam_search of transformers. Removed
-  # tokens of beams at -1e9 stay at the smallest finite value, so the sum is never infinite.
+  # The candidates of beam search for each prompt, as s32 {prompts, columns, candidates}: the
+  # bits of their scores, their indices in the scores of all beams of the prompt
+  # (beam * vocabulary + token) and with token_logprobs the bits of their log-probabilities.
+  # The score of a candidate is the log-softmax of the logits after the processors, plus the
+  # score of its beam, as in _beam_search of transformers. Removed tokens of beams at -1e9
+  # stay at the smallest finite value, so the sum is never infinite.
   defp select_beams(logits, index, seen, masks, states, scores, settings) do
     [logits, index, seen, scores | states] =
       Enum.map([logits, index, seen, scores | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
 
-    scores =
+    step_scores =
       logits
       |> Nx.take(index)
       |> Nx.as_type(:f32)
       |> log_softmax()
       |> process(seen, masks, states, settings)
-      |> Nx.add(scores)
-      |> Nx.max(Nx.Constants.min_finite(:f32))
-      |> Nx.devectorize(keep_names: false)
 
-    {rows, vocab} = Nx.shape(scores)
-    beams = settings.num_beams
-    scores = Nx.reshape(scores, {div(rows, beams), beams * vocab})
-    {values, indices} = Nx.top_k(scores, k: settings.candidates)
-    Nx.stack([values, Nx.as_type(indices, :f32)], axis: 1)
+    sums = step_scores |> Nx.add(scores) |> Nx.max(Nx.Constants.min_finite(:f32))
+    sums = Nx.devectorize(sums, keep_names: false)
+    {rows, vocab} = Nx.shape(sums)
+    shape = {div(rows, settings.num_beams), settings.num_beams * vocab}
+    {values, indices} = Nx.top_k(Nx.reshape(sums, shape), k: settings.candidates)
+    indices = Nx.as_type(indices, :s32)
+
+    columns =
+      if settings.token_logprobs? do
+        # The log-softmax of the step at a candidate is its step score minus the log-sum-exp
+        # of the step scores of its beam.
+        totals = step_scores |> Nx.logsumexp() |> Nx.devectorize(keep_names: false)
+        step_scores = step_scores |> Nx.devectorize(keep_names: false) |> Nx.reshape(shape)
+        totals = Nx.reshape(totals, {elem(shape, 0), settings.num_beams})
+        beams = Nx.quotient(indices, vocab)
+
+        logprobs =
+          Nx.subtract(
+            Nx.take_along_axis(step_scores, indices, axis: 1),
+            Nx.take_along_axis(totals, beams, axis: 1)
+          )
+
+        [bits(values), indices, bits(logprobs)]
+      else
+        [bits(values), indices]
+      end
+
+    Nx.stack(columns, axis: 1)
   end
 
   defp top_k(logits, k) when k > 0 and k < elem(logits.shape, 0) do

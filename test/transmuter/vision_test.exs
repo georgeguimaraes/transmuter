@@ -199,7 +199,7 @@ defmodule Transmuter.VisionTest do
       serving = Vision.image_to_text(source, [variant: variant] ++ @opts)
       # A tensor and a StbImage give the same result.
       results = Nx.Serving.run(serving, [image, StbImage.to_nx(image)])
-      assert results == List.duplicate(%{results: [%{text: text}]}, 2)
+      assert [result = %{results: [%{text: ^text, token_summary: %{input: 1}}]}, result] = results
     end
   end
 

@@ -524,18 +524,19 @@ defmodule Transmuter.Serving do
 
     * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The client makes the rows and the batches of a list of runs, so an error in them raises in the caller. A stream of runs, such as the windows of an audio stream, goes into batches when Nx.Serving reads them, once, in a process of its own. An error in such a stream ends the call with an exit, not an exception that the caller can rescue. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
-    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. The function returns the token ids of each row.
+    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. `generate` returns the tokens of each row, see `Transmuter.Generation.generate/5`. The function returns a list for each row, such as the result of `generate`. Its values are integers, f32 values such as log-probabilities, and lists of them. The serving sends the row as a flat list of integers, with each f32 value as its bits (see `Transmuter.Generation.from_bits/1`).
 
-    * `:postprocess` takes the list of the token ids of each run of an input, and the runs from `:preprocess` for this input, and returns the result.
+    * `:postprocess` takes the list of the integers of each run of an input, and the runs from `:preprocess` for this input, and returns the result.
 
     * `:keys` lists the keys of the runs. The default is `[nil]`.
 
-  `opts` are the options of the task. The serving reads `:batch_size` of `:compile`, `:stream`, `:stream_done` and `:defn_options`.
+  `opts` are the options of the task, after `generation_options!/1`. The serving reads `:batch_size` of `:compile`, `:stream`, `:stream_done` and `:defn_options`. The done event of a stream has the log-probabilities when the context has `token_logprobs: true`.
   """
   def generation(ctx, tokenizer, task, opts) do
     batch_size = Keyword.get(opts[:compile] || [], :batch_size, 1)
     keys = for key <- Map.get(task, :keys, [nil]), width <- @prompt_widths, do: {key, width}
     stream? = Keyword.get(opts, :stream, false)
+
     # The closures of the serving copy what they reference, so each one takes only its
     # function of the task.
     %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess} = task
@@ -572,7 +573,7 @@ defmodule Transmuter.Serving do
             Map.new(tensors, fn {name, tensor} -> {name, pad_rows(tensor, padding, backend)} end)
 
           generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
-          generated = run.(tensors, prompts, generate)
+          generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
           lengths = Enum.map(generated, &length/1)
 
           # A trailing zero, because Nx has no tensors of length 0.
@@ -615,13 +616,73 @@ defmodule Transmuter.Serving do
       batches = if Enum.all?(rows, &is_list/1), do: Enum.to_list(batches), else: batches
       {if(stream?, do: one_batch!(batches), else: batches), {multi?, runs}}
     end)
-    |> generation_postprocessing(tokenizer, postprocess, stream?, opts[:stream_done])
+    |> generation_postprocessing(
+      tokenizer,
+      postprocess,
+      stream?,
+      {opts[:stream_done], ctx.token_logprobs?}
+    )
   end
 
-  defp generation_postprocessing(serving, tokenizer, postprocess, stream?, done?) do
+  @doc """
+  Validates the options of a generation task that `Keyword.validate!/2` does not check, before the task loads its models, and returns them. `:token_logprobs` is `true` or `false`. A stream gives the log-probabilities in its done event, so `token_logprobs: true` with `stream: true` needs `stream_done: true`.
+  """
+  def generation_options!(opts) do
+    logprobs? = Keyword.get(opts, :token_logprobs, false)
+
+    unless is_boolean(logprobs?) do
+      raise ArgumentError,
+            "expected :token_logprobs to be true or false, got: #{inspect(logprobs?)}"
+    end
+
+    if logprobs? and opts[:stream] == true and opts[:stream_done] != true do
+      raise ArgumentError,
+            "a stream gives the token log-probabilities in its done event, so token_logprobs: true with stream: true needs stream_done: true"
+    end
+
+    opts
+  end
+
+  @doc """
+  Puts `logprobs`, the log-probability of each token of `result`, in `result` under `:token_logprobs` when `logprobs?` is `true`, the `:token_logprobs?` of the context.
+  """
+  def token_logprobs(result, logprobs, logprobs?),
+    do: if(logprobs?, do: Map.put(result, :token_logprobs, logprobs), else: result)
+
+  @doc """
+  Returns the token ids and their log-probabilities of the integers of a row whose values are the tokens of `Transmuter.Generation.generate/5`. Without log-probabilities, the integers are the ids, and the list of log-probabilities is empty.
+  """
+  def tokens(integers, false), do: {integers, []}
+
+  def tokens(integers, true) do
+    integers
+    |> Enum.chunk_every(2)
+    |> Enum.map(fn [id, bits] -> {id, Generation.from_bits(bits)} end)
+    |> Enum.unzip()
+  end
+
+  @doc """
+  Returns the `:postprocess` of a task whose run generates text: `%{results: [%{text: text, token_summary: summary}]}`, with `:token_logprobs` when `logprobs?` is `true`, the `:token_logprobs?` of the context. The token summary of the run gets the number of new tokens.
+  """
+  def text_postprocess(tokenizer, logprobs?) do
+    fn [integers], [run] ->
+      {ids, logprobs} = tokens(integers, logprobs?)
+      summary = Map.put(run.summary, :output, length(ids))
+      result = %{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}
+      %{results: [token_logprobs(result, logprobs, logprobs?)]}
+    end
+  end
+
+  # The flat integers of a row of :init, with each f32 value as its bits.
+  defp integers(row), do: row |> List.flatten() |> Enum.map(&integer/1)
+
+  defp integer(value) when is_integer(value), do: value
+  defp integer(value), do: Generation.to_bits(value)
+
+  defp generation_postprocessing(serving, tokenizer, postprocess, stream?, flags) do
     if stream? do
       Nx.Serving.client_postprocessing(serving, fn stream, {false, [[run]]} ->
-        stream_text(stream, tokenizer, run.summary, done?)
+        stream_text(stream, tokenizer, run.summary, flags)
       end)
     else
       Nx.Serving.client_postprocessing(serving, fn stream, {multi?, runs} ->
@@ -636,7 +697,7 @@ defmodule Transmuter.Serving do
     end
   end
 
-  # The token ids of the rows of each input, from the index of its input that each row gives
+  # The integers of the rows of each input, from the index of its input that each row gives
   # back.
   defp rows_by_input(stream) do
     stream
@@ -653,29 +714,42 @@ defmodule Transmuter.Serving do
   # part of a character, and a tokenizer can add or remove the space before a word from
   # the tokens around it. A newline or a CJK character ends a chunk at once, and the
   # pending tokens start again after a newline.
-  defp stream_text(stream, tokenizer, summary, done?) do
-    Stream.transform(stream, %{ids: [], count: 0, sent: 0, finished?: false}, fn
+  defp stream_text(stream, tokenizer, summary, {done?, logprobs?}) do
+    state = %{ids: [], logprobs: [], count: 0, sent: 0, finished?: false}
+    logprob = if logprobs?, do: &[Nx.to_number(&1.logprob[0])], else: fn _event -> [] end
+
+    Stream.transform(stream, state, fn
       _event, state = %{finished?: true} ->
         {:halt, state}
 
       {:batch, _outputs, _metadata}, state ->
         {:halt, state}
 
-      {:token, %{token: token, finished?: finished?}}, state ->
+      {:token, event = %{token: token, finished?: finished?}}, state ->
         token = Nx.to_number(token[0])
         finished? = Nx.to_number(finished?[0]) == 1
 
         state =
-          if token < 0,
-            do: state,
-            else: %{state | ids: state.ids ++ [token], count: state.count + 1}
+          if token < 0 do
+            state
+          else
+            logprobs = logprob.(event) ++ state.logprobs
+            %{state | ids: state.ids ++ [token], logprobs: logprobs, count: state.count + 1}
+          end
 
         text = tokenizer |> Tokenizer.decode(state.ids) |> binary_slice(state.sent..-1//1)
         {chunk, state} = chunk(text, finished?, state)
-        token_summary = Map.put(summary, :output, state.count)
-        done = if finished? and done?, do: [{:done, %{token_summary: token_summary}}], else: []
+
+        done =
+          if finished? and done?, do: [{:done, done(summary, state, logprobs?)}], else: []
+
         {Enum.reject([chunk], &(&1 == "")) ++ done, %{state | finished?: finished?}}
     end)
+  end
+
+  defp done(summary, state, logprobs?) do
+    result = %{token_summary: Map.put(summary, :output, state.count)}
+    token_logprobs(result, Enum.reverse(state.logprobs), logprobs?)
   end
 
   defp chunk(text, finished?, state) do

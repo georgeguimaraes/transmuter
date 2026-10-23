@@ -34,12 +34,14 @@ defmodule Transmuter.Text.Generation do
           :forced_eos_token_id,
           :seed,
           :template_options,
+          token_logprobs: false,
           stream: false,
           stream_done: false,
           compile: [],
           defn_options: []
         ] ++ Hub.options()
       )
+      |> Serving.generation_options!()
 
     Keyword.validate!(opts[:compile], [:batch_size])
 
@@ -60,16 +62,11 @@ defmodule Transmuter.Text.Generation do
       [%{prompt: ids, seed: seed, tensors: %{}, summary: summary}]
     end
 
-    postprocess = fn [ids], [run] ->
-      summary = Map.put(run.summary, :output, length(ids))
-      %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
-    end
-
     task = %{
       validate: &validate/1,
       preprocess: preprocess,
       init: fn _defn_options -> fn _tensors, prompts, generate -> generate.(%{}, prompts) end end,
-      postprocess: postprocess
+      postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
 
     Serving.generation(ctx, tokenizer, task, opts)

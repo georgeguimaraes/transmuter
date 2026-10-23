@@ -1065,3 +1065,107 @@ while len(tokens) < 21 and (len(tokens) == 1 or tokens[-1] != 2):
     logits = tiny["decoder_model"].run(["logits"], {"inputs_embeds": step, "encoder_hidden_states": hidden, "encoder_attention_mask": mask})[0][:, -1]
     tokens.append(int(processors(torch.tensor([tokens]), torch.from_numpy(logits)).argmax(-1)))
 print("florence tiny <OD> ids", tokens[1:], "largest absolute logit", float(np.abs(logits).max()))
+
+# Token log-probabilities, as token_logprobs: true. The values are compute_transition_scores
+# with normalize_logits=True, for greedy selection and for 2 beams. The script prints the new
+# token ids and the log-probability of each one, with the eos token at the end when the text
+# ends with it. Transmuter gives no value for the eos token. Whisper runs the generate of
+# GenerationMixin with the prompt of the Whisper generate without timestamps, as above.
+def token_logprobs(name, model, inputs, num_beams, max_new_tokens):
+    output = GenerationMixin.generate(model, **inputs, do_sample=False, num_beams=num_beams, max_new_tokens=max_new_tokens, output_scores=True, return_dict_in_generate=True)
+    indices = output.beam_indices if num_beams > 1 else None
+    scores = model.compute_transition_scores(output.sequences, output.scores, indices, normalize_logits=True)[0]
+    count = scores.shape[0] if indices is None else int((indices[0] >= 0).sum())
+    start = output.sequences.shape[1] - scores.shape[0]
+    print(name, num_beams, "beams", output.sequences[0, start : start + count].tolist(), [round(float(s), 6) for s in scores[:count]])
+
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+for num_beams in [1, 2]:
+    token_logprobs("gpt2 logprobs", model, tokenizer("The history of the printing press begins", return_tensors="pt"), num_beams, 8)
+
+processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
+features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+config = model.generation_config
+prompt = torch.tensor([[config.decoder_start_token_id, config.no_timestamps_token_id]])
+for num_beams in [1, 2]:
+    token_logprobs("whisper-tiny.en logprobs", model, {"input_features": features, "decoder_input_ids": prompt}, num_beams, 446)
+
+# The same values from ONNX Runtime on the exports that the tests run, Xenova/gpt2 and
+# Xenova/whisper-tiny.en in fp32. The exports give other logits than PyTorch, by up to
+# 2.4e-4 and 4.6e-4 in these log-probabilities. The value of a token reads only the tokens
+# before it in its hypothesis, so the script runs the decoder on the tokens of the result
+# without a cache and takes the log-softmax of the scores that the step selects from, with
+# the logits processors of transformers. For beam search, these are the processed
+# log-softmax of the logits. Sampling takes the tokens of Transmuter with seed 7,
+# temperature 0.7 and top_k 5, and Python gives their values after the warpers, from
+# PyTorch and from ONNX Runtime.
+import os
+
+from transformers.generation.logits_process import LogitsProcessorList, SuppressTokensAtBeginLogitsProcessor, SuppressTokensLogitsProcessor, TemperatureLogitsWarper, TopKLogitsWarper
+
+
+def ort_decoder(repo):
+    path = snapshot_download(repo, allow_patterns=["onnx/model.onnx", "onnx/decoder_model_merged.onnx", "onnx/encoder_model.onnx"])
+    name = "model" if os.path.exists(f"{path}/onnx/model.onnx") else "decoder_model_merged"
+    return path, ort.InferenceSession(f"{path}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])
+
+
+# The logits of the last token of `ids`, with an empty cache.
+def ort_logits(session, ids, given={}):
+    feeds = {}
+    for value in session.get_inputs():
+        if value.name == "input_ids":
+            feeds[value.name] = np.array([ids], dtype=np.int64)
+        elif value.name == "attention_mask":
+            feeds[value.name] = np.ones((1, len(ids)), dtype=np.int64)
+        elif value.name == "position_ids":
+            feeds[value.name] = np.arange(len(ids), dtype=np.int64)[None]
+        elif value.name == "use_cache_branch":
+            feeds[value.name] = np.array([False])
+        elif value.name.startswith("past_key_values."):
+            heads, dim = value.shape[1], value.shape[3]
+            feeds[value.name] = np.zeros((1, heads, 0, dim), dtype=np.float32)
+        else:
+            feeds[value.name] = given[value.name]
+    return torch.from_numpy(session.run(["logits"], feeds)[0][:, -1])
+
+
+def step_logprobs(logits_of, prompt, new, processors, beams):
+    values = []
+    for i, token in enumerate(new):
+        ids = prompt + new[:i]
+        scores = logits_of(ids).float()
+        scores = torch.log_softmax(scores, dim=-1) if beams else scores
+        scores = processors(torch.tensor([ids]), scores)
+        values.append(round(float(torch.log_softmax(scores, dim=-1)[0, token]), 6))
+    return values
+
+
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+_path, session = ort_decoder("Xenova/gpt2")
+prompt = tokenizer("The history of the printing press begins")["input_ids"]
+none = LogitsProcessorList()
+for name, new, beams in [("greedy", [351, 262, 13570, 1803, 13, 383, 717, 13570], False), ("2 beams", [351, 262, 14250, 286, 262, 13570, 1803, 287], True)]:
+    print("gpt2 onnxruntime logprobs", name, step_logprobs(lambda ids: ort_logits(session, ids), prompt, new, none, beams))
+
+sampled = [351, 262, 717, 13570, 31048, 13, 198, 198]
+assert tokenizer.decode(sampled) == " with the first printing presses.\n\n"
+warpers = LogitsProcessorList([TemperatureLogitsWarper(0.7), TopKLogitsWarper(5)])
+with torch.no_grad():
+    print("gpt2 sampling ids", sampled, "pytorch", step_logprobs(lambda ids: model(torch.tensor([ids])).logits[:, -1], prompt, sampled, warpers, False))
+print("gpt2 sampling onnxruntime", step_logprobs(lambda ids: ort_logits(session, ids), prompt, sampled, warpers, False))
+
+path, session = ort_decoder("Xenova/whisper-tiny.en")
+encoder = ort.InferenceSession(f"{path}/onnx/encoder_model.onnx", providers=["CPUExecutionProvider"])
+processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
+config = GenerationConfig.from_pretrained("openai/whisper-tiny.en")
+features = processor(audio, sampling_rate=16000, return_tensors="np").input_features
+(hidden,) = encoder.run(["last_hidden_state"], {"input_features": features})
+prompt = [config.decoder_start_token_id, config.no_timestamps_token_id]
+new = [1770, 13, 2264, 346, 353, 318, 262, 46329, 286, 262, 3504, 6097, 11, 290, 356, 389, 9675, 284, 7062, 465, 21443, 13]
+processors = LogitsProcessorList([SuppressTokensLogitsProcessor(config.suppress_tokens), SuppressTokensAtBeginLogitsProcessor(config.begin_suppress_tokens, len(prompt))])
+for name, beams in [("greedy", False), ("2 beams", True)]:
+    print("whisper-tiny.en onnxruntime logprobs", name, step_logprobs(lambda ids: ort_logits(session, ids, {"encoder_hidden_states": hidden}), prompt, new, processors, beams))

@@ -268,13 +268,13 @@ defmodule Transmuter.Vision do
   @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text. With Florence-2, it also gives the boxes, quad boxes or polygons of the location tasks.
 
-  The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.
+  The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text, token_summary: summary}]}`, as in `Transmuter.Text.generation/2`. The prompt of the decoder is `decoder_start_token_id`, so the summary counts 1 input token.
 
   The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the `VisionEncoderDecoderModel` exports of Xenova, such as `Xenova/vit-gpt2-image-captioning` and `Xenova/trocr-small-handwritten`. The default variant is fp32. The fp16 decoder of `Xenova/vit-gpt2-image-captioning` is broken: its `If` branches give outputs that no node of the branch computes. ONNX Runtime also rejects it, and `Transmuter.load!/2` raises an `ArgumentError`. Use the fp32 or q8 files of that repository. The encoder reads `pixel_values` from `Transmuter.Featurizer`. The decoder starts from `decoder_start_token_id` and reads the output of the encoder in each step.
 
       serving = Transmuter.Vision.image_to_text({:hf, "Xenova/vit-gpt2-image-captioning"})
       Nx.Serving.run(serving, image)
-      #=> %{results: [%{text: "a cat laying on a blanket next to a cat laying on a bed "}]}
+      #=> %{results: [%{text: "a cat laying on a blanket next to a cat laying on a bed ", token_summary: %{...}}]}
 
   The settings of generation come from `generation_config.json`, as in `Transmuter.Text.generation/2`, with beam search when the configuration has `num_beams`.
 
@@ -296,7 +296,7 @@ defmodule Transmuter.Vision do
 
     * `:task` - with Florence-2, the task of the inputs that do not give one. The default is `"<CAPTION>"`.
 
-    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:token_logprobs`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`. With Florence-2, `:token_logprobs` gives a value for each new token, also for the tokens of the locations.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 
@@ -334,7 +334,7 @@ defmodule Transmuter.Vision do
 
     * `:compile` - `:batch_size`, the number of chats that generate together. The default is `1`. Chats go into one batch when the number of their tiles (SmolVLM) or patches (Qwen2-VL and Qwen3-VL) rounds up to the same power of two. A chat can have up to 65536 tiles or patches. An image of SmolVLM gives up to 17 tiles, and an image of Qwen2-VL or Qwen3-VL gives up to `max_pixels / patch_size^2` patches.
 
-    * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+    * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:token_logprobs`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 

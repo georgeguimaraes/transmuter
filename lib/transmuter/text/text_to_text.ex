@@ -38,11 +38,13 @@ defmodule Transmuter.Text.TextToText do
           :seed,
           :source_language_token,
           :target_language_token,
+          token_logprobs: false,
           stream: false,
           stream_done: false,
           defn_options: []
         ] ++ Hub.options()
       )
+      |> Serving.generation_options!()
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
 
@@ -98,16 +100,11 @@ defmodule Transmuter.Text.TextToText do
       [%{prompt: [start], seed: seed, tensors: tensors, key: length, summary: summary}]
     end
 
-    postprocess = fn [ids], [run] ->
-      summary = Map.put(run.summary, :output, length(ids))
-      %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
-    end
-
     task = %{
       validate: &validate/1,
       preprocess: preprocess,
       init: init,
-      postprocess: postprocess,
+      postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: lengths
     }
 

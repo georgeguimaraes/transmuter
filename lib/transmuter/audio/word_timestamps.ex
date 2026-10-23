@@ -258,19 +258,16 @@ defmodule Transmuter.Audio.WordTimestamps do
   @unicode_languages ~w(zh ja th lo my yue)
 
   @doc """
-  Returns the words of `elements`, a list of `{token, {start, end}}`, as `{text, start, end}`. `language` is the language code of the text, which is `"en"` for a translation.
+  Returns the words of `elements`, a list of tuples whose first value is a token, as `{text, elements}` with the elements of each word. `language` is the language code of the text, which is `"en"` for a translation.
   """
   def words(tokenizer, elements, language) do
-    {tokens, stamps} = Enum.unzip(elements)
-    stamps = List.to_tuple(stamps)
+    tokens = Enum.map(elements, &elem(&1, 0))
+    elements = List.to_tuple(elements)
     pieces = split_on_unicode(tokenizer, tokens)
     pieces = if language in @unicode_languages, do: pieces, else: join_on_spaces(pieces)
 
-    for {text, indices} <- merge_punctuation(pieces) do
-      {start, _end} = elem(stamps, hd(indices))
-      {_start, stop} = elem(stamps, List.last(indices))
-      {text, start, stop}
-    end
+    for {text, indices} <- merge_punctuation(pieces),
+        do: {text, Enum.map(indices, &elem(elements, &1))}
   end
 
   # _split_tokens_on_unicode: a piece ends at a token after which the text has no

@@ -37,12 +37,14 @@ defmodule Transmuter.Vision.ImageTextToText do
           :early_stopping,
           :seed,
           :template_options,
+          token_logprobs: false,
           stream: false,
           stream_done: false,
           compile: [],
           defn_options: []
         ] ++ Hub.options()
       )
+      |> Serving.generation_options!()
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
@@ -84,16 +86,11 @@ defmodule Transmuter.Vision.ImageTextToText do
       [%{prompt: ids, seed: seed, tensors: tensors, key: key, summary: summary}]
     end
 
-    postprocess = fn [ids], [run] ->
-      summary = Map.put(run.summary, :output, length(ids))
-      %{results: [%{text: Tokenizer.decode(tokenizer, ids), token_summary: summary}]}
-    end
-
     task = %{
       validate: &validate/1,
       preprocess: preprocess,
       init: init,
-      postprocess: postprocess,
+      postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: @buckets
     }
 
