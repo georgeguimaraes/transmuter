@@ -23,8 +23,10 @@ defmodule Transmuter.Vision.Idefics3Processor do
 
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json` and `processor_config.json`.
+
+  `inputs` are the input names of the vision encoder. The processor does not use them, because the export of Idefics3 always names its inputs `"pixel_values"` and `"pixel_attention_mask"`.
   """
-  def load!(repo) do
+  def load!(repo, _inputs) do
     config =
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"

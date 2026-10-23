@@ -4,7 +4,7 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
-  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor` or `Transmuter.Vision.Qwen2VLProcessor`. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles or patches) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor` or `Transmuter.Vision.Qwen2VLProcessor`, which also reads the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles or patches) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
   """
 
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
@@ -52,7 +52,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     decoder_opts = [outputs: &Generation.outputs/1] ++ model_opts
     decoder = Repo.load_component!(repo, "decoder_model_merged", :q4, decoder_opts)
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
-    {module, processor} = processor!(repo)
+    {module, processor} = processor!(repo, vision)
     backend = opts[:backend] || Nx.default_backend()
 
     image_token = repo.config["image_token_id"]
@@ -100,7 +100,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
   end
 
-  defp processor!(repo) do
+  defp processor!(repo, vision) do
     processors = %{
       "Idefics3ImageProcessor" => Idefics3Processor,
       "Qwen2VLImageProcessor" => Qwen2VLProcessor
@@ -114,7 +114,7 @@ defmodule Transmuter.Vision.ImageTextToText do
               "image_text_to_text supports #{Enum.join(Map.keys(processors), " and ")}, got: #{inspect(config["image_processor_type"])}"
 
       module ->
-        {module, module.load!(repo)}
+        {module, module.load!(repo, vision.inputs)}
     end
   end
 

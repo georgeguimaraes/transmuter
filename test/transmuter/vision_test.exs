@@ -325,7 +325,7 @@ defmodule Transmuter.VisionTest do
   @tag ci_partition: 15
   test "the Idefics3 processor gives the tiles and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@smolvlm)
-    processor = Idefics3Processor.load!(repo)
+    processor = Idefics3Processor.load!(repo, ["pixel_values", "pixel_attention_mask"])
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
@@ -368,7 +368,7 @@ defmodule Transmuter.VisionTest do
   @tag ci_partition: 15
   test "the Qwen2-VL processor gives the patches and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@qwen2_vl)
-    processor = Qwen2VLProcessor.load!(repo)
+    processor = Qwen2VLProcessor.load!(repo, ["pixel_values", "grid_thw"])
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]

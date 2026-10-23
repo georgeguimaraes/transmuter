@@ -24,15 +24,18 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
     :patch_size,
     :merge_size,
     :temporal_patch_size,
-    :image_token
+    :image_token,
+    :grid_input
   ]
 
   @placeholder "<|image_pad|>"
 
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json` and `config.json`.
+
+  `inputs` are the input names of the vision encoder, such as `model.inputs` of the `vision_encoder` component. The input other than `"pixel_values"` takes the grid: `"grid_thw"` in the export of Qwen2-VL, and `"image_grid_thw"` in the export of Qwen3-VL.
   """
-  def load!(repo) do
+  def load!(repo, inputs) do
     config =
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
@@ -49,7 +52,8 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       patch_size: config["patch_size"] || 14,
       merge_size: config["merge_size"] || 2,
       temporal_patch_size: config["temporal_patch_size"] || 2,
-      image_token: repo.config["image_token_id"]
+      image_token: repo.config["image_token_id"],
+      grid_input: hd(inputs -- ["pixel_values"])
     }
   end
 
@@ -96,7 +100,8 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
 
     %{
       "pixel_values" => Nx.broadcast(zero, {merge * merge, 3 * temporal * patch * patch}),
-      "grid_thw" => Nx.tensor([[1, merge, merge]], type: :s64, backend: Nx.BinaryBackend)
+      processor.grid_input =>
+        Nx.tensor([[1, merge, merge]], type: :s64, backend: Nx.BinaryBackend)
     }
   end
 
@@ -117,7 +122,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
             images |> Enum.map_reduce(0, &{{&1, &2}, &2 + Enum.product(&1)}) |> elem(0) do
         inputs = %{
           "pixel_values" => Nx.slice_along_axis(pixels[row], start, Enum.product(grid), axis: 0),
-          "grid_thw" => Nx.tensor([grid], type: :s64, backend: Nx.BinaryBackend)
+          processor.grid_input => Nx.tensor([grid], type: :s64, backend: Nx.BinaryBackend)
         }
 
         encode.(inputs)["image_features"]
