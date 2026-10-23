@@ -887,6 +887,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
+  @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
 
   # The reference is the beam search of transformers on the export's image features, see
   # test/support/pipeline_references.py. Python runs each prompt without padding, and the
@@ -1118,6 +1119,50 @@ defmodule Transmuter.VisionLargeModelTest do
       ] ++ @opts
 
     serving = Vision.image_text_to_text(@qwen2_vl, opts)
+    results = Nx.Serving.run(serving, chats)
+    assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
+    assert Nx.Serving.run(serving, hd(chats)) == hd(results)
+  end
+
+  # The reference is ONNX Runtime on the same files: the fp32 vision encoder, the q4
+  # embeddings and the q4 decoder, with the 3-D positions of get_rope_index. The export has
+  # no deepstack features, so the PyTorch model gives another text. The model has 2B
+  # parameters, so CI leaves this test out.
+  @tag :large_model
+  test "image-text-to-text with Qwen3-VL matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for content <- [
+            [
+              %{type: "image", image: @image},
+              %{type: "text", text: "Can you describe this image?"}
+            ],
+            [
+              %{type: "image", image: tall},
+              %{type: "text", text: "What animals are in the image?"}
+            ],
+            [%{type: "text", text: "What is the capital of France?"}]
+          ],
+          do: %{messages: [%{role: "user", content: content}]}
+
+    expected = [
+      "This is a cozy, casual photograph of two cats resting on a vibrant pink couch.\n\n- **The Cats**: There are",
+      "Based on the image provided, the animals are two cats. They are both resting on a pink blanket or couch.",
+      "The capital of France is Paris."
+    ]
+
+    # The two chats with images have 320 patches each, so they go into one batch. The first
+    # chat also runs alone, with a padding row.
+    opts =
+      [
+        variant: %{vision_encoder: :fp32, embed_tokens: :q4},
+        strategy: :greedy,
+        max_new_tokens: 24,
+        compile: [batch_size: 2]
+      ] ++ @opts
+
+    serving = Vision.image_text_to_text(@qwen3_vl, opts)
     results = Nx.Serving.run(serving, chats)
     assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
     assert Nx.Serving.run(serving, hd(chats)) == hd(results)
