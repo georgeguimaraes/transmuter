@@ -501,6 +501,30 @@ defmodule Transmuter.Audio.WordTimestampsTest do
   end
 end
 
+defmodule Transmuter.Audio.SpeechToTextTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Audio.SpeechToText
+
+  # Two timestamps together at the start of the window give a seek that does not move. The
+  # row is done after one pass with all its tokens, as a row without two timestamps together.
+  @tag timeout: 10_000
+  test "a pass that does not move the seek ends the row" do
+    settings = %{frames: 4, frames_per_timestamp: 2, timestamp_begin: 100}
+    tokens = for token <- [100, 100, 7], do: {token, 0}
+    passes = :counters.new(1, [])
+
+    pass = fn _input, _prompts, _seeks ->
+      :counters.add(passes, 1, 1)
+      if :counters.get(passes, 1) > 1, do: flunk("the seek did not move")
+      [tokens]
+    end
+
+    features = Nx.broadcast(0.0, {1, 1, 4})
+    assert SpeechToText.transcribe(features, [[1]], [0], settings, pass) == [tokens]
+  end
+end
+
 defmodule Transmuter.AudioClassificationTest do
   use ExUnit.Case, async: true
 

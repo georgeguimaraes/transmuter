@@ -16,7 +16,7 @@ defmodule Transmuter.Audio.SpeechToText do
   Long audio follows `AutomaticSpeechRecognitionPipeline` of transformers with `chunk_length_s` and `stride_length_s`:
 
     1. The client splits the audio into windows (`chunk_iter`). Each window is one row of a batch of the serving.
-    2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again.
+    2. The serving transcribes each window as the `generate` function of `WhisperForConditionalGeneration` does. When the tokens of a window end with two timestamps, the last segment is not complete. The serving removes the tokens after these timestamps, moves the start of the features to the last timestamp, fills the end with zeros, and transcribes again. When these timestamps are at the start of the features, the window is done with all its tokens, as when the tokens have no two timestamps together.
     3. The client merges the tokens of the windows as `_decode_asr` of the Whisper tokenizer does. It removes the timestamps in the context of each window, and joins the overlap of two token sequences at the middle of their best alignment (`_find_longest_common_sequence`).
 
   With timestamps, the processor of `WhisperTimeStampLogitsProcessor` selects the tokens. With word timestamps, `Transmuter.Audio.WordTimestamps` gives the end time of each token after each pass, and the merge compares these times in the overlaps, as `_decode_asr` does with `token_timestamps`.
@@ -268,12 +268,13 @@ defmodule Transmuter.Audio.SpeechToText do
 
   defp windows(_samples, _start, _settings), do: []
 
+  @doc false
   # The loop of generate in WhisperForConditionalGeneration over the 3000 frames of the window
   # of each row. Tokens that end with two timestamps leave the last segment incomplete, so
   # the next pass of that row starts at the last timestamp, and the features after the frames
   # are zeros. A row without a prompt is done. A pass gives the tokens of each row as
   # {token, time}.
-  defp transcribe(features, prompts, seeks, settings, pass) do
+  def transcribe(features, prompts, seeks, settings, pass) do
     if Enum.all?(prompts, &(&1 == [])) do
       Enum.map(prompts, fn _ -> [] end)
     else
@@ -300,18 +301,20 @@ defmodule Transmuter.Audio.SpeechToText do
     end
   end
 
-  # The tokens to keep from a pass and the seek of the next pass. The seek is the number of
-  # frames when the row is done.
+  # The tokens to keep from a pass and the seek of the next pass. The seek moves to the first
+  # of the last two timestamps together, or to the start of the window without them. When
+  # the seek does not move or the tokens end with a single timestamp, the pass keeps all its
+  # tokens and the seek is the number of frames: the row is done.
   defp next_pass(tokens, seek, settings = %{frames: frames, timestamp_begin: begin}) do
     timestamps = Enum.map(tokens, fn {token, _time} -> token >= begin end)
     pairs = for {[true, true], i} <- Enum.with_index(Enum.chunk_every(timestamps, 2, 1), 1), do: i
+    {last, _time} = if pairs == [], do: {begin, 0}, else: Enum.at(tokens, List.last(pairs) - 1)
+    shift = (last - begin) * settings.frames_per_timestamp
 
-    if pairs == [] or Enum.take(timestamps, -2) == [false, true] do
-      {tokens, frames}
+    if shift > 0 and Enum.take(timestamps, -2) != [false, true] do
+      {Enum.take(tokens, List.last(pairs) + 1), seek + shift}
     else
-      kept = Enum.take(tokens, List.last(pairs) + 1)
-      {last, _time} = Enum.at(kept, -2)
-      {kept, seek + (last - begin) * settings.frames_per_timestamp}
+      {tokens, frames}
     end
   end
 
