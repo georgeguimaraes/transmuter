@@ -279,7 +279,7 @@ defmodule Transmuter.Tokenizer do
 
     * `:add_special_tokens` - adds the special tokens of the tokenizer, such as `[CLS]` and `[SEP]`. The default is `true`. Use `false` for text that already has them, such as the output of a chat template.
 
-    * `:suffix` - token ids that end each input, such as the end of a chat template. When truncation cuts an input, these ids replace its last tokens, as sentence-transformers restores the end of a chat template. The default is `[]`.
+    * `:suffix` - token ids that end each input, such as the end of a chat template. When an input reaches the largest length of `:length`, so that truncation can have cut it, these ids replace its last tokens, as sentence-transformers restores the end of a chat template. The default is `[]`.
   """
   def encode(tokenizer, inputs, opts \\ []) do
     inputs =
@@ -305,7 +305,15 @@ defmodule Transmuter.Tokenizer do
         else: Enum.map(encodings, &[&1])
 
     rows = Enum.concat(windows)
-    truncated = Enum.map(rows, &(Encoding.get_overflowing(&1) != []))
+    suffix = Keyword.get(opts, :suffix, [])
+    largest = tokenizer.length && Enum.max(List.wrap(tokenizer.length))
+    full = Enum.map(rows, &(Encoding.n_tokens(&1) == largest))
+
+    if largest && length(suffix) >= largest do
+      raise ArgumentError,
+            "the suffix of #{length(suffix)} tokens leaves no tokens for the text in a length of #{largest}"
+    end
+
     longest = rows |> Enum.map(&Encoding.n_tokens/1) |> Enum.max()
     length = pad_length(tokenizer.length, longest)
 
@@ -321,13 +329,13 @@ defmodule Transmuter.Tokenizer do
         else: pad(tokenizer, rows, length)
 
     tensor = &Nx.tensor(Enum.map(rows, &1), type: :s64, backend: Nx.BinaryBackend)
-    suffix = Keyword.get(opts, :suffix, [])
 
-    # A truncated row has no padding, so its last tokens are the end of the row.
+    # A row of the largest length has no padding, so its last tokens are the end of the row.
     ids =
-      Enum.zip_with(rows, truncated, fn row, truncated? ->
+      Enum.zip_with(rows, full, fn row, full? ->
         ids = ids(tokenizer, row)
-        if truncated?, do: Enum.drop(ids, -length(suffix)) ++ suffix, else: ids
+        count = if full?, do: length(suffix), else: 0
+        Enum.drop(ids, -count) ++ Enum.take(suffix, -count)
       end)
 
     tensors = %{
