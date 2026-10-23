@@ -143,6 +143,85 @@ defmodule Transmuter.TelemetryTest do
     assert Nx.to_flat_list(eager["nz_fill"]) == Enum.to_list(0..6399)
   end
 
+  # NonZero gives the positions of the positive x. Gather reads them on the device, and the
+  # Range of Break_NonZero_Range breaks on its limit, which comes from the device. So the
+  # positions go into the next segment as arguments, and other positions of the same count
+  # compile nothing new.
+  test "positions that no node reads on the host are not in the key of a segment" do
+    for name <- ["Break_NonZero_gather", "Break_NonZero_Range"] do
+      model = load_fixture(name)
+      compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+      calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
+
+      assert calls(compiled, model, [[0, 1, 0, 1, 0, 1, 0, 0], [1, 0, 0, 0, 0, 1, 1, 0]]) == [
+               %{compiled: 0, breaks: ["NonZero" | tl(model_breaks(name))], host_values: []},
+               %{compiled: 0, breaks: ["NonZero" | tl(model_breaks(name))], host_values: []}
+             ],
+             name
+    end
+  end
+
+  # The segment after the NonZero computes the first position, and the segment after the
+  # Range reads it as a Slice start. The first call breaks at the Slice and learns the names
+  # on the way back to the positions, so later calls keep them static and do not break there.
+  test "a value that a later segment reads on the host stays static" do
+    model = load_fixture("Break_NonZero_cross_segment")
+    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+
+    assert [%{breaks: ["NonZero", "Range", "Slice"], host_values: ["first", "idx", "nz"]}] =
+             calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
+
+    assert [%{breaks: ["NonZero", "Range"], host_values: []}, %{compiled: 0}] =
+             calls(compiled, model, [[0, 1, 1, 1, 0, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
+  end
+
+  defp model_breaks("Break_NonZero_gather"), do: ["NonZero"]
+  defp model_breaks("Break_NonZero_Range"), do: ["NonZero", "Range"]
+
+  defp positions(model, x) do
+    Map.take(
+      %{
+        "x" => Nx.tensor(x, type: :f32, backend: @backend),
+        "data" => Nx.iota({8, 4}, type: :f32, backend: @backend) |> Nx.divide(8),
+        "n" => Nx.tensor(5, backend: @backend)
+      },
+      model.inputs
+    )
+  end
+
+  # Calls compiled for each x, checks the outputs against an eager run and gives the
+  # compiled segments, the breaks and the names that joined the host values of each call.
+  defp calls(compiled, model, xs) do
+    for x <- xs do
+      inputs = positions(model, x)
+      outputs = compiled.(inputs)
+
+      for {name, expected} <- Transmuter.run(model, model.params, inputs),
+          do: assert(Nx.to_number(Nx.all_close(Nx.backend_copy(outputs[name]), expected)) == 1)
+
+      drain(%{compiled: 0, breaks: [], host_values: []})
+    end
+  end
+
+  defp drain(acc) do
+    receive do
+      {[:transmuter, :segment, :compile, :stop], meta} ->
+        drain(%{
+          acc
+          | compiled: acc.compiled + if(meta.compiled, do: 1, else: 0),
+            host_values: acc.host_values ++ meta.host_values
+        })
+
+      {[:transmuter, :break, :stop], meta} ->
+        drain(%{acc | breaks: acc.breaks ++ [meta.op_type]})
+
+      {_event, _meta} ->
+        drain(acc)
+    after
+      0 -> acc
+    end
+  end
+
   defp load_fixture(name) do
     Transmuter.load!(Path.expand("../fixtures/ops/#{name}/model.onnx", __DIR__),
       backend: @backend

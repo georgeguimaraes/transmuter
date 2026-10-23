@@ -850,6 +850,50 @@ case("Break_Loop_outer_sequence_empty_element",
      {"zero": np.array(0, np.int64), "axes": np.array([0], np.int64), "one_f": np.array(1.0, np.float32),
       "empty": np.zeros(0, np.int64)})
 
+
+def chain(src, prefix):
+    """24 nodes that read src on the device, so the segment that holds them compiles."""
+    nodes = []
+    for i in range(12):
+        nodes += [node("Mul", [src if i == 0 else f"{prefix}{i}", "scale"], [f"{prefix}m{i}"]),
+                  node("Add", [f"{prefix}m{i}", "shift"], [f"{prefix}{i + 1}"])]
+    return nodes, f"{prefix}12"
+
+
+# NonZero gives the positions of the positive x, as the word positions of GLiNER. The nodes
+# after it read them only as Gather indices, so positions of the same count keep the shapes.
+positions = [node("Greater", ["x", "zero_f"], ["mask"]), node("NonZero", ["mask"], ["nz"]),
+             node("Squeeze", ["nz", "axis0"], ["idx"]), node("Gather", ["data", "idx"], ["g0"], axis=0)]
+positions_init = {"zero_f": np.array(0.0, np.float32), "axis0": np.array([0], np.int64),
+                  "scale": np.array(0.9, np.float32), "shift": np.array(0.25, np.float32)}
+x_positions = np.array([1, 1, 1, 0, 0, 0, 0, 0], np.float32)
+r = rng_for("graph breaks with positions")
+data = r.standard_normal((8, 4)).astype(np.float32)
+gathered, g = chain("g0", "g")
+case("Break_NonZero_gather", positions + gathered + [node("Identity", [g], ["y"])],
+     {"x": x_positions, "data": data}, positions_init)
+# A count of n plus zero from the end of the chain, so a Range on it comes after the chain.
+after_chain = [node("Mul", [g, "zero_f"], ["g_zero"]), node("ReduceSum", ["g_zero"], ["g_sum"], keepdims=0),
+               node("Cast", ["g_sum"], ["g_int"], to=INT64), node("Add", ["n", "g_int"], ["count"])]
+# The Range starts at the first position and reads a limit from the device, so it breaks on
+# the limit. The positions stay arguments of the segment before it.
+case("Break_NonZero_Range",
+     positions + gathered + after_chain +
+     [node("ReduceMin", ["idx"], ["start"], keepdims=0), node("Add", ["start", "count"], ["limit"]),
+      node("Range", ["start", "limit", "one"], ["r"]), node("Cast", ["r"], ["y"], to=TensorProto.FLOAT)],
+     {"x": x_positions, "data": data, "n": np.array(5, np.int64)}, {**positions_init, "one": np.array(1, np.int64)},
+     outputs=[g, "y"])
+# The segment of the positions computes the first position, and the segment after the Range
+# reads it as a Slice start. So the positions stay static in the segment that computes it.
+counted, c = chain("rf", "c")
+case("Break_NonZero_cross_segment",
+     positions + gathered + after_chain +
+     [node("ReduceMin", ["idx"], ["first"], keepdims=1), node("Range", ["zero", "count", "one"], ["r"]),
+      node("Cast", ["r"], ["rf"], to=TensorProto.FLOAT)] + counted + [node("Slice", [c, "first", "end", "axis0"], ["tail"])],
+     {"x": x_positions, "data": data, "n": np.array(5, np.int64)},
+     {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
+     outputs=[g, "tail"])
+
 # ---------- long recurrences and loops ----------
 
 # More than 16 steps, so a compiled model runs these as a while loop.
