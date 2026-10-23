@@ -56,7 +56,7 @@ defmodule Transmuter.Telemetry do
 
   ### Graph break events
 
-  A compiled function keeps a cache of compiled segments. The cache key is the position where the segment starts, the shapes and types of the segment arguments, and the values of the static inputs. Each position keeps the `:cache_size` most recently used segments.
+  A compiled function keeps a cache of compiled segments. The cache key is the position where the segment starts, the shapes and types of the segment arguments, and the values of the static values that the segment reads, such as static inputs. Each position keeps the `:cache_size` most recently used segments.
 
   The `:position` in the metadata is the index of a node in the sorted graph. `:shapes` is a sorted list of `{name, {shape, type}}` for the segment arguments. A sequence argument has a list of `{shape, type}`.
 
@@ -86,7 +86,7 @@ defmodule Transmuter.Telemetry do
 
   `:stop` is the position of the break node where the segment stops, or `:end`. `:reason` describes the value that the break node needs, such as `"the If condition"`. It is `nil` when `:stop` is `:end`. A segment of fewer than 20 nodes after a break is not compiled, and `:compiled` is `false`. Then its nodes run eagerly on each call.
 
-  `:host_values` are the names of the values that a node of the segment reads on the host, such as the shape of a `Reshape` that comes from the positions of a `NonZero`, and that the trace found in this compilation. From then on these values enter the segment as static values, so their values are in the cache key of this segment. The keys of other segments do not change. The list is empty when the trace found no new name, and for a segment that runs eagerly. The `:shapes` of the stop event are those of the arguments that the segment compiled for, which can have fewer values than the `:shapes` of the start event.
+  `:host_values` are the names of new values that a node of the segment reads on the host. An example is the shape of a `Reshape` that comes from the positions of a `NonZero`. From then on, these values enter the segment as static values, so their values are in the cache key of this segment. The keys of other segments do not change. The list is empty when the trace found no new name. The `:shapes` of the stop event are those of the arguments of the compiled segment. They can have fewer values than the `:shapes` of the start event. `:compiled` is `false` when a trace found a compiled segment in the cache.
 
   A graph without breaks keeps its compiled function for the shapes of the inputs to `Transmuter.compile/3`. A call with these shapes does not use the cache, so it emits no cache events.
 
