@@ -33,9 +33,18 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json` and `config.json`.
 
-  `inputs` are the input names of the vision encoder, such as `model.inputs` of the `vision_encoder` component. The input other than `"pixel_values"` takes the grid: `"grid_thw"` in the export of Qwen2-VL, and `"image_grid_thw"` in the export of Qwen3-VL.
+  ## Options
+
+    * `:inputs` - the input names of the vision encoder, such as `model.inputs` of the `vision_encoder` component. The input whose name ends in `grid_thw` takes the grid: `"grid_thw"` in the export of Qwen2-VL, and `"image_grid_thw"` in the export of Qwen3-VL. The default is `["pixel_values", "grid_thw"]`.
   """
-  def load!(repo, inputs) do
+  def load!(repo, opts \\ []) do
+    inputs = Keyword.validate!(opts, inputs: ["pixel_values", "grid_thw"])[:inputs]
+
+    grid_input =
+      Enum.find(inputs, &String.ends_with?(&1, "grid_thw")) ||
+        raise ArgumentError,
+              "the vision encoder has no input whose name ends in grid_thw, got: #{inspect(inputs)}"
+
     config =
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
@@ -54,7 +63,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       merge_size: config["merge_size"] || 2,
       temporal_patch_size: config["temporal_patch_size"] || 2,
       image_token: repo.config["image_token_id"],
-      grid_input: hd(inputs -- ["pixel_values"])
+      grid_input: grid_input
     }
   end
 

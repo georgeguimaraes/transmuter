@@ -4,7 +4,7 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
-  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor` or `Transmuter.Vision.Qwen2VLProcessor`, which also reads the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles or patches) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor` or `Transmuter.Vision.Qwen2VLProcessor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles or patches) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
   """
 
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
@@ -100,22 +100,30 @@ defmodule Transmuter.Vision.ImageTextToText do
     Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
   end
 
+  # The lookup takes exact names, as AutoImageProcessor of Python transformers, and not the
+  # name without "Fast". A fast image processor can differ from the slow one: for example,
+  # Idefics3ImageProcessorFast resizes with bicubic in place of the lanczos of
+  # Idefics3ImageProcessor, because torchvision has no lanczos for tensors.
   defp processor!(repo, vision) do
+    qwen2_vl = fn -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)} end
+
     processors = %{
-      "Idefics3ImageProcessor" => Idefics3Processor,
-      "Qwen2VLImageProcessor" => Qwen2VLProcessor,
-      "Qwen2VLImageProcessorFast" => Qwen2VLProcessor
+      "Idefics3ImageProcessor" => fn -> {Idefics3Processor, Idefics3Processor.load!(repo)} end,
+      "Qwen2VLImageProcessor" => qwen2_vl,
+      "Qwen2VLImageProcessorFast" => qwen2_vl
     }
 
     config = Hub.json(repo.source, "preprocessor_config.json", repo.opts) || %{}
 
     case processors[config["image_processor_type"]] do
       nil ->
-        raise ArgumentError,
-              "image_text_to_text supports #{Enum.join(Map.keys(processors), " and ")}, got: #{inspect(config["image_processor_type"])}"
+        {last, names} = processors |> Map.keys() |> Enum.sort() |> List.pop_at(-1)
 
-      module ->
-        {module, module.load!(repo, vision.inputs)}
+        raise ArgumentError,
+              "image_text_to_text supports #{Enum.join(names, ", ")} and #{last}, got: #{inspect(config["image_processor_type"])}"
+
+      load ->
+        load.()
     end
   end
 
