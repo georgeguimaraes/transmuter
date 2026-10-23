@@ -181,9 +181,11 @@ for repo in ["openai/clip-vit-base-patch32", "google/siglip-base-patch16-224"]:
 # with the Caveat font (SIL Open Font License 1.1, github.com/google/fonts) at size 56.
 # handwriting_long.png has the text "We walked along the river and talked about the garden
 # until the sun went down behind the hills and trees.", which is more than the 20 new tokens
-# that generate gives without max_new_tokens.
-for repo, path in [("nlpconnect/vit-gpt2-image-captioning", "test/fixtures/cats.png"), ("microsoft/trocr-small-handwritten", "test/fixtures/handwriting.png"), ("microsoft/trocr-small-handwritten", "test/fixtures/handwriting_long.png")]:
-    caption = pipeline("image-to-text", model=repo, device="cpu")
+# that generate gives without max_new_tokens. The tokenizer is that of the Xenova export, which
+# Transmuter loads: its tokenizer_config.json has clean_up_tokenization_spaces true, and the
+# PyTorch repository does not have the key, so its tokenizer keeps the space in "noon .".
+for repo, export, path in [("nlpconnect/vit-gpt2-image-captioning", "Xenova/vit-gpt2-image-captioning", "test/fixtures/cats.png"), ("microsoft/trocr-small-handwritten", "Xenova/trocr-small-handwritten", "test/fixtures/handwriting.png"), ("microsoft/trocr-small-handwritten", "Xenova/trocr-small-handwritten", "test/fixtures/handwriting_long.png")]:
+    caption = pipeline("image-to-text", model=repo, tokenizer=AutoTokenizer.from_pretrained(export), device="cpu")
     print(repo, path, repr(caption(Image.open(path), generate_kwargs={"do_sample": False, "num_beams": 1})[0]["generated_text"]))
 
 # Text-to-text: greedy, as Transmuter.Text.text_to_text/2 with strategy: :greedy.
@@ -867,7 +869,9 @@ print("whisper-tiny.en timestamps generate", repr(processor.batch_decode(model.g
 # a 224x224 input (see the README). The PyTorch features give another text for all 6 cases, and
 # the export with the scales of a 768x768 input gives the text of PyTorch. The tokenizer is the
 # fast one, which decodes as Transmuter does: the slow one puts spaces between the special
-# tokens, and post_process_generation then finds no locations. The coordinates are those of
+# tokens, and post_process_generation then finds no locations. The tokenizer_config.json of
+# florence-community has clean_up_tokenization_spaces false, and that of onnx-community, which
+# Transmuter loads, has true. The two give the same text for the 6 cases. The coordinates are those of
 # dequantize before it truncates them to integers. The script writes the ids, the text and the
 # result of each case to test/fixtures/florence2.json.
 import json

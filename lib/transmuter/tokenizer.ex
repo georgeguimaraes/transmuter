@@ -19,6 +19,7 @@ defmodule Transmuter.Tokenizer do
     :special_tokens,
     :canonicalize,
     :unknown,
+    clean_up_tokenization_spaces: false,
     length: nil,
     pad_direction: :right,
     truncation: :longest_first,
@@ -39,6 +40,8 @@ defmodule Transmuter.Tokenizer do
     * `:truncation` - the text of a pair that truncation shortens: `:longest_first` (the default), `:only_first` or `:only_second`.
 
     * `:stride` - `nil` (the default) removes the tokens after the largest length. An integer keeps them in more windows of the largest length. Each window repeats the last `stride` tokens of the window before it. The stride is at most half of the largest length, as in the question answering pipeline of Python transformers.
+
+    * `:clean_up_tokenization_spaces` - when `true`, `decode/3` removes the space before punctuation and English contractions, as `clean_up_tokenization` of Python transformers. The default is `clean_up_tokenization_spaces` of `tokenizer_config.json`, and `false` when the file does not have it.
 
   Other options go to `Transmuter.Repo.load!/2` when the first argument is a source.
   """
@@ -86,7 +89,8 @@ defmodule Transmuter.Tokenizer do
       native: native,
       special_tokens: special_tokens(repo),
       canonicalize: canonicalize(repo.tokenizer_config),
-      unknown: unknown
+      unknown: unknown,
+      clean_up_tokenization_spaces: repo.tokenizer_config["clean_up_tokenization_spaces"] == true
     }
 
     configure(tokenizer, opts)
@@ -95,11 +99,11 @@ defmodule Transmuter.Tokenizer do
   def load!(source, opts), do: load!(Repo.load!(source, opts), opts)
 
   @doc """
-  Sets the `:length`, `:pad_direction`, `:truncation` and `:stride` options of `load!/2`.
+  Sets the `:length`, `:pad_direction`, `:truncation`, `:stride` and `:clean_up_tokenization_spaces` options of `load!/2`.
   """
   def configure(tokenizer, opts) do
-    tokenizer =
-      struct!(tokenizer, Keyword.take(opts, [:length, :pad_direction, :truncation, :stride]))
+    keys = [:length, :pad_direction, :truncation, :stride, :clean_up_tokenization_spaces]
+    tokenizer = struct!(tokenizer, Keyword.take(opts, keys))
 
     native =
       if tokenizer.length do
@@ -374,11 +378,18 @@ defmodule Transmuter.Tokenizer do
   def token_to_id(tokenizer, token), do: Tokenizer.token_to_id(tokenizer.native, token)
 
   @doc """
-  Decodes token ids into text, without the special tokens. With `skip_special_tokens: false`, the text keeps them, such as the location tokens of Florence-2.
+  Decodes token ids into text, without the special tokens. With `skip_special_tokens: false`, the text keeps them, such as the location tokens of Florence-2. With the `:clean_up_tokenization_spaces` option of `load!/2`, the text has no space before punctuation and English contractions.
   """
   def decode(tokenizer, ids, opts \\ []) do
     skip? = Keyword.get(opts, :skip_special_tokens, true)
     {:ok, text} = Tokenizer.decode(tokenizer.native, ids, skip_special_tokens: skip?)
-    text
+    if tokenizer.clean_up_tokenization_spaces, do: clean_up(text), else: text
   end
+
+  # clean_up_tokenization of Python transformers, with its replacements in the same order.
+  @clean_ups [{" .", "."}, {" ?", "?"}, {" !", "!"}, {" ,", ","}, {" ' ", "'"}] ++
+               [{" n't", "n't"}, {" 'm", "'m"}, {" 's", "'s"}, {" 've", "'ve"}, {" 're", "'re"}]
+
+  defp clean_up(text),
+    do: Enum.reduce(@clean_ups, text, fn {from, to}, text -> String.replace(text, from, to) end)
 end

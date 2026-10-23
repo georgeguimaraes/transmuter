@@ -183,12 +183,13 @@ defmodule Transmuter.VisionTest do
 
   # The reference is generate of the PyTorch models. The 8-bit TrOCR gives the text of
   # PyTorch. The 8-bit ViT-GPT2 gives another caption, also in ONNX Runtime, so its test
-  # uses fp32.
+  # uses fp32. The tokenizer config of the TrOCR export has clean_up_tokenization_spaces
+  # true, so the text has "noon." and not "noon .".
   test "image to text matches generate of transformers" do
     for {source, variant, image, text} <- [
           {{:hf, "Xenova/vit-gpt2-image-captioning"}, :fp32, @image,
            "a cat laying on a blanket next to a cat laying on a bed "},
-          {@trocr, :q8, @handwriting, "Meet me at the station at noon ."}
+          {@trocr, :q8, @handwriting, "Meet me at the station at noon."}
         ] do
       serving = Vision.image_to_text(source, [variant: variant] ++ @opts)
       # A tensor and a StbImage give the same result.
@@ -208,8 +209,8 @@ defmodule Transmuter.VisionTest do
     alone = for image <- [@handwriting, @handwriting_long], do: Nx.Serving.run(single, image)
 
     assert Enum.map(alone, fn %{results: [%{text: text}]} -> text end) == [
-             "Meet me at the station at noon .",
-             "We walked along the river and talked about the garden until the sun went down behind the hills and trees ."
+             "Meet me at the station at noon.",
+             "We walked along the river and talked about the garden until the sun went down behind the hills and trees."
            ]
 
     batched = Vision.image_to_text(@trocr, [compile: [batch_size: 2]] ++ opts)
