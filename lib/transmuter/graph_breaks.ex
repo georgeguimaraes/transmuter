@@ -16,49 +16,86 @@ defmodule Transmuter.GraphBreaks do
 
   @doc false
   def compile(model, inputs, static_inputs, opts) do
-    {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
-    compiler = opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
-    metadata = %{source: model[:source], compiler: compiler}
-
-    # EXLA keeps each compiled function in a global cache that never evicts. The segments
-    # are already cached here, with eviction and erasure when the owner exits, so EXLA must
-    # not keep a second copy. Other compilers, such as EMLX, reject the :cache option.
-    {disk_cache, opts} =
-      if compiler == EXLA,
-        do: {opts[:cache], Keyword.put(opts, :cache, false)},
-        else: {nil, opts}
+    {opts, metadata} = options(model, opts)
 
     :telemetry.span([:transmuter, :compile], metadata, fn ->
-      nodes = List.to_tuple(model.nodes)
-      last_use = last_use(model)
-
-      # The plan keeps the nodes once, as a tuple. A copy of a closure, such as in a new
-      # process or in :persistent_term, copies each reference to a term again. So the
-      # closure of a call holds the plan once.
-      plan = %{
-        cache_size: cache_size,
-        model: Map.delete(model, :nodes),
-        source: model[:source],
-        nodes: nodes,
-        last_use: last_use,
-        defined: defined(model),
-        constant: constant(model),
-        key: make_ref(),
-        opts: opts,
-        backend: Nx.Defn.to_backend(opts),
-        table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
-        scope: Shared.scope(),
-        disk_cache: disk_cache(disk_cache, model),
-        random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
-      }
-
-      {call, graph_break} =
-        with_graph(plan, fn ->
-          Transmuter.with_fold_memo(fn -> call(plan, inputs, static_inputs) end)
-        end)
-
+      plan = plan(model, opts)
+      {call, graph_break} = start(plan, inputs, static_inputs)
       {instrument(call, plan.source), Map.put(metadata, :graph_break, graph_break)}
     end)
+  end
+
+  @doc false
+  # Compiles the model for inputs, calls it once and returns the outputs with the segments
+  # that the call ran: %{start, stop, compiled, reason}, in the order of the graph. The plan
+  # leaves no segment and no table behind, also when the call raises.
+  def run_once(model, inputs, static_inputs, opts) do
+    {opts, _metadata} = options(model, opts)
+    plan = plan(model, opts)
+
+    try do
+      {call, _graph_break} = start(plan, inputs, static_inputs)
+      outputs = call.(inputs)
+
+      segments =
+        for {key = {start, _shapes, _static_key}, _used} <- :ets.tab2list(plan.table),
+            entry = Shared.get(plan.scope, key),
+            uniq: true do
+          %{start: start, stop: entry.stop, compiled: entry.compiled != nil, reason: entry.reason}
+        end
+
+      {outputs, Enum.sort_by(segments, & &1.start)}
+    after
+      Shared.erase_scope(plan.scope)
+      :ets.delete(plan.table)
+    end
+  end
+
+  # Compiles the first segment for inputs and returns the function of a call, and whether
+  # the graph breaks.
+  defp start(plan, inputs, static_inputs) do
+    with_graph(plan, fn ->
+      Transmuter.with_fold_memo(fn -> call(plan, inputs, static_inputs) end)
+    end)
+  end
+
+  # EXLA keeps each compiled function in a global cache that never evicts. The segments are
+  # already cached here, with eviction and erasure when the owner exits, so EXLA must not keep
+  # a second copy. Other compilers, such as EMLX, reject the :cache option.
+  defp options(model, opts) do
+    compiler = opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
+
+    opts =
+      if compiler == EXLA,
+        do: opts |> Keyword.put(:disk_cache, opts[:cache]) |> Keyword.put(:cache, false),
+        else: opts
+
+    {opts, %{source: model[:source], compiler: compiler}}
+  end
+
+  # The plan keeps the nodes once, as a tuple. A copy of a closure, such as in a new process
+  # or in :persistent_term, copies each reference to a term again. So the closure of a call
+  # holds the plan once.
+  defp plan(model, opts) do
+    {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
+    {disk_cache, opts} = Keyword.pop(opts, :disk_cache)
+
+    %{
+      cache_size: cache_size,
+      model: Map.delete(model, :nodes),
+      source: model[:source],
+      nodes: List.to_tuple(model.nodes),
+      last_use: last_use(model),
+      defined: defined(model),
+      constant: constant(model),
+      key: make_ref(),
+      opts: opts,
+      backend: Nx.Defn.to_backend(opts),
+      table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
+      scope: Shared.scope(),
+      disk_cache: disk_cache(disk_cache, model),
+      random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
+    }
   end
 
   @doc """

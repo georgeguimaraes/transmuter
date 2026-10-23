@@ -1,0 +1,14 @@
+.tgv { display: grid; grid-template-columns: 1fr 320px; grid-template-rows: auto 1fr; height: 100%; font-family: system-ui, sans-serif; color: #222; background: #fafafa; }
+.tgv * { box-sizing: border-box; }
+.tgv header { grid-column: 1 / 3; display: flex; gap: 12px; align-items: center; padding: 6px 12px; border-bottom: 1px solid #ddd; background: #fff; flex-wrap: wrap; font-size: 13px; }
+.tgv header h1 { font-size: 14px; margin: 0; }
+.tgv .tgv-cy { width: 100%; height: 100%; min-height: 0; }
+.tgv aside { border-left: 1px solid #ddd; background: #fff; padding: 10px 14px; overflow: auto; font-size: 13px; }
+.tgv aside h2 { font-size: 14px; margin: 0 0 8px; word-break: break-all; }
+.tgv aside dt { color: #666; margin-top: 8px; }
+.tgv aside dd { margin: 2px 0 0; word-break: break-all; }
+.tgv .legend span { display: inline-block; padding: 1px 8px; margin-right: 4px; border: 1px solid #64748b; border-radius: 3px; background: #dbeafe; }
+.tgv .legend .static { border-style: dashed; color: #6b7280; }
+.tgv .legend .fused { border-width: 3px; }
+.tgv .legend .break { background: #fecaca; border-color: #b91c1c; }
+.tgv .hint { color: #666; line-height: 1.5; }

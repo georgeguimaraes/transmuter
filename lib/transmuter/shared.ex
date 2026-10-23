@@ -16,9 +16,7 @@ defmodule Transmuter.Shared do
       ref = Process.monitor(owner)
 
       receive do
-        {:DOWN, ^ref, :process, _pid, _reason} ->
-          for {key = {__MODULE__, ^scope, _key}, _term} <- :persistent_term.get(),
-              do: :persistent_term.erase(key)
+        {:DOWN, ^ref, :process, _pid, _reason} -> erase_scope(scope)
       end
     end)
 
@@ -36,6 +34,15 @@ defmodule Transmuter.Shared do
       :persistent_term.put({__MODULE__, scope, key}, term)
       unless Process.alive?(owner), do: erase(scope, key)
     end
+
+    :ok
+  end
+
+  @doc false
+  # Erases all terms of the scope.
+  def erase_scope(scope) do
+    for {key = {__MODULE__, ^scope, _key}, _term} <- :persistent_term.get(),
+        do: :persistent_term.erase(key)
 
     :ok
   end

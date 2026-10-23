@@ -77,6 +77,28 @@ Common uses for static inputs:
 
 When a static input changes, Transmuter compiles a new version of the model. With `:cache_size` segments cached, a value that comes back later reuses its compiled version.
 
+## See the segments
+
+`Transmuter.Graph` shows where the graph breaks and why, which nodes fold on the host, and which subgraphs `Transmuter.Fusion` replaced. With `:inputs`, it compiles the model and calls it once:
+
+```elixir
+overlay = Transmuter.Graph.overlay(model, inputs: inputs, compile: [compiler: EXLA])
+overlay.segments
+# => [%{start: 0, stop: 2, compiled: true, reason: "a value that decides a shape"},
+#     %{start: 3, stop: :end, compiled: false, reason: nil}]
+```
+
+In Livebook, `Transmuter.Graph.as_graph/2` shows the same facts in an interactive view, with one fill color for each segment. Click a group to open it, and click a node to see its details, such as the shapes of its outputs. It needs the optional `kino` dependency. Outside Livebook, `Transmuter.Graph.to_html/3` writes the view to one HTML file:
+
+```elixir
+Transmuter.Graph.as_graph(model, inputs: inputs, compile: [compiler: EXLA])
+Transmuter.Graph.to_html(model, "graph.html", inputs: inputs, compile: [compiler: EXLA])
+```
+
+The view works without a network connection. Without `:inputs`, the view is static only and shows no segments.
+
+The `[:transmuter, :segment, :compile, :stop]` event also gives the reason of each break (see `Transmuter.Telemetry`). For the plain ONNX graph, use Netron: `uvx netron model.onnx`.
+
 ## Limit the number of compiled segments
 
 If the total number of compiled segments grows large (for example, with many unique audio lengths in Kokoro), set a `:cache_size` that matches the number of expected shapes:
