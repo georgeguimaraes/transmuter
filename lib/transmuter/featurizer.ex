@@ -20,6 +20,8 @@ defmodule Transmuter.Featurizer do
 
   The OWLv2 image processor (`Owlv2ImageProcessor`) does the steps in another order, and the featurizer reads `image_processor_type` and does the same. It rescales the image, pads it to a square on the bottom and the right with the value 0.5 (`do_pad`), resizes it with the `:gaussian_linear` method of `resize/4`, and normalizes it.
 
+  The Swin2SR image processor (`Swin2SRImageProcessor`) only rescales and pads. With `do_pad`, the bottom and the right get the `"symmetric"` padding of numpy (the edge pixel repeats: `a b c | c b a`) to the next multiple of `size_divisor` (`pad_size` in older configurations). As in Python transformers, a side that is already a multiple gets `size_divisor` more pixels.
+
   The result has the shape `{batch, channels, height, width}` and the type `:f32`.
   """
 
@@ -68,6 +70,16 @@ defmodule Transmuter.Featurizer do
   @doc """
   Builds a featurizer from the map of a `preprocessor_config.json`.
   """
+  # Swin2SRImageProcessor of Python transformers only rescales and pads.
+  def new(config = %{"image_processor_type" => "Swin2SRImageProcessor"}) do
+    multiple = config["size_divisor"] || config["pad_size"] || 8
+
+    %__MODULE__{
+      rescale: if(Map.get(config, "do_rescale", true), do: config["rescale_factor"] || 1 / 255),
+      pad: if(Map.get(config, "do_pad", true), do: {{:next_multiple, multiple}, :symmetric})
+    }
+  end
+
   def new(config) do
     crop = if config["do_center_crop"], do: square(config["crop_size"])
     size = config_size(config["size"], crop != nil or is_number(config["crop_pct"]))
@@ -177,7 +189,9 @@ defmodule Transmuter.Featurizer do
   @doc """
   Returns the `{height, width}` of the images that `process/2` gives, or `nil` when the size depends on the image, for example with `shortest_edge` and no crop.
   """
-  def size(%__MODULE__{pad: {{_, _} = size, _value}}), do: size
+  def size(%__MODULE__{pad: {{height, width}, _value}}) when is_integer(height),
+    do: {height, width}
+
   def size(%__MODULE__{crop: {_, _} = crop}), do: crop
   def size(%__MODULE__{resize: {height, width}}) when is_integer(height), do: {height, width}
   def size(%__MODULE__{}), do: nil
@@ -248,19 +262,42 @@ defmodule Transmuter.Featurizer do
     if featurizer.rescale, do: Nx.multiply(image, featurizer.rescale), else: image
   end
 
-  # Pads the bottom and the right of the image with a value, to a square of its long side
-  # (Owlv2ImageProcessor) or to a size (pad_size of SamImageProcessor).
+  # Pads the bottom and the right of the image to a square of its long side
+  # (Owlv2ImageProcessor), to a size (pad_size of SamImageProcessor) or to the next multiple
+  # of a size (Swin2SRImageProcessor). The padding is a value, or :symmetric, the mode of
+  # numpy.pad that reflects the image with its edge pixel: a b c | c b a.
   defp pad(image, nil), do: image
 
-  defp pad(image, {:square, value}) do
+  defp pad(image, {target, value}) do
     {height, width, _channels} = Nx.shape(image)
-    pad(image, {{max(height, width), max(height, width)}, value})
+    {to_height, to_width} = pad_size(target, {height, width})
+
+    if value == :symmetric do
+      image |> symmetric(0, to_height) |> symmetric(1, to_width)
+    else
+      padding = [{0, to_height - height, 0}, {0, to_width - width, 0}, {0, 0, 0}]
+      Nx.pad(image, Nx.tensor(value, type: Nx.type(image)), padding)
+    end
   end
 
-  defp pad(image, {{to_height, to_width}, value}) do
-    {height, width, _channels} = Nx.shape(image)
-    padding = [{0, to_height - height, 0}, {0, to_width - width, 0}, {0, 0, 0}]
-    Nx.pad(image, Nx.tensor(value, type: Nx.type(image)), padding)
+  defp pad_size(:square, {height, width}), do: {max(height, width), max(height, width)}
+
+  # Swin2SRImageProcessor also adds `multiple` pixels to a side that is already a multiple.
+  defp pad_size({:next_multiple, multiple}, {height, width}),
+    do: {(div(height, multiple) + 1) * multiple, (div(width, multiple) + 1) * multiple}
+
+  defp pad_size({to_height, to_width}, _size), do: {to_height, to_width}
+
+  defp symmetric(image, axis, to_size) do
+    size = Nx.axis_size(image, axis)
+
+    indices =
+      for i <- 0..(to_size - 1) do
+        i = rem(i, 2 * size)
+        if i < size, do: i, else: 2 * size - 1 - i
+      end
+
+    Nx.take(image, Nx.tensor(indices, backend: Nx.BinaryBackend), axis: axis)
   end
 
   @doc """

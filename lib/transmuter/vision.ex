@@ -243,6 +243,29 @@ defmodule Transmuter.Vision do
   defdelegate mask_generation(source, opts \\ []), to: Transmuter.Vision.MaskGeneration
 
   @doc """
+  Builds a serving that turns an image into a new image, with a super-resolution model such as Swin2SR.
+
+  The input is an image or a list of images. The result is `%{image: tensor}`, a `:u8` tensor of shape `{height, width, 3}`. Its size is the size of the input image times `upscale` of `config.json`.
+
+      serving = Transmuter.Vision.image_to_image({:hf, "Xenova/swin2SR-classical-sr-x2-64"})
+      %{image: image} = Nx.Serving.run(serving, image)
+      StbImage.write_file!(StbImage.from_nx(image), "cats_x2.png")
+
+  The featurizer prepares the image as `Swin2SRImageProcessor` of Python transformers (see `Transmuter.Featurizer`). It rescales the image to 0..1 and pads the bottom and the right to the next multiple of `pad_size` with the symmetric mode of numpy. A side that is already a multiple gets `pad_size` more pixels, as in Python transformers. The model gives the `reconstruction` output. As the `image-to-image` pipeline of Python transformers, the serving clamps it to 0..1, multiplies it by 255 and rounds it to 8 bits.
+
+  The `image-to-image` pipeline of Python transformers gives the upscaled image with the padding. The serving removes the padding: the result has only the region of the input image, `upscale * height` by `upscale * width`.
+
+  The output size depends on the image, so each image is a batch of its own, and the model compiles each new image size on its first call. On CUDA, the compile time of Swin2SR grows with the image size, because the XLA autotuner runs its kernels at that size: 8.5 s for an image of 64x48 pixels and 49 s for 136x104 pixels on an RTX 3060. On the EXLA CPU, a size compiles in about 2.5 s. The serving compiles only the image sizes that it gets. The default variant is fp32.
+
+  ## Options
+
+    * `:compile` - `:batch_size` must be `1`, the default.
+
+  See the module documentation for the other options.
+  """
+  defdelegate image_to_image(source, opts \\ []), to: Transmuter.Vision.ImageToImage
+
+  @doc """
   Builds a serving that gives the text of an image with an encoder-decoder model, such as a caption or handwritten text.
 
   The input is an image, `%{image: image, seed: seed}` or a list of them. The result is `%{results: [%{text: text}]}`, as in Bumblebee.

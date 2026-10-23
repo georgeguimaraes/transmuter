@@ -391,6 +391,15 @@ defmodule Transmuter.Serving do
     end)
   end
 
+  @doc """
+  Raises unless the `:batch_size` of the `:compile` option is 1, for a task of `each/2`. `reason` says why each input is a batch of its own.
+  """
+  def batch_size_one!(compile, reason) do
+    if Keyword.validate!(compile || [], batch_size: 1)[:batch_size] != 1,
+      do:
+        raise(ArgumentError, "#{reason}, so each input is a batch of its own. Use batch_size: 1")
+  end
+
   # Nx.Serving runs each batch of a serving process in a new process, which copies the
   # function of the batch and all that it holds, such as the compiled models. So a serving
   # process keeps the functions in a scope of Transmuter.Shared, and each batch reads them

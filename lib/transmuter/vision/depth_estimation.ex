@@ -13,7 +13,7 @@ defmodule Transmuter.Vision.DepthEstimation do
   @doc false
   def depth_estimation(source, opts) do
     opts = Keyword.validate!(opts, Serving.image_options())
-    batch_size!(opts[:compile])
+    Serving.batch_size_one!(opts[:compile], "the depth map has the size of the image")
     {repo, model} = Serving.load_model!(source, [outputs: ["predicted_depth"]] ++ opts, :fp32)
     featurizer = opts[:featurizer] || Featurizer.load!(repo)
     backend = opts[:backend] || Nx.default_backend()
@@ -59,15 +59,6 @@ defmodule Transmuter.Vision.DepthEstimation do
     }
 
     Serving.each(task, opts)
-  end
-
-  defp batch_size!(compile) do
-    if Keyword.validate!(compile || [], batch_size: 1)[:batch_size] != 1,
-      do:
-        raise(
-          ArgumentError,
-          "the depth map has the size of the image, so each image is a batch of its own. Use batch_size: 1"
-        )
   end
 
   # As the depth-estimation pipeline of Python transformers: the depth scaled to 0..1 with

@@ -939,4 +939,32 @@ defmodule Transmuter.VisionLargeModelTest do
     assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
     assert Nx.Serving.run(serving, hd(chats)) == hd(results)
   end
+
+  # The reference is the image-to-image pipeline of transformers, without the padding, on a
+  # 64x48 crop (sides that are multiples of 8, which get 8 more pixels) and a 59x50 crop.
+  # The 8-bit values round, so a value can be one step away. CI takes no new models until
+  # its download budget allows them, so the test is :large_model.
+  @tag :large_model
+  test "image to image with Swin2SR matches the pipeline" do
+    for {repo, name, {x, y, width, height}, scale} <- [
+          {"Xenova/swin2SR-classical-sr-x2-64", "x2", {110, 75, 64, 48}, 2},
+          {"Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr", "x4", {130, 70, 59, 50}, 4}
+        ] do
+      serving = Vision.image_to_image({:hf, repo}, @opts)
+      crop = StbImage.to_nx(@image)[[y..(y + height - 1), x..(x + width - 1)]]
+      %{image: image} = Nx.Serving.run(serving, crop)
+
+      expected =
+        Path.expand("../fixtures/cats_swin2sr_#{name}.png", __DIR__)
+        |> StbImage.read_file!()
+        |> StbImage.to_nx()
+
+      assert {Nx.shape(image), Nx.type(image)} == {{scale * height, scale * width, 3}, {:u, 8}}
+      assert Nx.shape(expected) == Nx.shape(image)
+      difference = Nx.abs(Nx.subtract(Nx.as_type(image, :s16), Nx.as_type(expected, :s16)))
+      differing = Nx.to_number(Nx.sum(Nx.not_equal(difference, 0)))
+      assert Nx.to_number(Nx.reduce_max(difference)) <= 1, name
+      assert differing <= 20, "#{name}: #{differing} values are one step away"
+    end
+  end
 end

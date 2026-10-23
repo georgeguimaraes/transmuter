@@ -623,6 +623,23 @@ for name, picture in pictures:
     values = np.array(mask)
     print("ormbg", name, values.shape, [int(values[p]) for p in [(0, 0), (100, 37), (57, 190), (150, 120), (239, 239)]], round(float(values.mean()), 4))
 
+# Image-to-image with Swin2SR: the image-to-image pipeline with the PyTorch models of the
+# Xenova exports, on a 64x48 crop of the image for x2 and a 59x50 crop for x4. Swin2SRImageProcessor
+# pads each side with the symmetric mode of numpy to the next multiple of 8, and a side that is
+# already a multiple gets 8 more pixels. The pipeline gives the upscaled padded image. The
+# script prints the size of that image, and writes its region of the crop, scale * height
+# by scale * width, to test/fixtures/cats_swin2sr_x2.png and cats_swin2sr_x4.png.
+image = Image.open("test/fixtures/cats.png")
+for repo, name, box in [("caidas/swin2SR-classical-sr-x2-64", "x2", (110, 75, 174, 123)), ("caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr", "x4", (130, 70, 189, 120))]:
+    upscale = pipeline("image-to-image", model=repo, device="cpu")
+    picture = image.crop(box)
+    result = upscale(picture)
+    scale = upscale.model.config.upscale
+    region = result.crop((0, 0, scale * picture.width, scale * picture.height))
+    region.save(f"test/fixtures/cats_swin2sr_{name}.png")
+    values = np.array(region)
+    print("swin2sr", name, picture.size, result.size, values.shape, [values[p].tolist() for p in [(0, 0), (37, 100), (values.shape[0] - 1, values.shape[1] - 1)]], round(float(values.mean()), 4))
+
 # Zero-shot object detection with the labels "cat", "remote control" and "couch", on the wide
 # and the tall image. The script prints pixel_values[0] of the slow OWL-ViT and OWLv2 image
 # processors of the Xenova exports at (channel, y, x) and the mean of the absolute values,

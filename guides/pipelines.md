@@ -348,6 +348,7 @@ image = StbImage.read_file!("cats.jpg")
 | `image_segmentation/2` | image | `%{segments: [%{label: label, score: nil, mask: tensor}]}` |
 | `background_removal/2` | image | `%{mask: tensor}` |
 | `mask_generation/2` | `%{image: image, prompts: prompts}` | `%{masks: [[tensor]], iou_scores: [[score]]}` |
+| `image_to_image/2` | image | `%{image: tensor}` |
 
 Each function also takes a list of images and then gives a list of results. The tests of Transmuter compare each task with the pipeline of Python transformers on the same image. The labels are the same, and the scores agree within 1.0e-4. For `image_to_text/2`, the text is the same as the text of the `image-to-text` pipeline in Python transformers. For `image_text_to_text/2`, the text is the same as the text of ONNX Runtime on the same ONNX files. For `object_detection/2`, the labels are the same as those of `post_process_object_detection` in Python transformers, the scores agree within 2.0e-5, and the boxes agree within 0.001 pixels. For `zero_shot_object_detection/3`, the labels are the same as those of the `zero-shot-object-detection` pipeline, and the boxes agree within 0.011 pixels. The scores of OWL-ViT and OWLv2 agree within 1.1e-4. The reference of Grounding DINO is ONNX Runtime with the post-processing of the pipeline, and its scores agree within 6.0e-4. For `depth_estimation/2`, the depth agrees within 1.0e-4 relative, and a value of the 8-bit depth image can be 1 step away. For `image_segmentation/2`, the labels and the masks are the same as those of the `image-segmentation` pipeline. For `background_removal/2`, a value of the mask can be 1 step away from ONNX Runtime with the post-processing of transformers.js and the bilinear resize of Pillow. For `mask_generation/2`, the masks are those of `SamModel` and `Sam2Model` of Python transformers with `post_process_masks`, except for at most a few pixels at the edges, where the logits are near 0, and the scores agree within 1.0e-4.
 
@@ -482,6 +483,18 @@ The serving runs the SAM and SAM 2 exports of transformers.js, such as `Xenova/s
 The vision encoder runs once for each image, and the decoder runs once for each prompt. Python transformers pads the points of the prompts of a batch to one length, and the padding changes the masks, so the serving runs each prompt alone, as one call of Python with one prompt. The decoder compiles once for each number of points, with or without a box. The `mask-generation` pipeline of Python transformers segments the whole image with a grid of points. The serving does not do that yet.
 
 SAM 2.1 has only a fast image processor, which resizes with torchvision. torchvision gives the weights of an 8-bit resize fewer bits than Pillow, so the featurizer does the same for each `image_processor_type` that ends in `Fast`. When the image gets smaller, a pixel of Pillow can be one step away.
+
+### Image to image
+
+```elixir
+serving = Transmuter.Vision.image_to_image({:hf, "Xenova/swin2SR-classical-sr-x2-64"})
+%{image: image} = Nx.Serving.run(serving, image)
+StbImage.write_file!(StbImage.from_nx(image), "cats_x2.png")
+```
+
+`Transmuter.Vision.image_to_image/2` runs super-resolution models, such as Swin2SR. The result is a `:u8` image of shape `{height, width, 3}`, `upscale` times larger than the input image. The featurizer pads the image to a multiple of `pad_size` as `Swin2SRImageProcessor` of Python transformers, and the serving rounds the output of the model to 8 bits as the `image-to-image` pipeline. The pipeline of Python transformers also gives the upscaled padding at the bottom and the right of the image. The serving removes it. The output size depends on the image, so each image runs alone, and the model compiles each new image size on its first call.
+
+The tests compare the image with the `image-to-image` pipeline of Python transformers, without its padding, for `Xenova/swin2SR-classical-sr-x2-64` and `Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr`. A value can be 1 step away.
 
 ### Image-text-to-text
 
