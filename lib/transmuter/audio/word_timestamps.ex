@@ -12,7 +12,7 @@ defmodule Transmuter.Audio.WordTimestamps do
   The words come from `_combine_tokens_into_words` of the Whisper tokenizer. The tokens split where their text is complete characters. A piece that starts with a space or that is punctuation starts a new word, and other pieces join the word before them. In Chinese, Japanese, Thai, Lao, Burmese and Cantonese, each piece is a word, as OpenAI whisper and transformers.js do. The pipeline of Python transformers does not know the language there, so it splits all languages at spaces. Then opening punctuation joins the next word, and closing punctuation joins the word before it.
   """
 
-  alias Transmuter.Tokenizer
+  alias Transmuter.{GraphBreaks, Tokenizer}
 
   @doc """
   Returns the names of the outputs of a decoder that `aligner/3` can read: the cross attentions of all layers. Give these names with those of `Transmuter.Generation.outputs/1` to the `:outputs` option of `Transmuter.load!/2`.
@@ -54,7 +54,7 @@ defmodule Transmuter.Audio.WordTimestamps do
     flag = Nx.tensor([0], type: :u8, backend: Nx.BinaryBackend)
 
     run =
-      Nx.Defn.jit(
+      GraphBreaks.jit(
         fn params, inputs, counts, frames ->
           inputs = Map.merge(placeholders(model, inputs["input_ids"]), inputs)
           outputs = Transmuter.run(model, params, inputs, %{"use_cache_branch" => flag})
