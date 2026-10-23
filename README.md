@@ -43,27 +43,34 @@ Nx.Serving.run(serving, %{messages: [%{role: "user", content: "What is the capit
 
 The tasks:
 
-- `Transmuter.Text`
-  - `text_embedding`, `text_classification`, `zero_shot_classification`, `token_classification`, `fill_mask` and `question_answering`
-  - `text_ranking`: cross-encoders and rerankers such as Qwen3-Reranker
-  - `generation`
-  - `text_to_text`: T5 and Marian, and NLLB and M2M100 for translation between many languages
-- `Transmuter.Vision`
-  - `image_classification`, `image_embedding` and `zero_shot_image_classification`
-  - `image_to_text`: ViT-GPT2, TrOCR and Florence-2
-  - `image_text_to_text`: chats about images with SmolVLM and Qwen2-VL
-  - `object_detection`: DETR, YOLOS, RT-DETR and RF-DETR
-  - `zero_shot_object_detection`: OWL-ViT, OWLv2 and Grounding DINO
-  - `depth_estimation`: Depth Anything
-  - `image_segmentation`: Segformer
-  - `background_removal`: ORMBG
-  - `mask_generation`: SAM and SAM 2, with point and box prompts
-  - `image_to_image`: Swin2SR super resolution
-- `Transmuter.Audio`
-  - `speech_to_text`: Whisper
-  - `audio_classification`: AST and wav2vec2
-  - `zero_shot_audio_classification`: CLAP
-  - `text_to_speech`: VITS and SpeechT5
+- [`Transmuter.Text`](https://hexdocs.pm/transmuter/Transmuter.Text.html)
+  - [`text_embedding`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_embedding/2): MiniLM, BGE, EmbeddingGemma and Qwen3-Embedding
+  - [`text_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_classification/2): DistilBERT and other sequence classifiers
+  - [`text_ranking`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_ranking/2): MS MARCO cross-encoders and Qwen3-Reranker
+  - [`zero_shot_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#zero_shot_classification/3): DistilBERT MNLI and other NLI models
+  - [`token_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#token_classification/2): BERT NER
+  - [`fill_mask`](https://hexdocs.pm/transmuter/Transmuter.Text.html#fill_mask/2): DistilRoBERTa
+  - [`question_answering`](https://hexdocs.pm/transmuter/Transmuter.Text.html#question_answering/2): DistilBERT SQuAD
+  - [`generation`](https://hexdocs.pm/transmuter/Transmuter.Text.html#generation/2): SmolLM2, SmolLM3, Qwen3 and Gemma 3
+  - [`text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_to_text/2): T5 and Marian, and NLLB and M2M100 for translation between many languages
+- [`Transmuter.Vision`](https://hexdocs.pm/transmuter/Transmuter.Vision.html)
+  - [`image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_classification/2): ViT
+  - [`image_embedding`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_embedding/2): CLIP
+  - [`zero_shot_image_classification`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_image_classification/3): CLIP
+  - [`image_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_text/2): ViT-GPT2, TrOCR and Florence-2
+  - [`image_text_to_text`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_text_to_text/2): chats about images with SmolVLM and Qwen2-VL
+  - [`object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#object_detection/2): DETR, YOLOS, RT-DETR and RF-DETR
+  - [`zero_shot_object_detection`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#zero_shot_object_detection/3): OWL-ViT, OWLv2 and Grounding DINO
+  - [`depth_estimation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#depth_estimation/2): Depth Anything
+  - [`image_segmentation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_segmentation/2): Segformer
+  - [`background_removal`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#background_removal/2): ORMBG
+  - [`mask_generation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#mask_generation/2): SAM and SAM 2, with point and box prompts
+  - [`image_to_image`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_image/2): Swin2SR super resolution
+- [`Transmuter.Audio`](https://hexdocs.pm/transmuter/Transmuter.Audio.html)
+  - [`speech_to_text`](https://hexdocs.pm/transmuter/Transmuter.Audio.html#speech_to_text/2): Whisper
+  - [`audio_classification`](https://hexdocs.pm/transmuter/Transmuter.Audio.html#audio_classification/2): AST and wav2vec2
+  - [`zero_shot_audio_classification`](https://hexdocs.pm/transmuter/Transmuter.Audio.html#zero_shot_audio_classification/3): CLAP
+  - [`text_to_speech`](https://hexdocs.pm/transmuter/Transmuter.Audio.html#text_to_speech/2): VITS and SpeechT5
 
 The results have the shapes of Bumblebee or of Python transformers, and their values match the pipelines of Python transformers. The text of `image_text_to_text` matches ONNX Runtime on the same files. See the [Pipelines guide](guides/pipelines.md).
 
