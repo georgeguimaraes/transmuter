@@ -47,6 +47,7 @@ The tasks:
   - [`text_embedding`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_embedding/2): MiniLM, BGE, EmbeddingGemma and Qwen3-Embedding
   - [`text_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_classification/2): DistilBERT and other sequence classifiers
   - [`text_ranking`](https://hexdocs.pm/transmuter/Transmuter.Text.html#text_ranking/2): MS MARCO cross-encoders and Qwen3-Reranker
+  - [`zero_shot_entity_recognition`](https://hexdocs.pm/transmuter/Transmuter.Text.html#zero_shot_entity_recognition/2): GLiNER (span and token models)
   - [`zero_shot_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#zero_shot_classification/3): DistilBERT MNLI and other NLI models
   - [`token_classification`](https://hexdocs.pm/transmuter/Transmuter.Text.html#token_classification/2): BERT NER
   - [`fill_mask`](https://hexdocs.pm/transmuter/Transmuter.Text.html#fill_mask/2): DistilRoBERTa

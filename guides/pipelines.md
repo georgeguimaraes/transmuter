@@ -50,6 +50,7 @@ ONNX exports keep each file in variants, for example `onnx/model.onnx` (fp32) an
 | `text_ranking/2` | `%{query: query, documents: documents}` | `%{results: [%{index: index, score: score}]}` |
 | `zero_shot_classification/3` | text | `%{predictions: [%{label: label, score: score}]}` |
 | `token_classification/2` | text | `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}` |
+| `zero_shot_entity_recognition/2` | `%{text: text, labels: labels}` | `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}` |
 | `fill_mask/2` | text with `[MASK]` | `%{predictions: [%{score: score, token: token}]}` |
 | `question_answering/2` | `%{question: question, context: context}` | `%{results: [%{text: text, start: start, end: end, score: score}]}` |
 | `generation/2` | text, or `%{messages: messages}` | `%{results: [%{text: text, token_summary: summary}]}` |
@@ -141,6 +142,20 @@ Nx.Serving.run(serving, "Hugging Face Inc. is a company based in New York City."
 ```
 
 `start` and `end` are byte offsets in the text, so `binary_part(text, start, end - start)` gives the span.
+
+### Entities of your labels
+
+```elixir
+serving = Transmuter.Text.zero_shot_entity_recognition({:hf, "onnx-community/gliner_small-v2.1"})
+
+Nx.Serving.run(serving, %{
+  text: "Cristiano Ronaldo plays for Al Nassr.",
+  labels: ["person", "organization"]
+})
+#=> %{entities: [%{label: "person", phrase: "Cristiano Ronaldo", start: 0, end: 17, ...}, ...]}
+```
+
+A GLiNER model finds the entities of the labels that you give, and each input can have its own labels. The steps follow gliner in Python. Span models and token models (such as `knowledgator/gliner-pii-small-v1.0`) both run. `:threshold` sets the lowest score, `flat_ner: false` keeps an entity inside another entity, and `multi_label: true` lets a span have more than one label.
 
 ### Generation
 

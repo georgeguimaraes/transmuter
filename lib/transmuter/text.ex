@@ -124,6 +124,26 @@ defmodule Transmuter.Text do
     to: Transmuter.Text.ZeroShotClassification
 
   @doc """
+  Builds a serving that finds entities of the labels that you give, with a GLiNER model, such as `onnx-community/gliner_small-v2.1`.
+
+  The input is `%{text: text, labels: labels}` or a list of them. Each input can have its own labels. The result is `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}`, in the order of the text. `start` and `end` are byte offsets in the text, and `phrase` is the text of the entity. gliner in Python gives character offsets.
+
+  The serving follows gliner 0.2.29 (see `Transmuter.Text.ZeroShotEntityRecognition`). It reads `gliner_config.json`, and it runs the span models and the token models (`span_mode` `"token_level"`) of GLiNER. Models with a labels encoder, a labels decoder or relations, streaming models, and other word splitters than `"whitespace"` raise. As gliner, the serving keeps the first `max_len` words of the text. It also keeps only the words that fit in the largest sequence length, which is 512 tokens by default. gliner does not truncate the tokens, so a longer text gets other entities.
+
+  ## Options
+
+    * `:threshold` - an entity needs a score more than this value. The default is `0.5`.
+
+    * `:flat_ner` - `true` (the default) removes an entity that overlaps an entity with a higher score. `false` removes it only when the two entities overlap partly, so an entity can be inside another entity.
+
+    * `:multi_label` - `true` lets a span of words have more than one label. The default is `false`.
+
+  See the module documentation for the other options.
+  """
+  defdelegate zero_shot_entity_recognition(source, opts \\ []),
+    to: Transmuter.Text.ZeroShotEntityRecognition
+
+  @doc """
   Builds a serving that labels the tokens of a text, such as named entity recognition.
 
   The input is a string or a list of strings. The result is `%{entities: [%{start: start, end: end, label: label, score: score, phrase: phrase}]}`. `start` and `end` are byte offsets in the text.
