@@ -116,7 +116,7 @@ defmodule Transmuter.Graph do
 
   ## Options
 
-    * `:max_members` - a group with more nodes directly in its scope than this splits them, in the order of the graph, into groups such as `"ops 1-40"`. Exports without name scopes and large flat scopes, such as the encoder of Kokoro, then still give small groups. The default is `40`.
+    * `:max_members` - a group with more nodes directly in its scope than this splits them, in the order of the graph, into groups of equal size, such as `"ops 1-21"` and `"ops 22-41"`. Exports without name scopes and large flat scopes, such as the encoder of Kokoro, then still give small groups. The default is `40`.
     * `:constants` - whether to keep the `Constant` nodes. Else each group counts the `Constant` nodes in its scope. The default is `false`.
   """
   def tree(%{nodes: nodes}, opts \\ []) do
@@ -140,12 +140,15 @@ defmodule Transmuter.Graph do
 
     leaves =
       if length(shown) > max_members do
+        # Groups of equal size, so no group holds only a few nodes.
+        size = ceil(length(shown) / ceil(length(shown) / max_members))
+
         shown
         |> Enum.sort_by(fn {_rest, node} -> node.id end)
-        |> Enum.chunk_every(max_members)
+        |> Enum.chunk_every(size)
         |> Enum.with_index()
         |> Enum.map(fn {chunk, i} ->
-          first = i * max_members + 1
+          first = i * size + 1
           name = "ops #{first}-#{first + length(chunk) - 1}"
 
           group(scope ++ [name], chunk, max_members, hide?)

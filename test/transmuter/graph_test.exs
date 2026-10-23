@@ -181,17 +181,20 @@ defmodule Transmuter.GraphTest do
     assert {"/zeros", 1, ["Constant"]} = tree |> outline() |> elem(2) |> List.last()
   end
 
-  test "a scope with many direct nodes splits them in the order of the graph" do
-    nodes = for i <- 1..90, do: node("Neg", ["v#{i - 1}"], ["v#{i}"], "Neg_#{i}")
-    tree = %{nodes: nodes, static: %{}} |> Graph.overlay() |> Graph.tree()
+  test "a scope with many direct nodes splits them in groups of equal size" do
+    tree = fn count ->
+      nodes = for i <- 1..count, do: node("Neg", ["v#{i - 1}"], ["v#{i}"], "Neg_#{i}")
+      %{nodes: nodes, static: %{}} |> Graph.overlay() |> Graph.tree()
+    end
 
-    assert [{"/ops 1-40", 40, _}, {"/ops 41-80", 40, _}, {"/ops 81-90", 10, _}] =
-             tree |> outline() |> elem(2)
+    assert [{"/ops 1-30", 30, _}, {"/ops 31-60", 30, _}, {"/ops 61-90", 30, _}] =
+             tree.(90) |> outline() |> elem(2)
 
-    assert tree.counts.nodes == 90
+    assert [{"/ops 1-21", 21, _}, {"/ops 22-41", 20, _}] = tree.(41) |> outline() |> elem(2)
+    assert tree.(40) |> outline() |> elem(2) |> length() == 40
 
-    assert tree |> find("/ops 41-80") |> Map.fetch!(:children) |> hd() |> Map.fetch!(:name) ==
-             "Neg_41"
+    assert tree.(90) |> find("/ops 31-60") |> Map.fetch!(:children) |> hd() |> Map.fetch!(:name) ==
+             "Neg_31"
   end
 
   test "a name that the exporter generated from the op type gives no label" do

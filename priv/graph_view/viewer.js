@@ -26,7 +26,7 @@
 
   function groupCounts(counts) {
     return [
-      counts.nodes.toLocaleString("en") + " ops",
+      counts.nodes.toLocaleString("en") + (counts.nodes === 1 ? " op" : " ops"),
       counts.static && counts.static.toLocaleString("en") + " static",
       counts.fused && counts.fused + " fused",
       counts.breaks && counts.breaks + (counts.breaks === 1 ? " break" : " breaks"),
@@ -147,6 +147,7 @@
 
     function segmentText(node) {
       if (node.break) return `between segment ${node.break.after} and ${node.break.after + 1}`;
+      if (!data.segments.length) return "unknown: the view is static only";
       return node.segment === null ? "none (the node did not run)" : String(node.segment);
     }
 
