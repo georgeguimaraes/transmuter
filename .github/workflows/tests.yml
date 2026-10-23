@@ -133,22 +133,23 @@ jobs:
       # the archive, and MLX_ARCHIVE_PATH gives it to the build, which then does not download.
       # The archive is not in ~/.cache/libmlx, because `mix compile --force` deletes that
       # directory.
-      - name: Find the MLX version
+      - name: Find the MLX archive
         id: mlx
         run: |
           version=$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "MLX_ARCHIVE_PATH=$HOME/mlx/mlx-$version-x86_64-linux-gnu.tar.gz" >> "$GITHUB_ENV"
+          archive=mlx-x86_64-linux-gnu.tar.gz
+          echo "url=https://github.com/cocoa-xu/mlx-build/releases/download/v$version/$archive" >> "$GITHUB_OUTPUT"
+          echo "MLX_ARCHIVE_PATH=$HOME/mlx/$version-$archive" >> "$GITHUB_ENV"
       - name: Restore MLX archive
         id: mlx-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/mlx
-          key: ${{ runner.os }}-mlx-${{ steps.mlx.outputs.version }}
+          key: mlx-${{ steps.mlx.outputs.url }}
       - name: Download MLX archive
         if: steps.mlx-cache.outputs.cache-hit != 'true'
         run: |
-          url="https://github.com/cocoa-xu/mlx-build/releases/download/v${{ steps.mlx.outputs.version }}/mlx-x86_64-linux-gnu.tar.gz"
+          url="${{ steps.mlx.outputs.url }}"
           mkdir -p ~/mlx
           curl -fsSL --retry 5 --retry-all-errors -o "$MLX_ARCHIVE_PATH" "$url"
           sum=$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)
@@ -211,6 +212,30 @@ jobs:
           key: ${{ runner.os }}-mix-${{ steps.beam.outputs.version }}-${{ hashFiles('**/mix.lock') }}
       - name: Install dependencies
         run: mix deps.get
+      # The MLX archive comes from curl, as in the exla job. The archive of macOS has the
+      # deployment target of emlx in its name.
+      - name: Find the MLX archive
+        id: mlx
+        run: |
+          version=$(sed -n 's/^  @mlx_version "\(.*\)"$/\1/p' deps/emlx/mix.exs)
+          target=$(sed -n 's/^  @macos_deployment_target_latest "\(.*\)"$/\1/p' deps/emlx/mix.exs)
+          archive=mlx-arm64-apple-darwin-$target.tar.gz
+          echo "url=https://github.com/cocoa-xu/mlx-build/releases/download/v$version/$archive" >> "$GITHUB_OUTPUT"
+          echo "MLX_ARCHIVE_PATH=$HOME/mlx/$version-$archive" >> "$GITHUB_ENV"
+      - name: Restore MLX archive
+        id: mlx-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/mlx
+          key: mlx-${{ steps.mlx.outputs.url }}
+      - name: Download MLX archive
+        if: steps.mlx-cache.outputs.cache-hit != 'true'
+        run: |
+          url="${{ steps.mlx.outputs.url }}"
+          mkdir -p ~/mlx
+          curl -fsSL --retry 5 --retry-all-errors -o "$MLX_ARCHIVE_PATH" "$url"
+          sum=$(curl -fsSL --retry 5 --retry-all-errors "$url.sha256" | cut -d ' ' -f 1)
+          echo "$sum  $MLX_ARCHIVE_PATH" | shasum -a 256 -c
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: emlx
