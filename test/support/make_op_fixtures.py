@@ -918,6 +918,47 @@ case("Break_NonZero_Loop_outer",
      {"x": x_positions, "v0": r.standard_normal(2).astype(np.float32)},
      {**positions_init, "one": np.array(1, np.int64), "one_f": np.array(1.0, np.float32), "trips": np.array(2, np.int64)})
 
+# A short segment after the NonZero reads the first position as a Slice start and runs
+# eagerly. It ends at a Range on a limit from the device. The compiled segment after the
+# Range reads the positions only as Gather indices.
+range_sum = [node("ReduceSum", ["r"], ["r_sum"], keepdims=0), node("Mul", ["r_sum", "zero"], ["r_zero"]),
+             node("Add", ["idx", "r_zero"], ["idx_late"]), node("Gather", ["data", "idx_late"], ["late"], axis=0)]
+late, l = chain("late", "l")
+case("Break_NonZero_eager_read",
+     positions[:3] + [node("ReduceMin", ["idx"], ["first"], keepdims=1), node("Slice", ["w", "first", "end", "axis0"], ["w_tail"]),
+                      node("Mul", ["w_tail", "zero_f"], ["w_zero"]), node("ReduceSum", ["w_zero"], ["w_sum"], keepdims=0),
+                      node("Cast", ["w_sum"], ["w_int"], to=INT64), node("Add", ["n", "w_int"], ["count"]),
+                      node("Range", ["zero", "count", "one"], ["r"])] + range_sum + late + [node("Identity", [l], ["y"])],
+     {"x": x_positions, "data": data, "w": r.standard_normal(8).astype(np.float32), "n": np.array(5, np.int64)},
+     {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64)},
+     outputs=["w_tail", "y"])
+# The start of a Slice comes from the positions through a random node that adds zero. The
+# random value is not static, so the Slice breaks, and the positions stay arguments.
+case("Break_NonZero_random_read",
+     positions + gathered +
+     [node("Cast", ["idx"], ["idx_f"], to=TensorProto.FLOAT), node("RandomUniformLike", ["idx_f"], ["noise"]),
+      node("Mul", ["noise", "zero_f"], ["no_noise"]), node("Add", ["idx_f", "no_noise"], ["start_f"]),
+      node("Cast", ["start_f"], ["start_i"], to=INT64), node("ReduceMin", ["start_i"], ["start"], keepdims=1),
+      node("Slice", [g, "start", "end", "axis0"], ["y"])],
+     {"x": x_positions, "data": data},
+     {**positions_init, "end": np.array([8], np.int64)})
+# The segment of the positions expands them to 6000 values, more than the host takes, and the
+# compiled segment after the Range reads their largest value as a Slice start. That value
+# cannot enter the segment as a static value, so the Slice breaks, as before.
+counted_large, cl = chain("rf", "k")
+case("Break_NonZero_large_read",
+     positions + gathered + after_chain +
+     [node("Unsqueeze", ["idx", "axis1"], ["idx_col"]), node("Expand", ["idx_col", "wide"], ["large"]),
+      node("Range", ["zero", "count", "one"], ["r"]), node("ReduceSum", ["r"], ["r_sum"], keepdims=0),
+      node("Mul", ["r_sum", "zero"], ["r_zero"]), node("Add", ["large", "r_zero"], ["large_late"]),
+      node("ReduceMax", ["large_late"], ["last"], keepdims=0), node("Unsqueeze", ["last", "axis0"], ["last_1"]),
+      node("Cast", ["r"], ["rf"], to=TensorProto.FLOAT)] + counted_large +
+     [node("Slice", [cl, "last_1", "end", "axis0"], ["y"])],
+     {"x": x_positions, "data": data, "w": r.standard_normal(8).astype(np.float32), "n": np.array(5, np.int64)},
+     {**positions_init, "zero": np.array(0, np.int64), "one": np.array(1, np.int64), "end": np.array([8], np.int64),
+      "axis1": np.array([1], np.int64), "wide": np.array([1, 2000], np.int64)},
+     outputs=[g, "y"])
+
 # ---------- long recurrences and loops ----------
 
 # More than 16 steps, so a compiled model runs these as a while loop.

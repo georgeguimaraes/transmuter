@@ -162,30 +162,61 @@ defmodule Transmuter.TelemetryTest do
   end
 
   # The segment after the NonZero computes the first position, and the segment after the
-  # Range reads it as a Slice start. The first call breaks at the Slice and learns the names
-  # on the way back to the positions, so later calls keep them static and do not break there.
-  test "a value that a later segment reads on the host stays static" do
+  # Range reads it as a Slice start. The first position enters that segment as a static
+  # value, so only that segment compiles for a new first position, and the segment of the
+  # positions does not.
+  test "a value that a later segment reads on the host is static in that segment only" do
     model = load_fixture("Break_NonZero_cross_segment")
     compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
 
-    assert [%{breaks: ["NonZero", "Range", "Slice"], host_values: ["first", "idx", "nz"]}] =
+    assert [%{breaks: ["NonZero", "Range"], host_values: ["first"]}] =
              calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0]])
 
+    assert [
+             %{compiled: 0, breaks: ["NonZero", "Range"], host_values: []},
+             %{compiled: 1, breaks: ["NonZero", "Range"], host_values: []}
+           ] = calls(compiled, model, [[1, 0, 1, 0, 1, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
+  end
+
+  # A short segment reads the first position on the host and runs eagerly. The compiled
+  # segment after the next break reads the positions on the device, so they stay its
+  # arguments.
+  test "a segment that runs eagerly does not make the values of other segments static" do
+    model = load_fixture("Break_NonZero_eager_read")
+    compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
+
     assert [%{breaks: ["NonZero", "Range"], host_values: []}, %{compiled: 0}] =
-             calls(compiled, model, [[0, 1, 1, 1, 0, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]])
+             calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [1, 0, 1, 0, 1, 0, 0, 0]])
+  end
+
+  # A Slice reads a value that comes from the positions through a random node, or that the
+  # segment before the Range expands to 6000 values, more than the host takes. Both break
+  # as before, and the segment of the positions does not compile for new positions.
+  test "a break on a random or large value keeps the positions as arguments" do
+    for {name, breaks} <- [
+          {"Break_NonZero_random_read", ["NonZero", "Slice"]},
+          {"Break_NonZero_large_read", ["NonZero", "Range", "Slice"]}
+        ] do
+      model = load_fixture(name)
+      compiled = Transmuter.compile(model, positions(model, [1, 0, 1, 1, 0, 0, 0, 0]), @compiler)
+
+      assert [
+               %{breaks: ^breaks, host_values: []},
+               %{compiled: 0, breaks: ^breaks, host_values: []}
+             ] = calls(compiled, model, [[1, 0, 1, 1, 0, 0, 0, 0], [0, 1, 1, 1, 0, 0, 0, 0]]),
+             name
+    end
   end
 
   # The Loop body expands to a position that it reads as an outer value, so the value that
   # it reads on the host is not an input of the Loop. Its state comes from the device. The
   # positions become static for one more trace, and the Loop does not break.
-  test "a node that reads a value that it computed from positions keeps them static" do
+  test "a node that reads a value that it computed from positions does not break" do
     model = load_fixture("Break_NonZero_Loop_outer")
     compiled = Transmuter.compile(model, positions(model, [1, 1, 1, 0, 0, 0, 0, 0]), @compiler)
 
-    assert [%{breaks: ["NonZero"], host_values: host_values}, %{breaks: ["NonZero"]}] =
+    assert [%{breaks: ["NonZero"]}, %{breaks: ["NonZero"]}] =
              calls(compiled, model, [[1, 1, 1, 0, 0, 0, 0, 0], [0, 1, 0, 1, 0, 1, 0, 0]])
-
-    assert "nz" in host_values
   end
 
   # The ScatterElements also computes its coordinates from the positions. With static
@@ -211,7 +242,8 @@ defmodule Transmuter.TelemetryTest do
         "x" => Nx.tensor(x, type: :f32, backend: @backend),
         "data" => Nx.iota({8, 4}, type: :f32, backend: @backend) |> Nx.divide(8),
         "n" => Nx.tensor(5, backend: @backend),
-        "v0" => Nx.tensor([0.5, -0.5], backend: @backend)
+        "v0" => Nx.tensor([0.5, -0.5], backend: @backend),
+        "w" => Nx.iota({8}, type: :f32, backend: @backend)
       },
       model.inputs
     )

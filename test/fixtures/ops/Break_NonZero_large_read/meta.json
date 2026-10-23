@@ -1,0 +1,77 @@
+{
+ "repo": "op/Break_NonZero_large_read",
+ "task": "op",
+ "file": "model.onnx",
+ "onnx_path": "model.onnx",
+ "unoptimized_ref": true,
+ "ops": {
+  "Greater": 1,
+  "NonZero": 1,
+  "Squeeze": 1,
+  "Gather": 1,
+  "Mul": 26,
+  "Add": 26,
+  "ReduceSum": 2,
+  "Cast": 2,
+  "Unsqueeze": 2,
+  "Expand": 1,
+  "Range": 1,
+  "ReduceMax": 1,
+  "Slice": 1
+ },
+ "static_inputs": [],
+ "reference": "onnxruntime",
+ "inputs": [
+  {
+   "name": "x",
+   "file": "in_0.bin",
+   "dtype": "f32",
+   "shape": [
+    8
+   ]
+  },
+  {
+   "name": "data",
+   "file": "in_1.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4
+   ]
+  },
+  {
+   "name": "w",
+   "file": "in_2.bin",
+   "dtype": "f32",
+   "shape": [
+    8
+   ]
+  },
+  {
+   "name": "n",
+   "file": "in_3.bin",
+   "dtype": "s64",
+   "shape": []
+  }
+ ],
+ "outputs": [
+  {
+   "name": "g12",
+   "file": "out_0.bin",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  {
+   "name": "y",
+   "file": "out_1.bin",
+   "dtype": "f32",
+   "shape": [
+    3
+   ]
+  }
+ ],
+ "ort_ok": true
+}
