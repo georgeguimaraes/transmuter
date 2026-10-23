@@ -146,7 +146,9 @@ defmodule Transmuter.TextGLiNERModelTest do
           labels: ["person", "date", "organization", "country"]
         },
         %{text: "José Müller visitó São Paulo y Zürich en 2023.", labels: ["person", "city"]},
-        %{text: "Cristiano Ronaldo plays for Al Nassr.", labels: ["person", "organization"]}
+        %{text: "Cristiano Ronaldo plays for Al Nassr.", labels: ["person", "organization"]},
+        # gliner gives no entities for a text without words.
+        %{text: "   ", labels: ["person"]}
       ])
 
     # The export is fp16, so the scores differ from ONNX Runtime by up to about 1e-3.
@@ -166,8 +168,11 @@ defmodule Transmuter.TextGLiNERModelTest do
       [
         {0, 17, "person", "Cristiano Ronaldo", 0.9912},
         {28, 36, "organization", "Al Nassr", 0.9689}
-      ]
+      ],
+      []
     ]
+
+    assert length(results) == 4
 
     for {result, expected} <- Enum.zip(results, expected),
         do: assert_entities(result, expected, 2.0e-3)
