@@ -517,6 +517,59 @@ for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.
     blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
     print("pixtral", name, inputs["image_sizes"].tolist(), blocks.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
+# Image-text-to-text with Ministral 3. The reference is ONNX Runtime on the q4 files of the
+# test: the vision encoder, the embeddings and the decoder. The vision encoder takes one image
+# of its size, and the features replace the embeddings of the [IMG] tokens only. The
+# decoder runs greedy with a cache that grows from 0 rows. Its MatMulNBits nodes get
+# accuracy_level 0. The data of the decoder is larger than 2 GB, the limit of a protobuf, so
+# the graph goes to a file next to its data, and the session reads that file.
+repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+
+
+def exact_file_session(name):
+    model = onnx.load(f"{directory}/onnx/{name}.onnx", load_external_data=False)
+    for node in model.graph.node:
+        for attribute in node.attribute:
+            if node.op_type == "MatMulNBits" and attribute.name == "accuracy_level":
+                attribute.i = 0
+    onnx.save(model, f"{directory}/onnx/{name}_exact.onnx")
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(f"{directory}/onnx/{name}_exact.onnx", options, providers=["CPUExecutionProvider"])
+
+
+vision, embed, decoder = (exact_file_session(name) for name in ["vision_encoder_q4", "embed_tokens_q4", "decoder_model_merged_q4"])
+names = [o.name for o in decoder.get_outputs()]
+image_token, eos = processor.tokenizer.convert_tokens_to_ids(["[IMG]", "</s>"])
+chats = {
+    "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
+    "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
+}
+
+for name, (images, messages) in chats.items():
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=prompt, images=images or None, add_special_tokens=False, return_tensors="pt")
+    ids = inputs["input_ids"].numpy().astype(np.int64)
+    embeds = embed.run(None, {"input_ids": ids})[0]
+    if images:
+        features = vision.run(None, {"pixel_values": inputs["pixel_values"].numpy()})[0]
+        print("ministral onnxruntime features", features.shape, [round(float(x), 4) for x in features[0, 0, :4]], round(float(np.abs(features).mean()), 4))
+        embeds[ids == image_token] = features.reshape(-1, embeds.shape[-1])
+    past = empty_cache(decoder)
+    tokens, length = [], ids.shape[1]
+    for _ in range(24):
+        n = embeds.shape[1]
+        feeds = {"inputs_embeds": embeds, "attention_mask": np.ones((1, length), np.int64), "position_ids": np.arange(length - n, length)[None], **past}
+        outputs = dict(zip(names, decoder.run(None, feeds)))
+        tokens.append(int(outputs["logits"][0, -1].argmax()))
+        if tokens[-1] == eos:
+            break
+        past = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+        embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0]
+        length += 1
+    print("ministral onnxruntime", name, ids.shape[1], tokens, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
 # Object detection: the slow image processor, the PyTorch model and
 # post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
 # truncates the boxes to integers, so the script prints the boxes before that. DETR uses
