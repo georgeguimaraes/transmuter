@@ -28,9 +28,10 @@ defmodule Transmuter.Graph do
   @compile {:no_warn_undefined, [Kino.JS, Transmuter.Graph.Kino]}
 
   alias Transmuter.Graph.Kino, as: GraphKino
-  alias Transmuter.GraphBreaks
+  alias Transmuter.{GraphBreaks, Ops}
 
   @fused_key "transmuter.fused"
+  @small_tensor 16
   @zero_counts %{nodes: 0, static: 0, fused: 0, breaks: 0, constants: 0}
   # The scripts of the view, in the order that they load. The data of the view gives them to
   # main.js, so as_graph/2 and to_html/3 load the same scripts.
@@ -52,6 +53,7 @@ defmodule Transmuter.Graph do
     * `:path` - the parts of the name. The nodes of a subgraph have the path of their parent node and the name of the subgraph attribute first, such as `["optimum::if", "then_branch", ...]`
     * `:reads` - the ids of the nodes whose outputs the node reads, also the outputs of its subgraphs. The inputs and the initializers of a subgraph hide the values of the same names outside it
     * `:fused` - the nodes that `Transmuter.Fusion` replaced with this node, as `"OpType name"`
+    * `:attributes` - the ONNX attributes of the node by name, as plain values: a number, a string or a list of them. A tensor of at most #{@small_tensor} elements gives its values, and a larger tensor gives `%{shape: dims, type: type}`. A subgraph gives its name
     * `:placement` - where the node runs, see `Transmuter.placement/2`, or `nil` for a node that did not run
     * `:literals` - the static inputs of a node that runs on the device. A traced segment takes them as literals
     * `:static` - whether the outputs of the node are static values, such as the output of `Shape`. Without `:inputs`, it is `true` for the nodes that fold on the host. It is `nil` for a node that did not run
@@ -339,6 +341,7 @@ defmodule Transmuter.Graph do
           sources: sources,
           reads: for({:node, read} <- sources ++ outputs, uniq: true, do: read),
           fused: fused(node),
+          attributes: Map.new(node.attribute, &{&1.name, attribute(&1)}),
           node: node
         }
 
@@ -360,6 +363,42 @@ defmodule Transmuter.Graph do
     case String.split(node.name || "", "/", trim: true) do
       [] -> [hd(node.output ++ [node.op_type])]
       parts -> parts
+    end
+  end
+
+  defp attribute(%{type: :INT, i: i}), do: i
+  defp attribute(%{type: :INTS, ints: ints}), do: ints
+  defp attribute(%{type: :FLOAT, f: f}), do: f
+  defp attribute(%{type: :FLOATS, floats: floats}), do: floats
+  defp attribute(%{type: :STRING, s: s}), do: text(s)
+  defp attribute(%{type: :STRINGS, strings: strings}), do: Enum.map(strings, &text/1)
+  defp attribute(%{type: :TENSOR, t: t}), do: tensor(t)
+  defp attribute(%{type: :TENSORS, tensors: tensors}), do: Enum.map(tensors, &tensor/1)
+  defp attribute(%{type: :GRAPH, g: g, name: name}), do: graph_name(g, name)
+
+  defp attribute(%{type: :GRAPHS, graphs: gs, name: name}),
+    do: Enum.map(gs, &graph_name(&1, name))
+
+  defp attribute(%{type: type}), do: Atom.to_string(type)
+
+  defp graph_name(graph, attribute),
+    do: if(graph.name in [nil, ""], do: attribute, else: graph.name)
+
+  # A string attribute holds bytes, which are not always UTF-8.
+  defp text(s), do: if(String.valid?(s), do: s, else: inspect(s))
+
+  defp tensor(t = %{dims: dims}) do
+    size = Enum.product(dims)
+
+    if size <= @small_tensor do
+      case Ops.tensor(t) do
+        {:strings, _shape, values} -> values
+        {:empty, _shape} -> []
+        value -> if dims == [], do: Nx.to_number(value), else: Nx.to_flat_list(value)
+      end
+    else
+      type = if t.data_type == 8, do: "string", else: Atom.to_string(Ops.dtype(t.data_type))
+      %{shape: dims, type: type}
     end
   end
 

@@ -78,6 +78,58 @@ defmodule Transmuter.GraphTest do
     assert mul.placement == :host
   end
 
+  test "the overlay gives the attributes of a node as plain values" do
+    small = %TensorProto{
+      dims: [2],
+      data_type: 7,
+      raw_data: <<3::signed-64-little, 4::signed-64-little>>
+    }
+
+    large = %TensorProto{dims: [4, 8], data_type: 1, raw_data: :binary.copy(<<0::32>>, 32)}
+    scalar = %TensorProto{dims: [], data_type: 1, raw_data: <<1.5::float-32-little>>}
+
+    attributes = [
+      %AttributeProto{name: "axis", type: :INT, i: -1},
+      %AttributeProto{name: "perm", type: :INTS, ints: [0, 2, 1]},
+      %AttributeProto{name: "alpha", type: :FLOAT, f: 0.5},
+      %AttributeProto{name: "scales", type: :FLOATS, floats: [1.0, 2.0]},
+      %AttributeProto{name: "mode", type: :STRING, s: "linear"},
+      %AttributeProto{name: "bytes", type: :STRING, s: <<255>>},
+      %AttributeProto{name: "names", type: :STRINGS, strings: ["a", "b"]},
+      %AttributeProto{name: "small", type: :TENSOR, t: small},
+      %AttributeProto{name: "scalar", type: :TENSOR, t: scalar},
+      %AttributeProto{name: "large", type: :TENSOR, t: large},
+      %AttributeProto{name: "tensors", type: :TENSORS, tensors: [small, large]},
+      %AttributeProto{name: "then_branch", type: :GRAPH, g: %GraphProto{name: "then"}},
+      %AttributeProto{name: "else_branch", type: :GRAPH, g: %GraphProto{}},
+      %AttributeProto{name: "graphs", type: :GRAPHS, graphs: [%GraphProto{name: "g0"}]}
+    ]
+
+    model = %{
+      nodes: [%{node("Custom", [], ["y"], "/Custom") | attribute: attributes}],
+      static: %{}
+    }
+
+    [%{attributes: values}] = Graph.overlay(model).nodes
+
+    assert values == %{
+             "axis" => -1,
+             "perm" => [0, 2, 1],
+             "alpha" => 0.5,
+             "scales" => [1.0, 2.0],
+             "mode" => "linear",
+             "bytes" => "<<255>>",
+             "names" => ["a", "b"],
+             "small" => [3, 4],
+             "scalar" => 1.5,
+             "large" => %{shape: [4, 8], type: "f32"},
+             "tensors" => [[3, 4], %{shape: [4, 8], type: "f32"}],
+             "then_branch" => "then",
+             "else_branch" => "else_branch",
+             "graphs" => ["g0"]
+           }
+  end
+
   test "the tree groups the nodes by name scope" do
     branch = %GraphProto{
       node: [node("Neg", ["m"], ["t"], "/b/Neg")],

@@ -156,6 +156,9 @@
         return escape(name) + (shape ? ` <b>${escape(shape)}</b>` : "");
       });
 
+      const attributes = Object.entries(node.attributes).map(([name, value]) =>
+        escape(name) + " = " + escape(typeof value === "string" ? value : JSON.stringify(value)));
+
       info.innerHTML = `<h2>${escape(node.op_type)}</h2><dl>
         <dt>Name</dt><dd>${escape(node.name || "")}</dd>
         <dt>Placement</dt><dd>${escape(node.placement ?? "unknown")}</dd>
@@ -164,6 +167,7 @@
         ${node.break ? `<dt>Graph break</dt><dd>${escape(node.break.reason)}</dd>` : ""}
         ${node.literals.length ? `<dt>Literal inputs</dt><dd>${node.literals.map(escape).join("<br>")}</dd>` : ""}
         ${node.fused.length ? `<dt>Fused from ${node.fused.length} nodes</dt><dd>${node.fused.map(escape).join("<br>")}</dd>` : ""}
+        ${attributes.length ? `<dt>Attributes</dt><dd>${attributes.join("<br>")}</dd>` : ""}
         <dt>Inputs</dt><dd>${node.inputs.map(escape).join("<br>")}</dd>
         <dt>Outputs</dt><dd>${outputs.join("<br>")}</dd></dl>`;
     }
