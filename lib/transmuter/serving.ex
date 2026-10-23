@@ -261,10 +261,8 @@ defmodule Transmuter.Serving do
     # The featurizer takes the whole audio, so the chunks of a stream go into one tensor.
     validate = fn input ->
       with {:ok, chunks} <- AudioFeaturizer.audio(input, featurizer.sampling_rate) do
-        case chunks |> Enum.map(&Nx.to_binary/1) |> IO.iodata_to_binary() do
-          "" -> {:error, "the audio has no samples"}
-          samples -> {:ok, [Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)]}
-        end
+        samples = chunks |> Enum.map(&Nx.to_binary/1) |> IO.iodata_to_binary()
+        {:ok, [Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)]}
       end
     end
 
@@ -492,7 +490,7 @@ defmodule Transmuter.Serving do
 
     * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
-    * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The enumerable can be a lazy stream, which the serving reads once, in another process. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
+    * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The client makes the rows and the batches of a list of runs, so an error in them raises in the caller. A stream of runs, such as the windows of an audio stream, goes into batches when Nx.Serving reads them, once, in a process of its own. An error in such a stream ends the call with an exit, not an exception that the caller can rescue. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
     * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. The function returns the token ids of each row.
 
@@ -569,20 +567,21 @@ defmodule Transmuter.Serving do
       end
 
       runs = Enum.map(inputs, preprocess)
+      rows = for {runs, input} <- Enum.with_index(runs), do: rows(runs, input)
 
-      # The runs can come from a stream, so the batches come as the runs do. A batch ends
-      # when it is full or when the key changes.
+      # A batch ends when it is full or when the key changes. Lists of runs give their
+      # batches here, so an error in a row raises in the caller. A stream of runs gives its
+      # batches when Nx.Serving reads them, in a process of its own.
       batches =
-        runs
-        |> Stream.with_index()
-        |> Stream.flat_map(fn {runs, input} -> Stream.map(runs, &generation_row(&1, input)) end)
+        rows
+        |> Stream.concat()
         |> Stream.chunk_while([], &batch_rows(&1, &2, batch_size), &last_batch_rows/1)
         |> Stream.map(fn rows = [{key, _row} | _] ->
           rows |> Enum.map(&elem(&1, 1)) |> Nx.Batch.stack() |> Nx.Batch.key(key)
         end)
 
-      # Streaming hooks take one batch, not a stream of batches.
-      {if(stream?, do: Enum.at(batches, 0), else: batches), {multi?, runs}}
+      batches = if Enum.all?(rows, &is_list/1), do: Enum.to_list(batches), else: batches
+      {if(stream?, do: one_batch!(batches), else: batches), {multi?, runs}}
     end)
     |> generation_postprocessing(tokenizer, postprocess, stream?, opts[:stream_done])
   end
@@ -680,6 +679,15 @@ defmodule Transmuter.Serving do
     [_batch | axes] = List.duplicate({0, 0, 0}, Nx.rank(tensor))
     tensor |> Nx.backend_transfer(backend) |> Nx.pad(0, [{0, padding, 0} | axes])
   end
+
+  defp rows(runs, input) when is_list(runs), do: Enum.map(runs, &generation_row(&1, input))
+  defp rows(runs, input), do: Stream.map(runs, &generation_row(&1, input))
+
+  # Streaming hooks take one batch, not a stream of batches.
+  defp one_batch!([batch]), do: batch
+
+  defp one_batch!(_batches),
+    do: raise(ArgumentError, "a serving with stream: true takes an input of one batch")
 
   defp batch_rows(row = {key, _row}, rows, batch_size) do
     case rows do

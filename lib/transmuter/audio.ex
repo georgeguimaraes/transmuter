@@ -20,16 +20,18 @@ defmodule Transmuter.Audio do
 
     * A tensor of PCM samples `{samples}` at the sampling rate of the model, of any float type.
 
-    * `{:file, path}` - an audio or video file. As `ffmpeg_read` of Python transformers, ffmpeg decodes the file, mixes its channels into one and changes its sampling rate to the sampling rate of the model. The `ffmpeg` executable must be in the `PATH`. A file that does not exist raises an `ArgumentError`.
+    * `{:file, path}` - an audio or video file. As `ffmpeg_read` of Python transformers, ffmpeg decodes the file, mixes its channels into one and changes its sampling rate to the sampling rate of the model. The `ffmpeg` executable must be in the `PATH`. The whole file decodes into memory before the serving runs: about 230 MB for one hour at 16 kHz. Use a stream for longer audio.
 
-    * A stream: an enumerable of tensors `{samples}` that is not a list, such as a `Stream`. Each tensor is the next part of the audio, at the sampling rate of the model. A list is not a stream, because a list is a batch of inputs.
+    * A stream of tensors `{samples}`: a `Stream`, a `File.Stream`, an `IO.Stream` or a stream function. Each tensor is the next part of the audio, at the sampling rate of the model. A list is not a stream, because a list is a batch of inputs.
+
+  An input error raises an `ArgumentError` in the caller, also for one input of a list: a tensor that is not `{samples}`, a path that does not exist or is a directory, a file that ffmpeg cannot decode, audio without samples, and a stream that is empty or whose first chunk is not a tensor `{samples}`. The serving reads the first chunk of a stream to check it.
 
   ```elixir
   serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"})
   Nx.Serving.run(serving, {:file, "speech.mp3"})
   ```
 
-  `speech_to_text/2` cuts a stream into windows when the tensors come, and transcribes each window before the stream ends. The windows are the same for each size of the tensors, so the result of a stream is the result of its audio in one tensor. The result comes when the stream ends. Nx.Serving reads the stream in a process of its own, so the stream must not depend on the process that calls the serving, for example to receive messages.
+  `speech_to_text/2` cuts a stream into windows when the tensors come, and transcribes each window before the stream ends. The windows are the same for each size of the tensors, so the result of a stream is the result of its audio in one tensor. The result comes when the stream ends. Nx.Serving reads the stream after its first chunk in a process of its own, so the stream must not depend on the process that calls the serving, for example to receive messages. A later chunk that is not a tensor `{samples}` ends the call with an exit, which the caller cannot rescue as an exception.
 
   The classification tasks take the whole audio, so they join the tensors of a stream before they run. A stream that does not end gives no result.
 

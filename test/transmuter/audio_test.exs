@@ -60,11 +60,16 @@ defmodule Transmuter.AudioTest do
     assert Nx.Serving.run(serving, file) == Nx.Serving.run(serving, @audio)
   end
 
-  test "a file that does not exist raises" do
+  # The client checks the inputs of a list, and the first chunk of a stream, so a bad input
+  # raises in the caller.
+  test "a bad input in a list raises in the caller" do
     serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, @opts)
 
-    assert_raise ArgumentError, ~r/does not exist/, fn ->
-      Nx.Serving.run(serving, {:file, "test/fixtures/missing.flac"})
+    for {bad, message} <- [
+          {{:file, "test/fixtures/missing.flac"}, ~r/does not exist/},
+          {Stream.map([:bad], & &1), ~r/each chunk of an audio stream/}
+        ] do
+      assert_raise ArgumentError, message, fn -> Nx.Serving.run(serving, [@audio, bad]) end
     end
   end
 
@@ -629,12 +634,44 @@ defmodule Transmuter.Audio.FeaturizerTest do
 
   alias Transmuter.Audio.Featurizer
 
-  @moduletag :ffmpeg
+  test "an input that is not audio gives an error" do
+    for {input, message} <- [
+          {{:file, "test/fixtures/missing.flac"}, ~r/does not exist/},
+          {{:file, "test/fixtures"}, ~r/is a directory/},
+          {%{"raw" => Nx.iota({4}), "sampling_rate" => 16_000}, ~r/expected a tensor/},
+          {1..3, ~r/expected a tensor/},
+          {Stream.map([], & &1), ~r/no samples/},
+          {Stream.map([:bad], & &1), ~r/each chunk of an audio stream/}
+        ] do
+      assert {:error, error} = Featurizer.audio(input, 16_000)
+      assert error =~ message
+    end
+  end
 
+  # The first chunk comes when Featurizer.audio/2 checks it. A later bad chunk raises when it
+  # comes.
+  test "a stream gives its chunks as f32 tensors" do
+    stream = Stream.map([Nx.tensor([1.0, 2.0], type: :f64), Nx.tensor([3.0]), :bad], & &1)
+    assert {:ok, chunks} = Featurizer.audio(stream, 16_000)
+    assert [first, second] = Enum.take(chunks, 2)
+
+    assert {Nx.type(first), Nx.to_list(first), Nx.to_list(second)} ==
+             {{:f, 32}, [1.0, 2.0], [3.0]}
+
+    assert_raise ArgumentError, ~r/each chunk/, fn -> Enum.to_list(chunks) end
+  end
+
+  @tag :ffmpeg
   test "ffmpeg decodes a file to its samples" do
     file = {:file, "test/fixtures/librispeech_0.flac"}
     assert {:ok, [audio]} = Featurizer.audio(file, 16_000)
     assert Nx.to_binary(audio) == File.read!("test/fixtures/librispeech_0.f32")
+  end
+
+  @tag :ffmpeg
+  test "a file that ffmpeg cannot decode gives the reason of ffmpeg" do
+    assert {:error, error} = Featurizer.audio({:file, "test/fixtures/librispeech_0.f32"}, 16_000)
+    assert error =~ ~r/exit status 183: .*Invalid data/s
   end
 end
 

@@ -755,6 +755,20 @@ defmodule Transmuter.TextServingTest do
     end
   end
 
+  # The client makes the rows of a list of inputs, so a prompt that is too long raises in the
+  # caller.
+  test "a prompt longer than generation takes raises in the caller" do
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "Xenova/gpt2"},
+        [variant: :fp32, max_new_tokens: 1] ++ @opts
+      )
+
+    assert_raise ArgumentError, ~r/generation takes up to 1048576/, fn ->
+      Nx.Serving.run(serving, String.duplicate(" a", 1_100_000))
+    end
+  end
+
   defp compiles(count \\ 0) do
     receive do
       :compiled -> compiles(count + 1)

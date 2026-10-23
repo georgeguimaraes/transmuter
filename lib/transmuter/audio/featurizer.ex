@@ -415,13 +415,13 @@ defmodule Transmuter.Audio.Featurizer do
   defp mel_to_hz(mel, :slaney), do: 200.0 * mel / 3.0
 
   @doc """
-  Accepts one audio at `sampling_rate` in Hz, and returns `{:ok, chunks}` or `{:error, message}`. The chunks are an enumerable of f32 tensors of PCM samples `{samples}` on `Nx.BinaryBackend`, in the order of time. The audio can be:
+  Accepts one audio at `sampling_rate` in Hz, and returns `{:ok, chunks}` or `{:error, message}`. The chunks are an enumerable of f32 tensors of PCM samples `{samples}` on `Nx.BinaryBackend`, in the order of time. Audio without samples gives an error. The audio can be:
 
     * A tensor of PCM samples `{samples}` at `sampling_rate`, of any float type. It is one chunk.
 
-    * `{:file, path}` - an audio or video file, which `ffmpeg` decodes into one chunk. The `ffmpeg` executable must be in the `PATH`. As `ffmpeg_read` of Python transformers, ffmpeg takes the first audio stream, mixes its channels into one, and changes its sampling rate to `sampling_rate`. A file that does not exist gives an error. A file that ffmpeg cannot decode raises.
+    * `{:file, path}` - an audio or video file, which `ffmpeg` decodes into one chunk. The `ffmpeg` executable must be in the `PATH`. As `ffmpeg_read` of Python transformers, ffmpeg takes the first audio stream, mixes its channels into one, and changes its sampling rate to `sampling_rate`. The whole file decodes into memory: about 230 MB for one hour at 16 kHz. A path that does not exist, a directory and a file that ffmpeg cannot decode give an error. A named pipe or `/dev/stdin` goes to ffmpeg.
 
-    * An enumerable of tensors `{samples}` that is not a list, such as a `Stream`. The tensors are the chunks, which come when the enumerable gives them. A chunk that is not a tensor `{samples}` raises when it comes. A list is not a stream, because a list of inputs is a batch.
+    * A stream of tensors `{samples}`: a `Stream`, a `File.Stream`, an `IO.Stream` or a stream function. The tensors are the chunks. This function reads the first chunk and checks it, so an empty stream or a first chunk that is not a tensor `{samples}` gives an error. The other chunks come when the enumerable gives them, and a later chunk that is not a tensor `{samples}` raises when it comes. A list is not a stream, because a list of inputs is a batch.
   """
   def audio(input, sampling_rate)
 
@@ -429,43 +429,98 @@ defmodule Transmuter.Audio.Featurizer do
 
   def audio({:file, path}, sampling_rate) when is_binary(path) do
     cond do
-      not File.regular?(path) -> {:error, "the file #{inspect(path)} does not exist"}
-      ffmpeg = System.find_executable("ffmpeg") -> {:ok, [decode!(ffmpeg, path, sampling_rate)]}
+      File.dir?(path) -> {:error, "#{inspect(path)} is a directory, not a file"}
+      not File.exists?(path) -> {:error, "the file #{inspect(path)} does not exist"}
+      ffmpeg = System.find_executable("ffmpeg") -> decode(ffmpeg, path, sampling_rate)
       true -> {:error, "a file input needs ffmpeg, which is not in the PATH"}
     end
   end
 
-  def audio(input, _sampling_rate) do
-    if Enumerable.impl_for(input) && not is_list(input),
-      do: {:ok, Stream.map(input, &chunk!/1)},
-      else:
-        {:error,
-         "expected a tensor of PCM samples {samples}, {:file, path} or a stream of tensors, got: #{inspect(input)}"}
+  def audio(stream, _sampling_rate)
+      when is_struct(stream, Stream) or is_struct(stream, File.Stream) or
+             is_struct(stream, IO.Stream) or is_function(stream, 2) do
+    case Enumerable.reduce(stream, {:cont, nil}, fn chunk, _acc -> {:suspend, chunk} end) do
+      {:suspended, first, continuation} ->
+        case chunk(first) do
+          {:ok, first} ->
+            {:ok, Stream.concat([first], rest(continuation))}
+
+          error ->
+            continuation.({:halt, nil})
+            error
+        end
+
+      {_done_or_halted, _acc} ->
+        {:error, "the audio has no samples"}
+    end
   end
 
-  defp chunk!(audio = %Nx.Tensor{shape: {_samples}}),
-    do: audio |> Nx.backend_transfer(Nx.BinaryBackend) |> Nx.as_type(:f32)
+  def audio(input, _sampling_rate) do
+    {:error,
+     "expected a tensor of PCM samples {samples}, {:file, path} or a stream of tensors, got: #{inspect(input)}"}
+  end
 
-  defp chunk!(chunk) do
-    raise ArgumentError,
-          "expected each chunk of an audio stream to be a tensor of PCM samples {samples}, got: #{inspect(chunk)}"
+  defp chunk(audio = %Nx.Tensor{shape: {_samples}}), do: {:ok, chunk!(audio)}
+
+  defp chunk(chunk),
+    do:
+      {:error,
+       "expected each chunk of an audio stream to be a tensor of PCM samples {samples}, got: #{inspect(chunk)}"}
+
+  defp chunk!(audio), do: audio |> Nx.backend_transfer(Nx.BinaryBackend) |> Nx.as_type(:f32)
+
+  # The chunks after the first, from the suspended reduce of the stream. A consumer that
+  # stops early halts the stream, so its resources close.
+  defp rest(continuation) do
+    Stream.resource(
+      fn -> continuation end,
+      fn
+        nil ->
+          {:halt, nil}
+
+        continuation ->
+          case continuation.({:cont, nil}) do
+            {:suspended, chunk, continuation} ->
+              case chunk(chunk) do
+                {:ok, chunk} -> {[chunk], continuation}
+                {:error, message} -> raise ArgumentError, message
+              end
+
+            {_done_or_halted, _acc} ->
+              {:halt, nil}
+          end
+      end,
+      fn
+        nil -> :ok
+        continuation -> continuation.({:halt, nil})
+      end
+    )
   end
 
   # The command of Python transformers, with the samples in the byte order of this machine,
-  # which Nx.from_binary/2 reads. "file:" keeps ffmpeg from reading the path as a URL.
-  defp decode!(ffmpeg, path, sampling_rate) do
+  # which Nx.from_binary/2 reads. "file:" keeps ffmpeg from reading the path as a URL. The
+  # samples come on stdout, so ffmpeg runs again with its errors on stdout to tell why it
+  # failed.
+  defp decode(ffmpeg, path, sampling_rate) do
     format = if System.endianness() == :little, do: "f32le", else: "f32be"
+    input = ["-nostdin", "-hide_banner", "-i", "file:" <> Path.expand(path)]
+    output = ["-ac", "1", "-ar", "#{sampling_rate}", "-f", format, "pipe:1"]
 
-    args =
-      ["-nostdin", "-hide_banner", "-loglevel", "quiet", "-i", "file:" <> Path.expand(path)] ++
-        ["-ac", "1", "-ar", "#{sampling_rate}", "-f", format, "pipe:1"]
+    case System.cmd(ffmpeg, ["-loglevel", "quiet"] ++ input ++ output) do
+      {"", 0} ->
+        {:error, "the audio has no samples"}
 
-    case System.cmd(ffmpeg, args) do
-      {samples, 0} when samples != "" ->
-        Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)
+      {samples, 0} ->
+        {:ok, [Nx.from_binary(samples, :f32, backend: Nx.BinaryBackend)]}
 
       {_samples, status} ->
-        raise "ffmpeg did not decode audio from #{inspect(path)}, exit status: #{status}"
+        {reason, _status} =
+          System.cmd(ffmpeg, ["-loglevel", "error"] ++ input ++ ["-f", "null", "-"],
+            stderr_to_stdout: true
+          )
+
+        {:error,
+         "ffmpeg cannot decode #{inspect(path)}, exit status #{status}: #{String.trim(reason)}"}
     end
   end
 end

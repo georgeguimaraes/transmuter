@@ -134,23 +134,27 @@ defmodule Transmuter.Audio.SpeechToText do
       end
     end
 
+    # The windows of a tensor or a file are a list, so an error in them raises in the caller.
     # Zero bits are the zero of f32.
     preprocess = fn chunks ->
       seed = opts[:seed] || :rand.uniform(2 ** 32)
 
-      chunks
-      |> windows(settings.chunk, settings.context)
-      |> Stream.map(fn {samples, stride = {size, _left, _right}} ->
-        padding = (featurizer.n_samples - size) * @bytes
+      runs =
+        chunks
+        |> windows(settings.chunk, settings.context)
+        |> Stream.map(fn {samples, stride = {size, _left, _right}} ->
+          padding = (featurizer.n_samples - size) * @bytes
 
-        audio =
-          Nx.from_binary(<<samples::binary, 0::size(padding)-unit(8)>>, :f32,
-            backend: Nx.BinaryBackend
-          )
+          audio =
+            Nx.from_binary(<<samples::binary, 0::size(padding)-unit(8)>>, :f32,
+              backend: Nx.BinaryBackend
+            )
 
-        stride = Nx.tensor(Tuple.to_list(stride), backend: Nx.BinaryBackend)
-        %{prompt: prompt, seed: seed, tensors: %{"audio" => audio, "stride" => stride}}
-      end)
+          stride = Nx.tensor(Tuple.to_list(stride), backend: Nx.BinaryBackend)
+          %{prompt: prompt, seed: seed, tensors: %{"audio" => audio, "stride" => stride}}
+        end)
+
+      if is_list(chunks), do: Enum.to_list(runs), else: runs
     end
 
     frame_seconds = settings.precision / settings.frames_per_timestamp
@@ -260,21 +264,23 @@ defmodule Transmuter.Audio.SpeechToText do
   # last when a sample follows it, so a full window waits for the next sample. At the end,
   # the samples that are left are the last window when they are more than its left context.
   # The state is the samples from the start of the next window, their count and the left
-  # context of that window.
+  # context of that window. The first chunk is the samples without a copy, and the windows
+  # are parts of the samples.
   def windows(chunks, chunk, context) do
     Stream.transform(
       chunks,
-      fn -> {[], 0, 0} end,
+      fn -> {"", 0, 0} end,
       fn audio, {pending, count, left} ->
-        pending = [pending | Nx.to_binary(audio)]
+        samples = Nx.to_binary(audio)
+        pending = if pending == "", do: samples, else: pending <> samples
         count = count + Nx.size(audio)
 
         if count > chunk,
-          do: cut(IO.iodata_to_binary(pending), count, left, chunk, context, []),
+          do: cut(pending, count, left, chunk, context, []),
           else: {[], {pending, count, left}}
       end,
       fn state = {pending, count, left} ->
-        last = if count > left, do: [{IO.iodata_to_binary(pending), {count, left, 0}}], else: []
+        last = if count > left, do: [{pending, {count, left, 0}}], else: []
         {last, state}
       end,
       fn _state -> :ok end

@@ -228,7 +228,7 @@ stream =
 Nx.Serving.run(serving, stream)
 ```
 
-The serving transcribes the windows before the stream ends, and merges them when it ends. The windows of a stream go into batches of `compile: [batch_size: n]`, so a batch waits until it has `n` windows or the stream ends. Nx.Serving reads the stream in a process of its own.
+The serving transcribes the windows before the stream ends, and merges them when it ends. The windows of a stream go into batches of `compile: [batch_size: n]`, so a batch waits until it has `n` windows or the stream ends. The client checks the first chunk of the stream, and Nx.Serving reads the other chunks in a process of its own.
 
 ### Timestamps
 
