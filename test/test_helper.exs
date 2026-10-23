@@ -54,3 +54,9 @@ exclude =
     if System.find_executable("ffmpeg"), do: [], else: [:ffmpeg]
 
 ExUnit.start(exclude: exclude)
+
+# The EMLX job of CI sets HANG_DIR. See Transmuter.HangWatchdog.
+if dir = System.get_env("HANG_DIR") do
+  Code.require_file("support/hang_watchdog.exs", __DIR__)
+  Transmuter.HangWatchdog.start(dir)
+end

@@ -198,8 +198,18 @@ jobs:
       # curl into ~/release-files, which the cache keeps, and gives them to the deps.
       - name: Download the release files of the deps
         run: .github/fetch-release-files.sh
+      # The EMLX worker sometimes blocks, and a test then times out. HANG_DIR starts
+      # Transmuter.HangWatchdog, which writes the state of the stuck call there.
       - name: Run tests
         env:
           TRANSMUTER_TEST_BACKEND: emlx
           TRANSMUTER_TEST_DEVICE: gpu
+          HANG_DIR: ${{ runner.temp }}/emlx-hang
         run: mix test --exclude large_model --exclude hub --include smoke
+      - name: Upload the state of a stuck EMLX call
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emlx-hang
+          path: ${{ runner.temp }}/emlx-hang
+          if-no-files-found: ignore
