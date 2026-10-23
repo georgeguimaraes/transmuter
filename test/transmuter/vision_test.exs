@@ -1004,6 +1004,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
   @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
+  @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
 
   # The reference is the beam search of transformers on the export's image features, see
   # test/support/pipeline_references.py. Python runs each prompt without padding, and the
@@ -1290,6 +1291,42 @@ defmodule Transmuter.VisionLargeModelTest do
     results = Nx.Serving.run(serving, chats)
     assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
     assert Nx.Serving.run(serving, hd(chats)) == hd(results)
+  end
+
+  # The reference is ONNX Runtime on the same q4 files, see test/support/pipeline_references.py.
+  # The features replace the embeddings of the [IMG] tokens only, and the prompt starts with
+  # one bos token. The model has 3.4B parameters, so CI leaves this test out.
+  @tag :large_model
+  test "image-text-to-text with Ministral 3 matches ONNX Runtime" do
+    chats =
+      for content <- [
+            [
+              %{type: "image", image: @image},
+              %{type: "text", text: "Can you describe this image?"}
+            ],
+            [%{type: "text", text: "What is the capital of France?"}]
+          ],
+          do: %{messages: [%{role: "user", content: content}]}
+
+    expected = [
+      {658,
+       "This image depicts two cats resting on a soft, pink surface, likely a cushion or blanket.\n\n- The cat on the"},
+      {542, "The capital of France is **Paris**."}
+    ]
+
+    opts =
+      [
+        variant: %{vision_encoder: :q4, embed_tokens: :q4, decoder_model_merged: :q4},
+        strategy: :greedy,
+        max_new_tokens: 24
+      ] ++ @opts
+
+    serving = Vision.image_text_to_text(@ministral, opts)
+
+    for {chat, {count, text}} <- Enum.zip(chats, expected) do
+      assert %{results: [%{text: ^text, token_summary: %{input: ^count}}]} =
+               Nx.Serving.run(serving, chat)
+    end
   end
 
   # The reference is the image-to-image pipeline of transformers, without the padding, on a
