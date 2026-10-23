@@ -121,6 +121,50 @@ defmodule Transmuter.Generation do
   end
 
   @doc """
+  Returns the inputs of a decoder, other than `input_ids`, for one step over `batch_size` rows of `length` tokens with an empty cache, and the static inputs of that step. A task that runs a decoder once over padded text, such as an embedding, gives these inputs with the tokens. A model without a cache has none, so the result is two empty maps.
+
+  The cache has length 0 and `use_cache_branch` is 0, as in the first step of transformers.js. Each row has the positions from 0. The attention mask counts all tokens, also the padding tokens after the text, as in generation. The decoder is causal, so the tokens of the text do not see the padding tokens.
+  """
+  def prompt_inputs(model, batch_size, length) do
+    case Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")) do
+      [] ->
+        {%{}, %{}}
+
+      cache ->
+        tensor = fn name, value ->
+          {type, _dims} = model.input_types[name]
+          Nx.tensor(value, type: type, backend: Nx.BinaryBackend)
+        end
+
+        row = Enum.to_list(0..(length - 1))
+
+        values = %{
+          "attention_mask" => List.duplicate(List.duplicate(1, length), batch_size),
+          "position_ids" => List.duplicate(row, batch_size),
+          "num_logits_to_keep" => length
+        }
+
+        inputs =
+          for {name, value} <- values, name in model.inputs, into: %{} do
+            {name, tensor.(name, value)}
+          end
+
+        inputs =
+          for name <- cache, into: inputs do
+            {_type, [_batch, heads, _length, head_dim]} = model.input_types[name]
+            {name, {:empty, {batch_size, heads, 0, head_dim}}}
+          end
+
+        static =
+          for name <- ["use_cache_branch"], name in model.inputs, into: %{} do
+            {name, tensor.(name, [0])}
+          end
+
+        {inputs, static}
+    end
+  end
+
+  @doc """
   Returns the outputs of a decoder that generation reads: `logits` and the present cache. `names` are the names of the graph outputs. Give this function to the `:outputs` option of `Transmuter.load!/2`, so the decoder computes no other outputs, such as the attention probabilities of the Whisper exports of Xenova.
   """
   def outputs(names),

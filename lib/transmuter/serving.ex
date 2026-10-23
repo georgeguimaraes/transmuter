@@ -110,7 +110,12 @@ defmodule Transmuter.Serving do
       {[{tensors, key}], rows}
     end
 
-    shapes = %{batch_size: batch_size, templates: templates, inputs: %{}}
+    steps =
+      Map.new(lengths, fn length ->
+        {{:sequence_length, length}, Generation.prompt_inputs(model, batch_size, length)}
+      end)
+
+    shapes = %{batch_size: batch_size, templates: templates, inputs: %{}, steps: steps}
     new(model, opts, shapes, preprocess, fun, postprocess, validate)
   end
 
@@ -285,7 +290,9 @@ defmodule Transmuter.Serving do
   end
 
   # `shapes` has the batch size, the input templates of each batch key, the inputs that are
-  # the same for all batches, and optionally the `:cache_size` of the compiled models.
+  # the same for all batches, and optionally the `:cache_size` of the compiled models and
+  # `:steps`, the inputs and the static inputs of a step of a decoder for each batch key
+  # (see `Transmuter.Generation.prompt_inputs/3`).
   # `validate` gives the sequences of each input. `preprocess` takes the sequences of all
   # inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each
   # sequence the list of its rows. The rows of the batches are those of the sequences, in order.
@@ -293,6 +300,14 @@ defmodule Transmuter.Serving do
     %{batch_size: batch_size, templates: templates} = shapes
     fixed = Map.take(shapes.inputs, model.inputs)
     compile_options = shapes |> Map.take([:cache_size]) |> Map.to_list()
+    steps = Map.get(shapes, :steps, %{})
+    step = &Map.get(steps, &1, {%{}, %{}})
+
+    given =
+      for {_key, {inputs, static}} <- steps,
+          name <- Map.keys(inputs) ++ Map.keys(static),
+          uniq: true,
+          do: name
 
     Nx.Serving.new(
       __MODULE__,
@@ -302,7 +317,10 @@ defmodule Transmuter.Serving do
 
         runs =
           Map.new(keys, fn key ->
-            {key, Transmuter.compile(model, Map.merge(fixed, templates[key]), defn_options)}
+            {inputs, static} = step.(key)
+            templates = fixed |> Map.merge(templates[key]) |> Map.merge(inputs)
+            run = Transmuter.compile(model, templates, [static_inputs: static] ++ defn_options)
+            {key, &run.(Map.merge(&1, inputs))}
           end)
 
         fn batch ->
@@ -327,7 +345,9 @@ defmodule Transmuter.Serving do
 
       batches =
         for {tensors, key} <- groups do
-          [model_inputs!(model, tensors, fixed)] |> Nx.Batch.concatenate() |> Nx.Batch.key(key)
+          [model_inputs!(model, tensors, fixed, given)]
+          |> Nx.Batch.concatenate()
+          |> Nx.Batch.key(key)
         end
 
       # Nx.Serving splits one batch that is larger than the batch size, but not a list.
@@ -675,8 +695,10 @@ defmodule Transmuter.Serving do
     Enum.uniq(Enum.map([32, 128, 512], &min(&1, max)))
   end
 
-  defp model_inputs!(model, tensors, fixed) do
-    case model.inputs -- Map.keys(Map.merge(tensors, fixed)) do
+  # The inputs in `given` come from the step of the batch key, and they replace those of the
+  # batch, such as the attention mask of a decoder. The task reads the tensors of the batch.
+  defp model_inputs!(model, tensors, fixed, given) do
+    case model.inputs -- (Map.keys(tensors) ++ Map.keys(fixed) ++ given) do
       [] ->
         Map.take(tensors, model.inputs -- Map.keys(fixed))
 

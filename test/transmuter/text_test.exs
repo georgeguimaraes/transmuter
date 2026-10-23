@@ -675,3 +675,45 @@ defmodule Transmuter.TextBatchTest do
     end
   end
 end
+
+# Text tasks on the exports of decoders, whose graphs take a KV cache. The models are
+# larger than those of Transmuter.TextTest.
+defmodule Transmuter.TextDecoderTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :hub
+  @moduletag timeout: 900_000
+  @moduletag ci_partition: 3
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  # The reference is ONNX Runtime on the q4 export with each text alone, see
+  # test/support/pipeline_references.py. In the batch, the first text has padding tokens.
+  test "a decoder with a cache gives the embedding of each text alone" do
+    serving =
+      Transmuter.Text.text_embedding(
+        {:hf, "onnx-community/Qwen3-Embedding-0.6B-ONNX"},
+        [variant: :q4, compile: [batch_size: 2, sequence_length: 32]] ++ @opts
+      )
+
+    [short, long] =
+      Nx.Serving.run(serving, [
+        "The cat sat on the mat.",
+        "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."
+      ])
+
+    assert_all_close(short.embedding[0..3], [0.0084, -0.0335, -0.002, -0.0375])
+    assert_all_close(long.embedding[0..3], [-0.0196, -0.0228, -0.0071, -0.1178])
+  end
+
+  defp assert_all_close(tensor, expected) do
+    expected = Nx.tensor(expected)
+
+    assert Nx.all_close(Nx.backend_transfer(tensor, Nx.BinaryBackend), expected, atol: 1.0e-4) ==
+             Nx.tensor(1, type: :u8),
+           "expected #{inspect(Nx.to_list(expected))}, got #{inspect(Nx.to_list(tensor))}"
+  end
+end

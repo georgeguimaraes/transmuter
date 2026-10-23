@@ -41,6 +41,40 @@ for name, text in [("short", "The cat sat on the mat."), ("543 tokens", long)]:
     print("embeddinggemma onnxruntime", name, [round(float(x), 4) for x in embedding[:4]])
     print("embeddinggemma sentence-transformers", name, [round(float(x), 4) for x in gemma.encode([text])[0][:4]])
 
+# Qwen3-Embedding is a decoder with a cache. The reference is ONNX Runtime on the q4 export,
+# with each text alone, an empty cache and the positions from 0. As in bench/coverage,
+# MatMulNBits gets accuracy_level 0 (level 4 quantizes the activations to int8) and the graph
+# optimizations are off. The base model Qwen/Qwen3-Embedding-0.6B pools the last token and
+# normalizes it.
+import onnx
+
+
+def exact_session(path):
+    model = onnx.load(path)
+    for node in model.graph.node:
+        for attribute in node.attribute:
+            if node.op_type == "MatMulNBits" and attribute.name == "accuracy_level":
+                attribute.i = 0
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"])
+
+
+def empty_cache(session):
+    return {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in session.get_inputs() if i.name.startswith("past_key_values.")}
+
+
+repo = "onnx-community/Qwen3-Embedding-0.6B-ONNX"
+tokenizer = AutoTokenizer.from_pretrained(repo)
+directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx"], local_dir=tempfile.mkdtemp())
+session = exact_session(f"{directory}/onnx/model_q4.onnx")
+for text in ["The cat sat on the mat.", "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."]:
+    ids = tokenizer([text], return_tensors="np")["input_ids"].astype(np.int64)
+    n = ids.shape[1]
+    feeds = {"input_ids": ids, "attention_mask": np.ones((1, n), np.int64), "position_ids": np.arange(n)[None], **empty_cache(session)}
+    hidden = session.run(["last_hidden_state"], feeds)[0][0, -1]
+    print("qwen3-embedding onnxruntime", n, "tokens", [round(float(x), 4) for x in (hidden / np.linalg.norm(hidden))[:4]])
+
 rerank = pipeline("text-classification", model="cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 query = "How many people live in Berlin?"
 for passage in ["Berlin has a population of 3,520,031 registered inhabitants.", "New York City is famous for the Metropolitan Museum of Art."]:

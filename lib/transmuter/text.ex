@@ -8,6 +8,8 @@ defmodule Transmuter.Text do
 
   The tasks need the optional `tokenizers` dependency: add `{:tokenizers, "~> 0.5"}` to your deps.
 
+  The tasks that run the model once also run the exports of decoders whose graph takes a KV cache, such as `onnx-community/Qwen3-Embedding-0.6B-ONNX`. The decoder runs once over the text, with an empty cache (see `Transmuter.Generation.prompt_inputs/3`).
+
   ## Options
 
   All tasks take these options:
