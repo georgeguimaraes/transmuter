@@ -484,11 +484,11 @@ defmodule Transmuter.Serving do
 
     * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
-    * `:preprocess` takes a valid input and returns a list of runs, such as the windows of long audio. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
+    * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The enumerable can be a lazy stream, which the serving reads once, in another process. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
     * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. The function returns the token ids of each row.
 
-    * `:postprocess` takes the list of the token ids of each run and the list of runs from `:preprocess`, and returns the result.
+    * `:postprocess` takes the list of the token ids of each run of an input, and the runs from `:preprocess` for this input, and returns the result.
 
     * `:keys` lists the keys of the runs. The default is `[nil]`.
 
@@ -517,7 +517,7 @@ defmodule Transmuter.Serving do
           Process.flag(:min_heap_size, @generation_heap_size)
           Process.flag(:min_bin_vheap_size, @generation_bin_vheap_size)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-          {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed"])
+          {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
 
           # Padding rows have no prompt. Nx.Batch.pad pads on the host, which is slow for
           # large rows such as audio, so the tensors of the task get their padding rows on
@@ -543,7 +543,8 @@ defmodule Transmuter.Serving do
 
           %{
             ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
-            length: Nx.tensor(lengths, backend: Nx.BinaryBackend)
+            length: Nx.tensor(lengths, backend: Nx.BinaryBackend),
+            input: pad_rows(rows["input"], padding, Nx.BinaryBackend)
           }
         end
       end,
@@ -561,18 +562,19 @@ defmodule Transmuter.Serving do
 
       runs = Enum.map(inputs, preprocess)
 
+      # The runs can come from a stream, so the batches come as the runs do. A batch ends
+      # when it is full or when the key changes.
       batches =
         runs
-        |> Enum.concat()
-        |> Enum.map(&generation_row/1)
-        |> Enum.chunk_by(&elem(&1, 0))
-        |> Enum.flat_map(&Enum.chunk_every(&1, batch_size))
-        |> Enum.map(fn rows = [{key, _row} | _] ->
+        |> Stream.with_index()
+        |> Stream.flat_map(fn {runs, input} -> Stream.map(runs, &generation_row(&1, input)) end)
+        |> Stream.chunk_while([], &batch_rows(&1, &2, batch_size), &last_batch_rows/1)
+        |> Stream.map(fn rows = [{key, _row} | _] ->
           rows |> Enum.map(&elem(&1, 1)) |> Nx.Batch.stack() |> Nx.Batch.key(key)
         end)
 
       # Streaming hooks take one batch, not a stream of batches.
-      {if(stream?, do: hd(batches), else: batches), {multi?, runs}}
+      {if(stream?, do: Enum.at(batches, 0), else: batches), {multi?, runs}}
     end)
     |> generation_postprocessing(tokenizer, postprocess, stream?, opts[:stream_done])
   end
@@ -584,17 +586,27 @@ defmodule Transmuter.Serving do
       end)
     else
       Nx.Serving.client_postprocessing(serving, fn stream, {multi?, runs} ->
+        rows = rows_by_input(stream)
+
         results =
-          stream
-          |> Enum.flat_map(fn {:batch, %{ids: ids, length: length}, _metadata} ->
-            Enum.zip_with(Nx.to_list(ids), Nx.to_list(length), &Enum.take/2)
-          end)
-          |> split_like(runs)
-          |> Enum.zip_with(runs, postprocess)
+          for {runs, input} <- Enum.with_index(runs),
+              do: postprocess.(Map.get(rows, input, []), runs)
 
         if multi?, do: results, else: hd(results)
       end)
     end
+  end
+
+  # The token ids of the rows of each input, from the index of its input that each row gives
+  # back.
+  defp rows_by_input(stream) do
+    stream
+    |> Enum.flat_map(fn {:batch, %{ids: ids, length: length, input: input}, _metadata} ->
+      Enum.zip_with([Nx.to_list(input), Nx.to_list(ids), Nx.to_list(length)], fn
+        [input, ids, length] -> {input, Enum.take(ids, length)}
+      end)
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
   end
 
   # The rule of Bumblebee and of TextStreamer in Python transformers. The text of the
@@ -661,7 +673,18 @@ defmodule Transmuter.Serving do
     tensor |> Nx.backend_transfer(backend) |> Nx.pad(0, [{0, padding, 0} | axes])
   end
 
-  defp generation_row(run) do
+  defp batch_rows(row = {key, _row}, rows, batch_size) do
+    case rows do
+      [{^key, _row} | _] when length(rows) < batch_size -> {:cont, [row | rows]}
+      [_ | _] -> {:cont, Enum.reverse(rows), [row]}
+      [] -> {:cont, [row]}
+    end
+  end
+
+  defp last_batch_rows([]), do: {:cont, []}
+  defp last_batch_rows(rows), do: {:cont, Enum.reverse(rows), []}
+
+  defp generation_row(run, input) do
     width =
       Enum.find(@prompt_widths, &(&1 >= length(run.prompt))) ||
         raise ArgumentError,
@@ -673,7 +696,8 @@ defmodule Transmuter.Serving do
       Map.merge(run.tensors, %{
         "prompt" => Nx.tensor(prompt, type: :s64, backend: Nx.BinaryBackend),
         "length" => Nx.tensor(length(run.prompt), type: :s64, backend: Nx.BinaryBackend),
-        "seed" => Nx.tensor(run.seed, type: :s64, backend: Nx.BinaryBackend)
+        "seed" => Nx.tensor(run.seed, type: :s64, backend: Nx.BinaryBackend),
+        "input" => Nx.tensor(input, type: :s64, backend: Nx.BinaryBackend)
       })
 
     {{Map.get(run, :key), width}, row}
