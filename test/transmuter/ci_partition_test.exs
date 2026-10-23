@@ -3,7 +3,7 @@ defmodule Transmuter.CIPartitionTest do
   # after all test files are loaded.
   use ExUnit.Case, async: false
 
-  # CI selects partitions 2 to 4 with --only ci_partition:N. An included tag wins over an
+  # CI selects a tagged partition with --only ci_partition:N. An included tag wins over an
   # excluded one, so such a run would also run the :large_model tests of the partition.
   test "no test has both a :ci_partition and a :large_model tag" do
     both =
@@ -16,5 +16,21 @@ defmodule Transmuter.CIPartitionTest do
           do: "#{inspect(module)}: #{test.name}"
 
     assert both == []
+  end
+
+  # A partition without a CI job does not run, and a CI job without tests runs nothing.
+  test "each :ci_partition tag has a CI job, and each CI job has tests" do
+    tagged =
+      for path <- Path.wildcard("test/**/*.exs"),
+          [_, n] <- Regex.scan(~r/@(?:module)?tag ci_partition: (\d+)/, File.read!(path)),
+          uniq: true,
+          do: String.to_integer(n)
+
+    jobs =
+      for [_, n] <-
+            Regex.scan(~r/--only ci_partition:(\d+)/, File.read!(".github/workflows/tests.yml")),
+          do: String.to_integer(n)
+
+    assert Enum.sort(tagged) == Enum.sort(jobs)
   end
 end

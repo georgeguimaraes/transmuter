@@ -6,7 +6,7 @@ defmodule Transmuter.GenerationTest do
   # gives another text than greedy selection, or another text than another row of its table.
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 5
+  @moduletag ci_partition: 11
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -18,6 +18,7 @@ defmodule Transmuter.GenerationTest do
   # The best beam of "What is 2 + 2?" ends with eos at the eighth token while the other
   # beams still run. Greedy selection gives "2 + 2 is a classic arithmetic operation that
   # can be" and " with the printing press. The first printing press was the first".
+  @tag ci_partition: 10
   test "beam search matches transformers in each mode of the KV cache" do
     chat = %{messages: [%{role: "user", content: "What is 2 + 2?"}]}
 
@@ -33,6 +34,7 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  @tag ci_partition: 9
   test "length_penalty and early_stopping change the text as in transformers" do
     chat = %{messages: [%{role: "user", content: "Say yes or no."}]}
 
@@ -123,6 +125,7 @@ defmodule Transmuter.GenerationTest do
 
   # The fourth input runs in a partial batch with two padding rows, and gpt2 runs a group for
   # each prompt length. The rows of the beams of each prompt follow each other.
+  @tag ci_partition: 10
   test "a batch with beams gives the text of each prompt alone" do
     questions = [
       "What is the capital of France?",

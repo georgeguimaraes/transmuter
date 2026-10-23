@@ -5,7 +5,7 @@ defmodule Transmuter.TextTest do
   # see test/support/pipeline_references.py. The first run downloads the models.
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 4
+  @moduletag ci_partition: 13
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -368,6 +368,7 @@ defmodule Transmuter.TextTest do
   end
 
   @tag :smoke
+  @tag ci_partition: 14
   test "greedy generation matches transformers in each mode of the KV cache" do
     chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
 
@@ -391,6 +392,7 @@ defmodule Transmuter.TextTest do
   # The n-grams include the prompt, and min_new_tokens counts only the new tokens. The empty
   # prompt is the bos token of gpt2, a prompt of one token, so the forced bos token is the
   # first new token.
+  @tag ci_partition: 14
   test "the logits processors that read the tokens of a row change the text as in transformers" do
     gpt2 = {:hf, "Xenova/gpt2"}
     chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
@@ -412,6 +414,7 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  @tag ci_partition: 14
   test "a half-precision export gives the f32 text in native f16" do
     # The fp16 export writes RMSNorm as Pow, ReduceMean, Add and Sqrt, which overflow in
     # native f16. Transmuter.Fusion replaces them with SimplifiedLayerNormalization.
@@ -427,6 +430,7 @@ defmodule Transmuter.TextTest do
              Nx.Serving.run(serving, chat)
   end
 
+  @tag ci_partition: 14
   test "sampling with the same seed gives the same text" do
     serving =
       Transmuter.Text.generation(
@@ -445,6 +449,7 @@ defmodule Transmuter.TextTest do
     assert text.(1) != text.(2)
   end
 
+  @tag ci_partition: 14
   test "streamed chunks join to the text, and characters of several byte tokens stay whole" do
     # Each of 景 and 谊 is three byte-level tokens of SmolLM2.
     repo = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
@@ -470,6 +475,7 @@ defmodule Transmuter.TextTest do
     assert streamed_summary == summary
   end
 
+  @tag ci_partition: 14
   test "concurrent streams of a started serving get the tokens of their own rows" do
     serving =
       Transmuter.Text.generation(
@@ -584,7 +590,7 @@ defmodule Transmuter.TextTest do
   end
 end
 
-# --only ci_partition:4 in CI would also include :large_model tests of TextTest, because an
+# --only ci_partition:N in CI would also include :large_model tests of TextTest, because an
 # included tag wins over an excluded one. So these tests are in a module without a
 # :ci_partition tag, and CI leaves them out.
 defmodule Transmuter.TextLargeModelTest do
@@ -712,7 +718,7 @@ defmodule Transmuter.TextServingTest do
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 4
+  @moduletag ci_partition: 6
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -786,14 +792,14 @@ defmodule Transmuter.TextServingTest do
   end
 end
 
-# The batch test takes about as long as all other text tests together on EXLA in CI, so it
-# is a module of its own, in its own CI partition.
+# The batch test is one of the slowest tests on EXLA in CI, so it is a module of its own, in
+# its own CI partition.
 defmodule Transmuter.TextBatchTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 5
+  @moduletag ci_partition: 8
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -833,7 +839,7 @@ defmodule Transmuter.TextDecoderTest do
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 3
+  @moduletag ci_partition: 6
 
   @opts [
     backend: Transmuter.TestBackend.backend(),

@@ -42,6 +42,7 @@ defmodule Transmuter.AudioTest do
   end
 
   @tag :smoke
+  @tag ci_partition: 12
   test "greedy transcription matches transformers" do
     for repo <- ["Xenova/whisper-tiny.en", "onnx-community/whisper-base"] do
       serving = Transmuter.Audio.speech_to_text({:hf, repo}, @opts)
@@ -73,6 +74,7 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  @tag ci_partition: 12
   test "a forced language changes the prompt of a multilingual model" do
     serving =
       Transmuter.Audio.speech_to_text(
@@ -86,6 +88,7 @@ defmodule Transmuter.AudioTest do
              " Mr. Quilter est le passé de la classe de la ville, et nous sommes glad de bienvenue son gosse-boule."
   end
 
+  @tag ci_partition: 12
   test "short audio with timestamps gives one segment" do
     serving =
       Transmuter.Audio.speech_to_text(
@@ -98,6 +101,7 @@ defmodule Transmuter.AudioTest do
   end
 
   # The decoder of Xenova/whisper-tiny.en gives the cross attentions that word timestamps read.
+  @tag ci_partition: 12
   test "short audio with word timestamps matches transformers" do
     serving =
       Transmuter.Audio.speech_to_text(
@@ -163,6 +167,7 @@ defmodule Transmuter.AudioTest do
     end
   end
 
+  @tag ci_partition: 12
   test "VITS without noise matches transformers, and the seed decides its audio" do
     assert_reference_audio(@vits)
     assert_seeded_audio(@vits)
@@ -234,14 +239,14 @@ defmodule Transmuter.AudioTest do
   end
 end
 
-# The long audio tests and the batch test are each slower than all other audio tests
-# together on EXLA in CI, so they are modules of their own, in their own CI partitions.
+# The long audio tests and the batch tests are the slowest tests on EXLA in CI, so they are
+# in modules without a :large_model test, and they run in CI partitions of their own.
 defmodule Transmuter.AudioLongTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 2
+  @moduletag ci_partition: 7
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -411,6 +416,7 @@ defmodule Transmuter.AudioLongTest do
     {" man!", 61.66, 62.44}
   ]
 
+  @tag ci_partition: 6
   test "long audio matches the pipeline of transformers" do
     for {repo, text} <- [
           {"Xenova/whisper-tiny.en",
@@ -436,6 +442,7 @@ defmodule Transmuter.AudioLongTest do
     {58.68, 62.0, " a shampooer and a Turkish bath, next man!"}
   ]
 
+  @tag ci_partition: 3
   test "long audio timestamps match the pipeline of transformers" do
     for {repo, expected} <- [
           {"Xenova/whisper-tiny.en", @tiny_segments},
@@ -501,7 +508,7 @@ defmodule Transmuter.AudioBatchTest do
 
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 3
+  @moduletag ci_partition: 4
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -517,23 +524,30 @@ defmodule Transmuter.AudioBatchTest do
   # audio have different numbers of passes. The long audio in a stream gives the same rows
   # and batches.
   test "a batch of windows gives the result of each audio alone" do
-    for {batch_size, timestamps, sizes} <- [{2, nil, [2, 2]}, {3, :segments, [3, 1]}] do
-      opts = [timestamps: timestamps] ++ @opts
-      single = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
+    assert_batches(2, nil, [2, 2])
+  end
 
-      batched =
-        Transmuter.Audio.speech_to_text(
-          {:hf, "Xenova/whisper-tiny.en"},
-          [compile: [batch_size: batch_size]] ++ opts
-        )
+  @tag ci_partition: 5
+  test "a batch of windows with timestamps gives the result of each audio alone" do
+    assert_batches(3, :segments, [3, 1])
+  end
 
-      alone = for audio <- [@long, @audio], do: Nx.Serving.run(single, audio)
+  defp assert_batches(batch_size, timestamps, sizes) do
+    opts = [timestamps: timestamps] ++ @opts
+    single = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
 
-      for inputs <- [[@long, @audio], [Transmuter.AudioTest.stream(@long, 7919), @audio]] do
-        {batches, _info} = batched.client_preprocessing.(inputs)
-        assert Enum.map(batches, & &1.size) == sizes
-        assert Nx.Serving.run(batched, inputs) == alone
-      end
+    batched =
+      Transmuter.Audio.speech_to_text(
+        {:hf, "Xenova/whisper-tiny.en"},
+        [compile: [batch_size: batch_size]] ++ opts
+      )
+
+    alone = for audio <- [@long, @audio], do: Nx.Serving.run(single, audio)
+
+    for inputs <- [[@long, @audio], [Transmuter.AudioTest.stream(@long, 7919), @audio]] do
+      {batches, _info} = batched.client_preprocessing.(inputs)
+      assert Enum.map(batches, & &1.size) == sizes
+      assert Nx.Serving.run(batched, inputs) == alone
     end
   end
 end
@@ -683,7 +697,7 @@ defmodule Transmuter.AudioClassificationTest do
   # wav2vec2 export is ONNX Runtime, because its PyTorch model is no longer on the Hub.
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 5
+  @moduletag ci_partition: 17
 
   @backend Transmuter.TestBackend.backend()
   @opts [backend: @backend, defn_options: Transmuter.TestBackend.compiler_opts()]

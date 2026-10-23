@@ -5,7 +5,7 @@ defmodule Transmuter.VisionTest do
   # The first run downloads the models.
   @moduletag :hub
   @moduletag timeout: 900_000
-  @moduletag ci_partition: 6
+  @moduletag ci_partition: 16
 
   @opts [
     backend: Transmuter.TestBackend.backend(),
@@ -19,6 +19,7 @@ defmodule Transmuter.VisionTest do
   @labels ["cats", "dogs", "a remote control", "a couch"]
   @detection_labels ["cat", "remote control", "couch"]
 
+  @tag ci_partition: 17
   test "the featurizer gives the pixel values of the image processors" do
     # ViT resizes to 224x224 with bilinear. CLIP resizes the short side to 224 with bicubic
     # and crops the center. DPT resizes to multiples of 14 near 518, with bicubic. Segformer
@@ -112,6 +113,7 @@ defmodule Transmuter.VisionTest do
   end
 
   @tag :smoke
+  @tag ci_partition: 17
   test "image classification matches the pipeline" do
     for {repo, expected} <- [
           {"Xenova/vit-base-patch16-224",
@@ -140,6 +142,7 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @tag ci_partition: 17
   test "an image embedding is the projected embedding or the first token" do
     for {repo, expected, norm} <- [
           {"Xenova/clip-vit-base-patch32", [-0.0767, 0.1363, -0.2939, 0.0325], 10.8946},
@@ -153,6 +156,7 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @tag ci_partition: 17
   test "zero-shot classification is a softmax for CLIP and a sigmoid for SigLIP" do
     for {repo, expected, sum} <- [
           {"Xenova/clip-vit-base-patch32",
@@ -185,6 +189,7 @@ defmodule Transmuter.VisionTest do
   # PyTorch. The 8-bit ViT-GPT2 gives another caption, also in ONNX Runtime, so its test
   # uses fp32. The tokenizer config of the TrOCR export has clean_up_tokenization_spaces
   # true, so the text has "noon." and not "noon .".
+  @tag ci_partition: 15
   test "image to text matches generate of transformers" do
     for {source, variant, image, text} <- [
           {{:hf, "Xenova/vit-gpt2-image-captioning"}, :fp32, @image,
@@ -203,6 +208,7 @@ defmodule Transmuter.VisionTest do
   # The rows of a batch stop at the end token at different steps, and the second row has more
   # than the 20 new tokens of generate in transformers. Both rows are clear text, so the
   # rounding of a batch does not change a token.
+  @tag ci_partition: 2
   test "a batch of images gives the text of each image alone, and a stream joins to it" do
     opts = [variant: :q8] ++ @opts
     single = Vision.image_to_text(@trocr, opts)
@@ -226,6 +232,7 @@ defmodule Transmuter.VisionTest do
   # The ids of test/fixtures/florence2.json come from the beam search of transformers on the
   # base model, see test/support/pipeline_references.py. The tiny export has the tokenizer and
   # the task tables of the base model. Generation gives the ids without the eos token.
+  @tag ci_partition: 15
   test "the Florence-2 processor parses the answers as post_process_generation" do
     repo = Transmuter.Repo.load!(@florence_tiny)
     processor = Florence2Processor.load!(repo)
@@ -244,6 +251,7 @@ defmodule Transmuter.VisionTest do
   # checks that the four models run together, alone and in a batch with two tasks, and not
   # their values. Without a task, the task is "<CAPTION>". The ids [0, 0, 0, 1, 0, 0] are
   # those of ONNX Runtime with the processors of transformers, as text "<s><s><s><pad><s><s>".
+  @tag ci_partition: 15
   test "Florence-2 runs the vision encoder, the embeddings, the encoder and the decoder" do
     opts = [num_beams: 1, max_new_tokens: 20] ++ @opts
 
@@ -314,6 +322,7 @@ defmodule Transmuter.VisionTest do
 
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
 
+  @tag ci_partition: 15
   test "the Idefics3 processor gives the tiles and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@smolvlm)
     processor = Idefics3Processor.load!(repo)
@@ -356,6 +365,7 @@ defmodule Transmuter.VisionTest do
 
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
 
+  @tag ci_partition: 15
   test "the Qwen2-VL processor gives the patches and the prompt of Python transformers" do
     repo = Transmuter.Repo.load!(@qwen2_vl)
     processor = Qwen2VLProcessor.load!(repo)
@@ -802,7 +812,7 @@ defmodule Transmuter.VisionTest do
   end
 end
 
-# --only ci_partition:6 in CI would also include :large_model tests of VisionTest, because an
+# --only ci_partition:N in CI would also include :large_model tests of VisionTest, because an
 # included tag wins over an excluded one. So these tests are in a module without a
 # :ci_partition tag, and CI leaves them out.
 defmodule Transmuter.VisionLargeModelTest do
