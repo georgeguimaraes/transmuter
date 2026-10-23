@@ -169,6 +169,11 @@ def external_files(path):
     return sorted({e.value for t in model.graph.initializer for e in t.external_data if e.key == "location"})
 
 
+# The clone flag of cp: -c on macOS, and --reflink=auto of GNU cp elsewhere, which copies when
+# the file system cannot clone.
+CLONE = "-c" if sys.platform == "darwin" else "--reflink=auto"
+
+
 def fetch(entry, file, slug):
     """Returns a local model path. Local exports are used as they are. Hub files with
     external data are cloned into a real directory, because ORT refuses external data
@@ -187,7 +192,7 @@ def fetch(entry, file, slug):
         target = os.path.join(local, f)
         if not os.path.exists(target):
             source = path if f == os.path.basename(file) else hf_hub_download(repo, os.path.join(folder, f) if folder else f)
-            subprocess.run(["cp", "-c", os.path.realpath(source), target], check=True)
+            subprocess.run(["cp", CLONE, os.path.realpath(source), target], check=True)
     return os.path.join(local, os.path.basename(file))
 
 
