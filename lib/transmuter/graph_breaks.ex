@@ -2,7 +2,7 @@ defmodule Transmuter.GraphBreaks do
   @moduledoc """
   Compiles a model whose graph needs values that are only known when it runs, such as the limit of a Range or the boxes of a NonMaxSuppression.
 
-  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. The small values that the break node reads (integer shapes, float scales) become static, also the outer values that its subgraphs read, so later segments can fold the shapes they decide. Compiled segments are cached by the shapes of their arguments and the values of their static inputs, with least recently used eviction.
+  The graph runs as segments. A segment traces top-level nodes from a position until a node raises Transmuter.UnknownValueError. That node runs eagerly on the values of the segment, and the next segment starts after it. The small values that the break node reads (integer shapes, float scales) become static, also the outer values that its subgraphs read, so later segments can fold the shapes they decide. The cache key of a compiled segment holds the shapes of its arguments, the values of the static inputs and the host values that the segment reads. A new value of such a host value compiles that segment again. The cache evicts the least recently used segments.
 
   Static values are those of the model, the static inputs, promoted values and values folded from them. A promoted value, or a value folded from it, enters a segment as an argument, so its value is not in the key. It stays static when a node of that segment needs its host value. The plan learns these names for each position from its traces. A node can need the host value of an argument that follows only from static values of the call. Then the break is induced, and the names where the way enters the segment stay static at that position. When a small value of an earlier segment is among them, the host gets a copy of it when the segment starts. Values that follow only from shapes and static inputs stay static. Everything else enters a segment as an argument.
   """
@@ -148,7 +148,7 @@ defmodule Transmuter.GraphBreaks do
   # EMLX traces again in a call whose quantized params it has not compiled.
   defp whole(plan, entry, inputs, static_inputs) do
     state = initial(plan, inputs, static_inputs)
-    {args, _static_key, _statics, _state} = live(plan, state, 0, MapSet.new())
+    {args, _static_key, _statics} = live(plan, state, 0, MapSet.new())
     with_graph(plan, fn -> state |> merge(run_compiled(entry, encode(args))) |> outputs(plan) end)
   end
 
@@ -220,9 +220,11 @@ defmodule Transmuter.GraphBreaks do
   defp run(plan, state, pos) do
     case segment(plan, state, pos) do
       {{:end, entry}, args, state} ->
+        {args, state} = upload(plan, state, args)
         merge(state, run_compiled(entry, args))
 
       {{:break, entry}, args, state} ->
+        {args, state} = upload(plan, state, args)
         state = merge(state, run_compiled(entry, args))
         run(plan, run_break(plan, state, entry.stop), entry.stop + 1)
 
@@ -234,42 +236,132 @@ defmodule Transmuter.GraphBreaks do
 
   # Finds or builds the compiled segment that starts at pos for these values, and gives
   # its arguments and the values of the call when it starts.
-  defp segment(plan, state, pos) do
-    host = host_names(plan, pos)
-    state = enter(state, host)
-    {key = {^pos, shapes, _static_key}, args, statics, state} = key(plan, state, pos, host)
+  defp segment(plan, state, pos),
+    do: attempt(plan, state, pos, host_names(plan, pos), %{added: %{}, real: MapSet.new()}, :call)
+
+  # A trace stops at a node that reads the host value of an argument. When that value
+  # follows only from static values of the call, the break is induced: the names where the
+  # way enters the segment become static, and the segment is traced again. When the node
+  # still breaks, the break is real, and the names become arguments again. The plan keeps
+  # the real breaks of each position and shapes, so a later miss does not try them again.
+  defp attempt(plan, state, pos, known, tried, mode) do
+    host = tried.added |> Map.values() |> Enum.reduce(known, &MapSet.union/2)
+    state = enter(plan, state, host)
+    {key = {^pos, shapes, _static_key}, args, statics} = key(plan, state, pos, host)
     metadata = %{source: plan.source, position: pos, shapes: shapes}
 
-    case lookup(plan, key) do
-      {:ok, entry} ->
+    case {lookup(plan, key), mode} do
+      {{:ok, entry}, :call} ->
         :telemetry.execute([:transmuter, :cache, :hit], %{count: 1}, metadata)
         {classify(entry), args, state}
 
-      :miss ->
+      {{:ok, entry}, :retry} ->
+        {entry, args, state, learn(plan, pos, known, host), false, shapes}
+
+      {:miss, :call} ->
         :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
-        build(plan, state, pos, host, {key, args, statics}, metadata)
+        tried = Map.merge(tried, %{real: real_breaks(plan, pos, shapes), shapes: shapes})
+
+        :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
+          {entry, args, state, added, built?, shapes} =
+            build(plan, state, pos, {known, host}, tried, {key, args, statics})
+
+          {{classify(entry), args, state},
+           Map.merge(metadata, %{
+             shapes: shapes,
+             stop: entry.stop,
+             compiled: built? and entry.compiled != nil,
+             reason: entry.reason,
+             host_values: Enum.sort(added)
+           })}
+        end)
+
+      {:miss, :retry} ->
+        build(plan, state, pos, {known, host}, tried, {key, args, statics})
+    end
+  end
+
+  defp build(plan, state, pos, {known, host}, tried, {key = {pos, shapes, _}, args, statics}) do
+    ref = make_ref()
+    plan_key = plan.key
+    statics = statics.()
+    fun = fn args -> trace(plan_key, statics, args, pos, ref) end
+    Process.put({ref, :context}, learn_context(state, pos, host, tried))
+
+    try do
+      compile_segment(plan, key, fun, args, ref)
+    after
+      Process.delete(ref)
+      Process.delete({ref, :context})
+    end
+    |> case do
+      {:induced, node, names} ->
+        added = Map.update(tried.added, node, names, &MapSet.union(&1, names))
+        attempt(plan, state, pos, known, %{tried | added: added}, :retry)
+
+      {:real, node} ->
+        keep(plan, {:real, pos, tried.shapes}, node)
+
+        tried = %{
+          tried
+          | added: Map.delete(tried.added, node),
+            real: MapSet.put(tried.real, node)
+        }
+
+        attempt(plan, state, pos, known, tried, :retry)
+
+      entry ->
+        store(plan, key, entry)
+        {entry, args, state, learn(plan, pos, known, host), true, shapes}
     end
   end
 
   defp key(plan, state, pos, host) do
-    {args, static_key, statics, state} = live(plan, state, pos, host)
+    {args, static_key, statics} = live(plan, state, pos, host)
     shapes = Enum.map(args, fn {name, value} -> {name, template(value)} end)
-    {{pos, shapes, static_key}, encode(args), statics, state}
+    {{pos, shapes, static_key}, encode(args), statics}
   end
 
   # The names whose host value a node of the segment at pos needs. They enter the segment
   # as static values. The plan learns them from the induced breaks of its traces, so the
   # set only grows.
-  defp host_names(plan, pos) do
-    plan.learned |> :ets.lookup(pos) |> MapSet.new(&elem(&1, 1))
+  defp host_names(plan, pos), do: plan |> kept(pos) |> MapSet.new()
+
+  defp real_breaks(plan, pos, shapes), do: plan |> kept({:real, pos, shapes}) |> MapSet.new()
+
+  defp kept(plan, key) do
+    plan.learned |> :ets.lookup(key) |> Enum.map(&elem(&1, 1))
   rescue
-    ArgumentError -> MapSet.new()
+    ArgumentError -> []
+  end
+
+  defp keep(plan, key, values) do
+    :ets.insert(plan.learned, Enum.map(List.wrap(values), &{key, &1}))
+  rescue
+    ArgumentError -> true
   end
 
   # A small value of an earlier segment whose host value a node of this segment needs
   # enters the segment as a static value: the host gets a copy, and its digest goes into
-  # the key of the segment.
-  defp enter(state, host), do: Enum.reduce(host, state, &promote(&2, &1))
+  # the key of the segment. It must follow only from static values in this call. A value
+  # that follows from device data in this call stays an argument, and the node breaks.
+  defp enter(plan, state, host) do
+    context = %{static: state.static, breaks: state.breaks}
+
+    {state, _memo} =
+      Enum.reduce(host, {state, %{}}, fn name, {state, memo} ->
+        if promote?(Map.get(state.env, name)) and not Map.has_key?(state.static, name) do
+          case upstream(plan, context, name, memo) do
+            {:static, memo} -> {promote(state, name), memo}
+            {:device, memo} -> {state, memo}
+          end
+        else
+          {state, memo}
+        end
+      end)
+
+    state
+  end
 
   # The device value stays as the upload of the name, so an argument does not copy the
   # host value back.
@@ -285,74 +377,43 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
-  defp build(plan, state, pos, host, prepared, metadata) do
-    :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
-      tried = %{added: %{}, real: MapSet.new()}
-      {key, args, entry, state, added, built?} = attempt(plan, state, pos, host, tried, prepared)
+  # The arguments of a compiled segment on the device. A static value goes to the device
+  # once in a call.
+  defp upload(plan, state, args) do
+    {args, state} =
+      Enum.map_reduce(args, state, fn {name, value}, state ->
+        if host_value?(value) do
+          upload = Map.get_lazy(state.uploads, name, fn -> on_device(value, plan.backend) end)
+          {{name, upload}, %{state | uploads: Map.put(state.uploads, name, upload)}}
+        else
+          {{name, value}, state}
+        end
+      end)
 
-      {{classify(entry), args, state},
-       Map.merge(metadata, %{
-         shapes: elem(key, 1),
-         stop: entry.stop,
-         compiled: built? and entry.compiled != nil,
-         reason: entry.reason,
-         host_values: Enum.sort(added)
-       })}
-    end)
+    {Map.new(args), state}
   end
 
-  # A trace stops at a node that reads the host value of an argument. When that value
-  # follows only from static values of the call, the break is induced: the names where the
-  # way enters the segment become static, and the segment is traced again. When the node
-  # still breaks, the break is real, and the names become arguments again. A key that a
-  # retry finds in the cache compiles nothing.
-  defp attempt(plan, state, pos, known, tried, prepared \\ nil) do
-    host = tried.added |> Map.values() |> Enum.reduce(known, &MapSet.union/2)
-    state = enter(state, host)
+  # An argument is a tensor, or the tuple of the tensors of a sequence.
+  defp host_value?(%Nx.Tensor{data: %Nx.BinaryBackend{}}), do: true
 
-    {key, args, statics, state} =
-      case prepared do
-        {key, args, statics} -> {key, args, statics, state}
-        nil -> key(plan, state, pos, host)
-      end
+  defp host_value?(tensors) when is_tuple(tensors),
+    do: tensors |> Tuple.to_list() |> Enum.any?(&host_value?/1)
 
-    case if(prepared, do: :miss, else: lookup(plan, key)) do
-      {:ok, entry} ->
-        {key, args, entry, state, learn(plan, pos, known, host), false}
+  defp host_value?(_value), do: false
 
-      :miss ->
-        ref = make_ref()
-        plan_key = plan.key
-        statics = statics.()
-        fun = fn args -> trace(plan_key, statics, args, pos, ref) end
-        Process.put({ref, :context}, learn_context(state, pos, host, tried))
+  defp on_device(tensors, backend) when is_tuple(tensors),
+    do: tensors |> Tuple.to_list() |> Enum.map(&on_device(&1, backend)) |> List.to_tuple()
 
-        try do
-          compile_segment(plan, key, fun, args, ref)
-        after
-          Process.delete(ref)
-          Process.delete({ref, :context})
-        end
-        |> case do
-          {:induced, node, names} ->
-            added = Map.update(tried.added, node, names, &MapSet.union(&1, names))
-            attempt(plan, state, pos, known, %{tried | added: added})
+  defp on_device(t = %Nx.Tensor{data: %Nx.BinaryBackend{}}, backend),
+    do: Nx.backend_copy(t, backend)
 
-          {:real, node} ->
-            tried = %{added: Map.delete(tried.added, node), real: MapSet.put(tried.real, node)}
-            attempt(plan, state, pos, known, tried)
-
-          entry ->
-            store(plan, key, entry)
-            {key, args, entry, state, learn(plan, pos, known, host), true}
-        end
-    end
-  end
+  defp on_device(t, _backend), do: t
 
   defp learn_context(state, pos, host, tried) do
     %{
       pos: pos,
       static: state.static,
+      env: state.env,
       breaks: state.breaks,
       host: host,
       real: tried.real,
@@ -363,10 +424,8 @@ defmodule Transmuter.GraphBreaks do
   # Keeps the names that a build added for its position, and gives them.
   defp learn(plan, pos, known, host) do
     added = MapSet.difference(host, known)
-    :ets.insert(plan.learned, Enum.map(added, &{pos, &1}))
+    keep(plan, pos, Enum.to_list(added))
     Enum.to_list(added)
-  rescue
-    ArgumentError -> []
   end
 
   # The compiler traces the segment before it builds a program. A short segment after a
@@ -551,7 +610,7 @@ defmodule Transmuter.GraphBreaks do
       Map.has_key?(context.static, name) ->
         {MapSet.new([name]), memo}
 
-      promote?(Map.get(env, name)) ->
+      promote?(Map.get(context.env, name)) ->
         {found, memo} = upstream(plan, context, name, memo)
         origin = if found == :device, do: :device, else: MapSet.new([name])
         {origin, Map.put(memo, name, origin)}
@@ -693,33 +752,30 @@ defmodule Transmuter.GraphBreaks do
   defp live(plan, state, pos, host) do
     {names, constants} = live_names(plan, state, pos)
 
-    {args, statics, key, uploads} =
-      Enum.reduce(names, {[], [], [], state.uploads}, fn name, acc ->
+    {args, statics, key} =
+      Enum.reduce(names, {[], [], []}, fn name, acc ->
         case state.env do
           %{^name => value} -> live_value(plan, state, host, name, value, acc)
           %{} -> acc
         end
       end)
 
-    statics = fn -> Map.merge(Map.take(state.env, constants), Map.new(statics)) end
-    {args, key, statics, %{state | uploads: uploads}}
+    {args, key, fn -> Map.merge(Map.take(state.env, constants), Map.new(statics)) end}
   end
 
-  # A static value that becomes an argument goes to the device once in a call.
-  defp live_value(plan, state, host, name, value, {args, statics, key, uploads}) do
+  defp live_value(plan, state, host, name, value, {args, statics, key}) do
     cond do
       argument?(plan, state, host, name, value) ->
-        upload = Map.get_lazy(uploads, name, fn -> to_backend(value, plan.backend) end)
-        {[{name, upload} | args], statics, key, Map.put(uploads, name, upload)}
+        {[{name, value} | args], statics, key}
 
       digest = state.static[name] ->
-        {args, [{name, value} | statics], [{name, digest} | key], uploads}
+        {args, [{name, value} | statics], [{name, digest} | key]}
 
       device_value?(value) ->
-        {[{name, value} | args], statics, key, uploads}
+        {[{name, value} | args], statics, key}
 
       true ->
-        {args, [{name, value} | statics], [{name, Ops.digest(value)} | key], uploads}
+        {args, [{name, value} | statics], [{name, Ops.digest(value)} | key]}
     end
   end
 

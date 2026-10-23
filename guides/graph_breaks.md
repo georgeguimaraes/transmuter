@@ -41,7 +41,7 @@ Transmuter handles a graph break in three steps:
 2. It runs the break operator on the real output values of step 1.
 3. It compiles the operators after the break for the shapes that the values decide, and continues.
 
-Compiled segments are cached, so a later call with the same shapes does not compile again. The break operators still run eagerly on each call. A segment of fewer than 20 nodes after a break is not compiled, and it also runs eagerly on each call.
+Compiled segments are cached. The key of a segment holds the shapes of its arguments, the values of the static inputs, and the host values that the segment reads (see below). A later call with the same shapes and the same values does not compile again. A new value of a host value that a segment reads compiles that segment again. The break operators still run eagerly on each call. A segment of fewer than 20 nodes after a break is not compiled, and it also runs eagerly on each call.
 
 ## What goes into the key of a segment
 
@@ -49,11 +49,11 @@ The cache key of a segment has these parts:
 
 - The position of the segment in the graph.
 - The shapes and types of its arguments.
-- The values of the static values that it reads.
+- The values of the static inputs and of the host values that it reads.
 
 The small values that a break node reads, such as the positions that a `NonZero` returns, become host values. Values that the graph computes from them on the host are host values too. A host value goes into the next segment as an argument when no node of that segment reads it on the host. Then its value is not in the key. For example, a `Gather` that reads the word positions of a text model compiles once for each number of words, and not once for each text.
 
-A host value stays static in a segment when a node of that segment needs it on the host, for example as the shape of a `Reshape` or the start of a `Slice`. Then its value is in the key of that segment, and each new value compiles that segment again. The keys of the other segments do not change. Transmuter finds these values when it traces a segment: the node breaks on the argument, and Transmuter traces the segment again with the value static. A small value that an earlier segment computes from host values, such as the first of the positions, is copied to the host when the segment starts. A value that is too large to copy, or that comes from a random operator, stays an argument, and the node breaks there as a graph break. While Transmuter learns these values, the first calls with new values can compile a segment once more. After that, a new value compiles a segment again only when it is in the key. A segment that runs eagerly does not compile, so a new value in its key costs only a trace. The `:host_values` of the `[:transmuter, :segment, :compile, :stop]` event give the names that a trace found (see `Transmuter.Telemetry`).
+A host value stays static in a segment when a node of that segment needs it on the host, for example as the shape of a `Reshape` or the start of a `Slice`. Then its value is in the key of that segment, and each new value compiles that segment again. The keys of the other segments do not change. Transmuter finds these values when it traces a segment: the node breaks on the argument, and Transmuter traces the segment again with the value static. A small value that an earlier segment computes from host values, such as the first of the positions, is copied to the host when the segment starts. A value that is too large to copy, or that comes from a random operator or from device data in this call, stays an argument, and the node breaks there as a graph break. While Transmuter learns these values, the first calls with new values can compile a segment once more. After that, a new value compiles a segment again only when it is in the key. A segment that runs eagerly does not compile, so a new value in its key costs only a trace. The `:host_values` of the `[:transmuter, :segment, :compile, :stop]` event give the names that a trace found (see `Transmuter.Telemetry`).
 
 Static inputs always stay static, so each new value of a static input is in the key.
 
