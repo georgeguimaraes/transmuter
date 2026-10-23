@@ -2,7 +2,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
   @moduledoc """
   The zero-shot entity recognition task with GLiNER models. See `Transmuter.Text.zero_shot_entity_recognition/2`.
 
-  The steps follow gliner 0.2.29. The text splits into words. The input of the model is a prompt with the labels, `<<ENT>>` and the label for each label and then `<<SEP>>`, followed by the words of the text. Each word is encoded alone, as the tokenizer of Python encodes a list of words. The model scores the words against the labels. `gliner_config.json` gives the variant of the model:
+  The steps follow gliner 0.2.29. The text splits into words. The input of the model is a prompt with the labels, `<<ENT>>` and the label for each label and then `<<SEP>>`, followed by the words of the text. Each word is encoded alone, as the tokenizer of Python encodes a list of words. A word that gives no tokens, such as a DEL character for DeBERTa, has no number in the words mask, so the words after it get lower numbers, as in gliner. The offsets of the entities follow these numbers, as gliner gives them, so an entity after such a word can have the offsets of the word before it. The model scores the words against the labels. `gliner_config.json` gives the variant of the model:
 
     * A span model, such as `onnx-community/gliner_small-v2.1`, scores each span of up to `max_width` words for each label. A span is an entity when its score is more than the threshold.
 
