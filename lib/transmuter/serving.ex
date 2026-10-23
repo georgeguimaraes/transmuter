@@ -295,25 +295,42 @@ defmodule Transmuter.Serving do
               "Set a size with height and width, or a crop size, in preprocessor_config.json"
   end
 
-  # `shapes` has the batch size, the input templates of each batch key, the inputs that are
-  # the same for all batches, and optionally the `:cache_size` of the compiled models and
-  # `:steps`, the inputs and the static inputs of a step of a decoder for each batch key
-  # (see `Transmuter.Generation.prompt_inputs/3`).
-  # `validate` gives the sequences of each input. `preprocess` takes the sequences of all
-  # inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each
-  # sequence the list of its rows. The rows of the batches are those of the sequences, in order.
-  defp new(model, opts, shapes, preprocess, fun, postprocess, validate) do
+  @doc """
+  Returns an `Nx.Serving` that runs `model` on the tensors of a task. `text/7`, `image/6` and `audio/6` build their servings with this function.
+
+  `shapes` is a map:
+
+    * `:batch_size` - the number of rows of a batch.
+
+    * `:templates` - the input tensors of each batch key. The serving compiles the model for them.
+
+    * `:inputs` - inputs of the model that are the same for all batches. Their first axis is not the batch.
+
+    * `:cache_size` - optional, the `:cache_size` option of `Transmuter.compile/3`.
+
+    * `:steps` - optional, the inputs and the static inputs of a step of a decoder for each batch key (see `Transmuter.Generation.prompt_inputs/3`).
+
+    * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and returns the inputs of the model. Use it for inputs whose shapes depend on the values of the batch. The serving compiles the model for the templates through this function too. The outputs of a batch can then have other shapes than those of another batch, so the serving streams the outputs of each batch to the client.
+
+  `validate` gives the sequences of each input. `preprocess` takes the sequences of all inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each sequence the list of its rows. The rows of the batches are those of the sequences, in order. `fun` and `postprocess` are as in `text/7`. `fun` takes the inputs of the batch before `:prepare`.
+  """
+  def new(model, opts, shapes, preprocess, fun, postprocess, validate) do
     %{batch_size: batch_size, templates: templates} = shapes
     fixed = Map.take(shapes.inputs, model.inputs)
     compile_options = shapes |> Map.take([:cache_size]) |> Map.to_list()
     steps = Map.get(shapes, :steps, %{})
     step = &Map.get(steps, &1, {%{}, %{}})
+    prepare = Map.get(shapes, :prepare, & &1)
 
     given =
       for {_key, {inputs, static}} <- steps,
           name <- Map.keys(inputs) ++ Map.keys(static),
           uniq: true,
           do: name
+
+    # The client does not give the inputs that :prepare adds.
+    template = Map.merge(fixed, templates |> Map.values() |> hd())
+    given = given ++ (Map.keys(prepare.(template)) -- Map.keys(template))
 
     Nx.Serving.new(
       __MODULE__,
@@ -324,9 +341,9 @@ defmodule Transmuter.Serving do
         runs =
           Map.new(keys, fn key ->
             {inputs, static} = step.(key)
-            templates = fixed |> Map.merge(templates[key]) |> Map.merge(inputs)
+            templates = fixed |> Map.merge(templates[key]) |> Map.merge(inputs) |> prepare.()
             run = Transmuter.compile(model, templates, [static_inputs: static] ++ defn_options)
-            {key, &run.(Map.merge(&1, inputs))}
+            {key, &run.(prepare.(Map.merge(&1, inputs)))}
           end)
 
         fn batch ->
@@ -345,6 +362,7 @@ defmodule Transmuter.Serving do
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
+    |> then(&if(Map.has_key?(shapes, :prepare), do: Nx.Serving.streaming(&1), else: &1))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
       {groups, rows} = preprocess.(Enum.concat(inputs))
@@ -361,17 +379,27 @@ defmodule Transmuter.Serving do
       items = rows |> split_like(inputs) |> Enum.map(&Enum.concat/1)
       {batches, {multi?, items}}
     end)
-    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, {multi?, items} ->
+    |> Nx.Serving.client_postprocessing(fn result, {multi?, items} ->
       results =
-        for(
-          i <- 0..(Enum.sum_by(items, &length/1) - 1)//1,
-          do: Map.new(outputs, fn {name, t} -> {name, t[i]} end)
-        )
+        result
+        |> batch_outputs()
+        |> Enum.flat_map(&output_rows/1)
         |> split_like(items)
         |> Enum.zip_with(items, postprocess)
 
       if multi?, do: results, else: hd(results)
     end)
+  end
+
+  # The outputs of the batches: one map of all rows, or a stream of the map of each batch.
+  defp batch_outputs({outputs, _metadata}), do: [outputs]
+
+  defp batch_outputs(stream),
+    do: Stream.map(stream, fn {:batch, outputs, _metadata} -> outputs end)
+
+  defp output_rows(outputs) do
+    rows = outputs |> Map.values() |> hd() |> Nx.axis_size(0)
+    for i <- 0..(rows - 1)//1, do: Map.new(outputs, fn {name, t} -> {name, t[i]} end)
   end
 
   @doc """

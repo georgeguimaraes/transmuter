@@ -376,11 +376,8 @@ defmodule Transmuter.Tokenizer do
   defp pad_length(lengths, longest) when is_list(lengths),
     do: Enum.find(Enum.sort(lengths), Enum.max(lengths), &(&1 >= longest))
 
-  # Tokenizers without a pad token pad with the eos token, as Python transformers does.
   defp pad(tokenizer, encodings, length) do
-    token =
-      tokenizer.special_tokens[:pad] || tokenizer.special_tokens[:eos] ||
-        raise ArgumentError, "the tokenizer has no pad token and no eos token to pad inputs"
+    token = pad_token(tokenizer)
 
     opts = [
       pad_id: Tokenizer.token_to_id(tokenizer.native, token),
@@ -389,6 +386,14 @@ defmodule Transmuter.Tokenizer do
     ]
 
     Enum.map(encodings, &Encoding.pad(&1, length, opts))
+  end
+
+  @doc """
+  Returns the token that pads inputs. Tokenizers without a pad token pad with the eos token, as Python transformers does.
+  """
+  def pad_token(tokenizer) do
+    tokenizer.special_tokens[:pad] || tokenizer.special_tokens[:eos] ||
+      raise ArgumentError, "the tokenizer has no pad token and no eos token to pad inputs"
   end
 
   @doc """
