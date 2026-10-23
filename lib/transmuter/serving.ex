@@ -79,7 +79,7 @@ defmodule Transmuter.Serving do
 
   `fun` takes the outputs of the model and the inputs of a batch, and returns a map of tensors with the rows on the first axis. `postprocess` takes the rows of one input and returns the result for that input. Its arguments are the list of rows of the map from `fun`, and a list of `{sequence, encoding}` for these rows.
 
-  The `:max_length` option of a task limits the default sequence lengths, as do the limits in `tokenizer_config.json` and `config.json`.
+  The `:max_length` option of a task limits the default sequence lengths, as do the limits in `tokenizer_config.json` and `config.json`. The `:encode_options` of a task go to `Transmuter.Tokenizer.encode/3`.
   """
   def text(repo, model, tokenizer, opts, fun, postprocess, validate \\ &string/1) do
     compile =
@@ -99,7 +99,7 @@ defmodule Transmuter.Serving do
       end)
 
     preprocess = fn sequences ->
-      {tensors, encodings} = Tokenizer.encode(tokenizer, sequences)
+      {tensors, encodings} = Tokenizer.encode(tokenizer, sequences, opts[:encode_options] || [])
       key = {:sequence_length, Nx.axis_size(tensors["input_ids"], 1)}
 
       rows =

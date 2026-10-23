@@ -278,6 +278,8 @@ defmodule Transmuter.Tokenizer do
   ## Options
 
     * `:add_special_tokens` - adds the special tokens of the tokenizer, such as `[CLS]` and `[SEP]`. The default is `true`. Use `false` for text that already has them, such as the output of a chat template.
+
+    * `:suffix` - token ids that end each input, such as the end of a chat template. When truncation cuts an input, these ids replace its last tokens, as sentence-transformers restores the end of a chat template. The default is `[]`.
   """
   def encode(tokenizer, inputs, opts \\ []) do
     inputs =
@@ -303,6 +305,7 @@ defmodule Transmuter.Tokenizer do
         else: Enum.map(encodings, &[&1])
 
     rows = Enum.concat(windows)
+    truncated = Enum.map(rows, &(Encoding.get_overflowing(&1) != []))
     longest = rows |> Enum.map(&Encoding.n_tokens/1) |> Enum.max()
     length = pad_length(tokenizer.length, longest)
 
@@ -318,9 +321,17 @@ defmodule Transmuter.Tokenizer do
         else: pad(tokenizer, rows, length)
 
     tensor = &Nx.tensor(Enum.map(rows, &1), type: :s64, backend: Nx.BinaryBackend)
+    suffix = Keyword.get(opts, :suffix, [])
+
+    # A truncated row has no padding, so its last tokens are the end of the row.
+    ids =
+      Enum.zip_with(rows, truncated, fn row, truncated? ->
+        ids = ids(tokenizer, row)
+        if truncated?, do: Enum.drop(ids, -length(suffix)) ++ suffix, else: ids
+      end)
 
     tensors = %{
-      "input_ids" => tensor.(&ids(tokenizer, &1)),
+      "input_ids" => Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
       "attention_mask" => tensor.(&Encoding.get_attention_mask/1),
       "token_type_ids" => tensor.(&Encoding.get_type_ids/1)
     }
