@@ -18,6 +18,7 @@ defmodule Transmuter.Telemetry.Logger do
 
       [info] [Transmuter] load completed in 412ms (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, 343 nodes, opset 11)
       [info] [Transmuter] compile completed in 1.2s (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, EMLX, no graph break)
+      [info] [Transmuter] segment.compile completed in 85ms (kokoro.onnx, position 0, stop 209 (a value that decides a shape), compiled, shapes [...])
       [info] [Transmuter] segment.compile completed in 640ms (kokoro.onnx, position 210, stop end, compiled, shapes [...])
       [info] [Transmuter] cache.evict (kokoro.onnx, position 210, cache size 8, shapes [...])
 
@@ -89,7 +90,9 @@ defmodule Transmuter.Telemetry.Logger do
   defp details("segment.compile", meta) do
     compiled = if meta.compiled, do: "compiled", else: "eager"
 
-    "#{format_source(meta.source)}, position #{meta.position}, stop #{meta.stop}, " <>
+    reason = if meta.reason, do: " (#{meta.reason})", else: ""
+
+    "#{format_source(meta.source)}, position #{meta.position}, stop #{meta.stop}#{reason}, " <>
       "#{compiled}, shapes #{inspect(meta.shapes)}"
   end
 

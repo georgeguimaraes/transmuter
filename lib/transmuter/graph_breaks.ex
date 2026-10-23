@@ -219,7 +219,13 @@ defmodule Transmuter.GraphBreaks do
         fun = fn args -> trace(plan_key, statics, args, pos, ref) end
         entry = compile_segment(plan, key, fun, args, ref)
         Process.delete(ref)
-        {entry, Map.merge(metadata, %{stop: entry.stop, compiled: entry.compiled != nil})}
+
+        {entry,
+         Map.merge(metadata, %{
+           stop: entry.stop,
+           compiled: entry.compiled != nil,
+           reason: entry.reason
+         })}
       end)
 
     store(plan, key, entry)
@@ -235,7 +241,7 @@ defmodule Transmuter.GraphBreaks do
 
     bounded = fn args ->
       outputs = fun.(args)
-      {stop, _out_names, _produced} = Process.get(ref)
+      {stop, _reason, _out_names, _produced} = Process.get(ref)
       stop_index = if stop == :end, do: count, else: stop
       if pos > 0 and stop_index - pos < @min_compiled_nodes, do: throw({ref, :eager})
       outputs
@@ -252,11 +258,12 @@ defmodule Transmuter.GraphBreaks do
     # Then a trace gives where the segment stops and what it returns.
     unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
 
-    {stop, out_names, produced} = Process.get(ref)
+    {stop, reason, out_names, produced} = Process.get(ref)
 
     %{
       compiled: compiled,
       stop: stop,
+      reason: reason,
       out_names: out_names,
       produced: produced,
       digests: digests(produced)
@@ -292,13 +299,13 @@ defmodule Transmuter.GraphBreaks do
   defp classify(entry = %{stop: :end}), do: {:end, entry}
   defp classify(entry), do: {:break, entry}
 
-  # The traced body of a segment. It records where it stopped, which traced values it
+  # The traced body of a segment. It records where it stopped and why, which traced values it
   # returns and which static values it folded, so the caller can resume after it.
   defp trace(key, statics, args, pos, ref) do
     %{} = plan = Process.get({__MODULE__, key})
     env = Map.merge(statics, decode(args))
     ctx = context(plan, env)
-    {env, stop} = run_until_break(plan, env, ctx, pos)
+    {env, stop, reason} = run_until_break(plan, env, ctx, pos)
     stop_index = if stop == :end, do: tuple_size(plan.nodes), else: stop
 
     live =
@@ -309,16 +316,17 @@ defmodule Transmuter.GraphBreaks do
           do: {name, Map.fetch!(env, name)}
 
     {traced, produced} = Map.split_with(live, fn {_name, value} -> traced?(value) end)
-    Process.put(ref, {stop, Map.keys(traced), produced})
+    Process.put(ref, {stop, reason, Map.keys(traced), produced})
     traced |> encode() |> Transmuter.tag_literals(Compiler.current())
   end
 
+  # The reason of a break is the description of the value that the break node needs.
   defp run_until_break(plan, env, ctx, pos) do
-    Enum.reduce_while(pos..(tuple_size(plan.nodes) - 1)//1, {env, :end}, fn i, {env, _} ->
+    Enum.reduce_while(pos..(tuple_size(plan.nodes) - 1)//1, {env, :end, nil}, fn i, {env, _, _} ->
       try do
-        {:cont, {Transmuter.run_nodes([elem(plan.nodes, i)], env, ctx), :end}}
+        {:cont, {Transmuter.run_nodes([elem(plan.nodes, i)], env, ctx), :end, nil}}
       rescue
-        UnknownValueError -> {:halt, {env, i}}
+        e in UnknownValueError -> {:halt, {env, i, e.value}}
       end
     end)
   end

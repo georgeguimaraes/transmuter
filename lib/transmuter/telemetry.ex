@@ -76,7 +76,7 @@ defmodule Transmuter.Telemetry do
       * Metadata: `%{source: term, position: integer, shapes: list}`
 
     * `[:transmuter, :segment, :compile, :stop]` - the segment is ready.
-      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean}`
+      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean, reason: String.t() | nil}`
 
     * `[:transmuter, :break, :start]` - a break node starts to run eagerly.
       * Metadata: `%{source: term, position: integer, node: String.t(), op_type: String.t()}`
@@ -84,7 +84,7 @@ defmodule Transmuter.Telemetry do
     * `[:transmuter, :break, :stop]` - the break node returns.
       * Metadata: `%{source: term, position: integer, node: String.t(), op_type: String.t()}`
 
-  `:stop` is the position of the break node where the segment stops, or `:end`. A segment of fewer than 20 nodes after a break is not compiled, and `:compiled` is `false`. Then its nodes run eagerly on each call.
+  `:stop` is the position of the break node where the segment stops, or `:end`. `:reason` describes the value that the break node needs, such as `"the If condition"`. It is `nil` when `:stop` is `:end`. A segment of fewer than 20 nodes after a break is not compiled, and `:compiled` is `false`. Then its nodes run eagerly on each call.
 
   A graph without breaks keeps its compiled function for the shapes of the inputs to `Transmuter.compile/3`. A call with these shapes does not use the cache, so it emits no cache events.
 

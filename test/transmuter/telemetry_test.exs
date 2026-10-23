@@ -31,7 +31,10 @@ defmodule Transmuter.TelemetryTest do
     compiled = Transmuter.compile(model, input, @compiler)
 
     assert_received {[:transmuter, :cache, :miss], %{position: 0}}
-    assert_received {[:transmuter, :segment, :compile, :stop], %{position: 0, stop: break}}
+
+    assert_received {[:transmuter, :segment, :compile, :stop],
+                     %{position: 0, stop: break, reason: "a value that decides a shape"}}
+
     compiler = @compiler[:compiler]
     assert_received {[:transmuter, :compile, :stop], %{graph_break: true, compiler: ^compiler}}
     after_break = break + 1
@@ -42,7 +45,7 @@ defmodule Transmuter.TelemetryTest do
     assert_received {[:transmuter, :cache, :miss], %{position: ^after_break}}
 
     assert_received {[:transmuter, :segment, :compile, :stop],
-                     %{position: ^after_break, stop: :end, compiled: true}}
+                     %{position: ^after_break, stop: :end, compiled: true, reason: nil}}
 
     compiled.(input)
     assert_received {[:transmuter, :cache, :hit], %{position: ^after_break}}
