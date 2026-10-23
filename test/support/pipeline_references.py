@@ -497,6 +497,26 @@ for name, (embeds, position_ids, delta) in prepared.items():
         length += 1
     print("qwen3-vl onnxruntime", name, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
 
+# The Pixtral processor of Ministral 3. The saved image processor is the fast one, so the
+# resize uses the weights of torchvision, as the featurizer does for a fast image processor.
+# The template writes the bos token, so the tokenizer adds no special tokens, as
+# apply_chat_template of the processor. The blocks are the 28x28 rows of Transmuter:
+# pixel_values at (block, value), the mean of the absolute values, and the number and a
+# SHA-256 of the int64 input ids. The tile of 7x7 images gets smaller to 1176x1540.
+repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
+image = Image.open("test/fixtures/cats.png")
+processor = AutoProcessor.from_pretrained(repo)
+chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
+prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
+positions = [(0, 0), (1, 100), (-1, 2351), (50, 777)]
+tile = Image.fromarray(np.tile(np.asarray(image), (7, 7, 1)))
+for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE)), ("tile", tile)]:
+    inputs = processor(text=prompt, images=[picture], add_special_tokens=False, return_tensors="pt")
+    ids, values = inputs["input_ids"][0].numpy().astype("<i8"), inputs["pixel_values"][0].numpy()
+    channels, height, width = values.shape
+    blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
+    print("pixtral", name, inputs["image_sizes"].tolist(), blocks.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+
 # Object detection: the slow image processor, the PyTorch model and
 # post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
 # truncates the boxes to integers, so the script prints the boxes before that. DETR uses

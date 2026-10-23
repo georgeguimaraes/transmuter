@@ -13,7 +13,13 @@ defmodule Transmuter.VisionTest do
   ]
 
   alias Transmuter.{ChatTemplate, Featurizer, Tokenizer, Vision}
-  alias Transmuter.Vision.{Florence2Processor, Idefics3Processor, Qwen2VLProcessor}
+
+  alias Transmuter.Vision.{
+    Florence2Processor,
+    Idefics3Processor,
+    PixtralProcessor,
+    Qwen2VLProcessor
+  }
 
   @image StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
   @labels ["cats", "dogs", "a remote control", "a couch"]
@@ -458,6 +464,82 @@ defmodule Transmuter.VisionTest do
 
       assert got == positions
     end
+  end
+
+  @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
+
+  @tag ci_partition: 15
+  test "the Pixtral processor gives the blocks and the prompt of Python transformers" do
+    repo = Transmuter.Repo.load!(@ministral)
+    processor = PixtralProcessor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+    prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+    # A wide and a tall image, which each side makes larger to a multiple of 28, and a tile
+    # of 1680x2240 that gets smaller to 1155x1540 and then 1176x1540. The template writes
+    # the bos token, so the tokenizer adds no special tokens.
+    for {image, size, blocks, expected, mean, count, sha} <- [
+          {image, [252, 336], 108, [0.2661, 0.5727, -0.8403, 1.361], 0.8947, 658,
+           "a5464f656bd6d048"},
+          {Nx.transpose(image, axes: [1, 0, 2]), [336, 252], 108,
+           [0.2661, -0.1718, -0.8403, 1.8281], 0.8947, 661, "02897cc4d8b54da3"},
+          {Nx.tile(image, [7, 7, 1]), [1176, 1540], 2310, [0.2953, 0.6165, -0.4279, -1.1061],
+           0.8882, 2893, "881f6660926c1767"}
+        ] do
+      {tensors, text} = PixtralProcessor.process(processor, image, @opts[:backend])
+      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {blocks, 2352}
+      assert Nx.to_list(tensors["image_sizes"]) == [size]
+
+      got =
+        for index <- [[0, 0], [1, 100], [-1, 2351], [50, 777]], do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(tokenizer.native, String.replace(prompt, "[IMG]", text),
+          add_special_tokens: false
+        )
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {count, sha}
+    end
+
+    # The encoder gets each image of a batch row alone, as {1, 3, height, width}. Here it
+    # gives the 28x28 blocks of the image as its features, so the features are the rows of
+    # the two images without the rows of zeros after them.
+    images = [image, Nx.transpose(image, axes: [1, 0, 2])]
+
+    tensors =
+      Enum.map(images, &elem(PixtralProcessor.process(processor, &1, Nx.BinaryBackend), 0))
+
+    batch =
+      Map.new(["pixel_values", "image_sizes"], fn name ->
+        tensor = tensors |> Enum.map(& &1[name]) |> Nx.concatenate()
+
+        {name,
+         tensor |> Nx.pad(0, [{0, 256 - Nx.axis_size(tensor, 0), 0}, {0, 0, 0}]) |> Nx.new_axis(0)}
+      end)
+
+    encode = fn %{"pixel_values" => image} ->
+      {1, 3, height, width} = Nx.shape(image)
+
+      blocks =
+        for y <- 0..(div(height, 28) - 1), x <- 0..(div(width, 28) - 1) do
+          image |> Nx.slice([0, 0, y * 28, x * 28], [1, 3, 28, 28]) |> Nx.reshape({1, 2352})
+        end
+
+      %{"image_features" => blocks |> Nx.concatenate() |> Nx.new_axis(0)}
+    end
+
+    %{image_features: features} = PixtralProcessor.encode(processor, encode, batch, [], nil)
+    assert features == Nx.concatenate(Enum.map(tensors, & &1["pixel_values"]))
   end
 
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
