@@ -699,6 +699,61 @@ defmodule Transmuter.VisionTest do
     assert Nx.to_list(features[[.., 0]]) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
   end
 
+  # The reference is ONNX Runtime on the fp32 files of the tiny export, see
+  # test/support/pipeline_references.py. The weights are random, and each chat gives the
+  # newline token, so the test checks the log-probabilities of the first 4 tokens. They depend
+  # on the image features: without them, the first value of the chat with one image is
+  # -2.61575, and with the images of the chat with three images in the reverse order it is
+  # -1.25709. Each image gives 4 image tokens. The chats with three and four images have a
+  # batch key of 4, so in a batch the first row has a row of zeros after its images.
+  @tag ci_partition: 9
+  test "image-text-to-text with a tiny Gemma 3 matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+    crop = StbImage.to_nx(@image)[0..99]
+
+    chats =
+      for {images, text} <- [
+            {[@image], "Can you describe this image?"},
+            {[@image, tall, crop], "How are these images different?"},
+            {[@image, tall, crop, @image], "How are these images different?"},
+            {[], "What is the capital of France?"}
+          ] do
+        content = Enum.map(images, &%{type: "image", image: &1}) ++ [%{type: "text", text: text}]
+        %{messages: [%{role: "user", content: content}]}
+      end
+
+    expected = [
+      {22, [-1.62155, -1.59322, -1.54156, -1.43598]},
+      {36, [-1.23644, -1.2447, -1.21787, -1.15569]},
+      {43, [-1.32047, -1.30492, -1.2527, -1.17569]},
+      {16, [-1.3735, -1.37734, -1.34455, -1.30693]}
+    ]
+
+    opts =
+      [
+        variant: %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32},
+        strategy: :greedy,
+        max_new_tokens: 4,
+        token_logprobs: true
+      ] ++ @opts
+
+    repo = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
+    alone = Nx.Serving.run(Vision.image_text_to_text(repo, opts), chats)
+
+    for {%{results: [result]}, {count, logprobs}} <- Enum.zip(alone, expected) do
+      assert %{text: "\n\n\n\n", token_summary: %{input: ^count}} = result
+      assert_all_close(result.token_logprobs, logprobs)
+    end
+
+    batched = Vision.image_text_to_text(repo, [compile: [batch_size: 2]] ++ opts)
+
+    for {%{results: [result]}, %{results: [expected]}} <-
+          Enum.zip(Nx.Serving.run(batched, Enum.slice(chats, 1, 2)), Enum.slice(alone, 1, 2)) do
+      assert result.text == expected.text
+      assert_all_close(result.token_logprobs, expected.token_logprobs)
+    end
+  end
+
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
     # A long side over longest_edge gives the short side longest_edge times the aspect ratio,
     # rounded half to even: 1333 * 400 / 800 is 666.5. YOLOS rounds each side down to a

@@ -601,6 +601,91 @@ for name, pictures, text in [
     ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
     print("gemma3", name, values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
+
+# Image-text-to-text with Gemma 3. The reference is ONNX Runtime on the files of the tests. The
+# decoder takes no token_type_ids, so the image tokens attend causally, as in transformers.js.
+# PyTorch attends in both directions inside an image, so its text can differ. The features
+# replace the embeddings of <image_soft_token>, and the decoder runs greedy with a cache that
+# grows from 0 rows and no position_ids. The vision session closes before the decoder session
+# opens.
+def gemma3_texts(repo, files, chats, exact, fast):
+    tokenizer = AutoTokenizer.from_pretrained(repo, extra_special_tokens=image_tokens)
+    processor = AutoProcessor.from_pretrained(repo, tokenizer=tokenizer)
+    assert type(processor.image_processor).__name__ == "Gemma3ImageProcessor" + ("Fast" if fast else "")
+    directory = snapshot_download(repo, allow_patterns=[f"onnx/{name}.onnx*" for name in files], local_dir=tempfile.mkdtemp())
+    session = lambda name: exact_session(f"{directory}/onnx/{name}.onnx", next_to_data=exact)  # noqa: E731
+    vision_file, embed_file, decoder_file = files
+    vision, embed = session(vision_file), session(embed_file)
+    image_token = processor.tokenizer.convert_tokens_to_ids("<image_soft_token>")
+    prepared = {}
+    for name, (images, text) in chats.items():
+        content = [{"type": "image", "image": picture} for picture in images] + [{"type": "text", "text": text}]
+        # The fast image processor gives only PyTorch tensors.
+        inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt")
+        inputs = {k: v.numpy() for k, v in inputs.items()}
+        ids = inputs["input_ids"].astype(np.int64)
+        embeds = embed.run(None, {"input_ids": ids})[0]
+        if images:
+            features = vision.run(None, {"pixel_values": inputs["pixel_values"]})[0]
+            embeds[ids == image_token] = features.reshape(-1, embeds.shape[-1])
+        prepared[name] = embeds
+    del vision
+
+    decoder = session(decoder_file)
+    names = [o.name for o in decoder.get_outputs()]
+    eos = GenerationConfig.from_pretrained(repo).eos_token_id
+    for name, embeds in prepared.items():
+        past = empty_cache(decoder)
+        tokens, logprobs, length = [], [], embeds.shape[1]
+        count = length
+        for _ in range(24):
+            feeds = {"inputs_embeds": embeds, "attention_mask": np.ones((1, length), np.int64), "num_logits_to_keep": np.array(1, np.int64), **past}
+            outputs = dict(zip(names, decoder.run(None, feeds)))
+            logits = outputs["logits"][0, -1].astype(np.float64)
+            tokens.append(int(logits.argmax()))
+            # The log-probability of the greedy token: minus the log of the sum of exp(logits - max).
+            logprobs.append(round(float(-np.log(np.exp(logits - logits.max()).sum())), 5))
+            if tokens[-1] in eos:
+                break
+            past = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+            embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0]
+            length += 1
+        print("gemma3 onnxruntime", repo, name, count, tokens, logprobs[:4], repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
+
+# The tiny export resizes to 28x28 with the fast image processor, and each image gives 4 image
+# tokens. Its weights are random. The chats with three and four images have a batch key of 4.
+crop = image.crop((0, 0, 320, 100))
+tall = image.transpose(Image.Transpose.TRANSPOSE)
+gemma3_texts(
+    "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration",
+    ["vision_encoder", "embed_tokens", "decoder_model_merged"],
+    {
+        "one image": ([image], "Can you describe this image?"),
+        "three images": ([image, tall, crop], "How are these images different?"),
+        "four images": ([image, tall, crop, image], "How are these images different?"),
+        "text": ([], "What is the capital of France?"),
+    },
+    exact=False,
+    fast=True,
+)
+
+# Gemma 3 4B with the default files of Transmuter: the q4 vision encoder and decoder and the
+# 8-bit embeddings. The data of the decoder is larger than 2 GB, so exact_session saves the
+# graph next to the data. The vision session needs about 2.5 GB and the decoder session about
+# 5 GB.
+gemma3_texts(
+    "onnx-community/gemma-3-4b-it-ONNX",
+    ["vision_encoder_q4", "embed_tokens_quantized", "decoder_model_merged_q4"],
+    {
+        "one image": ([image], "Can you describe this image?"),
+        "tall image": ([tall], "What animals are in the image?"),
+        "text": ([], "What is the capital of France?"),
+    },
+    exact=True,
+    fast=False,
+)
+
 # Object detection: the slow image processor, the PyTorch model and
 # post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
 # truncates the boxes to integers, so the script prints the boxes before that. DETR uses
