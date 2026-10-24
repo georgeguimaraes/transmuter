@@ -201,8 +201,8 @@ defmodule Transmuter do
 
     # The params move before they get compute_type, so the device converts them. On
     # Nx.BinaryBackend, the 153M f16 weights of vit-gpt2 take 14 s to convert.
-    params = if backend = opts[:backend], do: move_params(model, backend), else: model.params
-    %{model | params: Map.new(params, fn {k, t} -> {k, upcast(t, compute_type)} end)}
+    model = if backend = opts[:backend], do: move(model, backend), else: model
+    %{model | params: Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)}
   end
 
   # Tensors in node attributes, such as the value of a Constant, and the initializers of
@@ -974,12 +974,15 @@ defmodule Transmuter do
   end
 
   # On EMLX, Transmuter.EMLX keeps quantized weights packed.
-  defp move_params(model, backend) do
+  defp move(model, backend) do
     {module, backend_opts} = if is_atom(backend), do: {backend, []}, else: backend
 
     if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
-      do: Transmuter.EMLX.params(model, backend_opts),
-      else: Map.new(model.params, fn {name, t} -> {name, Nx.backend_transfer(t, backend)} end)
+      do: Transmuter.EMLX.move(model, backend_opts),
+      else: %{
+        model
+        | params: Map.new(model.params, fn {k, t} -> {k, Nx.backend_transfer(t, backend)} end)
+      }
   end
 
   @doc false

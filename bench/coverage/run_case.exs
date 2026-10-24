@@ -31,10 +31,11 @@ end
 try do
   {load_ms, model} = timed.(fn -> Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32) end)
   # With EMLX, EMLX_QUANTIZED=1 keeps MatMulNBits weights packed as MLX quantized tensors.
-  params =
+  model =
     if System.get_env("EMLX_QUANTIZED") == "1" and match?({EMLX.Backend, _}, backend),
-      do: Transmuter.EMLX.params(model, elem(backend, 1)),
-      else: Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)
+      do: Transmuter.EMLX.move(model, elem(backend, 1)),
+      else: %{model | params: Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)}
+  params = model.params
   {static, inputs} = Enum.split_with(meta["inputs"], static?)
   inputs = Map.new(inputs, &{&1["name"], read.(&1, backend)})
   static = Map.new(static, &{&1["name"], read.(&1, Nx.BinaryBackend)})

@@ -16,6 +16,27 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # A packed MatMulNBits weight holds its scales and zero points, so Transmuter.EMLX.move
+  # drops them when no other node reads them, and the node reads an empty input in their
+  # place. When another node reads the scales, they stay. The CPU device dequantizes the
+  # weight, so the test runs where EMLX runs.
+  if Code.ensure_loaded?(Transmuter.EMLX) do
+    test "Transmuter.EMLX.move drops the scales and zero points that only packed weights read" do
+      model = Transmuter.load!(Path.join(@fixtures, "MatMulNBits_b4_bs256_packed/model.onnx"))
+      [node] = model.nodes
+      assert node.input == ["A", "B", "scales", "zp"]
+
+      moved = Transmuter.EMLX.move(model, device: :cpu)
+      refute Map.has_key?(moved.params, "scales")
+      assert hd(moved.nodes).input == ["A", "B", "", ""]
+
+      reader = %{node | op_type: "Identity", domain: "", input: ["scales"], output: ["copy"]}
+      kept = Transmuter.EMLX.move(%{model | nodes: [node, reader]}, device: :cpu)
+      assert Map.has_key?(kept.params, "scales")
+      assert hd(kept.nodes).input == ["A", "B", "scales", ""]
+    end
+  end
+
   defp assert_matches_reference(dir) do
     meta = dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
 

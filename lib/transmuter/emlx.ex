@@ -15,7 +15,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
 
         model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"}, backend: EMLX.Backend)
 
-    `Transmuter.load!/2` with `backend: EMLX.Backend` calls `params/2` for you.
+    `Transmuter.load!/2` with `backend: EMLX.Backend` calls `move/2` for you.
 
     Weights that MLX cannot hold (other bit widths, block sizes other than 32,
     64 or a multiple of 128, or a K that is not a whole number of blocks) stay
@@ -26,7 +26,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     alias Transmuter.Ops.Packed
 
     @doc """
-    Returns `model.params` on EMLX, with compatible `MatMulNBits` weights packed on the GPU.
+    Moves the params of `model` to EMLX, with compatible `MatMulNBits` weights packed on the GPU, and returns the model.
 
     On the GPU, compatible `MatMulNBits` weights become MLX quantized tensors, so
     `mx::quantized_matmul` reads the packed weights directly. This avoids
@@ -44,8 +44,14 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     Weights that do not meet these criteria stay as packed bytes and are
     dequantized in the graph.
 
+    The packed weight holds its scales and zero points. A scales or zero points
+    initializer that only packed `MatMulNBits` nodes read does not move to EMLX:
+    it leaves the params, and these nodes get an empty name in its place. A node
+    that still reads it raises, because the value is missing. The scales are
+    computed on EMLX, from the params moved to EMLX.
+
     `Transmuter.load!/2` with `backend: EMLX.Backend` calls this function for
-    you. Call it directly only when you need to transfer params separately.
+    you. Call it directly only when you need to move the params separately.
 
     ## Options
 
@@ -54,15 +60,57 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     ## Examples
 
         model = Transmuter.load!({:hf, "onnx-community/Qwen3-0.6B-ONNX", "onnx/model_q4.onnx"})
-        params = Transmuter.EMLX.params(model, device: :gpu)
+        model = Transmuter.EMLX.move(model, device: :gpu)
     """
-    def params(model, opts \\ []) do
+    def move(model, opts \\ []) do
       backend = {EMLX.Backend, device: Keyword.get(opts, :device, :gpu)}
-      quantized = model |> quantizable_nodes() |> Map.new(&quantize(&1, model, backend))
+      packed = quantizable_nodes(model)
+      quantized = Map.new(packed, &quantize(&1, model, backend))
+      unused = unused_inputs(model, packed)
 
-      Map.new(model.params, fn {name, t} ->
-        {name, Map.get_lazy(quantized, name, fn -> Nx.backend_transfer(t, backend) end)}
-      end)
+      params =
+        for {name, t} <- model.params, not MapSet.member?(unused, name), into: %{} do
+          {name, Map.get_lazy(quantized, name, fn -> Nx.backend_transfer(t, backend) end)}
+        end
+
+      packed = MapSet.new(packed)
+
+      nodes =
+        Enum.map(model.nodes, fn node ->
+          if MapSet.member?(packed, node),
+            do: %{
+              node
+              | input: Enum.map(node.input, &if(MapSet.member?(unused, &1), do: "", else: &1))
+            },
+            else: node
+        end)
+
+      %{model | nodes: nodes, params: params}
+    end
+
+    # The scales and zero points (inputs 2 and 3) of packed nodes that no other reader needs:
+    # no other node, no other input of a packed node, no subgraph and no graph output.
+    defp unused_inputs(model, packed) do
+      packed_set = MapSet.new(packed)
+
+      quantization =
+        for node <- packed,
+            name <- Enum.slice(node.input, 2, 2),
+            name != "",
+            into: MapSet.new(),
+            do: name
+
+      used =
+        for node <- model.nodes,
+            name <-
+              if(MapSet.member?(packed_set, node),
+                do: List.delete_at(List.delete_at(node.input, 3), 2),
+                else: Transmuter.dependencies(node)
+              ),
+            into: MapSet.new(model.outputs),
+            do: name
+
+      MapSet.difference(quantization, used)
     end
 
     defp quantizable_nodes(model) do
@@ -87,6 +135,9 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       blocks = div(k, block)
       group = min(block, 128)
       value = &(Map.get(model.params, &1) || Map.fetch!(model.static, &1))
+      # The scales and the zero points move first, so their math runs on EMLX and not in the
+      # lists of Nx.BinaryBackend.
+      on_device = &(&1 |> then(value) |> Nx.backend_transfer(backend))
 
       per_group =
         &(&1
@@ -104,13 +155,13 @@ if Code.ensure_loaded?(EMLX.Quantization) do
 
       scales =
         scales_name
-        |> then(value)
+        |> on_device.()
         |> Transmuter.upcast(model[:compute_type])
         |> Nx.reshape({n, blocks})
 
       biases =
         scales
-        |> Nx.multiply(zero_points(List.first(rest), value, n, blocks, bits))
+        |> Nx.multiply(zero_points(List.first(rest), on_device, n, blocks, bits))
         |> Nx.negate()
 
       {scales, biases} = {per_group.(scales), per_group.(biases)}
@@ -118,8 +169,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       tensor =
         EMLX.Quantization.quantized_tensor(
           EMLX.Backend.from_nx(packed),
-          EMLX.Backend.from_nx(Nx.backend_transfer(scales, backend)),
-          EMLX.Backend.from_nx(Nx.backend_transfer(biases, backend)),
+          EMLX.Backend.from_nx(scales),
+          EMLX.Backend.from_nx(biases),
           {n, k},
           type: {:s, bits},
           group_size: group
