@@ -1,10 +1,10 @@
 defmodule Transmuter.Vision.ImageTextToText do
   @moduledoc """
-  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL, Qwen3-VL and Ministral 3. See `Transmuter.Vision.image_text_to_text/2`.
+  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL, Qwen3-VL, Ministral 3 and Gemma 3. See `Transmuter.Vision.image_text_to_text/2`.
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
-  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor`, `Transmuter.Vision.Qwen2VLProcessor` or `Transmuter.Vision.PixtralProcessor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles, patches or blocks) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor`, `Transmuter.Vision.Qwen2VLProcessor`, `Transmuter.Vision.PixtralProcessor` or `Transmuter.Vision.Gemma3Processor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles, patches, blocks or images) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
 
   The tokenizer adds its special tokens to the rendered prompt, unless the prompt starts with the bos token, as `apply_chat_template` of the processors of Python transformers.
   """
@@ -12,10 +12,10 @@ defmodule Transmuter.Vision.ImageTextToText do
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
 
   alias Transmuter.{ChatTemplate, Featurizer, Generation, Hub, Repo, Serving, Tokenizer}
-  alias Transmuter.Vision.{Idefics3Processor, PixtralProcessor, Qwen2VLProcessor}
+  alias Transmuter.Vision.{Gemma3Processor, Idefics3Processor, PixtralProcessor, Qwen2VLProcessor}
 
-  # The batch keys: the number of rows of the pixel values of a chat (tiles, patches or blocks),
-  # rounded up to a power of two, or 0 for a chat without images.
+  # The batch keys: the number of rows of the pixel values of a chat (tiles, patches, blocks or
+  # images), rounded up to a power of two, or 0 for a chat without images.
   @buckets [0 | for(exponent <- 0..16, do: 2 ** exponent)]
 
   @doc false
@@ -112,13 +112,16 @@ defmodule Transmuter.Vision.ImageTextToText do
   defp processor!(repo, vision) do
     qwen2_vl = fn -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)} end
     pixtral = fn -> {PixtralProcessor, PixtralProcessor.load!(repo)} end
+    gemma3 = fn -> {Gemma3Processor, Gemma3Processor.load!(repo)} end
 
     processors = %{
       "Idefics3ImageProcessor" => fn -> {Idefics3Processor, Idefics3Processor.load!(repo)} end,
       "Qwen2VLImageProcessor" => qwen2_vl,
       "Qwen2VLImageProcessorFast" => qwen2_vl,
       "PixtralImageProcessor" => pixtral,
-      "PixtralImageProcessorFast" => pixtral
+      "PixtralImageProcessorFast" => pixtral,
+      "Gemma3ImageProcessor" => gemma3,
+      "Gemma3ImageProcessorFast" => gemma3
     }
 
     config = Hub.json(repo.source, "preprocessor_config.json", repo.opts) || %{}

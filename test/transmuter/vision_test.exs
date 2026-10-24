@@ -661,7 +661,7 @@ defmodule Transmuter.VisionTest do
       assert_all_close(got, expected)
       assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
 
-      [first | rest] = String.split(prompt, Gemma3Processor.placeholder())
+      [first | rest] = String.split(prompt, Gemma3Processor.placeholder(processor))
       prompt = Enum.join([first | Enum.zip_with(texts, rest, &(&1 <> &2))])
 
       {:ok, encoding} =

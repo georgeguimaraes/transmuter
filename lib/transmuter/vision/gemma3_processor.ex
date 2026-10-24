@@ -7,7 +7,7 @@ defmodule Transmuter.Vision.Gemma3Processor do
   In the prompt, each image is a placeholder `<start_of_image>`, and `process/3` gives the text that replaces it: `\\n\\n<start_of_image>`, `image_seq_length` (256) tokens `<image_soft_token>`, and `<end_of_image>\\n\\n`. The vision encoder gives one feature for each of these image tokens.
   """
 
-  alias Transmuter.{Featurizer, Hub}
+  alias Transmuter.{Featurizer, Hub, Repo}
 
   defstruct [:featurizer, :image_seq_len, :image_token]
 
@@ -27,14 +27,14 @@ defmodule Transmuter.Vision.Gemma3Processor do
     %__MODULE__{
       featurizer: Featurizer.new(Map.put(config, "do_convert_rgb", true)),
       image_seq_len: processor["image_seq_length"] || 256,
-      image_token: repo.config["image_token_id"] || repo.config["image_token_index"]
+      image_token: Repo.image_token_id(repo)
     }
   end
 
   @doc """
   The text of an image in the prompt before `process/3` expands it.
   """
-  def placeholder, do: @placeholder
+  def placeholder(_processor), do: @placeholder
 
   @doc """
   Turns an image into pixel values and gives the text of the image in the prompt.
