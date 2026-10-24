@@ -1507,6 +1507,44 @@ defmodule Transmuter.VisionLargeModelTest do
     end
   end
 
+  # The reference is ONNX Runtime on the default files: the q4 vision encoder and decoder and
+  # the 8-bit embeddings, see test/support/pipeline_references.py. The prompt starts with one
+  # bos token. The model has 4.3B parameters and runs only on the GPU of EMLX, because the CPU
+  # of EMLX dequantizes the decoder to about 15.5 GB of f32 weights. CI leaves this test out.
+  @tag :large_model
+  test "image-text-to-text with Gemma 3 matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for {images, text} <- [
+            {[@image], "Can you describe this image?"},
+            {[tall], "What animals are in the image?"},
+            {[], "What is the capital of France?"}
+          ] do
+        content = Enum.map(images, &%{type: "image", image: &1}) ++ [%{type: "text", text: text}]
+        %{messages: [%{role: "user", content: content}]}
+      end
+
+    expected = [
+      {274,
+       "Here's a description of the image:\n\n**Overall Impression:**\n\nThe image shows two tabby cats sprawled out"},
+      {275,
+       "Based on the image, the animals are **cats**. \n\nThere are two cats, one is lying down and the"},
+      {16,
+       "The capital of France is **Paris**. \n\nIt's a global center for art, fashion, gastronomy, and"}
+    ]
+
+    opts = [strategy: :greedy, max_new_tokens: 24, compile: [batch_size: 2]] ++ @opts
+    serving = Vision.image_text_to_text({:hf, "onnx-community/gemma-3-4b-it-ONNX"}, opts)
+    results = Nx.Serving.run(serving, chats)
+
+    assert Enum.map(results, fn %{results: [%{text: text, token_summary: %{input: count}}]} ->
+             {count, text}
+           end) == expected
+
+    assert Nx.Serving.run(serving, hd(chats)) == hd(results)
+  end
+
   # The reference is the image-to-image pipeline of transformers, without the padding, on a
   # 64x48 crop (sides that are multiples of 8, which get 8 more pixels) and a 59x50 crop.
   # The 8-bit values round, so a value can be one step away. CI takes no new models until
