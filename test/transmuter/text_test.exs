@@ -702,6 +702,29 @@ defmodule Transmuter.TextLargeModelTest do
         do: assert_in_delta(result.score, expected, 1.0e-3)
   end
 
+  # Apertus decomposes xIELU into Softplus, Exp, Min and Where, and its q4 export has QK norm,
+  # GroupQueryAttention and MatMulNBits. The reference is the greedy text of ONNX Runtime on
+  # the q4 export, see test/support/pipeline_references.py. The model file is 811 MB.
+  @tag :large_model
+  test "Apertus generates the greedy text of ONNX Runtime" do
+    serving =
+      Transmuter.Text.generation(
+        {:hf, "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX"},
+        [strategy: :greedy, max_new_tokens: 16] ++ @opts
+      )
+
+    chat = %{messages: [%{role: "user", content: "What is the capital of France?"}]}
+
+    assert %{
+             results: [
+               %{
+                 text:
+                   "The capital of France is Paris, which is the largest city in terms of population"
+               }
+             ]
+           } = Nx.Serving.run(serving, chat)
+  end
+
   defp assert_all_close(tensor, expected) do
     expected = Nx.tensor(expected)
 
