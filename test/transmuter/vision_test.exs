@@ -912,16 +912,16 @@ defmodule Transmuter.VisionTest do
       {15, "Paris"}
     ]
 
-    opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
-    repo = {:hf, "llava-hf/llava-interleave-qwen-0.5b-hf"}
-    alone = Nx.Serving.run(Vision.image_text_to_text(repo, opts), chats)
+    # One serving runs each chat alone and then all chats in batches of 2.
+    opts = [strategy: :greedy, max_new_tokens: 24, compile: [batch_size: 2]] ++ @opts
+    serving = Vision.image_text_to_text({:hf, "llava-hf/llava-interleave-qwen-0.5b-hf"}, opts)
+    alone = Enum.map(chats, &Nx.Serving.run(serving, &1))
 
     assert Enum.map(alone, fn %{results: [%{text: text, token_summary: %{input: count}}]} ->
              {count, text}
            end) == expected
 
-    batched = Vision.image_text_to_text(repo, [compile: [batch_size: 2]] ++ opts)
-    assert Nx.Serving.run(batched, chats) == alone
+    assert Nx.Serving.run(serving, chats) == alone
   end
 
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
