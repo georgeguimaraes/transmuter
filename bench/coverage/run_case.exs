@@ -3,7 +3,20 @@
 
 [case_dir] = System.argv()
 meta = case_dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
-backend = {EMLX.Backend, device: String.to_atom(System.get_env("DEVICE", "gpu"))}
+# As in the tests, TRANSMUTER_TEST_BACKEND is emlx (the default) or exla, and
+# TRANSMUTER_TEST_DEVICE is gpu (the default) or cpu.
+device = String.to_atom(System.get_env("TRANSMUTER_TEST_DEVICE", "gpu"))
+
+{backend, compiler_opts} =
+  case System.get_env("TRANSMUTER_TEST_BACKEND", "emlx") do
+    "emlx" ->
+      {{EMLX.Backend, device: device}, [compiler: EMLX, device: device]}
+
+    "exla" ->
+      client = if device == :gpu, do: :cuda, else: :host
+      {{EXLA.Backend, client: client}, [compiler: EXLA, client: client]}
+  end
+
 result_path = Path.join(case_dir, "result.json")
 
 read = fn %{"file" => file, "dtype" => type, "shape" => shape}, backend ->
@@ -40,11 +53,7 @@ try do
     if System.get_env("EAGER") == "1",
       do: fn i -> Transmuter.run(model, params, i, static) end,
       else:
-        Transmuter.compile(%{model | params: params}, inputs,
-          static_inputs: static,
-          compiler: EMLX,
-          device: elem(backend, 1)[:device]
-        )
+        Transmuter.compile(%{model | params: params}, inputs, [static_inputs: static] ++ compiler_opts)
   {run_ms, out} = timed.(fn -> fun.(inputs) end)
 
   diffs =

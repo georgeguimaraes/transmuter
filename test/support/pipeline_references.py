@@ -80,6 +80,26 @@ for text in ["The cat sat on the mat.", "Transmuter runs ONNX models on any Nx b
     hidden = session.run(["last_hidden_state"], feeds)[0][0, -1]
     print("qwen3-embedding onnxruntime", n, "tokens", [round(float(x), 4) for x in (hidden / np.linalg.norm(hidden))[:4]])
 
+# Greedy generation with the q4 export of Apertus 0.5B: xIELU as Softplus, Exp, Min and
+# Where, QK norm, GroupQueryAttention and MatMulNBits. The reference is ONNX Runtime with
+# exact_session, the chat template of the repository and 16 new tokens. Each step gives
+# the cache of exact length.
+repo = "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX"
+tokenizer = AutoTokenizer.from_pretrained(repo)
+directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx*"], local_dir=tempfile.mkdtemp())
+session = exact_session(f"{directory}/onnx/model_q4.onnx")
+names = [i.name for i in session.get_inputs()]
+ids = [int(i) for i in tokenizer.apply_chat_template([{"role": "user", "content": "What is the capital of France?"}], add_generation_prompt=True, tokenize=True, return_dict=True)["input_ids"]]
+cache, step, tokens = empty_cache(session), ids, []
+for _ in range(16):
+    past = next(iter(cache.values())).shape[2]
+    feeds = {"input_ids": np.array([step], np.int64), "attention_mask": np.ones((1, past + len(step)), np.int64), "position_ids": np.arange(past, past + len(step))[None], **cache}
+    outputs = dict(zip([o.name for o in session.get_outputs()], session.run(None, {k: v for k, v in feeds.items() if k in names})))
+    step = [int(outputs["logits"][0, -1].argmax())]
+    tokens += step
+    cache = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+print("apertus onnxruntime", len(ids), "prompt tokens", tokens, repr(tokenizer.decode(tokens)))
+
 rerank = pipeline("text-classification", model="cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 query = "How many people live in Berlin?"
 for passage in ["Berlin has a population of 3,520,031 registered inhabitants.", "New York City is famous for the Metropolitan Museum of Art."]:

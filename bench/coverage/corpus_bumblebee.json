@@ -91,5 +91,41 @@
   "files": [
    "model.onnx"
   ]
+ },
+ {
+  "repo": "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX",
+  "task": "text-generation Apertus",
+  "files": [
+   "onnx/model_q4.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-internal-testing/tiny-random-ApertusForCausalLM",
+  "task": "text-generation Apertus",
+  "files": [
+   "onnx/model.onnx",
+   "onnx/model_q4.onnx"
+  ]
+ },
+ {
+  "repo": "onnx-internal-testing/tiny-random-Qwen3MoeForCausalLM",
+  "task": "text-generation Mixtral routing",
+  "files": [
+   "onnx/model.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/slovak-gpt-j-405M",
+  "task": "text-generation GPT-J #154",
+  "files": [
+   "onnx/decoder_model_merged_quantized.onnx"
+  ]
+ },
+ {
+  "repo": "Xenova/falcon-rw-1b",
+  "task": "text-generation Falcon #215",
+  "files": [
+   "onnx/decoder_model_merged_quantized.onnx"
+  ]
  }
 ]
