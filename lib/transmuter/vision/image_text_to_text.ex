@@ -50,18 +50,19 @@ defmodule Transmuter.Vision.ImageTextToText do
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
+    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    {image_token, image_text} = image_token!(repo, tokenizer)
+
+    # The processor reads its configuration before the larger models load, so a bad
+    # configuration raises early. The Qwen2-VL processor needs the inputs of the vision encoder.
     model_opts = Keyword.take(opts, [:backend, :compute_type])
     vision = Repo.load_component!(repo, "vision_encoder", :q4, model_opts)
+    {module, processor} = processor!(repo, vision)
     embed = Repo.load_component!(repo, "embed_tokens", :q8, model_opts)
     decoder_opts = [outputs: &Generation.outputs/1] ++ model_opts
     decoder = Repo.load_component!(repo, "decoder_model_merged", :q4, decoder_opts)
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
-    {module, processor} = processor!(repo, vision)
     backend = opts[:backend] || Nx.default_backend()
-
-    image_token = Repo.image_token_id(repo)
     ctx = Generation.context(repo, decoder, [embed: embed, image_token: image_token] ++ opts)
-    image_text = Tokenizers.Tokenizer.id_to_token(tokenizer.native, image_token)
 
     bos = Repo.special_token(repo, "bos")
 
@@ -101,6 +102,20 @@ defmodule Transmuter.Vision.ImageTextToText do
     }
 
     Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
+  end
+
+  # The id of the image token from config.json and its text from the tokenizer.
+  defp image_token!(repo, tokenizer) do
+    id =
+      Repo.image_token_id(repo) ||
+        raise ArgumentError,
+              "config.json of #{inspect(repo.source)} has no image_token_id or image_token_index"
+
+    text =
+      Tokenizers.Tokenizer.id_to_token(tokenizer.native, id) ||
+        raise ArgumentError, "the tokenizer has no token for the image token id #{id}"
+
+    {id, text}
   end
 
   # The lookup takes exact names, as AutoImageProcessor of Python transformers, and not the

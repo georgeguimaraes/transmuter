@@ -10,7 +10,7 @@ defmodule Transmuter.Vision.Gemma3Processor do
   alias Transmuter.{Featurizer, Hub, Repo}
   alias Transmuter.Vision.ImageTextToText
 
-  defstruct [:featurizer, :image_seq_len, :boi, :image, :eoi]
+  defstruct [:featurizer, :size, :image_seq_len, :boi, :image, :eoi]
 
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json`, `processor_config.json`, `config.json` and tokenizer configuration.
@@ -23,8 +23,16 @@ defmodule Transmuter.Vision.Gemma3Processor do
     processor = Hub.json(repo.source, "processor_config.json", repo.opts) || %{}
 
     # Gemma3Processor of Python transformers always converts the images to RGB.
+    featurizer = Featurizer.new(Map.put(config, "do_convert_rgb", true))
+
     %__MODULE__{
-      featurizer: Featurizer.new(Map.put(config, "do_convert_rgb", true)),
+      featurizer: featurizer,
+      size:
+        Featurizer.size(featurizer) ||
+          raise(
+            ArgumentError,
+            "the Gemma 3 processor needs a size of preprocessor_config.json that does not depend on the image"
+          ),
       image_seq_len: processor["image_seq_length"] || repo.config["mm_tokens_per_image"] || 256,
       boi: token!(repo, "boi"),
       image: token!(repo, "image"),
@@ -58,14 +66,10 @@ defmodule Transmuter.Vision.Gemma3Processor do
   end
 
   @doc """
-  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them, and for each other number of images of a batch on its first call.
+  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
   """
   def template(processor, _batch_size) do
-    {height, width} =
-      Featurizer.size(processor.featurizer) ||
-        raise ArgumentError,
-              "the Gemma 3 processor needs a size of preprocessor_config.json that does not depend on the image"
-
+    {height, width} = processor.size
     zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
     %{"pixel_values" => Nx.broadcast(zero, {1, 3, height, width})}
   end
@@ -73,24 +77,25 @@ defmodule Transmuter.Vision.Gemma3Processor do
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.
 
-  `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 3, height, width}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the images of a row. All images have the same size, so the images of all rows run in one call, and the rows of zeros do not run. Returns `%{image_features: features}`: the features of the images of all rows, in order, of shape `{images * image_seq_length, hidden}`. The prompts take the default positions.
+  `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 3, height, width}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the images of a row. Each image runs alone, so the encoder has one compiled shape and the memory of one image, and the rows of zeros do not run. Returns `%{image_features: features}`: the features of the images of all rows, in order, of shape `{images * image_seq_length, hidden}`. The prompts take the default positions.
   """
   def encode(processor, encode, tensors, _prompts, _backend) do
     %{"pixel_values" => pixels, "image_sizes" => sizes} = tensors
 
-    images =
+    features =
       for row <- ImageTextToText.images(pixels, sizes, fn _size -> 1 end),
-          {_size, image} <- row,
-          do: image
+          {_size, image} <- row do
+        %{"image_features" => features} = encode.(%{"pixel_values" => image})
+        {1, tokens, hidden} = Nx.shape(features)
 
-    %{"image_features" => features} = encode.(%{"pixel_values" => Nx.concatenate(images)})
-    {count, tokens, hidden} = Nx.shape(features)
+        if tokens != processor.image_seq_len do
+          raise ArgumentError,
+                "the vision encoder gives #{tokens} features for each image, and image_seq_length is #{processor.image_seq_len}"
+        end
 
-    if tokens != processor.image_seq_len do
-      raise ArgumentError,
-            "the vision encoder gives #{tokens} features for each image, and image_seq_length is #{processor.image_seq_len}"
-    end
+        Nx.reshape(features, {tokens, hidden})
+      end
 
-    %{image_features: Nx.reshape(features, {count * tokens, hidden})}
+    %{image_features: Nx.concatenate(features)}
   end
 end

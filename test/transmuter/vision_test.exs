@@ -676,7 +676,7 @@ defmodule Transmuter.VisionTest do
   end
 
   # The batch gives each row the images of its chat and rows of zeros up to the batch key, as
-  # the image sizes show. The encoder runs once on the images of the chats, and the features of
+  # the image sizes show. The encoder runs on each image of the chats alone, and the features of
   # each row follow those of the rows before it. The fake encoder gives each image the features
   # of its first pixel. An encoder that gives another number of features for each image than
   # image_seq_length raises.
@@ -696,9 +696,9 @@ defmodule Transmuter.VisionTest do
     }
 
     encode = fn tokens ->
-      fn %{"pixel_values" => images} ->
-        assert Nx.shape(images) == {4, 1, 1, 1}
-        %{"image_features" => Nx.broadcast(Nx.reshape(images, {4, 1, 1}), {4, tokens, 3})}
+      fn %{"pixel_values" => image} ->
+        assert Nx.shape(image) == {1, 1, 1, 1}
+        %{"image_features" => Nx.broadcast(Nx.reshape(image, {1, 1, 1}), {1, tokens, 3})}
       end
     end
 

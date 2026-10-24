@@ -307,11 +307,11 @@ processor = AutoProcessor.from_pretrained(repo, image_processor=AutoImageProcess
 # the mean of the absolute values, and the number and a SHA-256 of the int64 input ids.
 chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
 prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
-positions = [(0, 0, 0, 0), (1, 1, 100, 37), (-1, 2, 511, 511), (2, 0, 257, 190)]
+idefics3_positions = [(0, 0, 0, 0), (1, 1, 100, 37), (-1, 2, 511, 511), (2, 0, 257, 190)]
 for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE)), ("crop", image.crop((0, 0, 320, 100)))]:
     inputs = processor(text=prompt, images=[picture], return_tensors="np")
     ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"][0]
-    print("idefics3", name, values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("idefics3", name, values.shape, [round(float(values[p]), 4) for p in idefics3_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
 chats = {
     "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
@@ -374,11 +374,11 @@ config = AutoConfig.from_pretrained(repo)
 # value), the mean of the absolute values, and the number and a SHA-256 of the int64 input ids.
 chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
 prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
-positions = [(0, 0), (1, 100), (-1, 1175), (200, 777)]
+qwen2_vl_positions = [(0, 0), (1, 100), (-1, 1175), (200, 777)]
 for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
     inputs = processor(text=prompt, images=[picture], return_tensors="np")
     ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
-    print("qwen2-vl", name, values.shape, inputs["image_grid_thw"].tolist(), [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("qwen2-vl", name, values.shape, inputs["image_grid_thw"].tolist(), [round(float(values[p]), 4) for p in qwen2_vl_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
 chats = {
     "one image": ([image], [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]),
@@ -444,12 +444,12 @@ rope = SimpleNamespace(config=config)
 chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
 prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
 # The last two values are one step away with the weights of Pillow.
-positions = [(0, 0), (1, 100), (-1, 1535), (200, 777), (3, 684), (3, 714)]
+qwen3_vl_positions = [(0, 0), (1, 100), (-1, 1535), (200, 777), (3, 684), (3, 714)]
 for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
     inputs = {k: v.numpy() for k, v in processor(text=prompt, images=[picture], return_tensors="pt").items()}
     ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
     position_ids, delta = Qwen3VLModel.get_rope_index(rope, torch.tensor(ids[None]), torch.tensor(inputs["image_grid_thw"]), None, None)
-    print("qwen3-vl", name, values.shape, inputs["image_grid_thw"].tolist(), [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("qwen3-vl", name, values.shape, inputs["image_grid_thw"].tolist(), [round(float(values[p]), 4) for p in qwen3_vl_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
     print("qwen3-vl positions", name, position_ids[:, 0, [3, 4, 83, 84, 95]].tolist(), int(delta[0, 0]))
 
 chats = {
@@ -513,14 +513,14 @@ image = Image.open("test/fixtures/cats.png")
 processor = AutoProcessor.from_pretrained(repo)
 chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
 prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
-positions = [(0, 0), (1, 100), (-1, 2351), (50, 777)]
+pixtral_positions = [(0, 0), (1, 100), (-1, 2351), (50, 777)]
 tile = Image.fromarray(np.tile(np.asarray(image), (7, 7, 1)))
 for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE)), ("tile", tile)]:
     inputs = processor(text=prompt, images=[picture], add_special_tokens=False, return_tensors="pt")
     ids, values = inputs["input_ids"][0].numpy().astype("<i8"), inputs["pixel_values"][0].numpy()
     channels, height, width = values.shape
     blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
-    print("pixtral", name, inputs["image_sizes"].tolist(), blocks.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("pixtral", name, inputs["image_sizes"].tolist(), blocks.shape, [round(float(blocks[p]), 4) for p in pixtral_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
 # An image with alpha: the slow image processor puts it on white, and the fast one removes the
 # alpha channel. Without do_resize, the processor gives height // 28 rows of width // 28 tokens,
@@ -536,7 +536,7 @@ for name, pixtral, picture, options in [("rgba slow", slow, rgba, {}), ("rgba fa
     channels, height, width = values.shape
     values = values[:, : height // 28 * 28, : width // 28 * 28]
     blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
-    print("pixtral", name, type(pixtral.image_processor).__name__, values.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("pixtral", name, type(pixtral.image_processor).__name__, values.shape, [round(float(blocks[p]), 4) for p in pixtral_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
 # Image-text-to-text with Ministral 3. The reference is ONNX Runtime on the q4 files of the
 # test: the vision encoder, the embeddings and the decoder. The vision encoder takes one image
@@ -590,7 +590,7 @@ repo = "onnx-community/gemma-3-4b-it-ONNX"
 image = Image.open("test/fixtures/cats.png")
 image_tokens = {"boi_token": "<start_of_image>", "eoi_token": "<end_of_image>", "image_token": "<image_soft_token>"}
 processor = AutoProcessor.from_pretrained(repo, tokenizer=AutoTokenizer.from_pretrained(repo, extra_special_tokens=image_tokens))
-positions = [(0, 0, 0, 0), (0, 1, 100, 37), (0, 2, 895, 895), (0, 0, 447, 600)]
+gemma3_positions = [(0, 0, 0, 0), (0, 1, 100, 37), (0, 2, 895, 895), (0, 0, 447, 600)]
 for name, pictures, text in [
     ("wide", [image], "Can you describe this image?"),
     ("tall", [image.transpose(Image.Transpose.TRANSPOSE)], "Can you describe this image?"),
@@ -599,7 +599,7 @@ for name, pictures, text in [
     content = [{"type": "image", "image": picture} for picture in pictures] + [{"type": "text", "text": text}]
     inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="np")
     ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
-    print("gemma3", name, values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+    print("gemma3", name, values.shape, [round(float(values[p]), 4) for p in gemma3_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
 
 # Image-text-to-text with Gemma 3. The reference is ONNX Runtime on the files of the tests. The
