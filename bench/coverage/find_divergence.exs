@@ -40,10 +40,17 @@ threshold = "THRESHOLD" |> System.get_env("1.0e-3") |> String.to_float()
 diverged? = fn name, t ->
   r = ref[name]
   integer? = Nx.Type.integer?(Nx.type(t))
-  # An integer sum on the binary backend is exact. EMLX has no exact f64.
+  # An integer sum on the binary backend is exact in s64, also for u8 and s32 values that
+  # would overflow their own type. EMLX has no exact f64.
   abssum =
     if integer?,
-      do: t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.abs() |> Nx.sum() |> Nx.to_number()
+      do:
+        t
+        |> Nx.backend_copy(Nx.BinaryBackend)
+        |> Nx.as_type(:s64)
+        |> Nx.abs()
+        |> Nx.sum()
+        |> Nx.to_number()
 
   t = Nx.as_type(t, :f64)
   t = t |> then(&Nx.select(Nx.is_nan(&1), 0, &1)) |> Nx.clip(-3.0e38, 3.0e38)
@@ -56,7 +63,9 @@ diverged? = fn name, t ->
     |> Enum.max()
 
   shape = Tuple.to_list(Nx.shape(t))
-  sum_diff? = integer? and r["abssum"] != nil and abssum != r["abssum"]
+  # trace_ort.py writes the sum as an f64, so the exact sum becomes an f64 too, as for
+  # 9223372036854775807, the largest int64.
+  sum_diff? = integer? and r["abssum"] != nil and abssum * 1.0 != r["abssum"]
   diff = if sum_diff?, do: max(diff, abs(abssum - r["abssum"])), else: diff
 
   {shape != r["shape"] or sum_diff? or diff > threshold * max(r["absmax"], 1.0), shape, sample,
@@ -65,7 +74,7 @@ end
 
 env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
-ctx = %{opset: model.opset, compute_type: compute_type, key: key}
+ctx = %{opset: model.opset, compute_type: compute_type, key: key, backend: backend}
 
 model.nodes
 |> Enum.reduce_while(env, fn node, env ->
