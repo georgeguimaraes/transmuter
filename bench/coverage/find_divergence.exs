@@ -76,6 +76,33 @@ env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
 ctx = %{opset: model.opset, compute_type: compute_type, key: key, backend: backend}
 
+# A DynamicQuantizeLinear rounds x / scale to an integer, so a float difference of about
+# 1e-6 can move a value that is near a .5 tie by one quantum. This prints the values of
+# x / scale within 1e-4 of a tie, and the sampled outputs that differ, with their x / scale.
+report_ties = fn x, name, sample ->
+  x = x |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.as_type(:f64) |> Nx.reshape({:auto})
+  low = min(Nx.to_number(Nx.reduce_min(x)), 0)
+  high = max(Nx.to_number(Nx.reduce_max(x)), 0)
+  scale = (high - low) / 255
+  ratios = x |> Nx.divide(scale) |> Nx.to_flat_list()
+  distance = fn r -> abs(r - Float.floor(r) - 0.5) end
+
+  ties =
+    for {r, i} <- Enum.with_index(ratios), distance.(r) < 1.0e-4, do: {i, r, distance.(r)}
+
+  indices = for k <- 0..1023, do: rem(k * 2_654_435_761, length(ratios))
+
+  differ =
+    for {i, ours, ort} <- Enum.zip([indices, sample, ref[name]["sample"]]),
+        ours != ort,
+        uniq: true,
+        do: {i, ours, ort, Enum.at(ratios, i)}
+
+  IO.puts("  scale #{scale}. x / scale within 1e-4 of a .5 tie {index, x / scale, distance}:")
+  IO.puts("    #{inspect(ties)}")
+  IO.puts("  sampled outputs that differ {index, ours, ort, x / scale}: #{inspect(differ)}")
+end
+
 step = fn node, env ->
   ins =
     Enum.map(node.input, fn
@@ -135,6 +162,7 @@ step = fn node, env ->
         "  inputs: #{inspect(Enum.map(ins, &(&1 && ((is_struct(&1) && Nx.shape(&1)) || &1))))}"
       )
 
+      if node.op_type == "DynamicQuantizeLinear", do: report_ties.(hd(ins), name, sample)
       {:halt, :diverged}
   end
 end
