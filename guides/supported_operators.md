@@ -45,7 +45,7 @@ In native f16 and bf16 (the default), sums, normalizations, softmax, and attenti
 
 ## Known numeric differences
 
-These models do not match ONNX Runtime value by value. The first three make small rounding differences large. The differences are not bugs in Transmuter.
+These models do not match ONNX Runtime value by value. The first three make small rounding differences large, and for the int8 falcon-rw-1b file, the int8 kernel of ONNX Runtime on x86 is not exact. These differences are not bugs in Transmuter. The cause of the int8 slovak-gpt-j-405M difference is not known.
 
 **Grounding DINO**: `TopK` selects 900 of 13,294 queries. Some scores differ by only 9.5e-7, which can change the selected set. All operators before `TopK` match exactly. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
 
@@ -53,7 +53,7 @@ These models do not match ONNX Runtime value by value. The first three make smal
 
 **Kokoro TTS**: The model sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round the phase sum differently, and phases near zero amplitude can change by up to π. When given the ONNX Runtime outputs for the `Sin` and `STFT` nodes, all other Kokoro operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
 
-**int8 exports on x86**: The ONNX Runtime reference ran on x86 with AVX2 and no VNNI. There, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In `Xenova/falcon-rw-1b` (int8), one value of the layer 3 `query_key_value` product differs by 912, and the logits then differ by up to 1.46. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly. ONNX Runtime on arm64 (macOS) gives the result of Transmuter, with logits within 1.9e-5.
+**int8 falcon-rw-1b on x86**: The ONNX Runtime reference ran on x86 with AVX2 and no VNNI. There, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In `Xenova/falcon-rw-1b` (int8), one value of the layer 3 `query_key_value` product differs by 912, and the logits then differ by up to 1.46. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly. ONNX Runtime on arm64 (macOS) gives the result of Transmuter, with logits within 1.9e-5. The int8 `Xenova/slovak-gpt-j-405M` also differs from ONNX Runtime on x86, with logits up to 0.83 apart, and this section does not explain it: its `MatMulInteger` nodes are in an `If` branch, which the trace does not reach.
 
 ## Coverage
 

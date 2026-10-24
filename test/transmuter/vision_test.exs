@@ -38,8 +38,8 @@ defmodule Transmuter.VisionTest do
     # alone gives 514x1333. DETR pads to its pad_size with a pixel mask, so the featurizer
     # gives no padding for DETR. SAM resizes the long side to 1024 and pads to 1024x1024 with
     # zeros. SAM 2.1 resizes to 1024x1024 and SAM 3 to 1008x1008 with torchvision, whose 8-bit
-    # weights have fewer fraction bits than those of Pillow. On the tile, 27177 values of Pillow are one step
-    # away.
+    # weights have fewer fraction bits than those of Pillow. In the 1024x1024 resize of the
+    # tile for SAM 2.1, 27177 values of Pillow are one step away.
     tile = Nx.tile(StbImage.to_nx(@image), [6, 6, 1])
     crop = Nx.slice(StbImage.to_nx(@image), [0, 0, 0], [100, 259, 3])
 

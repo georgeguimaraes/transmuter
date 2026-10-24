@@ -607,8 +607,8 @@ defmodule Transmuter.Ops do
   end
 
   # The raw data is present when it is a non-empty binary. The test reads the byte size,
-  # because OTP 27 on x86_64 compares a binary of 2^29 or 2^30 bytes as equal to "" in a
-  # branch, and a weight of 512 MiB is common.
+  # because the x86_64 JIT of OTP 27 to 29 compares a binary of 2^29 or 2^30 bytes as equal
+  # to "" in a branch, and a weight of 512 MiB is common.
   defp raw?(raw), do: is_binary(raw) and byte_size(raw) > 0
 
   @doc """
