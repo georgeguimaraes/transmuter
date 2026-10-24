@@ -44,11 +44,15 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     Weights that do not meet these criteria stay as packed bytes and are
     dequantized in the graph.
 
-    The packed weight holds its scales and zero points. A scales or zero points
-    initializer that only packed `MatMulNBits` nodes read does not move to EMLX:
-    it leaves the params, and these nodes get an empty name in its place. A node
-    that still reads it raises, because the value is missing. The scales are
-    computed on EMLX, from the params moved to EMLX.
+    The packed weight holds its scales and zero points. A packed node reads A, the
+    packed weight under the name of B with `:packed` after it, and its bias, and its
+    scales and zero points inputs become empty names. The B, scales and zero points
+    that no other node, subgraph or graph output reads then leave the params and the
+    static values. A node that also reads them, such as `GatherBlockQuantized` of tied
+    embeddings, gets the raw values, in an array of its own, because MLX does not compile
+    one array as an input and as a part of a quantized tensor. Each name moves to EMLX
+    once, and the scales are computed on EMLX. The returned model has the EMLX backend.
+    A second move leaves the packed nodes as they are.
 
     `Transmuter.load!/2` with `backend: EMLX.Backend` calls this function for
     you. Call it directly only when you need to move the params separately.
@@ -65,79 +69,126 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     def move(model, opts \\ []) do
       backend = {EMLX.Backend, device: Keyword.get(opts, :device, :gpu)}
       packed = quantizable_nodes(model)
-      quantized = Map.new(packed, &quantize(&1, model, backend))
-      unused = unused_inputs(model, packed)
+      packed_outputs = MapSet.new(packed, &hd(&1.output))
 
-      params =
-        for {name, t} <- model.params, not MapSet.member?(unused, name), into: %{} do
-          {name, Map.get_lazy(quantized, name, fn -> Nx.backend_transfer(t, backend) end)}
-        end
-
-      packed = MapSet.new(packed)
-
+      # A packed node reads A, its packed weight and its bias. The packed weight has a name of
+      # its own, so a node that reads the raw B, such as GatherBlockQuantized of tied
+      # embeddings, still reads the raw bytes.
       nodes =
         Enum.map(model.nodes, fn node ->
-          if MapSet.member?(packed, node),
-            do: %{
-              node
-              | input: Enum.map(node.input, &if(MapSet.member?(unused, &1), do: "", else: &1))
-            },
+          if MapSet.member?(packed_outputs, List.first(node.output)),
+            do: %{node | input: packed_inputs(node.input, model)},
             else: node
         end)
 
-      %{model | nodes: nodes, params: params}
-    end
-
-    # The scales and zero points (inputs 2 and 3) of packed nodes that no other reader needs:
-    # no other node, no other input of a packed node, no subgraph and no graph output.
-    defp unused_inputs(model, packed) do
-      packed_set = MapSet.new(packed)
-
-      quantization =
-        for node <- packed,
-            name <- Enum.slice(node.input, 2, 2),
-            name != "",
-            into: MapSet.new(),
-            do: name
-
       used =
-        for node <- model.nodes,
-            name <-
-              if(MapSet.member?(packed_set, node),
-                do: List.delete_at(List.delete_at(node.input, 3), 2),
-                else: Transmuter.dependencies(node)
-              ),
+        for node <- nodes,
+            name <- Transmuter.dependencies(node),
             into: MapSet.new(model.outputs),
             do: name
 
-      MapSet.difference(quantization, used)
+      # Packing frees the B, scales and zero points of the packed nodes that no other node
+      # and no graph output reads. Other names stay as they are.
+      freed =
+        for node <- packed,
+            name <- Enum.slice(node.input, 1, 3),
+            name != "",
+            not MapSet.member?(used, name),
+            into: MapSet.new(),
+            do: name
+
+      quantization =
+        for node <- packed, name <- Enum.slice(node.input, 2, 2), name != "", uniq: true, do: name
+
+      kept = model.params |> Map.keys() |> Enum.reject(&MapSet.member?(freed, &1))
+
+      # Each name moves once, also when several packed nodes or other nodes read it.
+      device = names_on_device(model, quantization ++ kept, backend)
+
+      quantized =
+        packed
+        |> Enum.uniq_by(&Enum.at(&1.input, 1))
+        |> Map.new(&quantize(&1, model, device, backend))
+
+      # A scales or zero points name that another node also reads, such as those of tied
+      # embeddings, gives that node a copy. MLX does not compile one array as an input and
+      # as a part of a quantized tensor.
+      shared = MapSet.new(quantization)
+
+      params =
+        for name <- kept, into: quantized do
+          if MapSet.member?(shared, name),
+            do: {name, Nx.backend_copy(device[name], backend)},
+            else: {name, device[name]}
+        end
+
+      static = Map.drop(model.static, MapSet.to_list(freed))
+      %{model | nodes: nodes, params: params, static: static, backend: backend}
     end
 
-    defp quantizable_nodes(model) do
-      for node = %{op_type: "MatMulNBits", input: [_, b, _scales | rest]} <- model.nodes,
-          Map.has_key?(model.params, b),
-          Enum.at(rest, 1, "") == "",
-          Transmuter.Ops.attr(node, "bits", 4) in [4, 8],
-          block_size?(Transmuter.Ops.attr(node, "block_size")),
-          rem(Transmuter.Ops.attr(node, "K"), Transmuter.Ops.attr(node, "block_size")) == 0,
-          uniq: true,
-          do: node
+    # The inputs of a packed node: the packed weight in place of B, and no scales or zero
+    # points.
+    defp packed_inputs([a, b | rest], model) do
+      name = packed_name(b)
+
+      if Map.has_key?(model.params, name) or Map.has_key?(model.static, name) do
+        raise ArgumentError, "the model already has a value named #{name}"
+      end
+
+      [a, name | rest] |> List.replace_at(2, "") |> List.replace_at(3, "")
     end
+
+    defp packed_name(b), do: b <> ":packed"
+
+    # The names on the device, each moved once. A packed weight B moves in quantize/4.
+    defp names_on_device(model, names, backend) do
+      for name <- Enum.uniq(names), into: %{} do
+        value = Map.get(model.params, name) || Map.fetch!(model.static, name)
+        {name, Nx.backend_transfer(value, backend)}
+      end
+    end
+
+    # A MatMulNBits node whose B holds the packed bytes of its N x K weights and whose scales
+    # have a name. After a move, the node reads the packed weight and no scales, so a second
+    # move leaves it as it is.
+    defp quantizable_nodes(model) do
+      Enum.filter(model.nodes, &quantizable?(&1, model))
+    end
+
+    defp quantizable?(node = %{op_type: "MatMulNBits", input: [_, b, scales | rest]}, model) do
+      [k, n, bits, block] = sizes(node)
+
+      scales != "" and Enum.at(rest, 1, "") == "" and bits in [4, 8] and block_size?(block) and
+        rem(k, block) == 0 and packed_bytes?(Map.get(model.params, b), n * k * bits)
+    end
+
+    defp quantizable?(_node, _model), do: false
+
+    # K, N, bits and block_size of a MatMulNBits node. bits is 4 by default.
+    defp sizes(node) do
+      Enum.map([{"K", nil}, {"N", nil}, {"bits", 4}, {"block_size", nil}], fn {name, default} ->
+        Transmuter.Ops.attr(node, name, default)
+      end)
+    end
+
+    # The bytes of packed weights: u8 values, as many as the bits of the weights need.
+    defp packed_bytes?(b = %Nx.Tensor{}, bits),
+      do: Nx.type(b) == {:u, 8} and Nx.size(b) * 8 == bits
+
+    defp packed_bytes?(_b, _bits), do: false
 
     defp block_size?(size), do: size in [32, 64] or rem(size, 128) == 0
 
-    defp quantize(node = %{input: [_, b_name, scales_name | rest]}, model, backend) do
+    defp quantize(node = %{input: [_, b_name, scales_name | rest]}, model, device_values, backend) do
       {EMLX.Backend, device: device} = backend
 
-      [k, n, bits, block] =
-        Enum.map(["K", "N", "bits", "block_size"], &Transmuter.Ops.attr(node, &1))
+      [k, n, bits, block] = sizes(node)
 
       blocks = div(k, block)
       group = min(block, 128)
-      value = &(Map.get(model.params, &1) || Map.fetch!(model.static, &1))
-      # The scales and the zero points move first, so their math runs on EMLX and not in the
-      # lists of Nx.BinaryBackend.
-      on_device = &(&1 |> then(value) |> Nx.backend_transfer(backend))
+      # The scales and the zero points are on the device, so their math runs on EMLX and not
+      # in the lists of Nx.BinaryBackend.
+      on_device = &Map.fetch!(device_values, &1)
 
       per_group =
         &(&1
@@ -146,8 +197,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
           |> Nx.reshape({n, :auto}))
 
       packed =
-        b_name
-        |> then(value)
+        model.params
+        |> Map.fetch!(b_name)
         |> Nx.to_binary()
         |> Nx.from_binary(:u32, backend: Nx.BinaryBackend)
         |> Nx.reshape({n, div(k * bits, 32)})
@@ -176,7 +227,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
           group_size: group
         )
 
-      {b_name, if(device == :cpu, do: EMLX.dequantize(tensor), else: tensor)}
+      {packed_name(b_name), if(device == :cpu, do: EMLX.dequantize(tensor), else: tensor)}
     end
 
     defp zero_points(name, _value, _n, _groups, bits) when name in [nil, ""], do: 2 ** (bits - 1)

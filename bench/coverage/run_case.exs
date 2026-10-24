@@ -29,13 +29,13 @@ static? = fn spec ->
 end
 
 try do
-  {load_ms, model} = timed.(fn -> Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32) end)
-  # With EMLX, EMLX_QUANTIZED=1 keeps MatMulNBits weights packed as MLX quantized tensors.
-  model =
-    if System.get_env("EMLX_QUANTIZED") == "1" and match?({EMLX.Backend, _}, backend),
-      do: Transmuter.EMLX.move(model, elem(backend, 1)),
-      else: %{model | params: Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)}
-  params = model.params
+  # With EMLX_QUANTIZED=1 on EMLX, load! moves the params and packs the MatMulNBits weights
+  # as MLX quantized tensors. Otherwise the params move after the load, as in earlier runs,
+  # and the graph dequantizes the weights.
+  packed? = System.get_env("EMLX_QUANTIZED") == "1" and match?({EMLX.Backend, _}, backend)
+  load_opts = [compute_type: :f32] ++ if(packed?, do: [backend: backend], else: [])
+  {load_ms, model} = timed.(fn -> Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), load_opts) end)
+  model = if packed?, do: model, else: %{model | params: Nx.backend_transfer(model.params, backend)}
   {static, inputs} = Enum.split_with(meta["inputs"], static?)
   inputs = Map.new(inputs, &{&1["name"], read.(&1, backend)})
   static = Map.new(static, &{&1["name"], read.(&1, Nx.BinaryBackend)})
@@ -43,9 +43,9 @@ try do
   # breaks the graph at values that are only known when it runs.
   fun =
     if System.get_env("EAGER") == "1",
-      do: fn i -> Transmuter.run(model, params, i, static) end,
+      do: fn i -> Transmuter.run(model, model.params, i, static) end,
       else:
-        Transmuter.compile(%{model | params: params}, inputs, [static_inputs: static] ++ compiler_opts)
+        Transmuter.compile(model, inputs, [static_inputs: static] ++ compiler_opts)
   {run_ms, out} = timed.(fn -> fun.(inputs) end)
 
   diffs =

@@ -16,24 +16,56 @@ defmodule Transmuter.OpsTest do
     end
   end
 
-  # A packed MatMulNBits weight holds its scales and zero points, so Transmuter.EMLX.move
-  # drops them when no other node reads them, and the node reads an empty input in their
-  # place. When another node reads the scales, they stay. The CPU device dequantizes the
-  # weight, so the test runs where EMLX runs.
+  # A packed MatMulNBits weight holds its scales and zero points. Transmuter.EMLX.move gives
+  # the node the packed weight as "B:packed", blanks its scales and zero points, and drops B,
+  # the scales (a param) and the zero points (a static value) when no other node reads them.
+  # A second move leaves the model as it is. The CPU device dequantizes the weight, so the
+  # test runs where EMLX runs.
   if Code.ensure_loaded?(Transmuter.EMLX) do
     test "Transmuter.EMLX.move drops the scales and zero points that only packed weights read" do
       model = Transmuter.load!(Path.join(@fixtures, "MatMulNBits_b4_bs256_packed/model.onnx"))
       [node] = model.nodes
-      assert node.input == ["A", "B", "scales", "zp"]
+      assert {node.input, Map.has_key?(model.static, "zp")} == {["A", "B", "scales", "zp"], true}
 
       moved = Transmuter.EMLX.move(model, device: :cpu)
-      refute Map.has_key?(moved.params, "scales")
-      assert hd(moved.nodes).input == ["A", "B", "", ""]
+      assert hd(moved.nodes).input == ["A", "B:packed", "", ""]
+      assert Map.keys(moved.params) == ["B:packed"]
+      refute Map.has_key?(moved.static, "zp")
+      assert moved.backend == {EMLX.Backend, device: :cpu}
+      assert Nx.shape(moved.params["B:packed"]) == {40, 512}
 
-      reader = %{node | op_type: "Identity", domain: "", input: ["scales"], output: ["copy"]}
-      kept = Transmuter.EMLX.move(%{model | nodes: [node, reader]}, device: :cpu)
-      assert Map.has_key?(kept.params, "scales")
-      assert hd(kept.nodes).input == ["A", "B", "scales", ""]
+      again = Transmuter.EMLX.move(moved, device: :cpu)
+      assert {again.nodes, Map.keys(again.params)} == {moved.nodes, Map.keys(moved.params)}
+
+      # Identity nodes read B and the scales, as GatherBlockQuantized reads those of tied
+      # embeddings. They keep the raw values. The device of the tests packs the weight, and
+      # the compiled graph gives Y and the raw values.
+      readers =
+        for name <- ["B", "scales"],
+            do: %{
+              node
+              | op_type: "Identity",
+                domain: "",
+                input: [name],
+                output: [name <> "_copy"]
+            }
+
+      shared = %{model | nodes: [node | readers], outputs: ["Y", "B_copy", "scales_copy"]}
+      kept = Transmuter.EMLX.move(shared, device: :cpu)
+      assert hd(kept.nodes).input == ["A", "B:packed", "", ""]
+      assert Enum.sort(Map.keys(kept.params)) == ["B", "B:packed", "scales"]
+      assert Nx.shape(kept.params["B"]) == {40, 2, 128}
+
+      if Transmuter.TestBackend.compiler() == EMLX do
+        {EMLX.Backend, device_opts} = @backend
+        packed = Transmuter.EMLX.move(shared, device_opts)
+        a = Nx.iota({1, 512}, type: :f32, backend: @backend) |> Nx.divide(512)
+        run = Transmuter.compile(packed, %{"A" => a}, @compiler)
+        out = run.(%{"A" => a})
+        assert Nx.shape(out["Y"]) == {1, 40}
+        assert Nx.to_list(out["B_copy"]) == Nx.to_list(model.params["B"])
+        assert Nx.to_list(out["scales_copy"]) == Nx.to_list(model.params["scales"])
+      end
     end
   end
 
