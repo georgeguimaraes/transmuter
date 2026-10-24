@@ -72,6 +72,31 @@ defmodule Transmuter.GraphTest do
     assert Transmuter.dependencies(node) == ["x", "outer_g", "outer_a", "outer_b"]
   end
 
+  # A name over 64 bytes from the decoded file is a part of the binary of the whole file and
+  # keeps it alive. After the backend takes the params, the model keeps copies of its names.
+  # Without a backend, the params are the data of the file.
+  test "a model loaded with a backend keeps no part of the file binary", %{tmp_dir: dir} do
+    name = String.duplicate("a_long_initializer_name_", 4)
+    weight = %TensorProto{name: name, dims: [64], data_type: 1, raw_data: <<0::size(64 * 32)>>}
+
+    path =
+      write_model(dir, %GraphProto{
+        node: [node("Add", ["x", name], ["y"], "/" <> name)],
+        initializer: [weight],
+        input: [%ValueInfoProto{name: "x"}],
+        output: [%ValueInfoProto{name: "y"}]
+      })
+
+    file = File.stat!(path).size
+
+    shared = fn model ->
+      Enum.any?(Map.keys(model.params), &(:binary.referenced_byte_size(&1) >= file))
+    end
+
+    assert shared.(Transmuter.load!(path))
+    refute shared.(Transmuter.load!(path, backend: @backend))
+  end
+
   test "a subgraph resolves its inputs and initializers before the outer values" do
     k = %TensorProto{name: "k", dims: [], data_type: 1, raw_data: <<2.0::float-32-little>>}
 

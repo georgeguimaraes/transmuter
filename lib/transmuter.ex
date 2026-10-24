@@ -209,8 +209,35 @@ defmodule Transmuter do
     # The params move before they get compute_type, so the device converts them. On
     # Nx.BinaryBackend, the 153M f16 weights of vit-gpt2 take 14 s to convert.
     model = if backend = opts[:backend], do: move(model, backend), else: model
-    %{model | params: Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)}
+    params = Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)
+
+    # The strings and bytes that ModelProto.decode!/1 gives are parts of the binary of the
+    # whole file. A part that stays in the model, such as a name of a param or of a node, or
+    # the data of a small static tensor, keeps that whole binary alive. After a backend took
+    # the params, the model keeps a copy of each part. Without a backend, the params are the
+    # data of the file, which stays anyway.
+    if opts[:backend] do
+      params = Map.new(params, fn {name, t} -> {unshare(name), t} end)
+      model |> Map.delete(:params) |> unshare() |> Map.put(:params, params)
+    else
+      %{model | params: params}
+    end
   end
+
+  defp unshare(term) when is_binary(term) do
+    if :binary.referenced_byte_size(term) > byte_size(term), do: :binary.copy(term), else: term
+  end
+
+  defp unshare(list) when is_list(list), do: Enum.map(list, &unshare/1)
+
+  defp unshare(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> unshare() |> List.to_tuple()
+
+  defp unshare(struct = %module{}),
+    do: struct(module, struct |> Map.from_struct() |> unshare())
+
+  defp unshare(map) when is_map(map), do: Map.new(map, fn {k, v} -> {unshare(k), unshare(v)} end)
+  defp unshare(term), do: term
 
   # Tensors in node attributes, such as the value of a Constant, and the initializers of
   # subgraphs can also keep their data in the external file. Only the loader knows the
