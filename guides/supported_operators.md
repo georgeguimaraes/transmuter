@@ -53,7 +53,7 @@ These models do not match ONNX Runtime value by value. The first three make smal
 
 **Kokoro TTS**: The model sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round the phase sum differently, and phases near zero amplitude can change by up to π. When given the ONNX Runtime outputs for the `Sin` and `STFT` nodes, all other Kokoro operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
 
-**int8 exports on x86**: On x86 with AVX2 and no VNNI, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In `Xenova/falcon-rw-1b` (int8), one value of the layer 3 `query_key_value` product differs by 912, and the logits then differ by up to 1.46. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly.
+**int8 exports on x86**: The ONNX Runtime reference ran on x86 with AVX2 and no VNNI. There, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In `Xenova/falcon-rw-1b` (int8), one value of the layer 3 `query_key_value` product differs by 912, and the logits then differ by up to 1.46. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly.
 
 ## Coverage
 
@@ -63,7 +63,7 @@ The following table shows the result of running Transmuter against ONNX Runtime 
 |---|---|
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8, and fp16 variants of 10 repositories | all 12 q4 files match. int8 and fp16 are within the noise of ONNX Runtime |
-| Models requested in Bumblebee issues, with Apertus, a tiny Qwen3-MoE for the routing of Mixtral, GPT-J and Falcon | 15 of 18 files match. The Stable Diffusion VAE encoder samples noise. The int8 GPT-J and Falcon files differ, because the int8 kernel of ONNX Runtime on x86 is not exact, see below |
+| Models requested in Bumblebee issues, with Apertus, a tiny Qwen3-MoE for the routing of Mixtral, GPT-J and Falcon | 15 of 18 files match. The Stable Diffusion VAE encoder samples noise. The int8 Falcon file differs, because the int8 kernel of ONNX Runtime on x86 is not exact, see below. The int8 GPT-J file differs, and its cause is not traced |
 | Image classifiers from the ONNX Model Zoo, with int8 VGG16, AlexNet, and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
 | One graph for each operator variant | 255 of 255 match |
