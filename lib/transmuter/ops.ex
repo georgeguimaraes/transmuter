@@ -582,9 +582,9 @@ defmodule Transmuter.Ops do
     table = @fp8_to_f16[dt]
 
     bytes =
-      if t.raw_data in [nil, ""],
-        do: for(b <- t.int32_data, into: <<>>, do: <<b>>),
-        else: t.raw_data
+      if raw?(t.raw_data),
+        do: t.raw_data,
+        else: for(b <- t.int32_data, into: <<>>, do: <<b>>)
 
     for(<<b <- bytes>>, into: <<>>, do: elem(table, b))
     |> Nx.from_binary(:f16, backend: Nx.BinaryBackend)
@@ -596,7 +596,7 @@ defmodule Transmuter.Ops do
 
     flat =
       cond do
-        raw not in [nil, ""] -> Nx.from_binary(raw, type, backend: Nx.BinaryBackend)
+        raw?(raw) -> Nx.from_binary(raw, type, backend: Nx.BinaryBackend)
         t.float_data != [] -> static_tensor(t.float_data, type)
         t.int64_data != [] -> static_tensor(t.int64_data, type)
         t.int32_data != [] -> static_tensor(t.int32_data, type)
@@ -605,6 +605,11 @@ defmodule Transmuter.Ops do
 
     Nx.reshape(flat, List.to_tuple(dims))
   end
+
+  # The raw data is present when it is a non-empty binary. The test reads the byte size,
+  # because OTP 27 on x86_64 compares a binary of 2^29 or 2^30 bytes as equal to "" in a
+  # branch, and a weight of 512 MiB is common.
+  defp raw?(raw), do: is_binary(raw) and byte_size(raw) > 0
 
   @doc """
   Reads the data of a tensor that keeps it in a file next to the model.

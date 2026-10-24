@@ -303,7 +303,7 @@ defmodule Transmuter.Audio.SpeechToText do
       fn -> {"", 0, 0} end,
       fn audio, {pending, count, left} ->
         samples = Nx.to_binary(audio)
-        pending = if pending == "", do: samples, else: pending <> samples
+        pending = if byte_size(pending) == 0, do: samples, else: pending <> samples
         count = count + Nx.size(audio)
 
         if count > chunk,
