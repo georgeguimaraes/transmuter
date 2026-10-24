@@ -17,8 +17,8 @@ defmodule Transmuter do
   """
 
   alias Nx.Defn.{Compiler, Composite, Expr, Tree}
+  alias Transmuter.{DeferredTensor, Ops}
   alias Transmuter.Onnx.ModelProto
-  alias Transmuter.Ops
   alias Transmuter.Ops.Random
 
   @max_loop_iterations 100_000
@@ -174,10 +174,17 @@ defmodule Transmuter do
         {name, tensor}
       end
 
+    # With a backend, an initializer in the external file is a DeferredTensor, which the move
+    # reads, so the file data of all params is never in memory at once. A static value is
+    # read here.
     {static, params} =
       graph.initializer
-      |> Enum.map(&{&1.name, Ops.tensor(&1, dir)})
+      |> Enum.map(
+        &{&1.name, (opts[:backend] && DeferredTensor.new(&1, dir)) || Ops.tensor(&1, dir)}
+      )
       |> Enum.split_with(fn {_, t} -> static_initializer?(t, trainable) end)
+
+    static = Enum.map(static, fn {name, t} -> {name, DeferredTensor.value(t)} end)
 
     params = params ++ constants
 
@@ -983,7 +990,10 @@ defmodule Transmuter do
       do: Transmuter.EMLX.move(model, backend_opts),
       else: %{
         model
-        | params: Map.new(model.params, fn {k, t} -> {k, Nx.backend_transfer(t, backend)} end)
+        | params:
+            Map.new(model.params, fn {k, t} ->
+              {k, t |> DeferredTensor.value() |> Nx.backend_transfer(backend)}
+            end)
       }
   end
 
@@ -1059,9 +1069,12 @@ defmodule Transmuter do
   defp static_initializer?({:strings, _shape, _values}, _trainable), do: true
 
   defp static_initializer?(t, trainable) do
-    if Nx.Type.integer?(Nx.type(t)),
-      do: Nx.size(t) <= @static_int_max_size,
-      else: not trainable and Nx.size(t) <= @static_max_size
+    {shape, type} = DeferredTensor.shape_type(t)
+    size = Tuple.product(shape)
+
+    if Nx.Type.integer?(type),
+      do: size <= @static_int_max_size,
+      else: not trainable and size <= @static_max_size
   end
 
   @doc false

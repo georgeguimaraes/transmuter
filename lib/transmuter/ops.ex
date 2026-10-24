@@ -563,6 +563,28 @@ defmodule Transmuter.Ops do
 
   def tensor(t, dir), do: tensor_data(t, dir)
 
+  @doc """
+  The shape and the type of the tensor that `tensor/2` gives for `t`, from its dims and data_type, without its data. A string or an empty tensor gives `nil`.
+  """
+  def tensor_shape_type(%{data_type: 8}), do: nil
+
+  def tensor_shape_type(%{data_type: dt, dims: dims}) do
+    cond do
+      0 in dims ->
+        nil
+
+      dt in [21, 22] ->
+        {last, outer} = List.pop_at(dims, -1)
+        {List.to_tuple(outer ++ [div(last + 1, 2)]), if(dt == 22, do: {:s, 8}, else: {:u, 8})}
+
+      is_map_key(@fp8_to_f16, dt) ->
+        {List.to_tuple(dims), {:f, 16}}
+
+      true ->
+        {List.to_tuple(dims), Nx.Type.normalize!(dtype(dt))}
+    end
+  end
+
   defp tensor_data(%{data_type: 8, string_data: values, dims: dims}, _dir),
     do: {:strings, List.to_tuple(dims), values}
 
@@ -618,8 +640,15 @@ defmodule Transmuter.Ops do
     entries = Map.new(entries, &{&1.key, &1.value})
     path = Path.join(dir, entries["location"])
     offset = String.to_integer(entries["offset"] || "0")
+
+    # Without a length, the data goes to the end of the file.
+    length =
+      if length = entries["length"],
+        do: String.to_integer(length),
+        else: File.stat!(path).size - offset
+
     {:ok, file} = :file.open(path, [:read, :raw, :binary])
-    {:ok, raw} = :file.pread(file, offset, String.to_integer(entries["length"]))
+    {:ok, raw} = :file.pread(file, offset, length)
     :ok = :file.close(file)
     %{t | data_location: :DEFAULT, external_data: [], raw_data: raw}
   end

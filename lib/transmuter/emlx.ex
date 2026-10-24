@@ -23,6 +23,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     weights is MLX groups of 128 with the scale of the block.
     """
 
+    alias Transmuter.DeferredTensor
     alias Transmuter.Ops.Packed
 
     @doc """
@@ -144,7 +145,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     defp names_on_device(model, names, backend) do
       for name <- Enum.uniq(names), into: %{} do
         value = Map.get(model.params, name) || Map.fetch!(model.static, name)
-        {name, Nx.backend_transfer(value, backend)}
+        {name, value |> DeferredTensor.value() |> Nx.backend_transfer(backend)}
       end
     end
 
@@ -171,11 +172,14 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       end)
     end
 
-    # The bytes of packed weights: u8 values, as many as the bits of the weights need.
-    defp packed_bytes?(b = %Nx.Tensor{}, bits),
-      do: Nx.type(b) == {:u, 8} and Nx.size(b) * 8 == bits
+    # The bytes of packed weights: u8 values, as many as the bits of the weights need. B is a
+    # tensor, or a DeferredTensor of read!/2 that the move reads.
+    defp packed_bytes?(nil, _bits), do: false
 
-    defp packed_bytes?(_b, _bits), do: false
+    defp packed_bytes?(b, bits) do
+      {shape, type} = DeferredTensor.shape_type(b)
+      type == {:u, 8} and Tuple.product(shape) * 8 == bits
+    end
 
     defp block_size?(size), do: size in [32, 64] or rem(size, 128) == 0
 
@@ -199,6 +203,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       packed =
         model.params
         |> Map.fetch!(b_name)
+        |> DeferredTensor.value()
         |> Nx.to_binary()
         |> Nx.from_binary(:u32, backend: Nx.BinaryBackend)
         |> Nx.reshape({n, div(k * bits, 32)})

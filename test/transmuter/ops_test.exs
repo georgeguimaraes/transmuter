@@ -37,6 +37,30 @@ defmodule Transmuter.OpsTest do
       again = Transmuter.EMLX.move(moved, device: :cpu)
       assert {again.nodes, Map.keys(again.params)} == {moved.nodes, Map.keys(moved.params)}
 
+      # The same B in an external file, as read!/2 defers it with a backend, packs the same.
+      dir =
+        Path.join(System.tmp_dir!(), "transmuter-deferred-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "data"), Nx.to_binary(model.params["B"]))
+
+      proto = %Transmuter.Onnx.TensorProto{
+        name: "B",
+        dims: [40, 2, 128],
+        data_type: 2,
+        data_location: :EXTERNAL,
+        external_data: [%Transmuter.Onnx.StringStringEntryProto{key: "location", value: "data"}]
+      }
+
+      deferred = %{
+        model
+        | params: %{model.params | "B" => Transmuter.DeferredTensor.new(proto, dir)}
+      }
+
+      from_file = Transmuter.EMLX.move(deferred, device: :cpu)
+      assert hd(from_file.nodes).input == ["A", "B:packed", "", ""]
+      assert Nx.to_list(from_file.params["B:packed"]) == Nx.to_list(moved.params["B:packed"])
+
       # Identity nodes read B and the scales, as GatherBlockQuantized reads those of tied
       # embeddings. They keep the raw values. The device of the tests packs the weight, and
       # the compiled graph gives Y and the raw values.
@@ -67,6 +91,30 @@ defmodule Transmuter.OpsTest do
         assert Nx.to_list(out["scales_copy"]) == Nx.to_list(model.params["scales"])
       end
     end
+  end
+
+  # ONNX allows external data without a length, which goes to the end of the file. With a
+  # backend, the loader defers the tensor and knows its shape and type before it reads it.
+  test "an external tensor without a length reads to the end of the file" do
+    dir =
+      Path.join(System.tmp_dir!(), "transmuter-external-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "data"), <<0::32, 1.5::float-32-little, 2.5::float-32-little>>)
+
+    proto = %Transmuter.Onnx.TensorProto{
+      name: "w",
+      dims: [2],
+      data_type: 1,
+      data_location: :EXTERNAL,
+      external_data: [
+        %Transmuter.Onnx.StringStringEntryProto{key: "location", value: "data"},
+        %Transmuter.Onnx.StringStringEntryProto{key: "offset", value: "4"}
+      ]
+    }
+
+    assert Nx.to_list(Transmuter.Ops.tensor(proto, dir)) == [1.5, 2.5]
+    assert Transmuter.Ops.tensor_shape_type(proto) == {{2}, {:f, 32}}
   end
 
   defp assert_matches_reference(dir) do
