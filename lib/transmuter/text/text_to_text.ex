@@ -58,7 +58,7 @@ defmodule Transmuter.Text.TextToText do
     # The text2text-generation pipeline of Python transformers decodes with
     # clean_up_tokenization_spaces=False.
     tokenizer =
-      Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo),
+      Tokenizer.configure(Serving.tokenizer(repo, opts),
         length: lengths,
         clean_up_tokenization_spaces: false
       )

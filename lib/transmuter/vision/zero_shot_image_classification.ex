@@ -26,7 +26,7 @@ defmodule Transmuter.Vision.ZeroShotImageClassification do
     # tower. SigLIP was trained with this padding. CLIP pools the end token under a causal
     # mask, so the padding does not change its result.
     length = text_length!(repo)
-    tokenizer = Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), length: length)
+    tokenizer = Tokenizer.configure(Serving.tokenizer(repo, opts), length: length)
     texts = Enum.map(labels, &String.replace(opts[:hypothesis_template], "{}", &1))
     {text_inputs, _encodings} = Tokenizer.encode(tokenizer, texts)
     labels = List.to_tuple(labels)

@@ -50,8 +50,14 @@ defmodule Transmuter.Serving do
   """
   def load!(source, opts, variant, components \\ ["model"]) do
     {repo, model} = load_model!(source, opts, variant, components)
-    {repo, model, opts[:tokenizer] || Tokenizer.load!(repo)}
+    {repo, model, tokenizer(repo, opts)}
   end
+
+  @doc """
+  Returns the tokenizer of a task: the `:tokenizer` of `opts`, or else the tokenizer of `repo`. The tokenizer pads on the right. The padding then comes after the text, so the text keeps the positions that it has without padding, and a decoder does not see the padding through its causal mask (see `Transmuter.Generation.prompt_inputs/3`).
+  """
+  def tokenizer(repo, opts),
+    do: Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), pad_direction: :right)
 
   @doc """
   Loads the repository of `source` and its model. The model is the first of `components` that the repository has, in the default variant `variant` of the task. The `:outputs` in `opts` go to `Transmuter.load!/2`, so the model gives only the outputs that the task reads.

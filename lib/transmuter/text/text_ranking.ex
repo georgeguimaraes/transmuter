@@ -18,7 +18,7 @@ defmodule Transmuter.Text.TextRanking do
     opts = Keyword.validate!(opts, Serving.options() ++ [:prompt, :scores_function, :top_k])
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     # Each document is one row, so the tokenizer does not split a text into windows.
-    tokenizer = Tokenizer.configure(opts[:tokenizer] || Tokenizer.load!(repo), stride: nil)
+    tokenizer = Tokenizer.configure(Serving.tokenizer(repo, opts), stride: nil)
     ranking = ranking(repo, tokenizer, opts)
 
     model =

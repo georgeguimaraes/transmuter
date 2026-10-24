@@ -35,7 +35,7 @@ defmodule Transmuter.Tokenizer do
 
     * `:length` - the length of the encoded inputs. `nil` (the default) pads to the longest input. An integer pads to that length. A list of lengths pads to the smallest length that fits the longest input. Inputs longer than the largest length are truncated.
 
-    * `:pad_direction` - `:right` (the default) or `:left`.
+    * `:pad_direction` - `:right` (the default) or `:left`. The servings of the tasks always pad on the right, also with a tokenizer from their `:tokenizer` option (see `Transmuter.Serving.tokenizer/2`).
 
     * `:truncation` - the text of a pair that truncation shortens: `:longest_first` (the default), `:only_first` or `:only_second`.
 

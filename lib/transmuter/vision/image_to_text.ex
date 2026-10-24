@@ -42,7 +42,7 @@ defmodule Transmuter.Vision.ImageToText do
       |> Serving.generation_options!()
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     featurizer = opts[:featurizer] || Featurizer.load!(repo)
     opts = Keyword.put(opts, :max_new_tokens, Generation.max_new_tokens(repo, opts, 1))
     models = %{repo: repo, encoder: encoder, decoder: decoder}

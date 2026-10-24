@@ -57,7 +57,7 @@ defmodule Transmuter.Vision.ImageTextToText do
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     {image_token, image_text} = image_token!(repo, tokenizer)
 
     chat_template =

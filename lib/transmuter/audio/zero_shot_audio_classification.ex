@@ -19,7 +19,7 @@ defmodule Transmuter.Audio.ZeroShotAudioClassification do
 
     # As the zero-shot-audio-classification pipeline of Python transformers, the text of all
     # labels is padded to the longest text, and it goes into each batch.
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     texts = Enum.map(labels, &String.replace(opts[:hypothesis_template], "{}", &1))
     {text_inputs, _encodings} = Tokenizer.encode(tokenizer, texts)
     labels = List.to_tuple(labels)

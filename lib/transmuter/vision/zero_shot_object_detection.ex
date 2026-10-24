@@ -22,7 +22,7 @@ defmodule Transmuter.Vision.ZeroShotObjectDetection do
     {repo, model} =
       Serving.load_model!(source, [outputs: ["logits", "pred_boxes"]] ++ opts, :fp32)
 
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     featurizer = opts[:featurizer] || Featurizer.load!(repo)
 
     case repo.config["model_type"] do

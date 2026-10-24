@@ -537,6 +537,31 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  # With padding on the left, the Marian encoder gives the text other positions. Then the
+  # log-probabilities change, and the second text becomes "Transmuter führt ONNX-Modelle auf
+  # jedem Nx-Backend aus." in place of "Transmuter läuft ONNX-Modelle auf jedem Nx-Backend.".
+  test "a user tokenizer with padding on the left gives the text of each prompt alone" do
+    source = {:hf, "Xenova/opus-mt-en-de"}
+    texts = ["The house is wonderful.", "Transmuter runs ONNX models on any Nx backend."]
+    opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 32, token_logprobs: true] ++ @opts
+    left = Transmuter.Tokenizer.load!(source, pad_direction: :left)
+
+    batch =
+      Transmuter.Text.text_to_text(
+        source,
+        [tokenizer: left, compile: [batch_size: 2, sequence_length: 32]] ++ opts
+      )
+
+    alone = Transmuter.Text.text_to_text(source, opts)
+    results = Nx.Serving.run(batch, texts)
+
+    for {%{results: [result]}, text} <- Enum.zip(results, texts) do
+      %{results: [expected]} = Nx.Serving.run(alone, text)
+      assert result.text == expected.text
+      assert_all_close(Nx.tensor(result.token_logprobs), expected.token_logprobs)
+    end
+  end
+
   # The test downloads only the tokenizer and the configuration files. M2M100 has only the
   # slow tokenizer in Python, and its tokenizer.json has merges of pieces that are not in
   # its vocabulary. A bare language code, such as "fr", is an ordinary piece of the

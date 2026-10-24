@@ -78,7 +78,7 @@ defmodule Transmuter.Audio.SpeechToText do
 
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts, outputs)
     gen = repo.generation_config
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     featurizer = featurizer(repo)
     settings = settings(repo, featurizer, opts)
     prompt = prompt(gen, opts[:language], opts[:task], mode != nil)

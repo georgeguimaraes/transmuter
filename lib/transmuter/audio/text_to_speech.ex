@@ -46,7 +46,7 @@ defmodule Transmuter.Audio.TextToSpeech do
       )
 
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
-    tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
+    tokenizer = Serving.tokenizer(repo, opts)
     model_opts = Keyword.take(opts, [:backend, :compute_type, :noise])
 
     {init, speaker} =
