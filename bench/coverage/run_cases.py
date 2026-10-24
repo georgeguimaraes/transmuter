@@ -14,7 +14,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 cases_dir = sys.argv[1]
 rerun = "--rerun" in sys.argv
 lib = "".join(open(f).read() for f in glob.glob(os.path.join(here, "..", "..", "lib", "transmuter", "**", "*.ex"), recursive=True))
-supported = set(re.findall(r'op_type(?::| ==) "(\w+)"', lib)) | set(re.findall(r'"(\w+)"', " ".join(re.findall(r'(?:when \w+|op_type) in \[([^\]]*)\]', lib)))) | {"If", "Loop", "Scan"}
+supported = set(re.findall(r'op_type(?::| ==) "(\w+)"', lib)) | set(re.findall(r'"(\w+)"', " ".join(re.findall(r'(?:when \w+|op_type) in \[([^\]]*)\]', lib)))) | set(" ".join(re.findall(r"@op_types ~w\(([^)]*)\)", lib)).split()) | {"If", "Loop", "Scan"}
 
 
 def missing_ops(meta):

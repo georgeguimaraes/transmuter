@@ -60,6 +60,8 @@ def image_size(config, pre):
 
 
 def dim_value(param, ctx):
+    # Optimum writes a product of axes as "batch_size x num_heads".
+    param = param.replace(" x ", " * ")
     names = re.findall(r"[A-Za-z_][A-Za-z_0-9]*", param)
     env = {}
     for n in names:
@@ -95,7 +97,7 @@ def make_inputs(sess, config, pre, seq, past, dims=None):
     h, w = image_size(config, pre)
     text = config.get("text_config", config)
     vocab = min(text.get("vocab_size", 100) or 100, 1000)
-    ctx = {"seq": seq, "past": past, "height": h, "width": w, "encoder_sequence_length": 8, "num_frames": config.get("num_frames", 8)}
+    ctx = {"seq": seq, "past": past, "height": h, "width": w, "encoder_sequence_length": 8, "num_frames": config.get("num_frames", 8), "num_heads": text.get("num_attention_heads") or text.get("n_head", 1)}
     if config.get("model_type") == "whisper":
         ctx["encoder_sequence_length"] = config.get("max_source_positions", 1500)
     ctx.update(dims or {})

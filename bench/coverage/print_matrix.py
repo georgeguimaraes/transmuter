@@ -10,7 +10,7 @@ from collections import Counter, defaultdict
 here = os.path.dirname(os.path.abspath(__file__))
 cases_dir = sys.argv[1]
 lib = "".join(open(f).read() for f in glob.glob(os.path.join(here, "..", "..", "lib", "**", "*.ex"), recursive=True))
-supported = set(re.findall(r'op_type(?::| ==) "(\w+)"', lib)) | set(re.findall(r'"(\w+)"', " ".join(re.findall(r'(?:when \w+|op_type) in \[([^\]]*)\]', lib))))
+supported = set(re.findall(r'op_type(?::| ==) "(\w+)"', lib)) | set(re.findall(r'"(\w+)"', " ".join(re.findall(r'(?:when \w+|op_type) in \[([^\]]*)\]', lib)))) | set(" ".join(re.findall(r"@op_types ~w\(([^)]*)\)", lib)).split())
 
 files = []
 for slug in sorted(os.listdir(cases_dir)):
