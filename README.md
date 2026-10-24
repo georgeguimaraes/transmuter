@@ -180,7 +180,7 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 |---|---|
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8 and fp16 variants of 10 repositories | all 12 q4 files match; int8 and fp16 are within the noise of ONNX Runtime |
-| Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
+| Models requested in Bumblebee issues, with Apertus, a tiny Qwen3-MoE for the routing of Mixtral, GPT-J and Falcon | 15 of 18 files match. The Stable Diffusion VAE encoder samples noise. The int8 GPT-J and Falcon files differ, because the int8 kernel of ONNX Runtime on x86 is not exact, see below |
 | Image classifiers from the ONNX Model Zoo, with the int8 VGG16, AlexNet and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
 | Models that Bumblebee pull requests add: GLiNER, Nomic BERT, ColBERT, MPNet, Jina BERT v2, Swin, M2M100, NLLB, Llama 3.2, Phi-3.5, SmolLM3, Qwen3-VL, Gemma 4 and Ministral 3 | 19 of 21 files match. The Phi-3.5 q4f16 file is within noise. The Gemma 4 decoder differs, see below. The Ministral 3 vision encoder matches at its 1540x1540 input with EMLX on the GPU of an Apple M2 Pro |
@@ -190,11 +190,12 @@ Fine-tune an fp32 export. Inference exports have no dropout, and quantized weigh
 
 Transmuter supports all 203 operators of the ONNX standard domain, and the ONNX Runtime contrib operators that Hugging Face exports use, including the mixture-of-experts operators `MoE` and `QMoE`.
 
-Three models do not match value by value, because they make small rounding differences large:
+These models do not match value by value. Most of them make small rounding differences large:
 
 - **Grounding DINO** selects 900 of 13,294 queries with `TopK`, and some scores differ by only 9.5e-7. All operators before `TopK` match. On `test/fixtures/cats.png` with three labels, Transmuter gives the same labels and number of detections as ONNX Runtime, with scores within 0.001.
 - **The Gemma 4 E2B decoder** has activations up to about 1300 and final norm weights up to about 700. When the test changes the float inputs of ONNX Runtime by 1e-7 of their values, about one f32 rounding step, the logits of ONNX Runtime change by up to 5.5. The logits of Transmuter differ from ONNX Runtime by 5.3 on the CPU and by 13.6 on the GPU, which is the same noise. The two give the same token for 7 of 8 positions of the random test input.
 - **Kokoro** sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round that sum differently. Also, the `atan2` of the export gives a different phase for an exact STFT than for the STFT of ONNX Runtime (see [The atan2 fix](guides/speech_and_audio.md#the-atan2-fix)). When the test gives the `Sin` and `STFT` outputs of ONNX Runtime to Transmuter, all other operators match. With the `atan2` fix of the example, the spectrum of the speech matches PyTorch, with no tone at 4.8 kHz.
+- **The int8 exports of falcon-rw-1b and slovak-gpt-j-405M** use `DynamicQuantizeLinear` and `MatMulInteger`. On x86 with AVX2 and no VNNI, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In falcon-rw-1b, layers 0 to 2 match, and one value of the layer 3 `query_key_value` product differs by 912 out of 6144 values. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly, and the exact product gives that of Transmuter. The logits then differ by up to 1.46. The `MatMulInteger` nodes of slovak-gpt-j-405M are in an `If` branch, so this trace did not reach them.
 
 These models also ran from input to final result, and the result agrees with ONNX Runtime:
 
@@ -205,6 +206,8 @@ These models also ran from input to final result, and the result agrees with ONN
 | [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5. Without noise, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SpeechT5](https://huggingface.co/Xenova/speecht5_tts) | With a decoder dropout that keeps all values, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |
+| [Apertus 0.5B Instruct](https://huggingface.co/onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX) | `generation` gives the 16 greedy tokens of ONNX Runtime on the q4 export for a chat |
+| [BigBird RoBERTa base](https://huggingface.co/google/bigbird-roberta-base) (exported with Optimum) | `fill_mask` gives the top 5 tokens of ONNX Runtime, with scores within 1e-5, for 9 and 1809 tokens. The export has full attention. Above 704 tokens, Python uses block sparse attention and gives other tokens |
 | [SAM 3 tracker](https://huggingface.co/onnx-community/sam3-tracker-ONNX) | `mask_generation` gives the masks of ONNX Runtime with the processor of Python transformers 5, for 1 point, 3 points, a box, and a box with a point |
 | [Moonshine base](https://huggingface.co/onnx-community/moonshine-base-ONNX) | The same tokens for 2 s, 6 s and 15 s of speech |
 | [Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export) | The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter |
@@ -335,6 +338,11 @@ With the correct constants, the export gives the text of PyTorch for all 6 tasks
 | [onnx-community/Qwen3-0.6B-ONNX](https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX) | text-generation | 601M | model, model_q4, model_quantized | model, model_q4 match; model_quantized within noise |
 | tiny random Falcon (exported with Optimum) | text-generation | 4.18M | model | matches |
 | tiny random GPT-J (exported with Optimum) | text-generation | 131K | model | matches |
+| [onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX](https://huggingface.co/onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX) | text-generation | 573M | model_q4 | matches |
+| [onnx-internal-testing/tiny-random-ApertusForCausalLM](https://huggingface.co/onnx-internal-testing/tiny-random-ApertusForCausalLM) | text-generation | 4.21M | model, model_q4 | matches |
+| [onnx-internal-testing/tiny-random-Qwen3MoeForCausalLM](https://huggingface.co/onnx-internal-testing/tiny-random-Qwen3MoeForCausalLM) | text-generation | 11.3M | model | matches |
+| [Xenova/falcon-rw-1b](https://huggingface.co/Xenova/falcon-rw-1b) | text-generation | 1.31B | decoder_model_merged_quantized | differs, see above |
+| [Xenova/slovak-gpt-j-405M](https://huggingface.co/Xenova/slovak-gpt-j-405M) | text-generation | 414M | decoder_model_merged_quantized | differs, see above |
 | [Xenova/gpt2](https://huggingface.co/Xenova/gpt2) | text-generation | 127M | model | matches |
 | [Xenova/llama2.c-stories15M](https://huggingface.co/Xenova/llama2.c-stories15M) | text-generation | 30.4M | decoder_model, decoder_model_merged, decoder_with_past_model, model | matches |
 | [Xenova/tiny-random-GemmaForCausalLM](https://huggingface.co/Xenova/tiny-random-GemmaForCausalLM) | text-generation | 2.05M | model | matches |

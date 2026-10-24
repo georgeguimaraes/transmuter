@@ -166,6 +166,8 @@ defmodule Transmuter.Text do
 
   The input is a string with `[MASK]` once, or a list of them. `[MASK]` becomes the mask token of the tokenizer, such as `<mask>`. The serving raises when the encoded text does not have exactly one mask token, for example when truncation removes it. The result is `%{predictions: [%{score: score, token: token}]}`, from the highest score.
 
+  The model gives what its ONNX export computes. An Optimum export of BigBird, such as that of `google/bigbird-roberta-base`, traces full attention. Python transformers changes BigBird to block sparse attention for a text of more than 704 tokens, so a longer text can give other tokens than Python. A text of more than 512 tokens also needs a larger `:sequence_length` (see the module documentation).
+
   ## Options
 
     * `:top_k` - the number of predictions. The default is `5`.

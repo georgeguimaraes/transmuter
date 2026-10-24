@@ -45,13 +45,15 @@ In native f16 and bf16 (the default), sums, normalizations, softmax, and attenti
 
 ## Known numeric differences
 
-Three models do not match ONNX Runtime value by value, because they make small rounding differences large. The differences are not bugs.
+These models do not match ONNX Runtime value by value. The first three make small rounding differences large. The differences are not bugs in Transmuter.
 
 **Grounding DINO**: `TopK` selects 900 of 13,294 queries. Some scores differ by only 9.5e-7, which can change the selected set. All operators before `TopK` match exactly. On a real image with a text prompt, Transmuter gives the same detections as ONNX Runtime, with scores within 0.0001.
 
 **Gemma 4 E2B decoder**: The decoder has activations up to about 1300 and final norm weights up to about 700. When the test changes the float inputs of ONNX Runtime by 1e-7 of their values, the logits of ONNX Runtime change by up to 5.5. The logits of Transmuter differ from ONNX Runtime by 5.3 on the CPU and by 13.6 on the GPU, which is the same noise. The two give the same token for 7 of 8 positions of the random test input.
 
 **Kokoro TTS**: The model sums a phase over all audio samples and takes its STFT. ONNX Runtime and MLX round the phase sum differently, and phases near zero amplitude can change by up to π. When given the ONNX Runtime outputs for the `Sin` and `STFT` nodes, all other Kokoro operators match. On real speech, Transmuter is as close to ONNX Runtime as PyTorch is.
+
+**int8 exports on x86**: On x86 with AVX2 and no VNNI, the `MatMulInteger` kernel of ONNX Runtime adds each pair of u8 × s8 products in int16, and a pair above 32767 saturates. Transmuter gives the exact int32 sum. In `Xenova/falcon-rw-1b` (int8), one value of the layer 3 `query_key_value` product differs by 912, and the logits then differ by up to 1.46. A numpy product with the int16 saturation gives the output of ONNX Runtime exactly.
 
 ## Coverage
 
@@ -61,7 +63,7 @@ The following table shows the result of running Transmuter against ONNX Runtime 
 |---|---|
 | Top exports for each Hugging Face task | 75 of 77 repositories, 112 of 114 files match |
 | q4, int8, and fp16 variants of 10 repositories | all 12 q4 files match. int8 and fp16 are within the noise of ONNX Runtime |
-| Models requested in Bumblebee issues | 11 of 12 files match. The Stable Diffusion VAE encoder samples noise |
+| Models requested in Bumblebee issues, with Apertus, a tiny Qwen3-MoE for the routing of Mixtral, GPT-J and Falcon | 15 of 18 files match. The Stable Diffusion VAE encoder samples noise. The int8 GPT-J and Falcon files differ, because the int8 kernel of ONNX Runtime on x86 is not exact, see below |
 | Image classifiers from the ONNX Model Zoo, with int8 VGG16, AlexNet, and ZFNet | 7 of 7 match |
 | Faster R-CNN 10 and 12 and Mask R-CNN 12 from the ONNX Model Zoo | 3 of 3 match |
 | One graph for each operator variant | 255 of 255 match |
