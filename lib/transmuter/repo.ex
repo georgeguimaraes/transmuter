@@ -10,6 +10,8 @@ defmodule Transmuter.Repo do
     2. the `dtype` of the `transformers.js_config` block in `config.json`, a string or a map
     3. the default that the task gives, when the repository has that file
     4. fp32, then the other variants in the order of `@variants`
+
+  A repository has two chat templates. `:chat_template` is that of the tokenizer: `chat_template.jinja`, else the template of `tokenizer_config.json`, else that of the processor. `:processor_chat_template` is that of the processor of a multimodal model, as `ProcessorMixin` of Python transformers 4.57 loads it: the template of `chat_template.json`, else `chat_template.jinja`, else the `"chat_template"` of `processor_config.json`.
   """
 
   alias Transmuter.{Hub, HubError}
@@ -24,6 +26,7 @@ defmodule Transmuter.Repo do
     :tokenizer_config,
     :special_tokens,
     :chat_template,
+    :processor_chat_template,
     opts: []
   ]
 
@@ -54,6 +57,14 @@ defmodule Transmuter.Repo do
     tokenizer_config = json.("tokenizer_config.json") || %{}
     config = json.("config.json") || %{}
 
+    jinja =
+      case Hub.fetch(source, "chat_template.jinja", opts) do
+        {:ok, path} -> File.read!(path)
+        :error -> nil
+      end
+
+    processor_template = processor_chat_template(json, jinja)
+
     %__MODULE__{
       source: source,
       files: Hub.files(source, opts),
@@ -61,7 +72,8 @@ defmodule Transmuter.Repo do
       generation_config: json.("generation_config.json") || from_model_config(config),
       tokenizer_config: tokenizer_config,
       special_tokens: json.("special_tokens_map.json") || %{},
-      chat_template: chat_template(source, tokenizer_config, opts),
+      chat_template: jinja || tokenizer_chat_template(tokenizer_config) || processor_template,
+      processor_chat_template: processor_template,
       opts: opts
     }
   end
@@ -101,26 +113,17 @@ defmodule Transmuter.Repo do
   @doc """
   Returns the special token `name` (such as `"pad"` or `"eos"`) as a string, or `nil`.
 
-  The token comes from `special_tokens_map.json`, then `tokenizer_config.json`, as in Python transformers. A token in these files is a string or a map with `"content"`.
+  The token comes from `special_tokens_map.json`, then `tokenizer_config.json`, then the `"extra_special_tokens"` map of `tokenizer_config.json`, as in Python transformers. A token in these files is a string or a map with `"content"`.
   """
   def special_token(repo, name) do
-    case repo.special_tokens[name <> "_token"] || repo.tokenizer_config[name <> "_token"] do
+    key = name <> "_token"
+    extra = repo.tokenizer_config["extra_special_tokens"]
+    extra = if is_map(extra), do: extra[key]
+
+    case repo.special_tokens[key] || repo.tokenizer_config[key] || extra do
       %{"content" => content} when is_binary(content) -> content
       content when is_binary(content) -> content
       _none -> nil
-    end
-  end
-
-  @doc """
-  Returns the chat template of the processor of a multimodal model, or `nil`: `chat_template.jinja`, else the `"chat_template"` of `chat_template.json`, as `ProcessorMixin` of Python transformers loads it. The processor does not read the template of `tokenizer_config.json`, which the tokenizer uses.
-  """
-  def processor_chat_template(repo) do
-    case Hub.fetch(repo.source, "chat_template.jinja", repo.opts) do
-      {:ok, path} ->
-        File.read!(path)
-
-      :error ->
-        get_in(Hub.json(repo.source, "chat_template.json", repo.opts) || %{}, ["chat_template"])
     end
   end
 
@@ -247,19 +250,16 @@ defmodule Transmuter.Repo do
     end)
   end
 
-  # chat_template.jinja, then tokenizer_config.json (a string, or a list of named
-  # templates), then chat_template.json, which multimodal processors use.
-  defp chat_template(source, tokenizer_config, opts) do
-    case Hub.fetch(source, "chat_template.jinja", opts) do
-      {:ok, path} ->
-        File.read!(path)
+  defp processor_chat_template(json, jinja) do
+    get_in(json.("chat_template.json") || %{}, ["chat_template"]) || jinja ||
+      get_in(json.("processor_config.json") || %{}, ["chat_template"])
+  end
 
-      :error ->
-        case tokenizer_config["chat_template"] do
-          template when is_binary(template) -> template
-          [_ | _] = named -> Enum.find_value(named, &(&1["name"] == "default" && &1["template"]))
-          nil -> get_in(Hub.json(source, "chat_template.json", opts) || %{}, ["chat_template"])
-        end
+  # The template of tokenizer_config.json: a string, or a list of named templates.
+  defp tokenizer_chat_template(tokenizer_config) do
+    case tokenizer_config["chat_template"] do
+      [_ | _] = named -> Enum.find_value(named, &(&1["name"] == "default" && &1["template"]))
+      template -> template
     end
   end
 end

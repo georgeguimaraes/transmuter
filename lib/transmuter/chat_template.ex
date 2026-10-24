@@ -28,7 +28,7 @@ defmodule Transmuter.ChatTemplate do
 
     * `:template_options` - other variables of the template, such as `enable_thinking: false` for Qwen3.
 
-    * `:template` - the template to render in place of that of the tokenizer, such as `Transmuter.Repo.processor_chat_template/1`.
+    * `:template` - the template to render in place of that of the tokenizer, such as the `:processor_chat_template` of `Transmuter.Repo`.
   """
   def render(repo, messages, opts \\ []) do
     unless Code.ensure_loaded?(Otera.ChatTemplate) do

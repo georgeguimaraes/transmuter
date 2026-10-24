@@ -50,17 +50,17 @@ defmodule Transmuter.Featurizer do
     5 => :hamming
   }
 
-  # The default resample of the image processors of Python transformers 4.57 whose default is
-  # not bilinear, by the name of the class without "ImageProcessor" and "Fast". The slow and
-  # the fast class of a model have the same default.
+  # The default resample of the image processors of Python transformers 4.57, also the
+  # deprecated ones, whose default is not bilinear, by the name of the class without
+  # "ImageProcessor" and "Fast". The slow and the fast class of a model have the same default.
   @default_resamples Map.merge(
                        Map.new(
                          ~w(Aria Beit Bit Blip BridgeTower CLIP ChineseCLIP Cohere2Vision DPT
-                            DeepseekVL DeepseekVLHybrid DeiT Emu3 Flava Glm4v GotOcr2
-                            InstructBlipVideo Janus Levit Llava LlavaNext LlavaNextVideo
+                            DeepseekVL DeepseekVLHybrid DeiT EfficientFormer Emu3 Flava Glm4v
+                            GotOcr2 InstructBlipVideo Janus Levit Llava LlavaNext LlavaNextVideo
                             LlavaOnevision Ovis2 OwlViT Perceiver PerceptionLM Phi4Multimodal
                             Pixtral PoolFormer PromptDepthAnything Qwen2VL SegGpt Siglip
-                            VideoLlava Vilt),
+                            ViTHybrid VideoLlava Vilt),
                          &{&1, 3}
                        ),
                        %{"EfficientNet" => 0, "Chameleon" => 1, "Idefics3" => 1, "SmolVLM" => 1}
@@ -85,7 +85,15 @@ defmodule Transmuter.Featurizer do
 
   @doc """
   Builds a featurizer from the map of a `preprocessor_config.json`.
+
+  An older configuration names a `feature_extractor_type`, such as `ViTFeatureExtractor`, in place of an `image_processor_type`. As `AutoImageProcessor` of Python transformers, the featurizer reads it as the image processor of the same name, such as `ViTImageProcessor`.
   """
+  def new(config = %{"feature_extractor_type" => type})
+      when is_binary(type) and not is_map_key(config, "image_processor_type") do
+    type = String.replace(type, "FeatureExtractor", "ImageProcessor")
+    new(Map.put(config, "image_processor_type", type))
+  end
+
   # Swin2SRImageProcessor of Python transformers only rescales and pads.
   def new(config = %{"image_processor_type" => "Swin2SRImageProcessor"}) do
     multiple = config["size_divisor"] || config["pad_size"] || 8

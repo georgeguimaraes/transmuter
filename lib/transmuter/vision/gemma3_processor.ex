@@ -57,22 +57,15 @@ defmodule Transmuter.Vision.Gemma3Processor do
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{1, 3, height, width}` and type `:f32` on `backend`, and `"image_sizes"` of shape `{1, 2}` and type `:s64`, the height and the width of the image. Each pixel value row of a batch has 3 * height * width values (9.6 MB for 896x896), also a row of zeros that fills a chat to its batch key.
   """
   def process(processor, image, backend) do
-    pixels = Featurizer.process(processor.featurizer, [image], backend: backend)
-    {1, _channels, height, width} = Nx.shape(pixels)
-    sizes = Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
+    tensors = ImageTextToText.image_tensors(processor.featurizer, processor.size, image, backend)
     tokens = String.duplicate(processor.image, processor.image_seq_len)
-    text = "\n\n" <> processor.boi <> tokens <> processor.eoi <> "\n\n"
-    {%{"pixel_values" => pixels, "image_sizes" => sizes}, text}
+    {tensors, "\n\n" <> processor.boi <> tokens <> processor.eoi <> "\n\n"}
   end
 
   @doc """
   The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
   """
-  def template(processor, _batch_size) do
-    {height, width} = processor.size
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-    %{"pixel_values" => Nx.broadcast(zero, {1, 3, height, width})}
-  end
+  def template(processor, _batch_size), do: ImageTextToText.image_template(processor.size)
 
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.

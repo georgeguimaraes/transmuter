@@ -72,6 +72,28 @@ defmodule Transmuter.RepoTest do
     assert repo(dir, %{"chat_template.jinja" => "J"}).chat_template == "J"
   end
 
+  # As ProcessorMixin of transformers 4.57: chat_template.json comes before chat_template.jinja,
+  # and processor_config.json comes last. The tokenizer reads chat_template.jinja first.
+  test "the template of the processor comes from chat_template.json, .jinja, then processor_config.json",
+       %{tmp_dir: dir} do
+    all = %{
+      "chat_template.json" => %{"chat_template" => "P"},
+      "chat_template.jinja" => "J",
+      "tokenizer_config.json" => %{"chat_template" => "T"},
+      "processor_config.json" => %{"chat_template" => "C"}
+    }
+
+    for {files, tokenizer, processor} <- [
+          {all, "J", "P"},
+          {Map.delete(all, "chat_template.json"), "J", "J"},
+          {Map.take(all, ["tokenizer_config.json", "processor_config.json"]), "T", "C"},
+          {Map.take(all, ["processor_config.json"]), "C", "C"}
+        ] do
+      repo = repo(Path.join(dir, Enum.join(Enum.sort(Map.keys(files)), "-")), files)
+      assert {repo.chat_template, repo.processor_chat_template} == {tokenizer, processor}
+    end
+  end
+
   # GenerationConfig.from_model_config of transformers: config.json without its null keys, and
   # the decoder for the keys that config.json leaves at their default.
   test "without generation_config.json, the generation settings come from config.json", %{

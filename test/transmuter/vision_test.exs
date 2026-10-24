@@ -662,8 +662,17 @@ defmodule Transmuter.VisionTest do
     File.mkdir_p!(dir)
     repo = %Transmuter.Repo{source: dir, opts: [], tokenizer_config: %{}}
 
-    assert Vision.ImageTextToText.processor_module!(%{repo | config: %{"model_type" => "llava"}}) ==
-             LlavaProcessor
+    # Qwen2.5-VL and SmolVLM2 have processors of other names with the same processing.
+    for {model_type, class, module} <- [
+          {"llava", "LlavaProcessor", LlavaProcessor},
+          {"qwen2_5_vl", "Qwen2_5_VLProcessor", Qwen2VLProcessor},
+          {"smolvlm", "SmolVLMProcessor", Idefics3Processor}
+        ] do
+      by_type = %{repo | config: %{"model_type" => model_type}}
+      assert Vision.ImageTextToText.processor_module!(by_type) == module, model_type
+      by_class = %{repo | config: %{}, tokenizer_config: %{"processor_class" => class}}
+      assert Vision.ImageTextToText.processor_module!(by_class) == module, class
+    end
 
     assert_raise ArgumentError, ~r/supports the processors .* got: "PaliGemmaProcessor"/, fn ->
       Vision.ImageTextToText.processor_module!(%{
@@ -704,7 +713,7 @@ defmodule Transmuter.VisionTest do
       tokenizer = Tokenizer.load!(repo)
 
       prompt =
-        case Transmuter.Repo.processor_chat_template(repo) do
+        case repo.processor_chat_template do
           nil ->
             "USER: <image>\nWhat is this? ASSISTANT:"
 
@@ -935,6 +944,8 @@ defmodule Transmuter.VisionTest do
            :torchvision},
           {%{"image_processor_type" => "CLIPImageProcessor"}, :bicubic, :pillow},
           {%{"image_processor_type" => "ViTImageProcessor"}, :bilinear, :pillow},
+          {%{"feature_extractor_type" => "ViTHybridFeatureExtractor"}, :bicubic, :pillow},
+          {%{"feature_extractor_type" => "ViTFeatureExtractor"}, :bilinear, :pillow},
           {%{}, :bilinear, :pillow}
         ] do
       featurizer = Featurizer.new(Map.put(config, "do_normalize", false))

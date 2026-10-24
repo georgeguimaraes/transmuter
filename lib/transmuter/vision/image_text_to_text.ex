@@ -60,16 +60,16 @@ defmodule Transmuter.Vision.ImageTextToText do
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     {image_token, image_text} = image_token!(repo, tokenizer)
 
-    template =
-      Repo.processor_chat_template(repo) ||
+    chat_template =
+      repo.processor_chat_template ||
         raise ArgumentError,
-              "#{inspect(repo.source)} has no chat template of the processor, chat_template.jinja or chat_template.json"
+              "#{inspect(repo.source)} has no chat template of the processor in chat_template.json, chat_template.jinja or processor_config.json"
 
     # The processor reads its configuration before the larger models load, so a bad
     # configuration raises early. The Qwen2-VL processor needs the inputs of the vision encoder.
     model_opts = Keyword.take(opts, [:backend, :compute_type])
     vision = Repo.load_component!(repo, "vision_encoder", :q4, model_opts)
-    {module, processor} = processor!(repo, vision)
+    {module, processor} = processor!(repo, vision, image_text)
     embed = Repo.load_component!(repo, "embed_tokens", :q8, model_opts)
     decoder_opts = [outputs: &Generation.outputs/1] ++ model_opts
     decoder = Repo.load_component!(repo, "decoder_model_merged", :q4, decoder_opts)
@@ -93,7 +93,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     end
 
     preprocess = fn input ->
-      {text, images} = prompt(repo, template, input, opts)
+      {text, images} = prompt(repo, chat_template, input, opts)
 
       %{prompt: text, tensors: tensors, key: key, texts: texts} =
         expand!({module, processor}, text, images, backend)
@@ -130,11 +130,14 @@ defmodule Transmuter.Vision.ImageTextToText do
     {id, text}
   end
 
-  # The processor classes of Python transformers that the serving supports. Qwen3VLProcessor
-  # prepares images as Qwen2VLProcessor does.
+  # The processor classes of Python transformers that the serving supports. SmolVLMProcessor
+  # prepares images as Idefics3Processor does, and Qwen2_5_VLProcessor and Qwen3VLProcessor as
+  # Qwen2VLProcessor does.
   @processors %{
     "Idefics3Processor" => Idefics3Processor,
+    "SmolVLMProcessor" => Idefics3Processor,
     "Qwen2VLProcessor" => Qwen2VLProcessor,
+    "Qwen2_5_VLProcessor" => Qwen2VLProcessor,
     "Qwen3VLProcessor" => Qwen2VLProcessor,
     "PixtralProcessor" => PixtralProcessor,
     "Gemma3Processor" => Gemma3Processor,
@@ -145,7 +148,9 @@ defmodule Transmuter.Vision.ImageTextToText do
   # Python transformers.
   @model_types %{
     "idefics3" => "Idefics3Processor",
+    "smolvlm" => "SmolVLMProcessor",
     "qwen2_vl" => "Qwen2VLProcessor",
+    "qwen2_5_vl" => "Qwen2_5_VLProcessor",
     "qwen3_vl" => "Qwen3VLProcessor",
     "mistral3" => "PixtralProcessor",
     "pixtral" => "PixtralProcessor",
@@ -157,9 +162,10 @@ defmodule Transmuter.Vision.ImageTextToText do
   # then of preprocessor_config.json, then of tokenizer_config.json, then of config.json, then
   # the class of the model_type. The image processor of preprocessor_config.json, such as a
   # fast one, is an input of the processor.
-  defp processor!(repo, vision) do
+  defp processor!(repo, vision, image_text) do
     case processor_module!(repo) do
       Qwen2VLProcessor -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)}
+      LlavaProcessor -> {LlavaProcessor, LlavaProcessor.load!(repo, image_token: image_text)}
       module -> {module, module.load!(repo)}
     end
   end
@@ -183,12 +189,12 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   # The chat template of the processor renders an image part without its image. As in the pipeline of
   # Python transformers, a chat that ends with an assistant message continues that message.
-  defp prompt(repo, template, %{messages: messages}, opts) do
+  defp prompt(repo, chat_template, %{messages: messages}, opts) do
     {messages, images} = Enum.map_reduce(messages, [], &take_images/2)
     final = List.last(messages)
 
     template_opts = [
-      template: template,
+      template: chat_template,
       template_options: opts[:template_options],
       continue_final_message: (final[:role] || final["role"]) == "assistant"
     ]
@@ -283,6 +289,22 @@ defmodule Transmuter.Vision.ImageTextToText do
       Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: special?)
 
     Tokenizer.ids(tokenizer, encoding)
+  end
+
+  @doc false
+  # The tensors of an image for a processor that gives all images one `size`, such as Gemma 3
+  # and LLaVA: "pixel_values" {1, 3, height, width} from `featurizer` and "image_sizes" {1, 2}.
+  def image_tensors(featurizer, {height, width}, image, backend) do
+    pixels = Featurizer.process(featurizer, [image], backend: backend)
+    sizes = Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
+    %{"pixel_values" => pixels, "image_sizes" => sizes}
+  end
+
+  @doc false
+  # The inputs of the vision encoder for one image of `size`, on Nx.BinaryBackend.
+  def image_template({height, width}) do
+    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
+    %{"pixel_values" => Nx.broadcast(zero, {1, 3, height, width})}
   end
 
   @doc false

@@ -14,8 +14,12 @@ defmodule Transmuter.Vision.LlavaProcessor do
 
   @doc """
   Loads the processor of a `Transmuter.Repo` from its `preprocessor_config.json`, `processor_config.json` and tokenizer configuration.
+
+  The image token is that of the tokenizer, as `LlavaProcessor` of Python transformers reads it, else the `image_token` of `processor_config.json`, else the `:image_token` option, the text of the token of `image_token_index` in `config.json`.
   """
-  def load!(repo) do
+  def load!(repo, opts \\ []) do
+    opts = Keyword.validate!(opts, [:image_token])
+
     config =
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
@@ -43,7 +47,9 @@ defmodule Transmuter.Vision.LlavaProcessor do
       featurizer: featurizer,
       size: size,
       image_seq_len: count,
-      image: Repo.special_token(repo, "image") || processor["image_token"] || "<image>"
+      image:
+        Repo.special_token(repo, "image") || processor["image_token"] || opts[:image_token] ||
+          raise(ArgumentError, "#{inspect(repo.source)} names no image token")
     }
   end
 
@@ -58,21 +64,14 @@ defmodule Transmuter.Vision.LlavaProcessor do
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{1, 3, height, width}` and type `:f32` on `backend`, and `"image_sizes"` of shape `{1, 2}` and type `:s64`, the height and the width of the image.
   """
   def process(processor, image, backend) do
-    pixels = Featurizer.process(processor.featurizer, [image], backend: backend)
-    {height, width} = processor.size
-    sizes = Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
-    text = String.duplicate(processor.image, processor.image_seq_len)
-    {%{"pixel_values" => pixels, "image_sizes" => sizes}, text}
+    tensors = ImageTextToText.image_tensors(processor.featurizer, processor.size, image, backend)
+    {tensors, String.duplicate(processor.image, processor.image_seq_len)}
   end
 
   @doc """
   The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
   """
-  def template(processor, _batch_size) do
-    {height, width} = processor.size
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-    %{"pixel_values" => Nx.broadcast(zero, {1, 3, height, width})}
-  end
+  def template(processor, _batch_size), do: ImageTextToText.image_template(processor.size)
 
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on each image of a batch alone, and gives the inputs of `Transmuter.Generation.generate/5`.
