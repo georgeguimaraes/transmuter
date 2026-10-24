@@ -969,7 +969,9 @@ defmodule Transmuter do
   def random?(nodes) do
     Enum.any?(nodes, fn node ->
       node.op_type in Random.op_types() or
-        Enum.any?(node.attribute, &(&1.g != nil and random?(&1.g.node)))
+        Enum.any?(node.attribute, fn a ->
+          Enum.any?(List.wrap(a.g) ++ a.graphs, &random?(&1.node))
+        end)
     end)
   end
 
@@ -1199,7 +1201,8 @@ defmodule Transmuter do
   """
   def dependencies(node) do
     outer =
-      for %{g: graph} when graph != nil <- node.attribute,
+      for attribute <- node.attribute,
+          graph <- List.wrap(attribute.g) ++ attribute.graphs,
           name <- outer_reads(graph),
           do: name
 

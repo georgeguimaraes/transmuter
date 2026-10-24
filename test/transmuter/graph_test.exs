@@ -50,6 +50,28 @@ defmodule Transmuter.GraphTest do
   end
 
   # The body input x hides the outer x, and the body initializer k is static.
+  # A GRAPH attribute holds a subgraph in g, and a GRAPHS attribute holds a list of
+  # subgraphs. The outer names that both read are dependencies of the node.
+  test "the dependencies of a node include the outer names of its GRAPH and GRAPHS subgraphs" do
+    reads = fn name ->
+      %GraphProto{node: [node("Neg", [name], [name <> "_neg"], "/" <> name)], output: []}
+    end
+
+    node = %{
+      node("Custom", ["x"], ["y"], "/Custom")
+      | attribute: [
+          %AttributeProto{name: "body", type: :GRAPH, g: reads.("outer_g")},
+          %AttributeProto{
+            name: "branches",
+            type: :GRAPHS,
+            graphs: [reads.("outer_a"), reads.("outer_b")]
+          }
+        ]
+    }
+
+    assert Transmuter.dependencies(node) == ["x", "outer_g", "outer_a", "outer_b"]
+  end
+
   test "a subgraph resolves its inputs and initializers before the outer values" do
     k = %TensorProto{name: "k", dims: [], data_type: 1, raw_data: <<2.0::float-32-little>>}
 
