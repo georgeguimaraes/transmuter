@@ -675,28 +675,41 @@ defmodule Transmuter.VisionTest do
     end
   end
 
-  # The batch gives each row the images of its chat and rows of zeros up to the batch key. The
-  # encoder runs only on the images of the chats, and the features of each row follow those of
-  # the rows before it. The fake encoder gives each image the features of its first pixel.
+  # The batch gives each row the images of its chat and rows of zeros up to the batch key, as
+  # the image sizes show. The encoder runs once on the images of the chats, and the features of
+  # each row follow those of the rows before it. The fake encoder gives each image the features
+  # of its first pixel. An encoder that gives another number of features for each image than
+  # image_seq_length raises.
   @tag ci_partition: 15
   test "the Gemma 3 processor encodes only the images of each chat, in order" do
-    processor = %Gemma3Processor{image_seq_len: 2, image_token: 9}
+    processor = %Gemma3Processor{image_seq_len: 2}
 
     pixels =
       Nx.tensor([[1.0, 2.0, 3.0, 0.0], [4.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
       |> Nx.reshape({3, 4, 1, 1, 1})
 
-    prompts = [[2, 9, 9, 5, 9, 9, 9, 9, 7], [2, 9, 9, 7], []]
+    sizes = Nx.tensor([[1, 1, 1, 0], [1, 0, 0, 0], [0, 0, 0, 0]]) |> Nx.new_axis(-1)
 
-    encode = fn %{"pixel_values" => image} ->
-      assert Nx.shape(image) == {1, 1, 1, 1}
-      %{"image_features" => Nx.broadcast(Nx.reshape(image, {1, 1, 1}), {1, 2, 3})}
+    tensors = %{
+      "pixel_values" => pixels,
+      "image_sizes" => Nx.concatenate([sizes, sizes], axis: 2)
+    }
+
+    encode = fn tokens ->
+      fn %{"pixel_values" => images} ->
+        assert Nx.shape(images) == {4, 1, 1, 1}
+        %{"image_features" => Nx.broadcast(Nx.reshape(images, {4, 1, 1}), {4, tokens, 3})}
+      end
     end
 
-    %{image_features: features} =
-      Gemma3Processor.encode(processor, encode, %{"pixel_values" => pixels}, prompts, nil)
-
+    %{image_features: features} = Gemma3Processor.encode(processor, encode.(2), tensors, [], nil)
     assert Nx.to_list(features[[.., 0]]) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+
+    assert_raise ArgumentError,
+                 ~r/gives 3 features for each image, and image_seq_length is 2/,
+                 fn ->
+                   Gemma3Processor.encode(processor, encode.(3), tensors, [], nil)
+                 end
   end
 
   # The reference is ONNX Runtime on the fp32 files of the tiny export, see
@@ -744,6 +757,16 @@ defmodule Transmuter.VisionTest do
       assert %{text: "\n\n\n\n", token_summary: %{input: ^count}} = result
       assert_all_close(result.token_logprobs, logprobs)
     end
+
+    # A literal image token in the text gives one image token more than the images.
+    text = %{type: "text", text: "What is <image_soft_token> here?"}
+    literal = %{messages: [%{role: "user", content: [%{type: "image", image: @image}, text]}]}
+
+    assert_raise ArgumentError,
+                 ~r/the prompt has 5 image tokens "<image_soft_token>", and the images give 4/,
+                 fn ->
+                   Nx.Serving.run(Vision.image_text_to_text(repo, opts), literal)
+                 end
 
     batched = Vision.image_text_to_text(repo, [compile: [batch_size: 2]] ++ opts)
 

@@ -59,12 +59,9 @@ defmodule Transmuter.Vision.ImageTextToText do
     {module, processor} = processor!(repo, vision)
     backend = opts[:backend] || Nx.default_backend()
 
-    ctx =
-      Generation.context(
-        repo,
-        decoder,
-        [embed: embed, image_token: Repo.image_token_id(repo)] ++ opts
-      )
+    image_token = Repo.image_token_id(repo)
+    ctx = Generation.context(repo, decoder, [embed: embed, image_token: image_token] ++ opts)
+    image_text = Tokenizers.Tokenizer.id_to_token(tokenizer.native, image_token)
 
     bos = Repo.special_token(repo, "bos")
 
@@ -85,11 +82,12 @@ defmodule Transmuter.Vision.ImageTextToText do
     preprocess = fn input ->
       {text, images} = prompt(repo, input, opts)
 
-      %{prompt: text, tensors: tensors, key: key} =
+      %{prompt: text, tensors: tensors, key: key, texts: texts} =
         expand!({module, processor}, text, images, backend)
 
       seed = input[:seed] || opts[:seed] || :rand.uniform(2 ** 32)
       ids = token_ids(tokenizer, text, bos)
+      check_image_tokens!(ids, texts, image_token, image_text)
       summary = %{input: length(ids), padding: 0}
       [%{prompt: ids, seed: seed, tensors: tensors, key: key, summary: summary}]
     end
@@ -212,7 +210,22 @@ defmodule Transmuter.Vision.ImageTextToText do
         {name, Nx.backend_transfer(tensor, Nx.BinaryBackend)}
       end
 
-    %{prompt: prompt, tensors: tensors, key: key}
+    %{prompt: prompt, tensors: tensors, key: key, texts: texts}
+  end
+
+  # As get_placeholder_mask of Python transformers: the image tokens of the prompt must be
+  # those of the texts of the images, one for each feature. The text of a chat can also have
+  # the image token, which would move the features of the images to other tokens.
+  defp check_image_tokens!(_ids, [], _image_token, _image_text), do: :ok
+
+  defp check_image_tokens!(ids, texts, image_token, image_text) do
+    count = Enum.count(ids, &(&1 == image_token))
+    expected = Enum.sum_by(texts, &(length(String.split(&1, image_text)) - 1))
+
+    if count != expected do
+      raise ArgumentError,
+            "the prompt has #{count} image tokens #{inspect(image_text)}, and the images give #{expected}. The text of the chat must not have the image token"
+    end
   end
 
   # As apply_chat_template of ProcessorMixin of Python transformers: a prompt that starts
