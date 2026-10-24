@@ -76,8 +76,7 @@ env = model.static |> Map.merge(params) |> Map.merge(inputs)
 key = Nx.Random.key(System.unique_integer([:positive]))
 ctx = %{opset: model.opset, compute_type: compute_type, key: key, backend: backend}
 
-model.nodes
-|> Enum.reduce_while(env, fn node, env ->
+step = fn node, env ->
   ins =
     Enum.map(node.input, fn
       "" -> nil
@@ -138,5 +137,38 @@ model.nodes
 
       {:halt, :diverged}
   end
-end)
+end
+
+# An If with a known condition runs the nodes of its branch one at a time, as trace_ort.py
+# inlines that branch, so the nodes inside the branch have their own outputs in both traces.
+walk = fn walk, nodes, env ->
+  Enum.reduce_while(nodes, env, fn node, env ->
+    condition = node.op_type == "If" && Map.fetch!(env, hd(node.input))
+
+    if condition && Transmuter.Ops.known?(condition) do
+      name =
+        if Nx.to_number(Nx.any(condition)) == 1, do: "then_branch", else: "else_branch"
+
+      branch = Transmuter.Ops.attr(node, name)
+
+      env =
+        Enum.reduce(branch.initializer, env, fn t, env ->
+          Map.put(env, t.name, t |> Transmuter.Ops.tensor() |> Transmuter.upcast(compute_type))
+        end)
+
+      case walk.(walk, branch.node, env) do
+        :diverged ->
+          {:halt, :diverged}
+
+        env ->
+          outs = Enum.map(branch.output, &Map.fetch!(env, &1.name))
+          {:cont, Map.merge(env, Map.new(Enum.zip(node.output, outs)))}
+      end
+    else
+      step.(node, env)
+    end
+  end)
+end
+
+walk.(walk, model.nodes, env)
 |> then(&if(&1 != :diverged, do: IO.puts("No divergence in #{length(model.nodes)} nodes")))
