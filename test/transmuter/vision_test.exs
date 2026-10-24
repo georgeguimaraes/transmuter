@@ -37,8 +37,8 @@ defmodule Transmuter.VisionTest do
     # gets 515x1333, with the short side rounded half to even. The rule of shortest_edge
     # alone gives 514x1333. DETR pads to its pad_size with a pixel mask, so the featurizer
     # gives no padding for DETR. SAM resizes the long side to 1024 and pads to 1024x1024 with
-    # zeros. SAM 2.1 resizes to 1024x1024 with torchvision, whose 8-bit weights have fewer
-    # fraction bits than those of Pillow. On the tile, 27177 values of Pillow are one step
+    # zeros. SAM 2.1 resizes to 1024x1024 and SAM 3 to 1008x1008 with torchvision, whose 8-bit
+    # weights have fewer fraction bits than those of Pillow. On the tile, 27177 values of Pillow are one step
     # away.
     tile = Nx.tile(StbImage.to_nx(@image), [6, 6, 1])
     crop = Nx.slice(StbImage.to_nx(@image), [0, 0, 0], [100, 259, 3])
@@ -83,7 +83,11 @@ defmodule Transmuter.VisionTest do
           {"onnx-community/sam2.1-hiera-tiny-ONNX", @image, {1024, 1024},
            [0.2967, -2.0357, -1.5256, 0.6392, -1.6856], 1.0497},
           {"onnx-community/sam2.1-hiera-tiny-ONNX", tile, {1024, 1024},
-           [0.3652, 0.8704, -0.2532, 1.6324, -0.3025], 1.0332}
+           [0.3652, 0.8704, -0.2532, 1.6324, -0.3025], 1.0332},
+          {"onnx-community/sam3-tracker-ONNX", @image, {1008, 1008},
+           [0.1059, -0.9922, -0.2392, 0.2471, -0.8431], 0.4695},
+          {"onnx-community/sam3-tracker-ONNX", tile, {1008, 1008},
+           [0.1373, 0.051, -0.7647, 0.6235, -0.2], 0.4617}
         ] do
       featurizer =
         if is_binary(featurizer), do: Featurizer.load!({:hf, featurizer}), else: featurizer
@@ -101,22 +105,30 @@ defmodule Transmuter.VisionTest do
       assert_in_delta Nx.to_number(Nx.mean(Nx.abs(values))), mean, 1.0e-4
     end
 
-    # The 8-bit image of the tile after the resize, from the pixel values of SAM 2.1.
-    featurizer = Featurizer.load!({:hf, "onnx-community/sam2.1-hiera-tiny-ONNX"})
-    {mean, std} = featurizer.normalize
+    # The 8-bit image of the tile after the resize, from the pixel values of SAM 2.1 and
+    # SAM 3.
+    for {repo, hash} <- [
+          {"onnx-community/sam2.1-hiera-tiny-ONNX",
+           "f88aa51e6de09c5b1eb3810433b6583ec3933dc6e49938abf71d0bef2f1f0289"},
+          {"onnx-community/sam3-tracker-ONNX",
+           "9c7d77a8fbda0c78730da8805f9c7bb2eca4cc82405ef2475d4ad1d6d11aeeb9"}
+        ] do
+      featurizer = Featurizer.load!({:hf, repo})
+      {mean, std} = featurizer.normalize
 
-    resized =
-      featurizer
-      |> Featurizer.process([tile], backend: @opts[:backend])
-      |> Nx.backend_transfer(Nx.BinaryBackend)
-      |> Nx.multiply(Nx.reshape(Nx.tensor(std), {1, 3, 1, 1}))
-      |> Nx.add(Nx.reshape(Nx.tensor(mean), {1, 3, 1, 1}))
-      |> Nx.multiply(255)
-      |> Nx.round()
-      |> Nx.as_type(:u8)
+      resized =
+        featurizer
+        |> Featurizer.process([tile], backend: @opts[:backend])
+        |> Nx.backend_transfer(Nx.BinaryBackend)
+        |> Nx.multiply(Nx.reshape(Nx.tensor(std), {1, 3, 1, 1}))
+        |> Nx.add(Nx.reshape(Nx.tensor(mean), {1, 3, 1, 1}))
+        |> Nx.multiply(255)
+        |> Nx.round()
+        |> Nx.as_type(:u8)
 
-    assert Base.encode16(:crypto.hash(:sha256, Nx.to_binary(resized)), case: :lower) ==
-             "f88aa51e6de09c5b1eb3810433b6583ec3933dc6e49938abf71d0bef2f1f0289"
+      assert Base.encode16(:crypto.hash(:sha256, Nx.to_binary(resized)), case: :lower) == hash,
+             repo
+    end
   end
 
   @tag :smoke
@@ -1322,6 +1334,32 @@ defmodule Transmuter.VisionLargeModelTest do
          [0.92574, 0.36652, 0.7604],
          [0.59683, 0.23924, 0.81182],
          [0.57428, 0.50855, 0.82845]
+       ]}
+    )
+  end
+
+  # The PyTorch weights of SAM 3 are gated, so the reference is ONNX Runtime on the fp32
+  # export, with Sam2Processor and post_process_masks of transformers 5, see
+  # test/support/sam3_tracker_reference.py. The export has the inputs of SAM 2.1.
+  @tag :large_model
+  test "mask generation with the SAM 3 tracker matches ONNX Runtime" do
+    serving = Vision.mask_generation({:hf, "onnx-community/sam3-tracker-ONNX"}, @opts)
+
+    VisionTest.assert_masks(
+      serving,
+      "sam3",
+      VisionTest.sam_prompts(),
+      {[
+         [0.21363, 0.96287, 0.96229],
+         [0.68596, 0.76074, 0.24811],
+         [0.55256, 0.67912, 0.90793],
+         [0.55488, 0.58672, 0.81815]
+       ],
+       [
+         [0.13023, 0.97327, 0.97384],
+         [0.20258, 0.93383, 0.84267],
+         [0.03856, 0.00818, 0.01315],
+         [0.38125, 0.24019, 0.4902]
        ]}
     )
   end

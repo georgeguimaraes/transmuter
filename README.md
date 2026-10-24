@@ -65,7 +65,7 @@ The tasks:
   - [`depth_estimation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#depth_estimation/2): Depth Anything
   - [`image_segmentation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_segmentation/2): Segformer
   - [`background_removal`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#background_removal/2): ORMBG
-  - [`mask_generation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#mask_generation/2): SAM and SAM 2, with point and box prompts
+  - [`mask_generation`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#mask_generation/2): SAM, SAM 2 and the SAM 3 tracker, with point and box prompts
   - [`image_to_image`](https://hexdocs.pm/transmuter/Transmuter.Vision.html#image_to_image/2): Swin2SR super resolution
 - [`Transmuter.Audio`](https://hexdocs.pm/transmuter/Transmuter.Audio.html)
   - [`speech_to_text`](https://hexdocs.pm/transmuter/Transmuter.Audio.html#speech_to_text/2): Whisper
@@ -205,6 +205,7 @@ These models also ran from input to final result, and the result agrees with ONN
 | [MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng) | With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5. Without noise, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SpeechT5](https://huggingface.co/Xenova/speecht5_tts) | With a decoder dropout that keeps all values, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4 |
 | [SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX) | The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point |
+| [SAM 3 tracker](https://huggingface.co/onnx-community/sam3-tracker-ONNX) | `mask_generation` gives the masks of ONNX Runtime with the processor of Python transformers 5, for 1 point, 3 points, a box, and a box with a point |
 | [Moonshine base](https://huggingface.co/onnx-community/moonshine-base-ONNX) | The same tokens for 2 s, 6 s and 15 s of speech |
 | [Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export) | The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter |
 | [wav2vec2 base 960h](https://huggingface.co/Xenova/wav2vec2-base-960h) | The same CTC transcripts for 2 s, 6 s and 15 s of speech |

@@ -5,6 +5,7 @@ Usage: uv run --with "transformers>=5" --with torch --with torchvision --with on
 Only transformers 5 has the SAM 3 image processor, and test/support/pipeline_references.py uses transformers 4, so this script is separate. The PyTorch weights (facebook/sam3) are gated, so the reference is ONNX Runtime on the fp32 export of onnx-community/sam3-tracker-ONNX, with graph optimizations off. The processor is that of the export: Sam2Processor with Sam3ImageProcessorFast, which resizes to 1008x1008 with torchvision, and post_process_masks. For each image and prompt, the script prints the iou_scores and writes the 3 masks of each prompt one below the other, with 0 and 255. It also prints the largest number of mask pixels that change when the decoder logits move by 1e-4, the noise of the reference.
 """
 
+import hashlib
 import tempfile
 
 import numpy as np
@@ -17,6 +18,17 @@ from transformers import Sam2Processor
 export = "onnx-community/sam3-tracker-ONNX"
 processor = Sam2Processor.from_pretrained(export)
 print("sam3", type(processor.image_processor).__name__)
+
+# pixel_values[0] at (channel, y, x) and the mean of the absolute values, for the image and
+# its 6x6 tile (1920x1440), and the SHA-256 of the 8-bit image of the tile after the resize.
+image = Image.open("test/fixtures/cats.png")
+tile = Image.fromarray(np.tile(np.array(image), (6, 6, 1)))
+positions = [(0, 0, 0), (1, 100, 37), (2, 223, 223), (0, 57, 190), (1, 150, 120)]
+for picture_name, picture in [("wide", image), ("tile", tile)]:
+    values = processor(images=picture, return_tensors="pt")["pixel_values"][0].numpy()
+    print("sam3", picture_name, "pixel_values", values.shape, [round(float(values[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4))
+resized = np.round((values * 0.5 + 0.5) * 255).astype(np.uint8)
+print("sam3 tile, SHA-256 of the 8-bit resized image", hashlib.sha256(resized.tobytes()).hexdigest())
 
 directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp())
 options = ort.SessionOptions()
@@ -31,7 +43,6 @@ prompts = [
     {"points": [[80, 120]], "labels": [1], "box": [40, 60, 200, 230]},
 ]
 
-image = Image.open("test/fixtures/cats.png")
 for picture_name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
     pixel_values = processor(images=picture, return_tensors="pt")["pixel_values"]
     embeddings = dict(zip([o.name for o in encoder.get_outputs()], encoder.run(None, {"pixel_values": pixel_values.numpy()})))

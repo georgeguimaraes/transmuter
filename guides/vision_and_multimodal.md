@@ -141,6 +141,8 @@ mask_decoder = Transmuter.load!(
 )
 ```
 
+The export of the [SAM 3 tracker](https://huggingface.co/onnx-community/sam3-tracker-ONNX) has the same two files and the same inputs, so the same serving runs it. Its image size is 1008x1008.
+
 ## Depth estimation
 
 Depth Anything v2 takes a pixel tensor and returns a depth map of the same spatial size. It has no graph breaks:
