@@ -9,7 +9,13 @@ Application.put_env(:transmuter, :progress_bar_enabled, false)
 # EMLX 0.5 creates its compile cache, a named ETS table, in the first process that
 # compiles, and ETS deletes a table when its owner exits. A compile here makes this
 # long-lived process the owner, so async tests that finish do not delete the cache.
+#
+# MLX keeps freed buffers in a cache without a limit by default. The prompt of a vision
+# language model runs in parts of different sizes, so few buffers are used again, and the
+# cache grew to 9.4 GB in the LLaVA-Interleave test (live data at most 3.6 GB), near the 16 GB
+# of a Mac. A limit of 1 GB keeps the buffers of the decode steps, which have one size.
 if Transmuter.TestBackend.compiler() == EMLX do
+  EMLX.set_cache_limit(1_000_000_000)
   Nx.Defn.jit(&Nx.add(&1, 1), Transmuter.TestBackend.compiler_opts()).(Nx.tensor(1.0))
 end
 
