@@ -107,7 +107,7 @@ defmodule Transmuter.Telemetry do
 
   The cache belongs to the process that calls `Transmuter.compile/3`. When that process exits, each call emits a `[:transmuter, :cache, :miss]` event and compiles its segments again.
 
-  With EXLA and a `:cache` path, `:disk_cache` is `:hit` when EXLA loaded the program of the segment from its file, and `:miss` when EXLA compiled the program and wrote the file. It is `nil` without a `:cache` path and when `:compiled` is `false`.
+  With EXLA and a `:cache` path, each compiled segment has its own file. `:disk_cache` is `:hit` when the file of the segment exists before the compile, so EXLA loads the program from it, and `:miss` when the file does not exist, so EXLA compiles the program and writes the file. It is `nil` without a `:cache` path and when `:compiled` is `false`. EXLA does not use a file of another EXLA version or of another configuration. It logs a warning and compiles the program again, but the event shows `:hit`.
 
   ### Hub events
 
@@ -117,7 +117,7 @@ defmodule Transmuter.Telemetry do
 
     * `[:transmuter, :hub, :hit]` - the file is in the cache, and it is current.
       * Measurements: `%{count: 1, bytes: integer}`
-      * Metadata: `%{source: {:hf, repo, file}, revision: String.t(), check: :etag | :hash | :offline}`
+      * Metadata: `%{source: {:hf, repo, file}, revision: String.t(), check: :etag | :hash | :none | :offline}`
 
     * `[:transmuter, :hub, :download, :start]` - the file is not in the cache, or its ETag changed, and it starts to download.
       * Metadata: `%{source: {:hf, repo, file}, revision: String.t()}`
@@ -132,13 +132,14 @@ defmodule Transmuter.Telemetry do
     * `[:transmuter, :hub, :info, :stop]` - the metadata is ready.
       * Metadata: `%{source: {:hf, repo}, revision: String.t(), result: :fetched | :saved}`
 
-  `:bytes` is the size of the file. `:check` tells how the cache found that the file is current:
+  `:bytes` is the size of the file in bytes. `:check` tells how the cache found that the file is current:
 
     * `:etag` - the saved ETag of the file is the ETag in the metadata of the repository.
     * `:hash` - the file has no saved ETag, for example a file of an earlier version of Transmuter. Transmuter read the whole file to compute its ETag, and saved it.
+    * `:none` - the metadata of the repository gives no ETag for the file, so the file is used without a check.
     * `:offline` - the Hub is offline (see `Transmuter.Hub`), so the file is used without a check.
 
-  The metadata of a repository is in the cache too. A request goes to the Hub when the metadata is not in the cache, and in each `Transmuter.Repo.load!/2`, which reads the list of files again. A read of the saved metadata without a request emits no event. `:result` is `:fetched` when the metadata comes from the Hub, and `:saved` when the Hub gives an error or cannot be reached and the saved metadata is used. Then the files can be older than the files on the Hub. When there is no saved metadata, the error gives an `:exception` event.
+  The metadata of a repository is in the cache too. A request goes to the Hub when the metadata is not in the cache. `Transmuter.Repo.load!/2` reads the list of files again, so each load sends a request, except when the `:revision` is a commit hash of 40 hexadecimal characters. The files of a commit do not change, so its saved metadata is used. A read of the saved metadata without a request emits no event. `:result` is `:fetched` when the metadata comes from the Hub, and `:saved` when the Hub gives an error or cannot be reached and the saved metadata is used. Then the files can be older than the files on the Hub. When there is no saved metadata, the error gives an `:exception` event.
 
   ## Overhead
 

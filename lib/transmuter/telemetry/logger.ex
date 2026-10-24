@@ -21,8 +21,9 @@ defmodule Transmuter.Telemetry.Logger do
       [info] [Transmuter] compile completed in 1.2s (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, EMLX, no graph break)
       [info] [Transmuter] segment.compile completed in 85ms (kokoro.onnx, position 0, stop 209 (a value that decides a shape), compiled, shapes [...])
       [info] [Transmuter] segment.compile completed in 640ms (kokoro.onnx, position 210, stop end, compiled, shapes [...])
+      [info] [Transmuter] segment.compile completed in 12ms (kokoro.onnx, position 210, stop end, compiled, disk cache hit, shapes [...])
       [info] [Transmuter] cache.evict (kokoro.onnx, position 210, cache size 8, shapes [...])
-      [info] [Transmuter] hub.info used the saved metadata, because the Hub gave an error (Xenova/all-MiniLM-L6-v2, revision main)
+      [info] [Transmuter] hub.info used the saved metadata, because the Hub could not be reached or gave an error (Xenova/all-MiniLM-L6-v2, revision main)
 
   ## Options
 
@@ -77,7 +78,8 @@ defmodule Transmuter.Telemetry.Logger do
     if metadata.result == :saved do
       Logger.log(
         config.level,
-        "[Transmuter] hub.info used the saved metadata, because the Hub gave an error " <>
+        "[Transmuter] hub.info used the saved metadata, because the Hub could not be reached " <>
+          "or gave an error " <>
           "(#{format_source(metadata.source)}, revision #{metadata.revision})"
       )
     end
@@ -113,11 +115,12 @@ defmodule Transmuter.Telemetry.Logger do
 
   defp details("segment.compile", meta) do
     compiled = if meta.compiled, do: "compiled", else: "eager"
+    disk_cache = if meta.disk_cache, do: ", disk cache #{meta.disk_cache}", else: ""
 
     reason = if meta.reason, do: " (#{meta.reason})", else: ""
 
     "#{format_source(meta.source)}, position #{meta.position}, stop #{meta.stop}#{reason}, " <>
-      "#{compiled}, shapes #{inspect(meta.shapes)}"
+      "#{compiled}#{disk_cache}, shapes #{inspect(meta.shapes)}"
   end
 
   defp details(:evict, meta) do

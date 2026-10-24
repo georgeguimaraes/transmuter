@@ -120,7 +120,7 @@ defmodule Transmuter.Hub do
         raise ArgumentError, "#{repo} is not in the cache, and the Hub is offline"
 
       true ->
-        metadata = %{source: {:hf, repo}, revision: opts[:revision] || "main"}
+        metadata = %{source: {:hf, repo}, revision: revision(opts)}
 
         :telemetry.span([:transmuter, :hub, :info], metadata, fn ->
           {info, result} = request_info(repo, path, saved?, opts)
@@ -137,7 +137,7 @@ defmodule Transmuter.Hub do
     case Req.get(
            request(
              url:
-               "https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}?blobs=true",
+               "https://huggingface.co/api/models/#{repo}/revision/#{url_revision(opts)}?blobs=true",
              retry: if(saved?, do: false, else: :safe_transient),
              receive_timeout: 30_000
            )
@@ -177,11 +177,11 @@ defmodule Transmuter.Hub do
   defp download!(repo, commit, sibling, target, opts) do
     file = sibling["rfilename"]
     etag = sibling["lfs"]["sha256"] || sibling["blobId"]
-    metadata = %{source: {:hf, repo, file}, revision: opts[:revision] || "main"}
-    bytes = sibling["size"]
+    metadata = %{source: {:hf, repo, file}, revision: revision(opts)}
 
     cond do
       check = File.exists?(target) && check(target, etag, opts) ->
+        bytes = sibling["size"] || File.stat!(target).size
         hit = Map.put(metadata, :check, check)
         :telemetry.execute([:transmuter, :hub, :hit], %{count: 1, bytes: bytes}, hit)
 
@@ -191,7 +191,7 @@ defmodule Transmuter.Hub do
       true ->
         :telemetry.span([:transmuter, :hub, :download], metadata, fn ->
           download_file!(repo, commit, sibling, target, etag)
-          {:ok, %{bytes: bytes}, metadata}
+          {:ok, %{bytes: File.stat!(target).size}, metadata}
         end)
     end
   end
@@ -228,11 +228,11 @@ defmodule Transmuter.Hub do
 
   # How a file in the cache is current, or nil when it must download again. A file without
   # a saved ETag, such as a file of an earlier version of Transmuter, gets the ETag of its
-  # contents.
+  # contents. A file whose metadata has no ETag is used without a check.
   defp check(target, etag, opts) do
     cond do
       offline?(opts) -> :offline
-      etag == nil -> :etag
+      etag == nil -> :none
       true -> check_etag(target, etag)
     end
   end
@@ -333,12 +333,14 @@ defmodule Transmuter.Hub do
     root = opts[:cache_dir] || Path.join([System.user_home!(), ".cache", "transmuter"])
 
     if opts[:revision],
-      do: Path.join(root, "#{repo}@#{revision(opts)}"),
+      do: Path.join(root, "#{repo}@#{url_revision(opts)}"),
       else: Path.join(root, repo)
   end
 
   # A branch name can have a slash, such as refs/pr/1.
-  defp revision(opts), do: URI.encode(opts[:revision] || "main", &URI.char_unreserved?/1)
+  defp revision(opts), do: opts[:revision] || "main"
+
+  defp url_revision(opts), do: URI.encode(revision(opts), &URI.char_unreserved?/1)
 
   defp commit?(revision), do: is_binary(revision) and revision =~ ~r/\A[0-9a-f]{40}\z/
 

@@ -263,12 +263,26 @@ defmodule Transmuter.HubEnvTest do
                      %{source: ^source, revision: "main"}}
 
     etag_path = Path.join(dir, "a/b/.config.json.etag")
+    new_etag = fn -> File.write!(etag_path, String.duplicate("0", 40)) end
+
+    # Metadata saved before blobs=true has no "size", and a file can have no ETag. The size
+    # then comes from the file. The SHA-256 of an LFS file does not need the size.
+    save = fn sibling ->
+      info = %{"sha" => "0", "siblings" => [sibling]}
+      File.write!(Path.join(dir, "a/b/.info.json"), JSON.encode!(info))
+    end
+
+    sha256 = Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+    lfs = %{"rfilename" => "config.json", "lfs" => %{"sha256" => sha256}}
 
     for {change, opts, expected} <- [
           {fn -> :ok end, [], {:hit, :etag}},
           {fn -> File.rm!(etag_path) end, [], {:hit, :hash}},
           {fn -> :ok end, [offline: true], {:hit, :offline}},
-          {fn -> File.write!(etag_path, String.duplicate("0", 40)) end, [], :download}
+          {new_etag, [], :download},
+          {fn -> save.(Map.delete(sibling, "size")) end, [], {:hit, :etag}},
+          {fn -> save.(lfs) end, [], :download},
+          {fn -> save.(%{"rfilename" => "config.json"}) end, [], {:hit, :none}}
         ] do
       change.()
       assert fetch.(opts) == path

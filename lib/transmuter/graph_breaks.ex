@@ -255,24 +255,18 @@ defmodule Transmuter.GraphBreaks do
         {classify(entry), args, state}
 
       {{:ok, entry}, :retry} ->
-        {entry, args, state, learn(plan, pos, known, host), false, shapes}
+        built = %{shapes: shapes, compiled: false, disk_cache: nil}
+        {entry, args, state, Map.put(built, :host_values, learn(plan, pos, known, host))}
 
       {:miss, :call} ->
         :telemetry.execute([:transmuter, :cache, :miss], %{count: 1}, metadata)
 
         :telemetry.span([:transmuter, :segment, :compile], metadata, fn ->
-          {entry, args, state, added, built?, shapes} =
+          {entry, args, state, built} =
             build(plan, state, pos, {known, host}, tried, {key, args, statics})
 
-          {{classify(entry), args, state},
-           Map.merge(metadata, %{
-             shapes: shapes,
-             stop: entry.stop,
-             compiled: built? and entry.compiled != nil,
-             disk_cache: if(built?, do: entry.disk_cache),
-             reason: entry.reason,
-             host_values: Enum.sort(added)
-           })}
+          stop = %{stop: entry.stop, reason: entry.reason}
+          {{classify(entry), args, state}, metadata |> Map.merge(built) |> Map.merge(stop)}
         end)
 
       {:miss, :retry} ->
@@ -280,6 +274,9 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
+  # Gives the entry with the stop metadata of the segment compile: the shapes of the
+  # arguments, whether this build compiled the segment, whether the program came from the
+  # disk cache, and the names that the build added to the host values.
   defp build(plan, state, pos, {known, host}, tried, {key = {pos, shapes, _}, args, statics}) do
     ref = make_ref()
     plan_key = plan.key
@@ -302,9 +299,10 @@ defmodule Transmuter.GraphBreaks do
         tried = %{added: Map.delete(tried.added, node), real: MapSet.put(tried.real, node)}
         attempt(plan, state, pos, known, tried, :retry)
 
-      entry ->
+      {entry, disk_cache} ->
         store(plan, key, entry)
-        {entry, args, state, learn(plan, pos, known, host), true, shapes}
+        built = %{shapes: shapes, compiled: entry.compiled != nil, disk_cache: disk_cache}
+        {entry, args, state, Map.put(built, :host_values, learn(plan, pos, known, host))}
     end
   end
 
@@ -388,7 +386,7 @@ defmodule Transmuter.GraphBreaks do
   defp learn(plan, pos, known, host) do
     added = MapSet.difference(host, known)
     :ets.insert(plan.learned, Enum.map(added, &{pos, &1}))
-    Enum.to_list(added)
+    Enum.sort(added)
   rescue
     ArgumentError -> []
   end
@@ -396,9 +394,12 @@ defmodule Transmuter.GraphBreaks do
   # The compiler traces the segment before it builds a program. A short segment after a
   # break runs eagerly, so its trace stops the compiler. The first segment always compiles,
   # as a model without breaks always did. The compiled function keeps the trace function,
-  # so it holds the number of nodes and not the plan.
+  # so it holds the number of nodes and not the plan. EXLA loads the program from a :cache
+  # path that exists, and else compiles it and writes it there.
   defp compile_segment(plan, key = {pos, _shapes, _static_key}, fun, args, ref) do
     count = tuple_size(plan.nodes)
+    path = disk_path(plan, key)
+    disk_cache = path && if(File.exists?(path), do: :hit, else: :miss)
 
     bounded = fn args ->
       outputs = fun.(args)
@@ -411,27 +412,27 @@ defmodule Transmuter.GraphBreaks do
     try do
       compiled =
         try do
-          compile_program(plan, key, bounded, args)
+          compile_program(plan, path, bounded, args)
         catch
           {^ref, :eager} -> nil
         end
 
       # A compiler that loads the program from its disk cache does not trace the segment.
       # Then a trace gives where the segment stops and what it returns.
-      traced? = Process.get(ref) != nil
-      unless traced?, do: Nx.Defn.debug_expr(bounded).(args)
+      unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
 
       {stop, reason, out_names, produced} = Process.get(ref)
 
-      %{
+      entry = %{
         compiled: compiled,
-        disk_cache: plan.disk_cache && compiled && if(traced?, do: :miss, else: :hit),
         stop: stop,
         reason: reason,
         out_names: out_names,
         produced: produced,
         digests: digests(produced)
       }
+
+      {entry, compiled && disk_cache}
     catch
       {^ref, :induced, node, names} -> {:induced, node, names}
       {^ref, :real, node} -> {:real, node}
@@ -440,15 +441,13 @@ defmodule Transmuter.GraphBreaks do
 
   # The compiled function keeps its example arguments, so it gets templates. With the
   # values, each cached segment would keep the device tensors of its first call.
-  defp compile_program(plan, key, fun, args) do
-    opts =
-      case plan.disk_cache do
-        nil -> plan.opts
-        {path, model} -> Keyword.put(plan.opts, :cache, path <> "-" <> hash({model, key}))
-      end
-
+  defp compile_program(plan, path, fun, args) do
+    opts = if path, do: Keyword.put(plan.opts, :cache, path), else: plan.opts
     Nx.Defn.compile(fun, [Composite.traverse(args, &Nx.to_template/1)], opts)
   end
+
+  defp disk_path(%{disk_cache: {path, model}}, key), do: path <> "-" <> hash({model, key})
+  defp disk_path(_plan, _key), do: nil
 
   # EXLA keeps one program in each :cache path and checks only the shapes of its arguments.
   # So each segment gets its own path, from the graph and the key of the segment, and a
