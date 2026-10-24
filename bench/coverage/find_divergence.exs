@@ -5,7 +5,9 @@
 [case_dir] = System.argv()
 meta = case_dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
 ref = case_dir |> Path.join("ort_trace.json") |> File.read!() |> JSON.decode!()
-backend = {EMLX.Backend, device: String.to_atom(System.get_env("DEVICE", "gpu"))}
+# The backend of the tests: TRANSMUTER_TEST_BACKEND and TRANSMUTER_TEST_DEVICE.
+Code.require_file("../../test/support/test_backend.exs", __DIR__)
+backend = Transmuter.TestBackend.backend()
 
 read = fn %{"file" => file, "dtype" => type, "shape" => shape}, backend ->
   case_dir
@@ -40,17 +42,17 @@ threshold = "THRESHOLD" |> System.get_env("1.0e-3") |> String.to_float()
 diverged? = fn name, t ->
   r = ref[name]
   integer? = Nx.Type.integer?(Nx.type(t))
-  # An integer sum on the binary backend is exact in s64, also for u8 and s32 values that
-  # would overflow their own type. EMLX has no exact f64.
+  # The integer sum is exact, as in trace_ort.py: s64 for the narrow types, and Elixir
+  # integers for the 64-bit types. EMLX has no exact f64.
   abssum =
-    if integer?,
-      do:
-        t
-        |> Nx.backend_copy(Nx.BinaryBackend)
-        |> Nx.as_type(:s64)
-        |> Nx.abs()
-        |> Nx.sum()
-        |> Nx.to_number()
+    if integer? do
+      t = Nx.backend_copy(t, Nx.BinaryBackend)
+
+      case Nx.type(t) do
+        {_, 64} -> t |> Nx.to_flat_list() |> Enum.reduce(0, &(abs(&1) + &2))
+        _ -> t |> Nx.as_type(:s64) |> Nx.abs() |> Nx.sum() |> Nx.to_number()
+      end
+    end
 
   t = Nx.as_type(t, :f64)
   t = t |> then(&Nx.select(Nx.is_nan(&1), 0, &1)) |> Nx.clip(-3.0e38, 3.0e38)
@@ -63,9 +65,7 @@ diverged? = fn name, t ->
     |> Enum.max()
 
   shape = Tuple.to_list(Nx.shape(t))
-  # trace_ort.py writes the sum as an f64, so the exact sum becomes an f64 too, as for
-  # 9223372036854775807, the largest int64.
-  sum_diff? = integer? and r["abssum"] != nil and abssum * 1.0 != r["abssum"]
+  sum_diff? = integer? and r["abssum"] != nil and abssum != r["abssum"]
   diff = if sum_diff?, do: max(diff, abs(abssum - r["abssum"])), else: diff
 
   {shape != r["shape"] or sum_diff? or diff > threshold * max(r["absmax"], 1.0), shape, sample,
@@ -85,7 +85,8 @@ model.nodes
     end)
 
   # One step of the interpreter, so that If, Loop and Scan nodes run as in Transmuter.run/4.
-  outs = Enum.map(node.output, &Map.get(Transmuter.run_nodes([node], env, ctx), &1))
+  result = Transmuter.run_nodes([node], env, ctx)
+  outs = Enum.map(node.output, &Map.get(result, &1))
 
   bad =
     for {name, t} <- Enum.zip(node.output, outs),

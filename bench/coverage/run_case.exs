@@ -3,19 +3,10 @@
 
 [case_dir] = System.argv()
 meta = case_dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
-# As in the tests, TRANSMUTER_TEST_BACKEND is emlx (the default) or exla, and
-# TRANSMUTER_TEST_DEVICE is gpu (the default) or cpu.
-device = String.to_atom(System.get_env("TRANSMUTER_TEST_DEVICE", "gpu"))
-
-{backend, compiler_opts} =
-  case System.get_env("TRANSMUTER_TEST_BACKEND", "emlx") do
-    "emlx" ->
-      {{EMLX.Backend, device: device}, [compiler: EMLX, device: device]}
-
-    "exla" ->
-      client = if device == :gpu, do: :cuda, else: :host
-      {{EXLA.Backend, client: client}, [compiler: EXLA, client: client]}
-  end
+# The backend of the tests: TRANSMUTER_TEST_BACKEND and TRANSMUTER_TEST_DEVICE.
+Code.require_file("../../test/support/test_backend.exs", __DIR__)
+backend = Transmuter.TestBackend.backend()
+compiler_opts = Transmuter.TestBackend.compiler_opts()
 
 result_path = Path.join(case_dir, "result.json")
 
@@ -39,10 +30,10 @@ end
 
 try do
   {load_ms, model} = timed.(fn -> Transmuter.load!(Path.expand(meta["onnx_path"], case_dir), compute_type: :f32) end)
-  # EMLX_QUANTIZED=1 keeps MatMulNBits weights packed as MLX quantized tensors.
+  # With EMLX, EMLX_QUANTIZED=1 keeps MatMulNBits weights packed as MLX quantized tensors.
   params =
-    if System.get_env("EMLX_QUANTIZED") == "1",
-      do: Transmuter.EMLX.params(model),
+    if System.get_env("EMLX_QUANTIZED") == "1" and match?({EMLX.Backend, _}, backend),
+      do: Transmuter.EMLX.params(model, elem(backend, 1)),
       else: Map.new(model.params, fn {k, v} -> {k, Nx.backend_transfer(v, backend)} end)
   {static, inputs} = Enum.split_with(meta["inputs"], static?)
   inputs = Map.new(inputs, &{&1["name"], read.(&1, backend)})

@@ -91,13 +91,20 @@ def dim_value(param, ctx):
     return int(eval(param, {}, env))
 
 
+def kv_heads(text):
+    """The heads of the KV cache, as Optimum counts them: 1 for the multi-query attention of Falcon."""
+    if text.get("multi_query") and not text.get("new_decoder_architecture"):
+        return 1
+    return text.get("num_kv_heads") or text.get("num_key_value_heads") or text.get("num_attention_heads") or text.get("n_head", 1)
+
+
 def make_inputs(sess, config, pre, seq, past, dims=None):
     if not any("past" in i.name for i in sess.get_inputs()):
         past = 0
     h, w = image_size(config, pre)
     text = config.get("text_config", config)
     vocab = min(text.get("vocab_size", 100) or 100, 1000)
-    ctx = {"seq": seq, "past": past, "height": h, "width": w, "encoder_sequence_length": 8, "num_frames": config.get("num_frames", 8), "num_heads": text.get("num_attention_heads") or text.get("n_head", 1)}
+    ctx = {"seq": seq, "past": past, "height": h, "width": w, "encoder_sequence_length": 8, "num_frames": config.get("num_frames", 8), "num_heads": kv_heads(text)}
     if config.get("model_type") == "whisper":
         ctx["encoder_sequence_length"] = config.get("max_source_positions", 1500)
     ctx.update(dims or {})

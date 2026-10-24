@@ -29,7 +29,13 @@ for name in names:
     a = np.clip(np.nan_to_num(np.asarray(outs[name], dtype=np.float64), nan=0.0, posinf=3e38, neginf=-3e38), -3e38, 3e38)
     flat = a.reshape(-1)
     idx = [(k * 2654435761) % flat.size for k in range(1024)] if flat.size else []
-    stats[name] = {"shape": list(a.shape), "absmax": float(np.abs(a).max()) if a.size else 0.0, "abssum": float(np.abs(a).sum()), "sample": [float(flat[i]) for i in idx]}
+    raw = np.asarray(outs[name])
+    # An integer sum is exact: int64 for the narrow types, Python integers for the 64-bit types.
+    if np.issubdtype(raw.dtype, np.integer):
+        abssum = int(np.abs(raw.reshape(-1).astype(np.int64 if raw.dtype.itemsize < 8 else object)).sum())
+    else:
+        abssum = float(np.abs(a).sum())
+    stats[name] = {"shape": list(a.shape), "absmax": float(np.abs(a).max()) if a.size else 0.0, "abssum": abssum, "sample": [float(flat[i]) for i in idx]}
 json.dump(stats, open(os.path.join(case, "ort_trace.json"), "w"))
 # DUMP=name,name saves those node outputs in full, for find_divergence.exs OVERRIDE.
 for name in filter(None, os.environ.get("DUMP", "").split(",")):
