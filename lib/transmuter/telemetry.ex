@@ -2,7 +2,22 @@ defmodule Transmuter.Telemetry do
   @moduledoc """
   Telemetry events that Transmuter emits.
 
-  Transmuter uses the `:telemetry` library. Attach handlers to these events for logs, metrics or traces. The events show where a model spends time, and why a compiled function compiles again.
+  Transmuter uses the `:telemetry` library. Attach handlers to these events for logs, metrics or traces. The events show where a model spends time, why a compiled function compiles again, and which files come from the Hugging Face Hub.
+
+  ## Cache events
+
+  Transmuter keeps two caches. These events show how each cache works:
+
+    * The cache of compiled segments of a function from `Transmuter.compile/3`. It is in memory and belongs to the process that compiles. The servings and the tasks keep their compiled shapes in this cache too, for example the image sizes and the prompt lengths. See [Graph break events](#module-graph-break-events).
+      * `[:transmuter, :cache, :hit]`, `[:transmuter, :cache, :miss]` and `[:transmuter, :cache, :evict]` - a lookup of a compiled segment, and its eviction.
+      * `:disk_cache` in the metadata of `[:transmuter, :segment, :compile, :stop]` - whether EXLA loaded the program of the segment from the `:cache` path of `Transmuter.compile/3`.
+
+    * The Hub cache, the files of Hub repositories in the cache directory of `Transmuter.Hub`. See [Hub events](#module-hub-events).
+      * `[:transmuter, :hub, :hit]` - a file comes from the cache.
+      * `[:transmuter, :hub, :download, :*]` - a file downloads from the Hub.
+      * `[:transmuter, :hub, :info, :*]` - the metadata of a repository comes from the Hub, or from the cache when the Hub gives an error.
+
+  The compilers and their backends keep their own caches, such as the compile cache and the buffer cache of EMLX. Transmuter does not emit events for them. See [EMLX memory](#module-emlx-memory).
 
   ## Events
 
@@ -76,7 +91,7 @@ defmodule Transmuter.Telemetry do
       * Metadata: `%{source: term, position: integer, shapes: list}`
 
     * `[:transmuter, :segment, :compile, :stop]` - the segment is ready.
-      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean, reason: String.t() | nil, host_values: [String.t()]}`
+      * Metadata: `%{source: term, position: integer, shapes: list, stop: integer | :end, compiled: boolean, disk_cache: :hit | :miss | nil, reason: String.t() | nil, host_values: [String.t()]}`
 
     * `[:transmuter, :break, :start]` - a break node starts to run eagerly.
       * Metadata: `%{source: term, position: integer, node: String.t(), op_type: String.t()}`
@@ -92,9 +107,58 @@ defmodule Transmuter.Telemetry do
 
   The cache belongs to the process that calls `Transmuter.compile/3`. When that process exits, each call emits a `[:transmuter, :cache, :miss]` event and compiles its segments again.
 
+  With EXLA and a `:cache` path, `:disk_cache` is `:hit` when EXLA loaded the program of the segment from its file, and `:miss` when EXLA compiled the program and wrote the file. It is `nil` without a `:cache` path and when `:compiled` is `false`.
+
+  ### Hub events
+
+  These events come from `Transmuter.Hub` for a Hub source. A local directory has no cache, so it emits no Hub events. `Transmuter.load!/2` and the tasks fetch each file of a model, also the configuration files and the external data files, so each load emits a hit or a download for each file.
+
+  The `:source` in the metadata is `{:hf, repo, file}` for a file and `{:hf, repo}` for the metadata of a repository. `:revision` is the `:revision` option, `"main"` by default.
+
+    * `[:transmuter, :hub, :hit]` - the file is in the cache, and it is current.
+      * Measurements: `%{count: 1, bytes: integer}`
+      * Metadata: `%{source: {:hf, repo, file}, revision: String.t(), check: :etag | :hash | :offline}`
+
+    * `[:transmuter, :hub, :download, :start]` - the file is not in the cache, or its ETag changed, and it starts to download.
+      * Metadata: `%{source: {:hf, repo, file}, revision: String.t()}`
+
+    * `[:transmuter, :hub, :download, :stop]` - the download is complete, and the file is in the cache.
+      * Measurements: `%{duration: integer, monotonic_time: integer, bytes: integer}`
+      * Metadata: `%{source: {:hf, repo, file}, revision: String.t()}`
+
+    * `[:transmuter, :hub, :info, :start]` - a request for the metadata of a repository goes to the Hub API.
+      * Metadata: `%{source: {:hf, repo}, revision: String.t()}`
+
+    * `[:transmuter, :hub, :info, :stop]` - the metadata is ready.
+      * Metadata: `%{source: {:hf, repo}, revision: String.t(), result: :fetched | :saved}`
+
+  `:bytes` is the size of the file. `:check` tells how the cache found that the file is current:
+
+    * `:etag` - the saved ETag of the file is the ETag in the metadata of the repository.
+    * `:hash` - the file has no saved ETag, for example a file of an earlier version of Transmuter. Transmuter read the whole file to compute its ETag, and saved it.
+    * `:offline` - the Hub is offline (see `Transmuter.Hub`), so the file is used without a check.
+
+  The metadata of a repository is in the cache too. A request goes to the Hub when the metadata is not in the cache, and in each `Transmuter.Repo.load!/2`, which reads the list of files again. A read of the saved metadata without a request emits no event. `:result` is `:fetched` when the metadata comes from the Hub, and `:saved` when the Hub gives an error or cannot be reached and the saved metadata is used. Then the files can be older than the files on the Hub. When there is no saved metadata, the error gives an `:exception` event.
+
   ## Overhead
 
-  When no handler is attached, one event costs about 0.3 microseconds. A call of a graph without breaks emits 2 events. A call with a break emits 2 more events for each break and 1 event for each segment. Transmuter emits no event for each node.
+  When no handler is attached, one event costs about 0.3 microseconds. A call of a graph without breaks emits 2 events. A call with a break emits 2 more events for each break and 1 event for each segment. Transmuter emits no event for each node. The Hub events come only when a model loads, 1 or 2 for each file.
+
+  ## EMLX memory
+
+  MLX keeps freed buffers in a cache, which can grow to many gigabytes when the shapes change from call to call. EMLX owns this cache, and Transmuter emits no event for it. EMLX emits `[:emlx, :memory, :stats]` with `:active_memory`, `:peak_memory` and `:cache_memory` in bytes each time that you call `EMLX.Telemetry.memory_stats/0`. Call it from a periodic task, or from a handler of `[:transmuter, :call, :stop]`:
+
+      defmodule MyApp.EMLXMemory do
+        def attach do
+          event = [:transmuter, :call, :stop]
+          :telemetry.attach("my-app-emlx-memory", event, &__MODULE__.handle_event/4, nil)
+        end
+
+        def handle_event(_event, _measurements, _metadata, _config),
+          do: EMLX.Telemetry.memory_stats()
+      end
+
+  On EMLX, a call can return before the device calculates its outputs, so the memory at the `:stop` event is not always the peak of that call. `EMLX.set_cache_limit/1` sets the largest size of the cache. `EMLX.reset_peak_memory/0` resets the peak for all processes, so do not call it in a service where other code reads the peak.
 
   ## Logger
 
@@ -136,6 +200,8 @@ defmodule Transmuter.Telemetry do
         summary("transmuter.call.stop.duration", unit: {:native, :millisecond}),
         counter("transmuter.cache.miss.count", tags: [:position]),
         counter("transmuter.cache.evict.count", tags: [:position]),
+        counter("transmuter.hub.hit.count"),
+        sum("transmuter.hub.download.stop.bytes", unit: {:byte, :megabyte}),
         summary("transmuter.break.stop.duration", unit: {:native, :millisecond}, tags: [:op_type])
       ]
   """

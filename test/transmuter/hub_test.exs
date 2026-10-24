@@ -160,13 +160,33 @@ defmodule Transmuter.HubEnvTest do
   end
 
   defmodule Adapter do
-    # Gives the metadata of an empty repository, or the status that the test puts in its
-    # process, so no request leaves the test.
+    # Gives the metadata and the file that the test puts in its process, else the metadata
+    # of an empty repository, with the status that the test puts in its process. So no
+    # request leaves the test. A download writes the file through the into function.
     def run(request) do
       send(Transmuter.HubEnvTest, {:request, request})
       status = Process.get(:hub_status, 200)
-      {request, Req.Response.new(status: status, body: %{"sha" => "0", "siblings" => []})}
+      info = Process.get(:hub_info, %{"sha" => "0", "siblings" => []})
+
+      if is_function(request.into, 2) do
+        response = Req.Response.new(status: status, body: "")
+        {:cont, result} = request.into.({:data, Process.get(:hub_file)}, {request, response})
+        result
+      else
+        {request, Req.Response.new(status: status, body: info)}
+      end
     end
+  end
+
+  # Handlers are global, so the handler forwards only the events of the test process.
+  defp attach(events) do
+    id = make_ref()
+    :telemetry.attach_many(id, events, &__MODULE__.forward/4, self())
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  def forward(event, measurements, metadata, pid) do
+    if self() == pid, do: send(pid, {event, measurements, metadata})
   end
 
   defp request(env, dir) do
@@ -215,14 +235,69 @@ defmodule Transmuter.HubEnvTest do
     end
   end
 
+  # A file downloads once, after a request for the metadata. Later fetches read the saved
+  # metadata and find the file in the cache, and each event tells how the cache checked it.
+  # A new ETag on the Hub downloads it again.
+  test "a Hub file emits a download, then a hit with its check", %{tmp_dir: dir} do
+    attach([
+      [:transmuter, :hub, :hit],
+      [:transmuter, :hub, :download, :stop],
+      [:transmuter, :hub, :info, :stop]
+    ])
+
+    body = ~s({"model_type": "bert"})
+    bytes = byte_size(body)
+    blob = Base.encode16(:crypto.hash(:sha, "blob #{bytes}\0" <> body), case: :lower)
+    sibling = %{"rfilename" => "config.json", "blobId" => blob, "size" => bytes}
+    Process.put(:hub_info, %{"sha" => "0", "siblings" => [sibling]})
+    Process.put(:hub_file, body)
+    fetch = &Transmuter.Hub.fetch!({:hf, "a/b"}, "config.json", [cache_dir: dir] ++ &1)
+    path = fetch.([])
+    assert File.read!(path) == body
+    source = {:hf, "a/b", "config.json"}
+
+    assert_received {[:transmuter, :hub, :info, :stop], _measurements,
+                     %{source: {:hf, "a/b"}, result: :fetched}}
+
+    assert_received {[:transmuter, :hub, :download, :stop], %{bytes: ^bytes},
+                     %{source: ^source, revision: "main"}}
+
+    etag_path = Path.join(dir, "a/b/.config.json.etag")
+
+    for {change, opts, expected} <- [
+          {fn -> :ok end, [], {:hit, :etag}},
+          {fn -> File.rm!(etag_path) end, [], {:hit, :hash}},
+          {fn -> :ok end, [offline: true], {:hit, :offline}},
+          {fn -> File.write!(etag_path, String.duplicate("0", 40)) end, [], :download}
+        ] do
+      change.()
+      assert fetch.(opts) == path
+
+      case expected do
+        {:hit, check} ->
+          assert_received {[:transmuter, :hub, :hit], %{count: 1, bytes: ^bytes},
+                           %{source: ^source, check: ^check}}
+
+        :download ->
+          assert_received {[:transmuter, :hub, :download, :stop], %{bytes: ^bytes}, _metadata}
+      end
+
+      refute_received {[:transmuter, :hub | _event], _measurements, _metadata}
+    end
+  end
+
   test "an error of the Hub API gives the saved metadata at once, without retries", %{
     tmp_dir: dir
   } do
     info = Transmuter.Hub.info({:hf, "a/b"}, cache_dir: dir)
     assert_received {:request, _request}
+    attach([[:transmuter, :hub, :info, :stop]])
     Process.put(:hub_status, 503)
     assert Transmuter.Hub.info({:hf, "a/b"}, cache_dir: dir, refresh: true) == info
     assert_received {:request, _request}
     refute_received {:request, _request}
+
+    assert_received {[:transmuter, :hub, :info, :stop], _measurements,
+                     %{source: {:hf, "a/b"}, result: :saved}}
   end
 end

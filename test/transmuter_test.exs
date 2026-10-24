@@ -873,6 +873,9 @@ defmodule TransmuterTest.EXLACacheTest do
   } do
     backend = Transmuter.TestBackend.backend()
     opts = [cache: Path.join(dir, "model")] ++ Transmuter.TestBackend.compiler_opts()
+    id = make_ref()
+    :telemetry.attach(id, [:transmuter, :segment, :compile, :stop], &__MODULE__.forward/4, self())
+    on_exit(fn -> :telemetry.detach(id) end)
 
     # Cosh compiles one segment, and the Range break of the other model two segments.
     runs =
@@ -892,6 +895,7 @@ defmodule TransmuterTest.EXLACacheTest do
     expected = Enum.map(runs, & &1.())
     files = Path.wildcard(Path.join(dir, "model-*"))
     assert length(files) == 3
+    assert disk_cache() == [:miss, :miss, :miss]
 
     old = {{2000, 1, 1}, {0, 0, 0}}
     Enum.each(files, &File.touch!(&1, old))
@@ -903,5 +907,18 @@ defmodule TransmuterTest.EXLACacheTest do
 
     refute log =~ "does not match"
     assert Enum.map(files, &File.stat!(&1).mtime) == List.duplicate(old, 3)
+    assert disk_cache() == [:hit, :hit, :hit]
+  end
+
+  def forward(_event, _measurements, metadata, pid) do
+    if self() == pid, do: send(pid, {:disk_cache, metadata.disk_cache})
+  end
+
+  defp disk_cache do
+    receive do
+      {:disk_cache, value} -> [value | disk_cache()]
+    after
+      0 -> []
+    end
   end
 end

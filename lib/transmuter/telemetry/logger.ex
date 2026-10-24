@@ -2,7 +2,7 @@ defmodule Transmuter.Telemetry.Logger do
   @moduledoc """
   A Logger handler for the Transmuter events that show compile work.
 
-  It logs model loads, compiles, segment compiles and cache evictions. It does not log the events of each call, because a service makes many calls. See `Transmuter.Telemetry` for all events.
+  It logs model loads, compiles, segment compiles, cache evictions, Hub downloads and the Hub metadata that comes from the cache because the Hub could not be reached. It does not log the events of each call, because a service makes many calls, or the files that come from the Hub cache. See `Transmuter.Telemetry` for all events.
 
   ## Usage
 
@@ -16,11 +16,13 @@ defmodule Transmuter.Telemetry.Logger do
 
   ## Example output
 
+      [info] [Transmuter] hub.download completed in 2.31s (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, 90.4 MB)
       [info] [Transmuter] load completed in 412ms (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, 343 nodes, opset 11)
       [info] [Transmuter] compile completed in 1.2s (Xenova/all-MiniLM-L6-v2 onnx/model.onnx, EMLX, no graph break)
       [info] [Transmuter] segment.compile completed in 85ms (kokoro.onnx, position 0, stop 209 (a value that decides a shape), compiled, shapes [...])
       [info] [Transmuter] segment.compile completed in 640ms (kokoro.onnx, position 210, stop end, compiled, shapes [...])
       [info] [Transmuter] cache.evict (kokoro.onnx, position 210, cache size 8, shapes [...])
+      [info] [Transmuter] hub.info used the saved metadata, because the Hub gave an error (Xenova/all-MiniLM-L6-v2, revision main)
 
   ## Options
 
@@ -45,7 +47,9 @@ defmodule Transmuter.Telemetry.Logger do
     [:transmuter, :load, :stop],
     [:transmuter, :compile, :stop],
     [:transmuter, :segment, :compile, :stop],
-    [:transmuter, :cache, :evict]
+    [:transmuter, :cache, :evict],
+    [:transmuter, :hub, :download, :stop],
+    [:transmuter, :hub, :info, :stop]
   ]
 
   @doc """
@@ -67,6 +71,26 @@ defmodule Transmuter.Telemetry.Logger do
   @doc false
   def handle_event([:transmuter, :cache, :evict], _measurements, metadata, config) do
     Logger.log(config.level, "[Transmuter] cache.evict (#{details(:evict, metadata)})")
+  end
+
+  def handle_event([:transmuter, :hub, :info, :stop], _measurements, metadata, config) do
+    if metadata.result == :saved do
+      Logger.log(
+        config.level,
+        "[Transmuter] hub.info used the saved metadata, because the Hub gave an error " <>
+          "(#{format_source(metadata.source)}, revision #{metadata.revision})"
+      )
+    end
+  end
+
+  def handle_event([:transmuter, :hub, :download, :stop], measurements, metadata, config) do
+    megabytes = :io_lib.format("~.1f MB", [measurements.bytes / 1.0e6])
+
+    Logger.log(
+      config.level,
+      "[Transmuter] hub.download completed in #{format_duration(measurements.duration)} " <>
+        "(#{format_source(metadata.source)}, #{megabytes})"
+    )
   end
 
   def handle_event([:transmuter | name], %{duration: duration}, metadata, config) do
@@ -102,6 +126,7 @@ defmodule Transmuter.Telemetry.Logger do
   end
 
   defp format_source({:hf, repo, file}), do: "#{repo} #{file}"
+  defp format_source({:hf, repo}), do: repo
   defp format_source(path) when is_binary(path), do: path
   defp format_source(source), do: inspect(source)
 

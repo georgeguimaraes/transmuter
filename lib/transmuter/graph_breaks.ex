@@ -269,6 +269,7 @@ defmodule Transmuter.GraphBreaks do
              shapes: shapes,
              stop: entry.stop,
              compiled: built? and entry.compiled != nil,
+             disk_cache: if(built?, do: entry.disk_cache),
              reason: entry.reason,
              host_values: Enum.sort(added)
            })}
@@ -417,12 +418,14 @@ defmodule Transmuter.GraphBreaks do
 
       # A compiler that loads the program from its disk cache does not trace the segment.
       # Then a trace gives where the segment stops and what it returns.
-      unless Process.get(ref), do: Nx.Defn.debug_expr(bounded).(args)
+      traced? = Process.get(ref) != nil
+      unless traced?, do: Nx.Defn.debug_expr(bounded).(args)
 
       {stop, reason, out_names, produced} = Process.get(ref)
 
       %{
         compiled: compiled,
+        disk_cache: plan.disk_cache && compiled && if(traced?, do: :miss, else: :hit),
         stop: stop,
         reason: reason,
         out_names: out_names,

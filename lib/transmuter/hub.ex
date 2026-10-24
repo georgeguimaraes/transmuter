@@ -120,38 +120,47 @@ defmodule Transmuter.Hub do
         raise ArgumentError, "#{repo} is not in the cache, and the Hub is offline"
 
       true ->
-        # With saved metadata, an error gives the saved metadata at once. Without it, Req
-        # retries a transient error.
-        case Req.get(
-               request(
-                 url:
-                   "https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}?blobs=true",
-                 retry: if(saved?, do: false, else: :safe_transient),
-                 receive_timeout: 30_000
-               )
-             ) do
-          {:ok, %{status: 200, body: info}} ->
-            File.mkdir_p!(Path.dirname(path))
-            write_file!(path, JSON.encode!(info))
-            info
+        metadata = %{source: {:hf, repo}, revision: opts[:revision] || "main"}
 
-          _error when saved? ->
-            path |> File.read!() |> JSON.decode!()
-
-          {:ok, %{headers: %{"x-error-code" => ["RevisionNotFound"]}}} ->
-            raise ArgumentError, "#{repo} has no revision #{opts[:revision]}"
-
-          {:ok, %{status: status, body: body}} ->
-            raise Transmuter.HubError, repo: repo, status: status, details: inspect(body)
-
-          {:error, error} ->
-            raise ArgumentError,
-                  "could not reach the Hugging Face Hub for #{repo}: #{Exception.message(error)}"
-        end
+        :telemetry.span([:transmuter, :hub, :info], metadata, fn ->
+          {info, result} = request_info(repo, path, saved?, opts)
+          {info, Map.put(metadata, :result, result)}
+        end)
     end
   end
 
   def info(dir, _opts) when is_binary(dir), do: nil
+
+  # With saved metadata, an error gives the saved metadata at once. Without it, Req retries
+  # a transient error.
+  defp request_info(repo, path, saved?, opts) do
+    case Req.get(
+           request(
+             url:
+               "https://huggingface.co/api/models/#{repo}/revision/#{revision(opts)}?blobs=true",
+             retry: if(saved?, do: false, else: :safe_transient),
+             receive_timeout: 30_000
+           )
+         ) do
+      {:ok, %{status: 200, body: info}} ->
+        File.mkdir_p!(Path.dirname(path))
+        write_file!(path, JSON.encode!(info))
+        {info, :fetched}
+
+      _error when saved? ->
+        {path |> File.read!() |> JSON.decode!(), :saved}
+
+      {:ok, %{headers: %{"x-error-code" => ["RevisionNotFound"]}}} ->
+        raise ArgumentError, "#{repo} has no revision #{opts[:revision]}"
+
+      {:ok, %{status: status, body: body}} ->
+        raise Transmuter.HubError, repo: repo, status: status, details: inspect(body)
+
+      {:error, error} ->
+        raise ArgumentError,
+              "could not reach the Hugging Face Hub for #{repo}: #{Exception.message(error)}"
+    end
+  end
 
   # External data files of an ONNX file are named <file>_data, <file>_data_1, ... or <file>.data.
   defp data_files(file, files) do
@@ -168,52 +177,73 @@ defmodule Transmuter.Hub do
   defp download!(repo, commit, sibling, target, opts) do
     file = sibling["rfilename"]
     etag = sibling["lfs"]["sha256"] || sibling["blobId"]
-    hash = etag && hash_init(etag, sibling["size"])
+    metadata = %{source: {:hf, repo, file}, revision: opts[:revision] || "main"}
+    bytes = sibling["size"]
 
     cond do
-      File.exists?(target) and (offline?(opts) or current?(target, etag)) ->
-        :ok
+      check = File.exists?(target) && check(target, etag, opts) ->
+        hit = Map.put(metadata, :check, check)
+        :telemetry.execute([:transmuter, :hub, :hit], %{count: 1, bytes: bytes}, hit)
 
       offline?(opts) ->
         raise ArgumentError, "#{file} of #{repo} is not in the cache, and the Hub is offline"
 
       true ->
-        File.mkdir_p!(Path.dirname(target))
-        part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
-
-        try do
-          response =
-            File.open!(part, [:write, :binary], fn device ->
-              Req.get!(
-                request(
-                  url: "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
-                  into: &write(device, file, hash, &1, &2)
-                )
-              )
-            end)
-
-          if response.status != 200,
-            do: raise(Transmuter.HubError, repo: repo, status: response.status, details: file)
-
-          if etag && digest(Req.Response.get_private(response, :hash, hash)) != etag,
-            do: raise(ArgumentError, "the download of #{file} of #{repo} does not match its ETag")
-
-          File.rename!(part, target)
-          if etag, do: save_etag(target, etag)
-        after
-          File.rm(part)
-        end
+        :telemetry.span([:transmuter, :hub, :download], metadata, fn ->
+          download_file!(repo, commit, sibling, target, etag)
+          {:ok, %{bytes: bytes}, metadata}
+        end)
     end
   end
 
-  # A file without a saved ETag, such as a file of an earlier version of Transmuter, gets the
-  # ETag of its contents.
-  defp current?(_target, nil), do: true
+  defp download_file!(repo, commit, sibling, target, etag) do
+    file = sibling["rfilename"]
+    hash = etag && hash_init(etag, sibling["size"])
+    File.mkdir_p!(Path.dirname(target))
+    part = "#{target}.#{System.pid()}-#{System.unique_integer([:positive])}.part"
 
-  defp current?(target, etag) do
+    try do
+      response =
+        File.open!(part, [:write, :binary], fn device ->
+          Req.get!(
+            request(
+              url: "https://huggingface.co/#{repo}/resolve/#{commit}/#{file}",
+              into: &write(device, file, hash, &1, &2)
+            )
+          )
+        end)
+
+      if response.status != 200,
+        do: raise(Transmuter.HubError, repo: repo, status: response.status, details: file)
+
+      if etag && digest(Req.Response.get_private(response, :hash, hash)) != etag,
+        do: raise(ArgumentError, "the download of #{file} of #{repo} does not match its ETag")
+
+      File.rename!(part, target)
+      if etag, do: save_etag(target, etag)
+    after
+      File.rm(part)
+    end
+  end
+
+  # How a file in the cache is current, or nil when it must download again. A file without
+  # a saved ETag, such as a file of an earlier version of Transmuter, gets the ETag of its
+  # contents.
+  defp check(target, etag, opts) do
+    cond do
+      offline?(opts) -> :offline
+      etag == nil -> :etag
+      true -> check_etag(target, etag)
+    end
+  end
+
+  defp check_etag(target, etag) do
     case File.read(etag_path(target)) do
-      {:ok, saved} ->
-        saved == etag
+      {:ok, ^etag} ->
+        :etag
+
+      {:ok, _other} ->
+        nil
 
       {:error, _reason} ->
         hash =
@@ -221,7 +251,7 @@ defmodule Transmuter.Hub do
           |> File.stream!(1_048_576)
           |> Enum.reduce(hash_init(etag, File.stat!(target).size), &:crypto.hash_update(&2, &1))
 
-        if digest(hash) == etag, do: save_etag(target, etag) == :ok
+        if digest(hash) == etag and save_etag(target, etag) == :ok, do: :hash
     end
   end
 
