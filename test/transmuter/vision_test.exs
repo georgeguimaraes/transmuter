@@ -381,46 +381,49 @@ defmodule Transmuter.VisionTest do
     prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
 
     # A wide and a tall image. Both have 99 image tokens, so their prompts are equal.
-    for {image, grid, expected} <- [
-          {image, [1, 18, 22], [0.2661, 0.5435, -0.8403, -0.2963]},
-          {Nx.transpose(image, axes: [1, 0, 2]), [1, 22, 18], [0.2661, -0.201, -0.8403, -1.0317]}
-        ] do
-      {tensors, text} = Qwen2VLProcessor.process(processor, image, @opts[:backend])
-      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
-      assert Nx.shape(pixels) == {396, 1176}
-      assert Nx.to_list(tensors["image_grid_thw"]) == [grid]
-
-      got =
-        for index <- [[0, 0], [1, 100], [-1, 1175], [200, 777]], do: Nx.to_number(pixels[index])
-
-      assert_all_close(got, expected)
-      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), 0.8945, 1.0e-4
-
-      {:ok, encoding} =
-        Tokenizers.Tokenizer.encode(
-          tokenizer.native,
-          String.replace(prompt, "<|image_pad|>", text)
-        )
-
-      ids = Tokenizers.Encoding.get_ids(encoding)
-      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
-
-      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
-               {126, "5879c4bd9e8deede"}
-    end
-
-    # Two batch rows with one image each and rows of zeros after it. The encoder gets each
-    # image alone, and each prompt gets the positions of the grid of its own image. Here the
-    # encoder gives the patches as the features.
     rows =
-      for image <- [image, Nx.transpose(image, axes: [1, 0, 2])] do
-        {tensors, _text} = Qwen2VLProcessor.process(processor, image, Nx.BinaryBackend)
+      for {image, grid, expected} <- [
+            {image, [1, 18, 22], [0.2661, 0.5435, -0.8403, -0.2963]},
+            {Nx.transpose(image, axes: [1, 0, 2]), [1, 22, 18],
+             [0.2661, -0.201, -0.8403, -1.0317]}
+          ] do
+        {tensors, text} = Qwen2VLProcessor.process(processor, image, @opts[:backend])
+
+        tensors =
+          Map.new(tensors, fn {name, tensor} ->
+            {name, Nx.backend_transfer(tensor, Nx.BinaryBackend)}
+          end)
+
+        pixels = tensors["pixel_values"]
+        assert Nx.shape(pixels) == {396, 1176}
+        assert Nx.to_list(tensors["image_grid_thw"]) == [grid]
+
+        got =
+          for index <- [[0, 0], [1, 100], [-1, 1175], [200, 777]], do: Nx.to_number(pixels[index])
+
+        assert_all_close(got, expected)
+        assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), 0.8945, 1.0e-4
+
+        {:ok, encoding} =
+          Tokenizers.Tokenizer.encode(
+            tokenizer.native,
+            String.replace(prompt, "<|image_pad|>", text)
+          )
+
+        ids = Tokenizers.Encoding.get_ids(encoding)
+        digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+        assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+                 {126, "5879c4bd9e8deede"}
 
         Map.new(tensors, fn {name, tensor} ->
           {name, Nx.pad(tensor, 0, [{0, 512 - Nx.axis_size(tensor, 0), 0}, {0, 0, 0}])}
         end)
       end
 
+    # Two batch rows, the wide and the tall image, with rows of zeros after each image. The
+    # encoder gets each image alone, and each prompt gets the positions of the grid of its own
+    # image. Here the encoder gives the patches as the features.
     batch =
       Map.new(
         ["pixel_values", "image_grid_thw"],
@@ -510,48 +513,88 @@ defmodule Transmuter.VisionTest do
     image = StbImage.to_nx(@image)
     content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
     prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+    config = Transmuter.Hub.json(repo.source, "preprocessor_config.json", repo.opts)
+    processor_config = Transmuter.Hub.json(repo.source, "processor_config.json", repo.opts)
+    slow = config |> Map.put("image_processor_type", "PixtralImageProcessor")
+    slow = PixtralProcessor.new(slow, processor_config)
+    no_resize = PixtralProcessor.new(Map.put(config, "do_resize", false), processor_config)
+    {height, width, _channels} = Nx.shape(image)
+
+    alpha =
+      Nx.remainder(
+        Nx.add(
+          Nx.iota({height, width, 1}, axis: 1) |> Nx.multiply(7),
+          Nx.iota({height, width, 1}, axis: 0) |> Nx.multiply(3)
+        ),
+        256
+      )
+
+    rgba = Nx.concatenate([image, Nx.as_type(alpha, :u8)], axis: 2)
 
     # A wide and a tall image, which each side makes larger to a multiple of 28, and a tile
-    # of 1680x2240 that gets smaller to 1155x1540 and then 1176x1540. The template writes
-    # the bos token, so the tokenizer adds no special tokens.
-    for {image, size, blocks, expected, mean, count, sha} <- [
-          {image, [252, 336], 108, [0.2661, 0.5727, -0.8403, 1.361], 0.8947, 658,
-           "a5464f656bd6d048"},
-          {Nx.transpose(image, axes: [1, 0, 2]), [336, 252], 108,
-           [0.2661, -0.1718, -0.8403, 1.8281], 0.8947, 661, "02897cc4d8b54da3"},
-          {Nx.tile(image, [7, 7, 1]), [1176, 1540], 2310, [0.2953, 0.6165, -0.4279, -1.1061],
-           0.8882, 2893, "881f6660926c1767"}
-        ] do
-      {tensors, text} = PixtralProcessor.process(processor, image, @opts[:backend])
-      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
-      assert Nx.shape(pixels) == {blocks, 2352}
-      assert Nx.to_list(tensors["image_sizes"]) == [size]
+    # of 1680x2240 that gets smaller to 1155x1540 and then 1176x1540. An RGBA image goes on
+    # white with the slow image processor, and loses its alpha channel with the fast one.
+    # Without do_resize, the 240x320 image keeps the 224x308 pixels of its full blocks. The
+    # template writes the bos token, so the tokenizer adds no special tokens.
+    tensors =
+      for {processor, image, size, blocks, expected, mean, count, sha} <- [
+            {processor, image, [252, 336], 108, [0.2661, 0.5727, -0.8403, 1.361], 0.8947, 658,
+             "a5464f656bd6d048"},
+            {processor, Nx.transpose(image, axes: [1, 0, 2]), [336, 252], 108,
+             [0.2661, -0.1718, -0.8403, 1.8281], 0.8947, 661, "02897cc4d8b54da3"},
+            {processor, Nx.tile(image, [7, 7, 1]), [1176, 1540], 2310,
+             [0.2953, 0.6165, -0.4279, -1.1061], 0.8882, 2893, "881f6660926c1767"},
+            {slow, rgba, [252, 336], 108, [1.9303, 1.6822, 0.5675, 1.6092], 1.2486, 658,
+             "a5464f656bd6d048"},
+            {processor, rgba, [252, 336], 108, [0.2661, 0.5727, -0.8403, 1.361], 0.8947, 658,
+             "a5464f656bd6d048"},
+            {no_resize, image, [224, 308], 88, [0.2661, 0.6457, 1.2927, 0.4121], 0.8821, 637,
+             "d6820051c9296734"}
+          ] do
+        {tensors, text} = PixtralProcessor.process(processor, image, @opts[:backend])
 
-      got =
-        for index <- [[0, 0], [1, 100], [-1, 2351], [50, 777]], do: Nx.to_number(pixels[index])
+        tensors =
+          Map.new(tensors, fn {name, tensor} ->
+            {name, Nx.backend_transfer(tensor, Nx.BinaryBackend)}
+          end)
 
-      assert_all_close(got, expected)
-      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
+        pixels = tensors["pixel_values"]
+        assert Nx.shape(pixels) == {blocks, 2352}
+        assert Nx.to_list(tensors["image_sizes"]) == [size]
 
-      {:ok, encoding} =
-        Tokenizers.Tokenizer.encode(tokenizer.native, String.replace(prompt, "[IMG]", text),
-          add_special_tokens: false
-        )
+        got =
+          for index <- [[0, 0], [1, 100], [-1, 2351], [50, 777]], do: Nx.to_number(pixels[index])
 
-      ids = Tokenizers.Encoding.get_ids(encoding)
-      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+        assert_all_close(got, expected)
+        assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
 
-      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
-               {count, sha}
+        {:ok, encoding} =
+          Tokenizers.Tokenizer.encode(tokenizer.native, String.replace(prompt, "[IMG]", text),
+            add_special_tokens: false
+          )
+
+        ids = Tokenizers.Encoding.get_ids(encoding)
+        digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+        assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+                 {count, sha}
+
+        tensors
+      end
+
+    # As in Python transformers, a side that rounds to 0 pixels has no image.
+    assert_raise ArgumentError, ~r/gives no block of 28x28 pixels/, fn ->
+      PixtralProcessor.process(
+        processor,
+        Nx.broadcast(Nx.tensor(0, type: :u8), {1, 2000, 3}),
+        @opts[:backend]
+      )
     end
 
     # The encoder gets each image of a batch row alone, as {1, 3, height, width}. Here it
     # gives the 28x28 blocks of the image as its features, so the features are the rows of
-    # the two images without the rows of zeros after them.
-    images = [image, Nx.transpose(image, axes: [1, 0, 2])]
-
-    tensors =
-      Enum.map(images, &elem(PixtralProcessor.process(processor, &1, Nx.BinaryBackend), 0))
+    # the wide and the tall image without the rows of zeros after them.
+    tensors = Enum.take(tensors, 2)
 
     batch =
       Map.new(["pixel_values", "image_sizes"], fn name ->

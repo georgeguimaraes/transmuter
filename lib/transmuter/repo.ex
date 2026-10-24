@@ -112,6 +112,13 @@ defmodule Transmuter.Repo do
   end
 
   @doc """
+  Returns the id of the image token of a vision language model from `config.json`, or `nil`.
+
+  The id is `image_token_id`, or else `image_token_index`, its other name in the `attribute_map` of `Mistral3Config` and `LlavaConfig` of Python transformers.
+  """
+  def image_token_id(repo), do: repo.config["image_token_id"] || repo.config["image_token_index"]
+
+  @doc """
   Returns the first result of `read` that is not `nil`, on the source of `repo` and then on the base model in its model card. `read` takes a source and reads the sentence-transformers files of that source, such as `modules.json`. ONNX exports often leave these files out, and their base model has them.
 
   When the Hub denies the base model, such as a gated model without a token or a model that does not exist, this function logs a warning and does not read it.

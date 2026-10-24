@@ -14,7 +14,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   The image tokens of the prompt take 3-D positions for M-RoPE, as `get_rope_index` of Python transformers. The text tokens have the same position on the 3 axes. The image tokens of an image have the positions of their frame, row and column after the text before them, and the text after the image continues from the largest of these positions.
   """
 
-  alias Transmuter.{Featurizer, Hub}
+  alias Transmuter.{Featurizer, Hub, Repo}
   alias Transmuter.Vision.ImageTextToText
 
   defstruct [
@@ -63,7 +63,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       patch_size: config["patch_size"] || 14,
       merge_size: config["merge_size"] || 2,
       temporal_patch_size: config["temporal_patch_size"] || 2,
-      image_token: ImageTextToText.image_token(repo),
+      image_token: Repo.image_token_id(repo),
       grid_input: grid_input
     }
   end
@@ -71,7 +71,7 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   @doc """
   The text of an image in the prompt before `process/3` expands it.
   """
-  def placeholder, do: @placeholder
+  def placeholder(_processor), do: @placeholder
 
   @doc """
   Turns an image into patches and gives the text of the image in the prompt.

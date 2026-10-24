@@ -49,14 +49,19 @@ for name, text in [("short", "The cat sat on the mat."), ("543 tokens", long)]:
 import onnx
 
 
-def exact_session(path):
-    model = onnx.load(path)
+# With next_to_data, the graph goes to a file next to its external data, and the session reads
+# that file. A model of more than 2 GB, the limit of a protobuf, needs it.
+def exact_session(path, next_to_data=False):
+    model = onnx.load(path, load_external_data=not next_to_data)
     for node in model.graph.node:
         for attribute in node.attribute:
             if node.op_type == "MatMulNBits" and attribute.name == "accuracy_level":
                 attribute.i = 0
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    if next_to_data:
+        onnx.save(model, path.removesuffix(".onnx") + "_exact.onnx")
+        return ort.InferenceSession(path.removesuffix(".onnx") + "_exact.onnx", options, providers=["CPUExecutionProvider"])
     return ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"])
 
 
@@ -517,29 +522,32 @@ for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.
     blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
     print("pixtral", name, inputs["image_sizes"].tolist(), blocks.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
 
+# An image with alpha: the slow image processor puts it on white, and the fast one removes the
+# alpha channel. Without do_resize, the processor gives height // 28 rows of width // 28 tokens,
+# and the vision tower uses the blocks from the top left corner, so the script prints the
+# values of these blocks only.
+pixels = np.asarray(image)
+y, x = np.mgrid[0 : pixels.shape[0], 0 : pixels.shape[1]]
+rgba = Image.fromarray(np.dstack([pixels, ((7 * x + 3 * y) % 256).astype(np.uint8)]), "RGBA")
+slow = AutoProcessor.from_pretrained(repo, image_processor=AutoImageProcessor.from_pretrained(repo, use_fast=False))
+for name, pixtral, picture, options in [("rgba slow", slow, rgba, {}), ("rgba fast", processor, rgba, {}), ("no resize", processor, image, {"do_resize": False})]:
+    inputs = pixtral(text=prompt, images=[picture], add_special_tokens=False, return_tensors="pt", **options)
+    ids, values = inputs["input_ids"][0].numpy().astype("<i8"), inputs["pixel_values"][0].numpy()
+    channels, height, width = values.shape
+    values = values[:, : height // 28 * 28, : width // 28 * 28]
+    blocks = values.reshape(channels, height // 28, 28, width // 28, 28).transpose(1, 3, 0, 2, 4).reshape(-1, channels * 28 * 28)
+    print("pixtral", name, type(pixtral.image_processor).__name__, values.shape, [round(float(blocks[p]), 4) for p in positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16])
+
 # Image-text-to-text with Ministral 3. The reference is ONNX Runtime on the q4 files of the
 # test: the vision encoder, the embeddings and the decoder. The vision encoder takes one image
 # of its size, and the features replace the embeddings of the [IMG] tokens only. The
 # decoder runs greedy with a cache that grows from 0 rows. Its MatMulNBits nodes get
-# accuracy_level 0. The data of the decoder is larger than 2 GB, the limit of a protobuf, so
-# the graph goes to a file next to its data, and the session reads that file.
+# accuracy_level 0. The data of the decoder is larger than 2 GB, so exact_session saves the
+# graph next to the data.
 repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
 directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
 
-
-def exact_file_session(name):
-    model = onnx.load(f"{directory}/onnx/{name}.onnx", load_external_data=False)
-    for node in model.graph.node:
-        for attribute in node.attribute:
-            if node.op_type == "MatMulNBits" and attribute.name == "accuracy_level":
-                attribute.i = 0
-    onnx.save(model, f"{directory}/onnx/{name}_exact.onnx")
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    return ort.InferenceSession(f"{directory}/onnx/{name}_exact.onnx", options, providers=["CPUExecutionProvider"])
-
-
-vision, embed, decoder = (exact_file_session(name) for name in ["vision_encoder_q4", "embed_tokens_q4", "decoder_model_merged_q4"])
+vision, embed, decoder = (exact_session(f"{directory}/onnx/{name}.onnx", next_to_data=True) for name in ["vision_encoder_q4", "embed_tokens_q4", "decoder_model_merged_q4"])
 names = [o.name for o in decoder.get_outputs()]
 image_token, eos = processor.tokenizer.convert_tokens_to_ids(["[IMG]", "</s>"])
 chats = {

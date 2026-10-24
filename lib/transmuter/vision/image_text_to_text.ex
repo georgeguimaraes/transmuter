@@ -60,7 +60,11 @@ defmodule Transmuter.Vision.ImageTextToText do
     backend = opts[:backend] || Nx.default_backend()
 
     ctx =
-      Generation.context(repo, decoder, [embed: embed, image_token: image_token(repo)] ++ opts)
+      Generation.context(
+        repo,
+        decoder,
+        [embed: embed, image_token: Repo.image_token_id(repo)] ++ opts
+      )
 
     bos = Repo.special_token(repo, "bos")
 
@@ -179,7 +183,7 @@ defmodule Transmuter.Vision.ImageTextToText do
   # Each placeholder of the rendered prompt takes the text of its image. The tensors of all
   # images go into one row, with rows of zeros up to the batch key.
   defp expand!({module, processor}, text, images, backend) do
-    [first | rest] = String.split(text, module.placeholder())
+    [first | rest] = String.split(text, module.placeholder(processor))
 
     if length(rest) != length(images) do
       raise ArgumentError,
@@ -218,11 +222,6 @@ defmodule Transmuter.Vision.ImageTextToText do
 
     Tokenizer.ids(tokenizer, encoding)
   end
-
-  @doc false
-  # The id of the image token. As the attribute_map of Mistral3Config and LlavaConfig of
-  # Python transformers, image_token_index is another name of image_token_id.
-  def image_token(repo), do: repo.config["image_token_id"] || repo.config["image_token_index"]
 
   @doc false
   # The images of each row of a batch, before the rows of zeros, as {size, pixels}: a row

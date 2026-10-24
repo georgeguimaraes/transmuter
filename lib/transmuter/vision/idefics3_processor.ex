@@ -47,7 +47,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
   @doc """
   The text of an image in the prompt before `process/3` expands it.
   """
-  def placeholder, do: @placeholder
+  def placeholder(_processor), do: @placeholder
 
   @doc """
   Turns an image into tiles and gives the text of the image in the prompt.
