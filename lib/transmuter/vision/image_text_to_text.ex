@@ -1,10 +1,10 @@
 defmodule Transmuter.Vision.ImageTextToText do
   @moduledoc """
-  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL, Qwen3-VL, Ministral 3 and Gemma 3. See `Transmuter.Vision.image_text_to_text/2`.
+  The image-text-to-text task of decoder-only vision language models, such as SmolVLM, Qwen2-VL, Qwen3-VL, Ministral 3, Gemma 3 and LLaVA. See `Transmuter.Vision.image_text_to_text/2`.
 
   The repository has three models, as the `ImageTextToText` exports of transformers.js: `vision_encoder` turns the pixel values of the images into features, `embed_tokens` turns token ids into embeddings, and `decoder_model_merged` generates from the embeddings. `Transmuter.Generation` puts the features in the place of the image tokens of the prompt.
 
-  The processor of the model comes from `image_processor_type` in `preprocessor_config.json`: `Transmuter.Vision.Idefics3Processor`, `Transmuter.Vision.Qwen2VLProcessor`, `Transmuter.Vision.PixtralProcessor` or `Transmuter.Vision.Gemma3Processor`. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles, patches, blocks or images) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
+  The processor of the model comes from its `processor_class`, as in `AutoProcessor` of Python transformers: `Transmuter.Vision.Idefics3Processor`, `Transmuter.Vision.Qwen2VLProcessor`, `Transmuter.Vision.PixtralProcessor`, `Transmuter.Vision.Gemma3Processor` or `Transmuter.Vision.LlavaProcessor`. The chat template is that of the processor. The Qwen2-VL processor also gets the input names of the vision encoder. The client renders the chat template, turns each image into tensors with the processor, and replaces the placeholder of each image in the prompt with its image tokens. The tensors of the images of a chat are one row of the batch. The rows of their pixel values (tiles, patches, blocks or images) and of the other tensors are concatenated. The number of rows of the pixel values, rounded up to a power of two, is the batch key, and rows of zeros fill each tensor to that number of rows. In the serving process, the processor runs the vision encoder on the images of the batch and gives the features and the positions of each prompt to `Transmuter.Generation`.
 
   The tokenizer adds its special tokens to the rendered prompt, unless the prompt starts with the bos token, as `apply_chat_template` of the processors of Python transformers.
   """
@@ -12,7 +12,14 @@ defmodule Transmuter.Vision.ImageTextToText do
   @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
 
   alias Transmuter.{ChatTemplate, Featurizer, Generation, Hub, Repo, Serving, Tokenizer}
-  alias Transmuter.Vision.{Gemma3Processor, Idefics3Processor, PixtralProcessor, Qwen2VLProcessor}
+
+  alias Transmuter.Vision.{
+    Gemma3Processor,
+    Idefics3Processor,
+    LlavaProcessor,
+    PixtralProcessor,
+    Qwen2VLProcessor
+  }
 
   # The batch keys: the number of rows of the pixel values of a chat (tiles, patches, blocks or
   # images), rounded up to a power of two, or 0 for a chat without images.
@@ -53,6 +60,11 @@ defmodule Transmuter.Vision.ImageTextToText do
     tokenizer = opts[:tokenizer] || Tokenizer.load!(repo)
     {image_token, image_text} = image_token!(repo, tokenizer)
 
+    template =
+      Repo.processor_chat_template(repo) ||
+        raise ArgumentError,
+              "#{inspect(repo.source)} has no chat template of the processor, chat_template.jinja or chat_template.json"
+
     # The processor reads its configuration before the larger models load, so a bad
     # configuration raises early. The Qwen2-VL processor needs the inputs of the vision encoder.
     model_opts = Keyword.take(opts, [:backend, :compute_type])
@@ -81,7 +93,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     end
 
     preprocess = fn input ->
-      {text, images} = prompt(repo, input, opts)
+      {text, images} = prompt(repo, template, input, opts)
 
       %{prompt: text, tensors: tensors, key: key, texts: texts} =
         expand!({module, processor}, text, images, backend)
@@ -118,46 +130,65 @@ defmodule Transmuter.Vision.ImageTextToText do
     {id, text}
   end
 
-  # The lookup takes exact names, as AutoImageProcessor of Python transformers, and not the
-  # name without "Fast". A fast image processor can differ from the slow one: for example,
-  # Idefics3ImageProcessorFast resizes with bicubic in place of the lanczos of
-  # Idefics3ImageProcessor, because torchvision has no lanczos for tensors.
+  # The processor classes of Python transformers that the serving supports. Qwen3VLProcessor
+  # prepares images as Qwen2VLProcessor does.
+  @processors %{
+    "Idefics3Processor" => Idefics3Processor,
+    "Qwen2VLProcessor" => Qwen2VLProcessor,
+    "Qwen3VLProcessor" => Qwen2VLProcessor,
+    "PixtralProcessor" => PixtralProcessor,
+    "Gemma3Processor" => Gemma3Processor,
+    "LlavaProcessor" => LlavaProcessor
+  }
+
+  # The processor class of each model_type of these models in PROCESSOR_MAPPING_NAMES of
+  # Python transformers.
+  @model_types %{
+    "idefics3" => "Idefics3Processor",
+    "qwen2_vl" => "Qwen2VLProcessor",
+    "qwen3_vl" => "Qwen3VLProcessor",
+    "mistral3" => "PixtralProcessor",
+    "pixtral" => "PixtralProcessor",
+    "gemma3" => "Gemma3Processor",
+    "llava" => "LlavaProcessor"
+  }
+
+  # As AutoProcessor of Python transformers: the processor_class of processor_config.json,
+  # then of preprocessor_config.json, then of tokenizer_config.json, then of config.json, then
+  # the class of the model_type. The image processor of preprocessor_config.json, such as a
+  # fast one, is an input of the processor.
   defp processor!(repo, vision) do
-    qwen2_vl = fn -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)} end
-    pixtral = fn -> {PixtralProcessor, PixtralProcessor.load!(repo)} end
-    gemma3 = fn -> {Gemma3Processor, Gemma3Processor.load!(repo)} end
-
-    processors = %{
-      "Idefics3ImageProcessor" => fn -> {Idefics3Processor, Idefics3Processor.load!(repo)} end,
-      "Qwen2VLImageProcessor" => qwen2_vl,
-      "Qwen2VLImageProcessorFast" => qwen2_vl,
-      "PixtralImageProcessor" => pixtral,
-      "PixtralImageProcessorFast" => pixtral,
-      "Gemma3ImageProcessor" => gemma3,
-      "Gemma3ImageProcessorFast" => gemma3
-    }
-
-    config = Hub.json(repo.source, "preprocessor_config.json", repo.opts) || %{}
-
-    case processors[config["image_processor_type"]] do
-      nil ->
-        {last, names} = processors |> Map.keys() |> Enum.sort() |> List.pop_at(-1)
-
-        raise ArgumentError,
-              "image_text_to_text supports #{Enum.join(names, ", ")} and #{last}, got: #{inspect(config["image_processor_type"])}"
-
-      load ->
-        load.()
+    case processor_module!(repo) do
+      Qwen2VLProcessor -> {Qwen2VLProcessor, Qwen2VLProcessor.load!(repo, inputs: vision.inputs)}
+      module -> {module, module.load!(repo)}
     end
   end
 
-  # The chat template renders an image part without its image. As in the pipeline of
+  @doc false
+  def processor_module!(repo) do
+    class =
+      Enum.find_value(["processor_config.json", "preprocessor_config.json"], fn file ->
+        (Hub.json(repo.source, file, repo.opts) || %{})["processor_class"]
+      end) || repo.tokenizer_config["processor_class"] || repo.config["processor_class"] ||
+        @model_types[repo.config["model_type"]]
+
+    @processors[class] ||
+      (
+        {last, names} = @processors |> Map.keys() |> Enum.sort() |> List.pop_at(-1)
+
+        raise ArgumentError,
+              "image_text_to_text supports the processors #{Enum.join(names, ", ")} and #{last}, got: #{inspect(class)}"
+      )
+  end
+
+  # The chat template of the processor renders an image part without its image. As in the pipeline of
   # Python transformers, a chat that ends with an assistant message continues that message.
-  defp prompt(repo, %{messages: messages}, opts) do
+  defp prompt(repo, template, %{messages: messages}, opts) do
     {messages, images} = Enum.map_reduce(messages, [], &take_images/2)
     final = List.last(messages)
 
     template_opts = [
+      template: template,
       template_options: opts[:template_options],
       continue_final_message: (final[:role] || final["role"]) == "assistant"
     ]
@@ -252,6 +283,28 @@ defmodule Transmuter.Vision.ImageTextToText do
       Tokenizers.Tokenizer.encode(tokenizer.native, text, add_special_tokens: special?)
 
     Tokenizer.ids(tokenizer, encoding)
+  end
+
+  @doc false
+  # Runs `encode` on each image of `tensors` alone: the "pixel_values" {1, 3, height, width} of
+  # each image of each row, as "image_sizes" shows, without the rows of zeros. So the encoder
+  # has one compiled shape and the memory of one image. Each image must give `count` features.
+  # Returns the features of all images in order, of shape {images * count, hidden}.
+  def encode_each(encode, %{"pixel_values" => pixels, "image_sizes" => sizes}, count) do
+    features =
+      for row <- images(pixels, sizes, fn _size -> 1 end), {_size, image} <- row do
+        %{"image_features" => features} = encode.(%{"pixel_values" => image})
+        {1, tokens, hidden} = Nx.shape(features)
+
+        if tokens != count do
+          raise ArgumentError,
+                "the vision encoder gives #{tokens} features for each image, and the processor gives #{count} image tokens"
+        end
+
+        Nx.reshape(features, {tokens, hidden})
+      end
+
+    Nx.concatenate(features)
   end
 
   @doc false

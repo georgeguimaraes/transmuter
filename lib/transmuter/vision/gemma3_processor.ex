@@ -79,23 +79,6 @@ defmodule Transmuter.Vision.Gemma3Processor do
 
   `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 3, height, width}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the images of a row. Each image runs alone, so the encoder has one compiled shape and the memory of one image, and the rows of zeros do not run. Returns `%{image_features: features}`: the features of the images of all rows, in order, of shape `{images * image_seq_length, hidden}`. The prompts take the default positions.
   """
-  def encode(processor, encode, tensors, _prompts, _backend) do
-    %{"pixel_values" => pixels, "image_sizes" => sizes} = tensors
-
-    features =
-      for row <- ImageTextToText.images(pixels, sizes, fn _size -> 1 end),
-          {_size, image} <- row do
-        %{"image_features" => features} = encode.(%{"pixel_values" => image})
-        {1, tokens, hidden} = Nx.shape(features)
-
-        if tokens != processor.image_seq_len do
-          raise ArgumentError,
-                "the vision encoder gives #{tokens} features for each image, and image_seq_length is #{processor.image_seq_len}"
-        end
-
-        Nx.reshape(features, {tokens, hidden})
-      end
-
-    %{image_features: Nx.concatenate(features)}
-  end
+  def encode(processor, encode, tensors, _prompts, _backend),
+    do: %{image_features: ImageTextToText.encode_each(encode, tensors, processor.image_seq_len)}
 end

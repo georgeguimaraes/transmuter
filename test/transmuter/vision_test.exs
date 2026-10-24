@@ -18,6 +18,7 @@ defmodule Transmuter.VisionTest do
     Florence2Processor,
     Gemma3Processor,
     Idefics3Processor,
+    LlavaProcessor,
     PixtralProcessor,
     Qwen2VLProcessor
   }
@@ -632,6 +633,104 @@ defmodule Transmuter.VisionTest do
     assert features == Nx.concatenate(Enum.map(tensors, & &1["pixel_values"]))
   end
 
+  # As AutoProcessor of Python transformers, the processor_class of the configuration files
+  # picks the processor, also for a fast image processor (Ministral 3, the tiny Gemma 3) and a
+  # generic one (SiglipImageProcessor of LLaVA-Interleave). Without a processor_class, the
+  # model_type picks it. The test reads only configurations.
+  @tag ci_partition: 15
+  test "image-text-to-text picks the processor from processor_class, as AutoProcessor" do
+    for {source, module} <- [
+          {"HuggingFaceTB/SmolVLM-256M-Instruct", Idefics3Processor},
+          {"onnx-community/Qwen2-VL-2B-Instruct", Qwen2VLProcessor},
+          {"onnx-community/Qwen3-VL-2B-Instruct-ONNX", Qwen2VLProcessor},
+          {"mistralai/Ministral-3-3B-Instruct-2512-ONNX", PixtralProcessor},
+          {"onnx-community/gemma-3-4b-it-ONNX", Gemma3Processor},
+          {"onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration", Gemma3Processor},
+          {"llava-hf/llava-interleave-qwen-0.5b-hf", LlavaProcessor},
+          {"Xenova/tiny-random-LlavaForConditionalGeneration", LlavaProcessor}
+        ] do
+      repo = Transmuter.Repo.load!({:hf, source})
+      assert Vision.ImageTextToText.processor_module!(repo) == module, source
+    end
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "transmuter-processor-class-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    repo = %Transmuter.Repo{source: dir, opts: [], tokenizer_config: %{}}
+
+    assert Vision.ImageTextToText.processor_module!(%{repo | config: %{"model_type" => "llava"}}) ==
+             LlavaProcessor
+
+    assert_raise ArgumentError, ~r/supports the processors .* got: "PaliGemmaProcessor"/, fn ->
+      Vision.ImageTextToText.processor_module!(%{
+        repo
+        | config: %{"processor_class" => "PaliGemmaProcessor"}
+      })
+    end
+  end
+
+  # LLaVA-Interleave has SiglipImageProcessor (384x384, 729 image tokens) and the chat template
+  # of the processor. The tiny export has CLIPImageProcessor (a center crop of 30x30, patch 2,
+  # 225 image tokens) and no chat template, so its prompt is a text. Neither tokenizer has a bos
+  # token in the prompt, so the tokenizer adds its special tokens. The test reads only the
+  # configuration and the tokenizer of each repository.
+  @tag ci_partition: 15
+  test "the LLaVA processor gives the pixel values and the prompt of Python transformers" do
+    image = StbImage.to_nx(@image)
+    tall = Nx.transpose(image, axes: [1, 0, 2])
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+
+    for {source, positions, size, cases} <- [
+          {"llava-hf/llava-interleave-qwen-0.5b-hf",
+           [[0, 0, 0, 0], [0, 1, 100, 37], [0, 2, 383, 383], [0, 0, 191, 300]], 384,
+           [
+             {image, [0.1059, -0.6078, -0.6941, 0.1529], 0.4741, 744, "ff11547da8bf7b6f"},
+             {tall, [0.1059, -0.898, -0.6941, 0.9373], 0.4741, 744, "ff11547da8bf7b6f"}
+           ]},
+          {"Xenova/tiny-random-LlavaForConditionalGeneration",
+           [[0, 0, 0, 0], [0, 1, 10, 7], [0, 2, 29, 29], [0, 0, 15, 20]], 30,
+           [
+             {image, [0.6457, 0.0488, 0.8661, 0.4705], 0.801, 241, "b71a2686595233e6"},
+             {tall, [0.6457, -0.0412, 0.8661, 1.7114], 0.8011, 241, "b71a2686595233e6"}
+           ]}
+        ],
+        {picture, expected, mean, count, sha} <- cases do
+      repo = Transmuter.Repo.load!({:hf, source})
+      processor = LlavaProcessor.load!(repo)
+      tokenizer = Tokenizer.load!(repo)
+
+      prompt =
+        case Transmuter.Repo.processor_chat_template(repo) do
+          nil ->
+            "USER: <image>\nWhat is this? ASSISTANT:"
+
+          template ->
+            ChatTemplate.render(repo, [%{role: "user", content: content}], template: template)
+        end
+
+      {%{"pixel_values" => pixels}, text} =
+        LlavaProcessor.process(processor, picture, @opts[:backend])
+
+      pixels = Nx.backend_transfer(pixels, Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {1, 3, size, size}
+      assert_all_close(Enum.map(positions, &Nx.to_number(pixels[&1])), expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), mean, 1.0e-4
+
+      prompt = String.replace(prompt, LlavaProcessor.placeholder(processor), text)
+      {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, prompt)
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {count, sha},
+             source
+    end
+  end
+
   @gemma3 {:hf, "onnx-community/gemma-3-4b-it-ONNX"}
 
   # The test reads only the configuration and the tokenizer of the repository. The chat
@@ -718,7 +817,7 @@ defmodule Transmuter.VisionTest do
     assert Nx.to_list(features[[.., 0]]) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
 
     assert_raise ArgumentError,
-                 ~r/gives 3 features for each image, and image_seq_length is 2/,
+                 ~r/gives 3 features for each image, and the processor gives 2 image tokens/,
                  fn ->
                    Gemma3Processor.encode(processor, encode.(3), tensors, [], nil)
                  end
@@ -787,6 +886,42 @@ defmodule Transmuter.VisionTest do
       assert result.text == expected.text
       assert_all_close(result.token_logprobs, expected.token_logprobs)
     end
+  end
+
+  # The reference is ONNX Runtime on the default files: the q4 vision encoder and decoder and
+  # the 8-bit embeddings, see test/support/pipeline_references.py. Each image gives 729 image
+  # tokens. The files have 721 MB.
+  @tag ci_partition: 14
+  test "image-text-to-text with LLaVA-Interleave matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for {images, text} <- [
+            {[@image], "Can you describe this image?"},
+            {[tall], "What animals are in the image?"},
+            {[], "What is the capital of France?"}
+          ] do
+        content = Enum.map(images, &%{type: "image", image: &1}) ++ [%{type: "text", text: text}]
+        %{messages: [%{role: "user", content: content}]}
+      end
+
+    expected = [
+      {744,
+       "In the heart of the image, two cats are peacefully sleeping on a pink blanket. The cat on the left, with"},
+      {745, "There are two cats in the image."},
+      {15, "Paris"}
+    ]
+
+    opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
+    repo = {:hf, "llava-hf/llava-interleave-qwen-0.5b-hf"}
+    alone = Nx.Serving.run(Vision.image_text_to_text(repo, opts), chats)
+
+    assert Enum.map(alone, fn %{results: [%{text: text, token_summary: %{input: count}}]} ->
+             {count, text}
+           end) == expected
+
+    batched = Vision.image_text_to_text(repo, [compile: [batch_size: 2]] ++ opts)
+    assert Nx.Serving.run(batched, chats) == alone
   end
 
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do

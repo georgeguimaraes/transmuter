@@ -706,6 +706,60 @@ gemma3_texts(
     fast=False,
 )
 
+# The LLaVA processor. LLaVA-Interleave saves the slow SiglipImageProcessor, which resizes to
+# 384x384, and its chat template is that of the processor in chat_template.json. The tiny
+# export has CLIPImageProcessor, which resizes the short side to 30 and crops the center, and
+# no chat template, so its prompt is a text. The pixel values at (image, channel, y, x), the
+# mean of the absolute values, and the number and a SHA-256 of the int64 input ids.
+for repo, text, llava_positions in [
+    ("llava-hf/llava-interleave-qwen-0.5b-hf", None, [(0, 0, 0, 0), (0, 1, 100, 37), (0, 2, 383, 383), (0, 0, 191, 300)]),
+    ("Xenova/tiny-random-LlavaForConditionalGeneration", "USER: <image>\nWhat is this? ASSISTANT:", [(0, 0, 0, 0), (0, 1, 10, 7), (0, 2, 29, 29), (0, 0, 15, 20)]),
+]:
+    processor = AutoProcessor.from_pretrained(repo)
+    for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
+        if text is None:
+            content = [{"type": "image", "image": picture}, {"type": "text", "text": "Can you describe this image?"}]
+            inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="np")
+        else:
+            inputs = processor(text=text, images=[picture], return_tensors="np")
+        ids, values = inputs["input_ids"][0].astype("<i8"), inputs["pixel_values"]
+        print("llava", repo, type(processor.image_processor).__name__, name, values.shape, [round(float(values[p]), 4) for p in llava_positions], round(float(np.abs(values).mean()), 4), len(ids), hashlib.sha256(ids.tobytes()).hexdigest()[:16], int((ids == processor.image_token_id).sum()))
+
+
+# Image-text-to-text with LLaVA-Interleave. The reference is ONNX Runtime on the default files
+# of Transmuter: the q4 vision encoder and decoder and the 8-bit embeddings. The features
+# replace the embeddings of the <image> tokens, and the decoder runs greedy with a cache that
+# grows from 0 rows and the positions from 0.
+repo = "llava-hf/llava-interleave-qwen-0.5b-hf"
+processor = AutoProcessor.from_pretrained(repo)
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx", "onnx/embed_tokens_quantized.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp())
+vision, embed, decoder = (exact_session(f"{directory}/onnx/{name}.onnx") for name in ["vision_encoder_q4", "embed_tokens_quantized", "decoder_model_merged_q4"])
+names = [o.name for o in decoder.get_outputs()]
+eos = GenerationConfig.from_pretrained(repo).eos_token_id
+eos = eos if isinstance(eos, list) else [eos]
+tall = image.transpose(Image.Transpose.TRANSPOSE)
+for name, images, text in [("one image", [image], "Can you describe this image?"), ("tall image", [tall], "What animals are in the image?"), ("text", [], "What is the capital of France?")]:
+    content = [{"type": "image", "image": picture} for picture in images] + [{"type": "text", "text": text}]
+    inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="np")
+    ids = inputs["input_ids"].astype(np.int64)
+    embeds = embed.run(None, {"input_ids": ids})[0]
+    if images:
+        features = vision.run(None, {"pixel_values": inputs["pixel_values"]})[0]
+        embeds[ids == processor.image_token_id] = features.reshape(-1, embeds.shape[-1])
+    past = empty_cache(decoder)
+    tokens, length = [], ids.shape[1]
+    for _ in range(24):
+        n = embeds.shape[1]
+        feeds = {"inputs_embeds": embeds, "attention_mask": np.ones((1, length), np.int64), "position_ids": np.arange(length - n, length)[None], **past}
+        outputs = dict(zip(names, decoder.run(None, feeds)))
+        tokens.append(int(outputs["logits"][0, -1].argmax()))
+        if tokens[-1] in eos:
+            break
+        past = {k.replace("present", "past_key_values"): v for k, v in outputs.items() if k.startswith("present")}
+        embeds = embed.run(None, {"input_ids": np.array([tokens[-1:]])})[0]
+        length += 1
+    print("llava onnxruntime", name, ids.shape[1], tokens, repr(processor.tokenizer.decode(tokens, skip_special_tokens=True)))
+
 # Object detection: the slow image processor, the PyTorch model and
 # post_process_object_detection with the threshold of the pipeline, 0.5. The pipeline
 # truncates the boxes to integers, so the script prints the boxes before that. DETR uses

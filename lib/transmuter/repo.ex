@@ -112,6 +112,19 @@ defmodule Transmuter.Repo do
   end
 
   @doc """
+  Returns the chat template of the processor of a multimodal model, or `nil`: `chat_template.jinja`, else the `"chat_template"` of `chat_template.json`, as `ProcessorMixin` of Python transformers loads it. The processor does not read the template of `tokenizer_config.json`, which the tokenizer uses.
+  """
+  def processor_chat_template(repo) do
+    case Hub.fetch(repo.source, "chat_template.jinja", repo.opts) do
+      {:ok, path} ->
+        File.read!(path)
+
+      :error ->
+        get_in(Hub.json(repo.source, "chat_template.json", repo.opts) || %{}, ["chat_template"])
+    end
+  end
+
+  @doc """
   Returns the id of the image token of a vision language model from `config.json`, or `nil`.
 
   The id is `image_token_id`, or else `image_token_index`, its other name in the `attribute_map` of `Mistral3Config` and `LlavaConfig` of Python transformers.

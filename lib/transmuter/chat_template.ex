@@ -27,6 +27,8 @@ defmodule Transmuter.ChatTemplate do
     * `:tools` - a list of tool definitions in JSON schema form. A repository with a template named `"tool_use"` renders tools with it.
 
     * `:template_options` - other variables of the template, such as `enable_thinking: false` for Qwen3.
+
+    * `:template` - the template to render in place of that of the tokenizer, such as `Transmuter.Repo.processor_chat_template/1`.
   """
   def render(repo, messages, opts \\ []) do
     unless Code.ensure_loaded?(Otera.ChatTemplate) do
@@ -49,7 +51,9 @@ defmodule Transmuter.ChatTemplate do
       variables: Map.merge(special, Map.new(opts[:template_options] || []))
     ]
 
-    case Otera.ChatTemplate.render(template(repo, opts[:tools]), messages, render_opts) do
+    template = opts[:template] || template(repo, opts[:tools])
+
+    case Otera.ChatTemplate.render(template, messages, render_opts) do
       {:ok, prompt} ->
         prompt
 
