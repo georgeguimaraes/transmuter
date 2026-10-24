@@ -924,6 +924,24 @@ defmodule Transmuter.VisionTest do
     assert Nx.Serving.run(serving, chats) == alone
   end
 
+  # Without resample, the filter is the default of the class, as in Python transformers. The
+  # fast Idefics3 image processor resizes with bicubic in place of lanczos, also when the
+  # configuration names lanczos.
+  test "the featurizer takes the default resample of the image processor class" do
+    for {config, resample, weights} <- [
+          {%{"image_processor_type" => "Idefics3ImageProcessor"}, :lanczos, :pillow},
+          {%{"image_processor_type" => "Idefics3ImageProcessorFast"}, :bicubic, :torchvision},
+          {%{"image_processor_type" => "Idefics3ImageProcessorFast", "resample" => 1}, :bicubic,
+           :torchvision},
+          {%{"image_processor_type" => "CLIPImageProcessor"}, :bicubic, :pillow},
+          {%{"image_processor_type" => "ViTImageProcessor"}, :bilinear, :pillow},
+          {%{}, :bilinear, :pillow}
+        ] do
+      featurizer = Featurizer.new(Map.put(config, "do_normalize", false))
+      assert {featurizer.resample, featurizer.weights} == {resample, weights}, inspect(config)
+    end
+  end
+
   test "the featurizer gives the sizes of the DETR, YOLOS and DPT image processors" do
     # A long side over longest_edge gives the short side longest_edge times the aspect ratio,
     # rounded half to even: 1333 * 400 / 800 is 666.5. YOLOS rounds each side down to a

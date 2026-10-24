@@ -26,9 +26,9 @@ defmodule Transmuter.Vision.PixtralProcessor do
   ]
 
   # The defaults of PixtralImageProcessor and PixtralImageProcessorFast of Python
-  # transformers, which are the same. They also take the place of a null value.
+  # transformers, which are the same. They also take the place of a null value. The
+  # featurizer gives the bicubic resample of these classes.
   @defaults %{
-    "resample" => 3,
     "image_mean" => [0.48145466, 0.4578275, 0.40821073],
     "image_std" => [0.26862954, 0.26130258, 0.27577711]
   }

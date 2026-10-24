@@ -10,7 +10,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
     4. The image splits into tiles, from left to right and from top to bottom. The image resized to one tile comes after them. Without `do_image_splitting`, the image resized to one tile is the only tile.
     5. Each tile is rescaled and normalized, as in `Transmuter.Featurizer`.
 
-  The resizes use the `resample` filter of the configuration on the 8-bit image, as Pillow does.
+  The resizes use the `resample` filter of the configuration on the 8-bit image, as Pillow does, or with the weights of torchvision for `Idefics3ImageProcessorFast`, which uses bicubic in place of lanczos. See `Transmuter.Featurizer.resize/4`.
 
   In the prompt, each image is a placeholder `<image>`, and `process/3` gives the text that replaces it: `<fake_token_around_image><row_r_col_c>` and `image_seq_len` image tokens for each tile, a newline after each row, and then `\\n<fake_token_around_image><global-img>`, the image tokens of the last tile and `<fake_token_around_image>`.
   """
@@ -56,27 +56,23 @@ defmodule Transmuter.Vision.Idefics3Processor do
   """
   def process(processor, image, backend) do
     {:ok, image} = Featurizer.tensor(image)
-    resample = processor.featurizer.resample
+    %{resample: resample, weights: weights} = processor.featurizer
+    resize = &Featurizer.resize(&1, &2, resample, weights)
     image = image |> Nx.backend_transfer(backend) |> Featurizer.rgb()
     {height, width, _channels} = Nx.shape(image)
 
     image =
       if processor.longest_edge,
-        do:
-          Featurizer.resize(
-            image,
-            longest_edge({height, width}, processor.longest_edge),
-            resample
-          ),
+        do: resize.(image, longest_edge({height, width}, processor.longest_edge)),
         else: image
 
     {tiles, rows, columns} =
       if processor.split? do
         {height, width, _channels} = Nx.shape(image)
-        image = Featurizer.resize(image, tile_multiple({height, width}, processor.tile), resample)
-        split(image, processor.tile, resample)
+        image = resize.(image, tile_multiple({height, width}, processor.tile))
+        split(image, processor.tile, resize)
       else
-        {[Featurizer.resize(image, {processor.tile, processor.tile}, resample)], 0, 0}
+        {[resize.(image, {processor.tile, processor.tile})], 0, 0}
       end
 
     pixels = Featurizer.process(processor.featurizer, tiles, backend: backend)
@@ -149,7 +145,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
 
   # An image of one tile does not split. The sides are multiples of a tile, so all tiles
   # have the same size.
-  defp split(image, tile, resample) do
+  defp split(image, tile, resize) do
     {height, width, channels} = Nx.shape(image)
 
     if height > tile or width > tile do
@@ -160,7 +156,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
             column <- 0..(columns - 1),
             do: Nx.slice(image, [row * tile, column * tile, 0], [tile, tile, channels])
 
-      {tiles ++ [Featurizer.resize(image, {tile, tile}, resample)], rows, columns}
+      {tiles ++ [resize.(image, {tile, tile})], rows, columns}
     else
       {[image], 0, 0}
     end

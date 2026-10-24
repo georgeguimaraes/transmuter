@@ -12,7 +12,7 @@ defmodule Transmuter.Featurizer do
   The steps and their order are those of the image processors of Python transformers:
 
     1. `do_convert_rgb` - the image gets 3 channels. A gray image repeats its channel, and the alpha channel is removed.
-    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. See `resize/4`. For an `image_processor_type` that ends in `Fast`, the weights are those of torchvision, so a pixel can be one step away from Pillow. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR, YOLOS and Grounding DINO image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The SAM image processor gives the long side `longest_edge`, also when the image is smaller. The featurizer reads `image_processor_type` and does the same.
+    2. `do_resize` - the image gets the `size` of the configuration with the `resample` filter of Pillow. Without `resample`, the filter is the default of the class of `image_processor_type` in Python transformers, such as bicubic for `CLIPImageProcessor` and lanczos for `Idefics3ImageProcessor`, else bilinear. A fast image processor resizes with bicubic in place of lanczos, because torchvision has no lanczos for tensors. See `resize/4`. For an `image_processor_type` that ends in `Fast`, the weights are those of torchvision, so a pixel can be one step away from Pillow. A `size` with `height` and `width` gives that size. A `size` with `shortest_edge` keeps the aspect ratio, and `longest_edge` limits the long side. With `ensure_multiple_of`, each side becomes the nearest multiple of it, as in the DPT image processor. With `keep_aspect_ratio`, both sides take the scale of `size` that is nearer to 1, so the size depends on the image. The DETR, YOLOS and Grounding DINO image processors compute this size with their own rounding, and YOLOS rounds each side down to a multiple of 16. The SAM image processor gives the long side `longest_edge`, also when the image is smaller. The featurizer reads `image_processor_type` and does the same.
     3. `do_center_crop` - the center region of `crop_size` stays. A configuration with `crop_pct`, such as ConvNeXt, resizes the short side to `shortest_edge / crop_pct` and crops a square of `shortest_edge`. When `shortest_edge` is 384 or more, it resizes to a square of `shortest_edge` and does not crop.
     4. `do_rescale` - the values are multiplied by `rescale_factor`.
     5. `do_normalize` - the values are normalized with `image_mean` and `image_std`.
@@ -49,6 +49,22 @@ defmodule Transmuter.Featurizer do
     4 => :box,
     5 => :hamming
   }
+
+  # The default resample of the image processors of Python transformers 4.57 whose default is
+  # not bilinear, by the name of the class without "ImageProcessor" and "Fast". The slow and
+  # the fast class of a model have the same default.
+  @default_resamples Map.merge(
+                       Map.new(
+                         ~w(Aria Beit Bit Blip BridgeTower CLIP ChineseCLIP Cohere2Vision DPT
+                            DeepseekVL DeepseekVLHybrid DeiT Emu3 Flava Glm4v GotOcr2
+                            InstructBlipVideo Janus Levit Llava LlavaNext LlavaNextVideo
+                            LlavaOnevision Ovis2 OwlViT Perceiver PerceptionLM Phi4Multimodal
+                            Pixtral PoolFormer PromptDepthAnything Qwen2VL SegGpt Siglip
+                            VideoLlava Vilt),
+                         &{&1, 3}
+                       ),
+                       %{"EfficientNet" => 0, "Chameleon" => 1, "Idefics3" => 1, "SmolVLM" => 1}
+                     )
 
   @doc """
   Loads the featurizer of a `Transmuter.Repo` or of a source (`{:hf, repo}` or a local directory) from its `preprocessor_config.json`.
@@ -89,7 +105,7 @@ defmodule Transmuter.Featurizer do
 
     owlv2(config, %__MODULE__{
       resize: if(Map.get(config, "do_resize", true), do: size),
-      resample: Map.fetch!(@resamples, config["resample"] || 2),
+      resample: resample(config),
       weights: weights(config["image_processor_type"]),
       crop: crop,
       rescale: if(Map.get(config, "do_rescale", true), do: config["rescale_factor"] || 1 / 255),
@@ -97,6 +113,19 @@ defmodule Transmuter.Featurizer do
       pad: sam_pad(config),
       rgb: Map.get(config, "do_convert_rgb", true)
     })
+  end
+
+  # A missing resample takes the default of the class of image_processor_type, as in Python.
+  # torchvision has no lanczos for tensors, so the fast image processors of Python transformers
+  # resize with bicubic in its place, as Idefics3ImageProcessorFast does.
+  defp resample(config) do
+    type = config["image_processor_type"] || ""
+
+    class =
+      type |> String.replace_suffix("Fast", "") |> String.replace_suffix("ImageProcessor", "")
+
+    resample = Map.fetch!(@resamples, config["resample"] || Map.get(@default_resamples, class, 2))
+    if resample == :lanczos and weights(type) == :torchvision, do: :bicubic, else: resample
   end
 
   # The fast image processors of Python transformers resize with torchvision.

@@ -50,9 +50,8 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
       Hub.json(repo.source, "preprocessor_config.json", repo.opts) ||
         raise ArgumentError, "#{inspect(repo.source)} has no preprocessor_config.json"
 
-    # The defaults are those of Python transformers, also the bicubic resample of
-    # Qwen2VLImageProcessor. min_pixels and max_pixels take precedence over the size.
-    config = Map.put_new(config, "resample", 3)
+    # The defaults are those of Python transformers. The featurizer gives the bicubic resample
+    # of Qwen2VLImageProcessor. min_pixels and max_pixels take precedence over the size.
     size = config["size"] || %{}
 
     %__MODULE__{
