@@ -6,8 +6,12 @@ defmodule Transmuter.Ops.Transformer do
 
   All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel.
 
-  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor and the two shapes of a `Reshape` pair of the probabilities. Its `k` is the right operand of the first `MatMul`. On EMLX, it runs as one kernel when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities.
+  Without the kernel, the attention core builds the scores of the query rows, in f32 or in the wider float type of q and k. When the scores of all rows take more than 256 MiB, the core runs on chunks of query rows, one chunk at a time. The rows split into the fewest chunks whose scores fit in 256 MiB, with the same number of rows in each chunk. A chunk has at least one row, so when the scores of one row take more than 256 MiB, the scores of a chunk take more too. Each row has its own softmax over all keys, so the chunks give the values of all rows at once. For example, a 1540x1540 image in the vision encoder of Ministral 3 has 12100 query rows and scores of 9.4 GB, which become 35 chunks of 346 rows and 268 MB.
+
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor and the two shapes of a `Reshape` pair of the probabilities. Its `k` is the right operand of the first `MatMul`. It runs as the shared attention core, the kernel on EMLX or the chunks of query rows, when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities. The other layouts keep the plain operations of the graph and build the scores of all rows at once: the `MatMul` broadcasting, a divisor tensor, a softmax along another axis and a `Reshape` pair do not split by query row.
   """
+
+  alias Nx.Defn.Expr
 
   import Transmuter.Ops,
     only: [
@@ -32,6 +36,10 @@ defmodule Transmuter.Ops.Transformer do
       split_along: 3,
       widen: 2
     ]
+
+  # The scores of the Nx attention core take at most this many bytes at a time, see
+  # chunk_rows/3.
+  @scores_budget 256 * 1024 * 1024
 
   @op_types ~w(Attention AttentionCore GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
@@ -615,11 +623,110 @@ defmodule Transmuter.Ops.Transformer do
     else
       [q, k, v, opts.bias]
       |> widen(fn [q, k, v, bias] ->
-        [q |> scores(k, %{opts | bias: bias}, 3) |> grouped_values(v)]
+        [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
       end)
       |> hd()
     end
   end
+
+  @doc false
+  # The attention core of the Nx operations. It is public for the tests of the chunks. When
+  # the scores of all query rows take more than `budget` bytes, the core runs on chunks of
+  # query rows (see chunk_rows/3), so that only the scores of one chunk exist at a time. Each
+  # row has its own softmax over all keys, so a chunk computes the same values. The last
+  # chunk starts at S - rows and computes some rows again, so every chunk has the same
+  # shape. A traced core runs the chunks in an Nx while loop, whose state holds the tensors
+  # that a chunk reads. An eager core runs the chunks one after the other.
+  def attend_rows(q, k, v, opts, budget) do
+    {b, heads, s, _head_size} = Nx.shape(q)
+    t = Nx.axis_size(k, 2)
+    type = Nx.Type.to_floating(Nx.Type.merge(Nx.type(q), Nx.type(k)))
+
+    case chunk_rows({b, heads, s, t}, type, budget) do
+      nil ->
+        q |> scores(k, opts, 3) |> grouped_values(v)
+
+      {count, rows} ->
+        shape = put_elem(Nx.shape(q), 3, Nx.axis_size(v, 3))
+        out = Nx.broadcast(Nx.tensor(0, type: Nx.Type.merge(type, Nx.type(v))), shape)
+
+        masks =
+          Map.reject(%{bias: opts.bias, hidden: opts.hidden}, fn {_name, mask} -> is_nil(mask) end)
+
+        state = Map.merge(%{out: out, q: q, k: k, v: v}, masks)
+
+        # The start is a tensor in both loops, so an eager chunk runs the same device
+        # operations as the other chunks instead of compiling a slice for each start.
+        step = fn i, acc ->
+          start = Nx.min(Nx.multiply(i, rows), s - rows)
+          opts = %{opts | bias: acc[:bias], hidden: acc[:hidden]}
+
+          %{
+            acc
+            | out: Nx.put_slice(acc.out, [0, 0, start, 0], query_chunk(acc, opts, start, rows))
+          }
+        end
+
+        range = 0..(count - 1)//1
+
+        if Enum.any?(Map.values(state), &traced?/1) do
+          body = fn :body, {i, acc} -> step.(i, acc) end
+          Expr.defn_while(__ENV__.file, __ENV__.line, state, {:while, range}, body, []).out
+        else
+          Enum.reduce(range, state, step).out
+        end
+    end
+  end
+
+  @doc false
+  # The chunks of query rows of attention scores of this shape and type: nil when the scores
+  # of all rows take at most `budget` bytes, which includes a zero size, or else {count,
+  # rows} for the fewest chunks whose scores fit in the budget, with the same number of rows
+  # in each chunk. A chunk has at least one row, so the scores of one row can go over the
+  # budget. It is public for its test.
+  def chunk_rows({b, heads, s, t}, type, budget) do
+    bytes = b * heads * t * div(elem(type, 1), 8)
+
+    if s * bytes <= budget do
+      nil
+    else
+      max_rows = max(div(budget, bytes), 1)
+      count = div(s + max_rows - 1, max_rows)
+      {count, div(s + count - 1, count)}
+    end
+  end
+
+  # The values of `rows` query rows from `start`, which can be a tensor. The causal mask of
+  # the chunk comes from its offset, so no mask of all rows is built.
+  defp query_chunk(%{q: q, k: k, v: v}, opts, start, rows) do
+    {s, t} = {Nx.axis_size(q, 2), Nx.axis_size(k, 2)}
+
+    hidden =
+      any_hidden([
+        opts.hidden && query_rows(opts.hidden, s, start, rows),
+        opts.causal && causal_hidden(rows, t, Nx.add(start, t - s))
+      ])
+
+    opts = %{opts | bias: opts.bias && query_rows(opts.bias, s, start, rows), hidden: hidden}
+
+    q
+    |> Nx.slice_along_axis(start, rows, axis: 2)
+    |> scores(k, %{opts | causal: false}, 3)
+    |> grouped_values(v)
+  end
+
+  # The rows of the queries from start, for a mask with a query axis of S rows. A mask with
+  # one row is the same for all queries.
+  defp query_rows(mask, s, start, rows) do
+    axis = Nx.rank(mask) - 2
+
+    if axis >= 0 and Nx.axis_size(mask, axis) == s,
+      do: Nx.slice_along_axis(mask, start, rows, axis: axis),
+      else: mask
+  end
+
+  defp traced?(%Nx.Tensor{data: %Expr{}}), do: true
+  defp traced?(_tensor), do: false
 
   defp fused_attention(q, k, v, opts = %{bias: nil, hidden: nil}) do
     if opts.causal,

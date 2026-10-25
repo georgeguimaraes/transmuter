@@ -1,6 +1,8 @@
 defmodule Transmuter.OpsTest do
   use ExUnit.Case, async: true
 
+  alias Transmuter.Ops.Transformer
+
   # Each fixture is one small ONNX graph around one operator variant, with reference
   # outputs from ONNX Runtime (graph optimizations off) or from the ONNX reference
   # evaluator. test/support/make_op_fixtures.py writes them, so these tests need no Python.
@@ -115,6 +117,54 @@ defmodule Transmuter.OpsTest do
 
     assert Nx.to_list(Transmuter.Ops.tensor(proto, dir)) == [1.5, 2.5]
     assert Transmuter.Ops.tensor_shape_type(proto) == {{2}, {:f, 32}}
+  end
+
+  # A budget of 5 rows of scores gives 3 chunks of 5 rows. The 13 query rows then run as
+  # the chunks at rows 0, 5 and 8. The float mask has a row for each query, the hidden keys
+  # are the same for all queries, and the causal mask hides the keys after each query. Two
+  # query heads share each key head. v is f16, so the chunks and the output buffer must
+  # take the type of the probabilities, f32, as the values of all rows at once do.
+  test "the attention core in chunks of query rows gives the values of all rows at once" do
+    {b, heads, kv_heads, s, t, head_size} = {2, 4, 2, 13, 17, 8}
+    key = Nx.Random.key(1)
+    {q, key} = Nx.Random.normal(key, shape: {b, heads, s, head_size})
+    {k, key} = Nx.Random.normal(key, shape: {b, kv_heads, t, head_size})
+    {v, key} = Nx.Random.normal(key, shape: {b, kv_heads, t, head_size}, type: :f16)
+    {bias, _key} = Nx.Random.normal(key, shape: {1, 1, s, t})
+    lengths = Nx.reshape(Nx.tensor([17, 11]), {b, 1, 1, 1})
+    hidden = Nx.greater_equal(Nx.iota({b, 1, 1, t}, axis: 3), lengths)
+    opts = %{scale: 0.3, softcap: 0.0, bias: bias, hidden: hidden, causal: true}
+    budget = b * heads * t * 4 * 5
+    attend = &Transformer.attend_rows(q, k, v, opts, &1)
+    assert attend.(budget) == attend.(2 ** 40)
+
+    jit = fn budget ->
+      Nx.Defn.jit_apply(
+        &Transformer.attend_rows(&1, &2, &3, %{opts | bias: &4, hidden: &5}, budget),
+        Enum.map([q, k, v, bias, hidden], &Nx.backend_transfer(&1, @backend)),
+        @compiler
+      )
+    end
+
+    assert Nx.to_number(Nx.all_close(jit.(budget), jit.(2 ** 40), atol: 1.0e-5)) == 1
+  end
+
+  # The scores of all rows fit in the budget, also with a zero size, so there are no chunks
+  # and no division. Otherwise the rows split into the fewest chunks whose scores fit, with
+  # the same number of rows in each chunk, and at least one row.
+  test "the chunks of query rows are balanced and fit in the budget" do
+    mib = 256 * 1024 * 1024
+    assert Transformer.chunk_rows({2, 4, 13, 17}, {:f, 32}, 2 * 4 * 13 * 17 * 4) == nil
+
+    for shape <- [{0, 4, 13, 17}, {2, 0, 13, 17}, {2, 4, 0, 17}, {2, 4, 13, 0}] do
+      assert Transformer.chunk_rows(shape, {:f, 32}, 0) == nil
+    end
+
+    assert Transformer.chunk_rows({2, 4, 13, 17}, {:f, 32}, 2 * 4 * 17 * 4 * 5) == {3, 5}
+    # Ministral 3 at 1540x1540: 346 rows of 16 heads and 12100 keys fit in 256 MiB.
+    assert Transformer.chunk_rows({1, 16, 12_100, 12_100}, {:f, 32}, mib) == {35, 346}
+    assert Transformer.chunk_rows({1, 16, 12_100, 12_100}, {:f, 64}, mib) == {70, 173}
+    assert Transformer.chunk_rows({1, 1, 3, 100}, {:f, 32}, 10) == {3, 1}
   end
 
   defp assert_matches_reference(dir) do
