@@ -8,6 +8,9 @@ Only transformers 5 has the SAM 3 image processor, and test/support/pipeline_ref
 import hashlib
 import tempfile
 
+# The downloads go into this directory, and Python deletes it at exit.
+scratch = tempfile.TemporaryDirectory()
+
 import numpy as np
 import onnxruntime as ort
 import torch
@@ -30,7 +33,7 @@ for picture_name, picture in [("wide", image), ("tile", tile)]:
 resized = np.round((values * 0.5 + 0.5) * 255).astype(np.uint8)
 print("sam3 tile, SHA-256 of the 8-bit resized image", hashlib.sha256(resized.tobytes()).hexdigest())
 
-directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 options = ort.SessionOptions()
 options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
 encoder = ort.InferenceSession(f"{directory}/onnx/vision_encoder.onnx", options, providers=["CPUExecutionProvider"])

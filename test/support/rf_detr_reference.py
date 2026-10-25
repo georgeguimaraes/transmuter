@@ -9,6 +9,9 @@ The script also runs ONNX Runtime on the fp32 export of onnx-community. Its prep
 
 import tempfile
 
+# The downloads go into this directory, and Python deletes it at exit.
+scratch = tempfile.TemporaryDirectory()
+
 import numpy as np
 import onnxruntime as ort
 import torch
@@ -22,7 +25,7 @@ processor = RTDetrImageProcessorPil(size={"height": 384, "width": 384}, do_norma
 model = RfDetrForObjectDetection.from_pretrained("Roboflow/rf-detr-nano")
 post = RfDetrImageProcessor()
 
-directory = snapshot_download("onnx-community/rfdetr_nano-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("onnx-community/rfdetr_nano-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 
 image = Image.open("test/fixtures/cats.png")

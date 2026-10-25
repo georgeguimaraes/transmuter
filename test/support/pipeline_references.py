@@ -25,6 +25,9 @@ print("all-MiniLM-L6-v2, 541 tokens", [round(float(x), 4) for x in embedding[:4]
 # google/embeddinggemma-300m is gated: accept its license on the Hub and log in with hf auth login.
 import tempfile
 
+# The downloads go into this directory, and Python deletes it at exit.
+scratch = tempfile.TemporaryDirectory()
+
 import numpy as np
 import onnxruntime as ort
 from huggingface_hub import snapshot_download
@@ -33,7 +36,7 @@ from transformers import AutoTokenizer
 repo = "onnx-community/embeddinggemma-300m-ONNX"
 gemma = SentenceTransformer("google/embeddinggemma-300m", device="cpu")
 tokenizer = AutoTokenizer.from_pretrained(repo)
-directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 for name, text in [("short", "The cat sat on the mat."), ("543 tokens", long)]:
     inputs = {k: v.astype(np.int64) for k, v in tokenizer([text], return_tensors="np").items()}
@@ -71,7 +74,7 @@ def empty_cache(session):
 
 repo = "onnx-community/Qwen3-Embedding-0.6B-ONNX"
 tokenizer = AutoTokenizer.from_pretrained(repo)
-directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = exact_session(f"{directory}/onnx/model_q4.onnx")
 for text in ["The cat sat on the mat.", "Transmuter runs ONNX models on any Nx backend, with no code for each architecture."]:
     ids = tokenizer([text], return_tensors="np")["input_ids"].astype(np.int64)
@@ -86,7 +89,7 @@ for text in ["The cat sat on the mat.", "Transmuter runs ONNX models on any Nx b
 # the cache of exact length.
 repo = "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX"
 tokenizer = AutoTokenizer.from_pretrained(repo)
-directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = exact_session(f"{directory}/onnx/model_q4.onnx")
 names = [i.name for i in session.get_inputs()]
 ids = [int(i) for i in tokenizer.apply_chat_template([{"role": "user", "content": "What is the capital of France?"}], add_generation_prompt=True, tokenize=True, return_dict=True)["input_ids"]]
@@ -181,7 +184,7 @@ ids = tokenizer.apply_chat_template([{"role": "user", "content": "Write a long s
 if not isinstance(ids, list):
     ids = ids["input_ids"]
 # ONNX Runtime does not read external data through the symbolic links of the Hub cache.
-directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/model_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model_q4.onnx", providers=["CPUExecutionProvider"])
 past = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in session.get_inputs() if i.name.startswith("past_key_values")}
 names = [o.name for o in session.get_outputs()]
@@ -222,7 +225,7 @@ print("clip image_embeds", [round(float(x), 4) for x in embedding[:4]], round(fl
 
 # The DINOv2 export interpolates the position embeddings in another way than transformers
 # does now, so its reference is ONNX Runtime: the first token of last_hidden_state.
-directory = snapshot_download("Xenova/dinov2-small", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("Xenova/dinov2-small", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 pixel_values = processor("facebook/dinov2-small")(image, return_tensors="np")["pixel_values"]
 cls = session.run(None, {"pixel_values": pixel_values})[0][0, 0]
@@ -340,7 +343,7 @@ chats = {
     "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
 }
 
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_quantized.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_quantized.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
 vision, embed, decoder = session("vision_encoder_q4"), session("embed_tokens_quantized"), session("decoder_model_merged_q4")
 names = [o.name for o in decoder.get_outputs()]
@@ -406,7 +409,7 @@ chats = {
     "text": ([], [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]),
 }
 
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_fp16.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_fp16.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
 vision, embed, decoder = session("vision_encoder"), session("embed_tokens_fp16"), session("decoder_model_merged_q4")
 names = [o.name for o in decoder.get_outputs()]
@@ -482,7 +485,7 @@ chats = {
 # The vision encoder of the export takes all images of a chat in one call, with a mask that
 # keeps the attention of each image to its own patches. Transmuter runs each image alone, so
 # the script prints the largest difference between the two ways for the chat with two images.
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
 embed = session("embed_tokens_q4")
 prepared = {}
@@ -572,7 +575,7 @@ chats = {
 # In PyTorch, cu_seqlens keeps the attention of each image to its own patches, and Transmuter
 # runs each image alone, so the reference encodes each image alone. The script prints the
 # difference, and the features of the wide image for the vision encoder comparison.
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = lambda name: ort.InferenceSession(f"{directory}/onnx/{name}.onnx", providers=["CPUExecutionProvider"])  # noqa: E731
 embed = session("embed_tokens_q4")
 prepared = {}
@@ -661,7 +664,7 @@ for name, pixtral, picture, options in [("rgba slow", slow, rgba, {}), ("rgba fa
 # accuracy_level 0. The data of the decoder is larger than 2 GB, so exact_session saves the
 # graph next to the data.
 repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 
 vision, embed, decoder = (exact_session(f"{directory}/onnx/{name}.onnx", next_to_data=True) for name in ["vision_encoder_q4", "embed_tokens_q4", "decoder_model_merged_q4"])
 names = [o.name for o in decoder.get_outputs()]
@@ -728,7 +731,7 @@ def gemma3_texts(repo, files, chats, exact, fast):
     tokenizer = AutoTokenizer.from_pretrained(repo, extra_special_tokens=image_tokens)
     processor = AutoProcessor.from_pretrained(repo, tokenizer=tokenizer)
     assert type(processor.image_processor).__name__ == "Gemma3ImageProcessor" + ("Fast" if fast else "")
-    directory = snapshot_download(repo, allow_patterns=[f"onnx/{name}.onnx*" for name in files], local_dir=tempfile.mkdtemp())
+    directory = snapshot_download(repo, allow_patterns=[f"onnx/{name}.onnx*" for name in files], local_dir=tempfile.mkdtemp(dir=scratch.name))
     session = lambda name: exact_session(f"{directory}/onnx/{name}.onnx", next_to_data=exact)  # noqa: E731
     vision_file, embed_file, decoder_file = files
     vision, embed = session(vision_file), session(embed_file)
@@ -828,7 +831,7 @@ for repo, text, llava_positions in [
 # grows from 0 rows and the positions from 0.
 repo = "llava-hf/llava-interleave-qwen-0.5b-hf"
 processor = AutoProcessor.from_pretrained(repo)
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx", "onnx/embed_tokens_quantized.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx", "onnx/embed_tokens_quantized.onnx", "onnx/decoder_model_merged_q4.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 vision, embed, decoder = (exact_session(f"{directory}/onnx/{name}.onnx") for name in ["vision_encoder_q4", "embed_tokens_quantized", "decoder_model_merged_q4"])
 names = [o.name for o in decoder.get_outputs()]
 eos = GenerationConfig.from_pretrained(repo).eos_token_id
@@ -903,7 +906,7 @@ def print_depth(name, depth, u8):
 
 
 estimate = pipeline("depth-estimation", model=AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf"), image_processor=processor, device="cpu")
-directory = snapshot_download("Xenova/depth-anything-small-hf", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("Xenova/depth-anything-small-hf", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.TRANSPOSE))]:
     result = estimate(picture)
@@ -972,7 +975,7 @@ def keep_all_session(path):
     return ort.InferenceSession(graph.SerializeToString(), providers=["CPUExecutionProvider"])
 
 
-directory = snapshot_download("Xenova/speecht5_tts", allow_patterns=["onnx/encoder_model.onnx", "onnx/decoder_model_merged.onnx", "onnx/decoder_postnet_and_vocoder.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("Xenova/speecht5_tts", allow_patterns=["onnx/encoder_model.onnx", "onnx/decoder_model_merged.onnx", "onnx/decoder_postnet_and_vocoder.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 encoder, decoder, vocoder = (keep_all_session(f"{directory}/onnx/{name}.onnx") for name in ["encoder_model", "decoder_model_merged", "decoder_postnet_and_vocoder"])
 hidden, mask = encoder.run(None, {"input_ids": ids.numpy()})
 names = [o.name for o in decoder.get_outputs()]
@@ -1013,7 +1016,7 @@ for name, samples, points in [("short", audio, [(0, 0), (100, 37), (583, 127), (
 repo = "onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX"
 extractor = AutoFeatureExtractor.from_pretrained(repo)
 id2label = AutoConfig.from_pretrained(repo).id2label
-directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download(repo, allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 for name, samples in [("short", audio), ("cut", audio[:32000])]:
     values = extractor(samples, sampling_rate=16000, return_tensors="np")["input_values"]
@@ -1048,7 +1051,7 @@ for name, samples in clap_inputs:
 tokenizer = AutoTokenizer.from_pretrained("Xenova/clap-htsat-unfused")
 text = dict(tokenizer([f"This is a sound of {label}." for label in labels], padding=True, return_tensors="np"))
 for file in ["model", "model_quantized"]:
-    directory = snapshot_download("Xenova/clap-htsat-unfused", allow_patterns=[f"onnx/{file}.onnx"], local_dir=tempfile.mkdtemp())
+    directory = snapshot_download("Xenova/clap-htsat-unfused", allow_patterns=[f"onnx/{file}.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
     session = ort.InferenceSession(f"{directory}/onnx/{file}.onnx", providers=["CPUExecutionProvider"])
     for name, samples in clap_inputs:
         features = extractor(samples, sampling_rate=48000, return_tensors="np")["input_features"]
@@ -1089,7 +1092,7 @@ for name, picture in pictures:
 # with the canvas in the browser. The script writes the masks to test/fixtures/cats_ormbg_wide.png
 # and cats_ormbg_tall.png and prints the mask at (y, x) and its mean.
 processor = AutoImageProcessor.from_pretrained("onnx-community/ormbg-ONNX", use_fast=False)
-directory = snapshot_download("onnx-community/ormbg-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("onnx-community/ormbg-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 for name, picture in pictures:
     alphas = session.run(None, {"pixel_values": processor(picture, return_tensors="np")["pixel_values"]})[0][0]
@@ -1177,7 +1180,7 @@ for repo, export in [("google/owlvit-base-patch32", "Xenova/owlvit-base-patch32"
 
 processor = AutoImageProcessor.from_pretrained("onnx-community/grounding-dino-tiny-ONNX", use_fast=False)
 tokenizer = AutoTokenizer.from_pretrained("onnx-community/grounding-dino-tiny-ONNX")
-directory = snapshot_download("onnx-community/grounding-dino-tiny-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("onnx-community/grounding-dino-tiny-ONNX", allow_patterns=["onnx/model.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 session = ort.InferenceSession(f"{directory}/onnx/model.onnx", providers=["CPUExecutionProvider"])
 for name, picture in pictures:
     inputs = {k: v.numpy() for k, v in processor(picture, return_tensors="pt").items()}
@@ -1222,7 +1225,7 @@ for name, export, processor, model in [
             mean, std = (np.array(processor.image_processor.image_mean)[:, None, None], np.array(processor.image_processor.image_std)[:, None, None])
             resized = np.round((values * std + mean) * 255).astype(np.uint8)
             print(name, "tile, SHA-256 of the 8-bit resized image", hashlib.sha256(resized.tobytes()).hexdigest())
-    directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp())
+    directory = snapshot_download(export, allow_patterns=["onnx/vision_encoder.onnx*", "onnx/prompt_encoder_mask_decoder.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
     encoder = ort.InferenceSession(f"{directory}/onnx/vision_encoder.onnx", providers=["CPUExecutionProvider"])
     decoder = ort.InferenceSession(f"{directory}/onnx/prompt_encoder_mask_decoder.onnx", providers=["CPUExecutionProvider"])
     for picture_name, picture in pictures:

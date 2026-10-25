@@ -8,6 +8,9 @@ Sentence-transformers 6.2.0 needs transformers 5, and test/support/pipeline_refe
 import gc
 import tempfile
 
+# The downloads go into this directory, and Python deletes it at exit.
+scratch = tempfile.TemporaryDirectory()
+
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -45,7 +48,7 @@ gc.collect()
 # The scores come from ONNX Runtime on the q4 export, with the token ids above, an empty cache
 # and the positions from 0. As in pipeline_references.py, MatMulNBits gets accuracy_level 0 and
 # the graph optimizations are off.
-directory = snapshot_download("onnx-community/Qwen3-Reranker-0.6B-ONNX", allow_patterns=["onnx/model_q4.onnx"], local_dir=tempfile.mkdtemp())
+directory = snapshot_download("onnx-community/Qwen3-Reranker-0.6B-ONNX", allow_patterns=["onnx/model_q4.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 model = onnx.load(f"{directory}/onnx/model_q4.onnx")
 for node in model.graph.node:
     for attribute in node.attribute:
