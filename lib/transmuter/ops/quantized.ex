@@ -1,6 +1,6 @@
 defmodule Transmuter.Ops.Quantized do
   @moduledoc """
-  Quantized weights are dequantized to floats inside the graph (see `Transmuter.Ops.Packed`). On EMLX, `Transmuter.EMLX` gives `MatMulNBits` a weight of shape `{N, K}`: packed on the GPU, or dequantized once at load on the CPU. The graph does not dequantize these weights.
+  Quantized weights are dequantized to floats inside the graph (see `Transmuter.Ops.Packed`). A model loaded with a `:backend` gives each compatible `MatMulNBits` node a weight of shape `{N, K}` when it loads: an MLX quantized tensor on the EMLX GPU (see `Transmuter.EMLX`), or the float weights of `dequantize_weight/4` on every other backend. The graph then multiplies by this weight and does not unpack it. A model loaded without a backend dequantizes in the graph on each call.
   """
 
   import Transmuter.Ops,
@@ -33,19 +33,16 @@ defmodule Transmuter.Ops.Quantized do
     if g_idx,
       do: raise(ArgumentError, "MatMulNBits with the g_idx input is not supported")
 
-    {k, n, bits, block_size} =
-      {attr(node, "K"), attr(node, "N"), attr(node, "bits", 4), attr(node, "block_size")}
+    {k, n, bits, block_size} = nbits_sizes(node)
 
-    blocks = div(k + block_size - 1, block_size)
-    type = Nx.type(a)
+    # B given as an {N, K} weight (a moved model) needs no unpacking.
+    w =
+      if Nx.shape(b) == {n, k},
+        do: b,
+        else: dequantize_weight(b, scales, zero_points, {k, n, bits, block_size, Nx.type(a)})
 
-    # B given as an {N, K} weight (for example an EMLX quantized tensor) needs no unpacking.
-    if Nx.shape(b) == {n, k} do
-      out = Nx.dot(a, [-1], b, [1])
-      if bias, do: Nx.add(out, bias), else: out
-    else
-      dequantized_matmul(a, b, scales, zero_points, bias, {k, n, bits, block_size, blocks, type})
-    end
+    out = Nx.dot(a, [-1], w, [1])
+    if bias, do: Nx.add(out, bias), else: out
   end
 
   # com.microsoft GatherBlockQuantized: gathers rows of a table quantized along its last axis.
@@ -224,14 +221,22 @@ defmodule Transmuter.Ops.Quantized do
     |> saturate(Nx.type(y_zero))
   end
 
-  defp dequantized_matmul(a, b, scales, zero_points, bias, {k, n, bits, block_size, blocks, type}) do
+  @doc false
+  # K, N, bits and block_size of a MatMulNBits node. bits is 4 by default.
+  def nbits_sizes(node) do
+    {attr(node, "K"), attr(node, "N"), attr(node, "bits", 4), attr(node, "block_size")}
+  end
+
+  @doc false
+  # The {N, K} float weights of a MatMulNBits node in `type`: the packed B unpacked, less the
+  # zero points (none, packed, or floats), times the scales of each block. The graph runs this
+  # on each call for a model without a backend, and `Transmuter.move/2` runs it once at load.
+  def dequantize_weight(b, scales, zero_points, {k, n, bits, block_size, type}) do
+    blocks = div(k + block_size - 1, block_size)
     q = b |> unpack(bits) |> Nx.reshape({n, blocks * block_size}) |> Nx.as_type(type)
     scales = scales |> Nx.reshape({n, blocks}) |> Nx.as_type(type)
     zero = block_zero_points(zero_points, {n, blocks}, bits, type)
-    w = q |> Packed.dequantize(zero, scales) |> Nx.slice_along_axis(0, k, axis: 1)
-
-    out = Nx.dot(a, [-1], w, [1])
-    if bias, do: Nx.add(out, bias), else: out
+    q |> Packed.dequantize(zero, scales) |> Nx.slice_along_axis(0, k, axis: 1)
   end
 
   defp integer_matmul(a, b),

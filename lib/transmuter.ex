@@ -19,7 +19,7 @@ defmodule Transmuter do
   alias Nx.Defn.{Compiler, Composite, Expr, Tree}
   alias Transmuter.{DeferredTensor, Ops}
   alias Transmuter.Onnx.ModelProto
-  alias Transmuter.Ops.Random
+  alias Transmuter.Ops.{Quantized, Random}
 
   @max_loop_iterations 100_000
   @max_unrolled_steps 16
@@ -52,9 +52,14 @@ defmodule Transmuter do
     * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params
       to this backend after loading. For example, `EMLX.Backend` or
       `{EXLA.Backend, client: :cuda}`. On the EMLX GPU, 4-bit and 8-bit
-      `MatMulNBits` weights stay packed as MLX quantized tensors. On the EMLX
-      CPU, they become float weights when the model loads (see
-      `Transmuter.EMLX`). The default is `Nx.BinaryBackend`.
+      `MatMulNBits` weights stay packed as MLX quantized tensors (see
+      `Transmuter.EMLX`). On every other backend, also the EMLX CPU, these
+      weights become float weights of shape `{N, K}` when the model loads, with
+      the math of the graph, so each call runs one matmul and does not unpack
+      the weights. The float weights take about 4 bytes per weight (2 bytes
+      for a q4f16 export): a 4B q4 model needs about 16 GB. A model loaded
+      without a backend dequantizes the weights in the graph on each call. The
+      default is `Nx.BinaryBackend`.
 
     * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
       through every operator. The default is `nil`, which keeps the types of the
@@ -1009,19 +1014,143 @@ defmodule Transmuter do
     end)
   end
 
-  # On EMLX, Transmuter.EMLX keeps quantized weights packed.
-  defp move(model, backend) do
-    {module, backend_opts} = if is_atom(backend), do: {backend, []}, else: backend
+  @doc false
+  # Moves the params of model to backend and returns the model with that backend.
+  #
+  # A compatible MatMulNBits node (see packable?/2) gets one {N, K} weight when the model
+  # moves, so the graph does not unpack the weight on each call: an MLX quantized tensor on
+  # the EMLX GPU, or the float weights of Transmuter.Ops.Quantized.dequantize_weight/4, in the
+  # type of the scales after :compute_type, on every other backend. The node then reads A,
+  # the weight under the name of B with ":packed" after it, and its bias, and its scales and
+  # zero points inputs become empty names. The B, scales and zero points that no other node,
+  # subgraph or graph output reads leave the params and the static values. Each name moves
+  # once. A second move leaves the packed nodes as they are. See Transmuter.EMLX for the MLX
+  # side, and load!/2 for the memory cost of the float weights.
+  def move(model, backend) do
+    {module, _opts} = if is_atom(backend), do: {backend, []}, else: backend
 
-    if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
-      do: Transmuter.EMLX.move(model, backend_opts),
-      else: %{
-        model
-        | params:
-            Map.new(model.params, fn {k, t} ->
-              {k, t |> DeferredTensor.value() |> Nx.backend_transfer(backend)}
-            end)
-      }
+    {compatible?, weight} =
+      if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
+        do: {&Transmuter.EMLX.compatible?/1, &Transmuter.EMLX.weight/6},
+        else: {fn _node -> true end, &dequantized_weight/6}
+
+    packed = Enum.filter(model.nodes, &(packable?(&1, model) and compatible?.(&1)))
+    packed_outputs = MapSet.new(packed, &hd(&1.output))
+
+    # A packed node reads A, its weight and its bias. The weight has a name of its own, so a
+    # node that reads the raw B, such as GatherBlockQuantized of tied embeddings, still reads
+    # the raw bytes.
+    nodes =
+      Enum.map(model.nodes, fn node ->
+        if MapSet.member?(packed_outputs, List.first(node.output)),
+          do: %{node | input: packed_inputs(node.input, model)},
+          else: node
+      end)
+
+    used =
+      for node <- nodes, name <- dependencies(node), into: MapSet.new(model.outputs), do: name
+
+    # Packing frees the B, scales and zero points of the packed nodes that no other node and
+    # no graph output reads. Other names stay as they are.
+    freed =
+      for node <- packed,
+          name <- Enum.slice(node.input, 1, 3),
+          name != "",
+          not MapSet.member?(used, name),
+          into: MapSet.new(),
+          do: name
+
+    quantization =
+      for node <- packed, name <- Enum.slice(node.input, 2, 2), name != "", uniq: true, do: name
+
+    kept = model.params |> Map.keys() |> Enum.reject(&MapSet.member?(freed, &1))
+
+    # Each name moves once, also when several packed nodes or other nodes read it. The scales
+    # and the zero points are on the device, so their math runs there and not in the lists of
+    # Nx.BinaryBackend.
+    device = names_on_device(model, quantization ++ kept, backend)
+
+    weights =
+      packed
+      |> Enum.uniq_by(&Enum.at(&1.input, 1))
+      |> Map.new(fn node = %{input: [_a, b_name, scales | rest]} ->
+        b = model.params |> Map.fetch!(b_name) |> DeferredTensor.value()
+        zero_points = device[Enum.at(rest, 0, "")]
+        {packed_name(b_name), weight.(node, b, device[scales], zero_points, model, backend)}
+      end)
+
+    # A scales or zero points name that another node also reads, such as those of tied
+    # embeddings, gives that node a copy. MLX does not compile one array as an input and
+    # as a part of a quantized tensor.
+    shared = MapSet.new(quantization)
+
+    params =
+      for name <- kept, into: weights do
+        if MapSet.member?(shared, name),
+          do: {name, Nx.backend_copy(device[name], backend)},
+          else: {name, device[name]}
+      end
+
+    static = Map.drop(model.static, MapSet.to_list(freed))
+    %{model | nodes: nodes, params: params, static: static, backend: backend}
+  end
+
+  # The inputs of a packed node: the weight in place of B, and no scales or zero points.
+  defp packed_inputs([a, b | rest], model) do
+    name = packed_name(b)
+
+    if Map.has_key?(model.params, name) or Map.has_key?(model.static, name) do
+      raise ArgumentError, "the model already has a value named #{name}"
+    end
+
+    [a, name | rest] |> List.replace_at(2, "") |> List.replace_at(3, "")
+  end
+
+  defp packed_name(b), do: b <> ":packed"
+
+  # The names on the device, each moved once. A packed weight B moves in the weight function.
+  defp names_on_device(model, names, backend) do
+    for name <- Enum.uniq(names), into: %{} do
+      value = Map.get(model.params, name) || Map.fetch!(model.static, name)
+      {name, value |> DeferredTensor.value() |> Nx.backend_transfer(backend)}
+    end
+  end
+
+  # A MatMulNBits node whose B param holds the packed bytes of its N x K weights, whose
+  # scales have a name and that has no g_idx. After a move, the node reads the weight and no
+  # scales, so a second move leaves it as it is. A small B is a static value and stays in the
+  # graph.
+  defp packable?(node = %{op_type: "MatMulNBits", input: [_, b, scales | rest]}, model) do
+    {k, n, bits, _block_size} = Quantized.nbits_sizes(node)
+
+    scales != "" and Enum.at(rest, 1, "") == "" and bits in [2, 4, 8] and
+      packed_bytes?(Map.get(model.params, b), n * k * bits)
+  end
+
+  defp packable?(_node, _model), do: false
+
+  # The bytes of packed weights: u8 values, as many as the bits of the weights need. B is a
+  # tensor, or a DeferredTensor of read!/2 that the move reads.
+  defp packed_bytes?(nil, _bits), do: false
+
+  defp packed_bytes?(b, bits) do
+    {shape, type} = DeferredTensor.shape_type(b)
+    type == {:u, 8} and Tuple.product(shape) * 8 == bits
+  end
+
+  # The float weights of a MatMulNBits node on the device, with the math of the graph. One
+  # evaluation per weight frees each intermediate value after its last use: the s16 and f32
+  # values of a 151936 x 2048 weight take gigabytes on the device.
+  defp dequantized_weight(node, b, scales, zero_points, model, backend) do
+    {k, n, bits, block_size} = Quantized.nbits_sizes(node)
+    scales = upcast(scales, model[:compute_type])
+    sizes = {k, n, bits, block_size, Nx.type(scales)}
+    b = Nx.backend_transfer(b, backend)
+    jit = &Nx.Defn.jit(&1, compiler: Nx.Defn.Evaluator, garbage_collect: true)
+
+    if zero_points,
+      do: jit.(&Quantized.dequantize_weight(&1, &2, &3, sizes)).(b, scales, zero_points),
+      else: jit.(&Quantized.dequantize_weight(&1, &2, nil, sizes)).(b, scales)
   end
 
   @doc false

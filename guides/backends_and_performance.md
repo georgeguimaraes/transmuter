@@ -44,11 +44,13 @@ Many exports write RMSNorm, LayerNorm and the attention core as separate operato
 - all-MiniLM-L6-v2 embeds 128 tokens in 2.34 ms instead of 2.57 ms, and a batch of 8 in 9.15 ms instead of 10.0 ms.
 - bert-base-uncased embeds 128 tokens in 10.5 ms instead of 11.5 ms, and a batch of 8 in 58.4 ms instead of 64.2 ms.
 
-### 4-bit and 8-bit weights on the EMLX CPU
+### 4-bit and 8-bit weights on the EMLX CPU and on other backends
 
 On the GPU, `Transmuter.EMLX` keeps the `MatMulNBits` weights packed, and `mx::quantized_matmul` reads them. On the CPU (`device: :cpu`), MLX runs `mx::quantized_matmul` on one thread. So on the CPU, `Transmuter.EMLX` dequantizes these weights once, when the model loads, and each matmul runs in the BLAS of the CPU (OpenBLAS on Linux, Accelerate on macOS) on all cores.
 
-The float weights take the memory of an fp32 export: 8 times the memory of the 4-bit weights. The 106M `MatMulNBits` weights of SmolLM2 135M take about 425 MB instead of about 66 MB. The 85M weights of the SmolVLM 256M vision encoder take about 340 MB instead of about 53 MB. On the CPU, a q4 export thus saves only download size. When memory is the limit on the CPU, use the q8 export (`model_quantized.onnx`). Its `MatMulInteger` weights stay 8-bit integers.
+Every other backend, such as EXLA on the CPU or on CUDA, does the same: a model loaded with a `:backend` dequantizes each `MatMulNBits` weight once, on the device, when the model loads. The weight becomes an `{N, K}` float tensor in the type of the scales (f32 in a q4 export, f16 in a q4f16 export), with the math of the graph, so the outputs are the same as the dequantize in the graph. A model loaded without a backend dequantizes the weights in the graph on each call. See the EXLA section below for the memory and the speed of both.
+
+The float weights take the memory of an fp32 export: 8 times the memory of the 4-bit weights, about 4 bytes per weight. The 106M `MatMulNBits` weights of SmolLM2 135M take about 425 MB instead of about 66 MB. The 85M weights of the SmolVLM 256M vision encoder take about 340 MB instead of about 53 MB. A 4B q4 model needs about 16 GB. A q4 export thus saves only download size on these backends. When memory is the limit, use the q8 export (`model_quantized.onnx`). Its `MatMulInteger` weights stay 8-bit integers.
 
 On a Linux runner with 4 vCPUs and OpenBLAS (packed weights against float weights):
 
@@ -94,6 +96,15 @@ NVIDIA_TF32_OVERRIDE=0 XLA_FLAGS=--xla_gpu_enable_triton_gemm=false
 ```
 
 On an RTX 3060, the test suite passes with both variables. Without them, 15 tests that compare with reference values fail.
+
+A model loaded with `backend: {EXLA.Backend, client: :cuda}` dequantizes its `MatMulNBits` weights once, when it loads (see the section above). The graph of a model loaded without a backend unpacks the weights on each call, and XLA then holds f32 copies of them as temporary buffers. Qwen3-1.7B q4 (`onnx-community/Qwen3-1.7B-ONNX`) on an RTX 3060, with a prompt of 128 tokens and greedy decoding, both runs with the same text:
+
+| Weights | Weights on the device | Temporary buffers of XLA | Prefill of 128 tokens | Decode step |
+| --- | --- | --- | --- | --- |
+| Dequantized in the graph (no backend at load) | 2.0 GiB | 3.1 to 3.5 GiB | 119 ms | 40.7 ms |
+| Dequantized at load | 6.4 GiB | 4 to 14 MiB | 100 ms | 26.4 ms |
+
+The load takes 4.6 s instead of 2.0 s, and the peak allocation of EXLA during the load is 7.7 GB.
 
 ### Nx.BinaryBackend (CPU, no compilation)
 

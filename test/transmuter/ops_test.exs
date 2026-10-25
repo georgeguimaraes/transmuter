@@ -95,6 +95,78 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # A move gives a MatMulNBits node its {N, K} weight once, on the device, in place of the
+  # unpacking in the graph. The cases: 4-bit with packed zero points (the fixture), 4-bit
+  # without zero points (the default zero point), 8-bit with zero points, and f16 scales with
+  # compute_type :f32, each from the same fixture in memory. The last case dequantizes in f32,
+  # as the graph does after read!/2 upcasts the scales, and not in f16. On EXLA the weight is
+  # the dequantize of the graph, so the outputs are equal to the bit. On EMLX the weight is an
+  # MLX quantized tensor, or MLX's dequantize `q * scale + bias` with the bias `-zero * scale`
+  # on the CPU, so the last bits differ.
+  test "a moved MatMulNBits gives the outputs of the dequantize in the graph" do
+    model = Transmuter.load!(Path.join(@fixtures, "MatMulNBits_b4_bs256_packed/model.onnx"))
+    [node] = model.nodes
+    key = Nx.Random.key(3)
+    {a, key} = Nx.Random.normal(key, shape: {2, 3, 512})
+    {b8, key} = Nx.Random.randint(key, 0, 256, shape: {40, 2, 256})
+    {zp8, _key} = Nx.Random.randint(key, 0, 256, shape: {80})
+    {b8, zp8} = {Nx.as_type(b8, :u8), Nx.as_type(zp8, :u8)}
+    bits8 = Enum.map(node.attribute, fn a -> if a.name == "bits", do: %{a | i: 8}, else: a end)
+
+    cases = [
+      {"4-bit with zero points", model},
+      {"4-bit without zero points",
+       %{
+         model
+         | nodes: [%{node | input: ["A", "B", "scales", ""]}],
+           static: Map.delete(model.static, "zp")
+       }},
+      {"8-bit with zero points",
+       %{
+         model
+         | nodes: [%{node | attribute: bits8}],
+           params: %{model.params | "B" => b8},
+           static: %{model.static | "zp" => zp8}
+       }},
+      {"f16 scales in f32",
+       %{
+         model
+         | params: %{model.params | "scales" => Nx.as_type(model.params["scales"], :f16)},
+           compute_type: :f32
+       }}
+    ]
+
+    inputs = %{"A" => Nx.backend_transfer(a, @backend)}
+    {backend, _opts} = @backend
+
+    for {name, model} <- cases do
+      params =
+        Map.new(model.params, fn {k, t} ->
+          {k, t |> Nx.backend_transfer(@backend) |> Transmuter.upcast(model.compute_type)}
+        end)
+
+      in_graph = %{model | params: params, backend: @backend}
+      moved = Transmuter.move(model, @backend)
+      assert hd(moved.nodes).input == ["A", "B:packed", "", ""], name
+      assert Map.keys(moved.params) == ["B:packed"], name
+      weight = moved.params["B:packed"]
+      assert Nx.shape(weight) == {40, 512}, name
+      assert %Nx.Tensor{data: %{__struct__: ^backend}} = weight, name
+
+      [expected, got] =
+        for m <- [in_graph, moved] do
+          Transmuter.compile(m, inputs, @compiler).(inputs)["Y"] |> Nx.backend_transfer()
+        end
+
+      if Transmuter.TestBackend.compiler() == EXLA do
+        assert Nx.type(weight) == {:f, 32}, name
+        assert Nx.to_binary(got) == Nx.to_binary(expected), name
+      else
+        assert Nx.to_number(Nx.all_close(got, expected, atol: 1.0e-4)) == 1, name
+      end
+    end
+  end
+
   # ONNX allows external data without a length, which goes to the end of the file. With a
   # backend, the loader defers the tensor and knows its shape and type before it reads it.
   test "an external tensor without a length reads to the end of the file" do
