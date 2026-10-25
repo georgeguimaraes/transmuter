@@ -370,6 +370,36 @@ defmodule Transmuter.Ops do
   end
 
   @doc """
+  Returns how `EMLX.Fast.scaled_dot_product_attention` reaches a fused kernel of MLX 0.32.0 for attention of these shapes: q `{batch, heads, s, d}`, k `{batch, kv_heads, t, d}` and a v head size `dv`. `mask` is `:none`, `:array` or `:causal`.
+
+  MLX decides in `ScaledDotProductAttention::use_fallback` (mlx/backend/metal/scaled_dot_product_attention.cpp:591-641 of MLX 0.32.0). The "vector" kernel takes s <= 8, s <= t, s * heads / kv_heads <= 32, and a head size of 64, 96, 128 or 256 (or d = 192 with dv = 128). The "full" kernel takes s > 8, d = dv of 64, 80 or 128, and no mask, an array mask, or a causal mask with s <= t. Other shapes take the fallback of mlx/fast.cpp, which builds the scores of all queries and keys at once.
+
+  Returns `:fused` when a kernel takes the shapes, `{:pad, size}` when q, k and v with zeros up to the head size `size` take a kernel and `size` is at most 1.25 times d, or `:plain` otherwise. Zeros after the head size do not change q * k, and the values of the zero columns of v are sliced off.
+  """
+  def mlx_attention({_batch, heads, s, d}, {_kv_batch, kv_heads, t, _kv_d}, dv, mask) do
+    fused? =
+      &(vector_kernel?(s, t, div(heads, kv_heads), &1, &2) or full_kernel?(s, t, &1, &2, mask))
+
+    padded =
+      d == dv &&
+        Enum.find([64, 80, 96, 128, 256], &(&1 > d and &1 * 4 <= d * 5 and fused?.(&1, &1)))
+
+    cond do
+      fused?.(d, dv) -> :fused
+      padded -> {:pad, padded}
+      true -> :plain
+    end
+  end
+
+  defp vector_kernel?(s, t, group, d, dv) do
+    s <= 8 and s <= t and s * group <= 32 and
+      ((d == dv and d in [64, 96, 128, 256]) or (d == 192 and dv == 128))
+  end
+
+  defp full_kernel?(s, t, d, dv, mask),
+    do: s > 8 and d == dv and d in [64, 80, 128] and (mask != :causal or s <= t)
+
+  @doc """
   Normalizes `x` over `axes` with `fun`, a kernel of `EMLX.Fast` that normalizes the last axis.
 
   The normalized axes become one axis, and each weight becomes a vector of this axis. `fun` gets this view of x and the weights.

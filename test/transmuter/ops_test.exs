@@ -149,6 +149,29 @@ defmodule Transmuter.OpsTest do
     assert Nx.to_number(Nx.all_close(jit.(budget), jit.(2 ** 40), atol: 1.0e-5)) == 1
   end
 
+  # MLX 0.32.0 has fused kernels for some head sizes. A head size of 72 pads to 80 for the
+  # "full" kernel, 64 takes it as it is, and 256 with 16 queries has no fused size within
+  # 1.25 times, so the Nx core runs in chunks. Each case gives the values of the Nx core.
+  test "attention takes the fused MLX kernel, a padded head size, or the Nx core" do
+    key = Nx.Random.key(2)
+    opts = %{scale: 0.1, softcap: 0.0, bias: nil, hidden: nil, causal: false}
+
+    for {head_size, kind} <- [{72, {:pad, 80}}, {64, :fused}, {256, :plain}] do
+      q_shape = {1, 4, 16, head_size}
+      k_shape = {1, 2, 24, head_size}
+      assert Transmuter.Ops.mlx_attention(q_shape, k_shape, head_size, :none) == kind
+
+      {q, key} = Nx.Random.normal(key, shape: q_shape)
+      {k, key} = Nx.Random.normal(key, shape: k_shape)
+      {v, _key} = Nx.Random.normal(key, shape: k_shape)
+      expected = Transformer.attend_rows(q, k, v, opts, 2 ** 40)
+      [q, k, v] = Enum.map([q, k, v], &Nx.backend_transfer(&1, @backend))
+      got = q |> Transformer.attend(k, v, opts) |> Nx.backend_transfer(Nx.BinaryBackend)
+      assert Nx.shape(got) == Nx.shape(expected)
+      assert Nx.to_number(Nx.all_close(got, expected, atol: 1.0e-4)) == 1, inspect(kind)
+    end
+  end
+
   # The scores of all rows fit in the budget, also with a zero size, so there are no chunks
   # and no division. Otherwise the rows split into the fewest chunks whose scores fit, with
   # the same number of rows in each chunk, and at least one row.

@@ -22,6 +22,7 @@ defmodule Transmuter.Ops.Transformer do
       broadcast_shape: 1,
       emlx?: 1,
       emlx_norm: 4,
+      mlx_attention: 4,
       empty?: 1,
       known!: 2,
       known?: 1,
@@ -616,18 +617,39 @@ defmodule Transmuter.Ops.Transformer do
   # The masks broadcast to {B, N, S, T}. On EMLX without softcap, one kernel computes it: the
   # causal kernel when the causal mask is the only mask, or else the kernel with one additive
   # mask in the type of q.
-  defp attend(q, k, v, opts) do
-    if emlx?(q) and opts.softcap == 0 do
-      type = Nx.type(q)
-      fused_attention(q, Nx.as_type(k, type), Nx.as_type(v, type), opts)
-    else
-      [q, k, v, opts.bias]
-      |> widen(fn [q, k, v, bias] ->
-        [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
-      end)
-      |> hd()
+  @doc false
+  # The attention of q, k and v. On EMLX, the fused kernel of MLX runs when it takes the
+  # shapes, or when the head size padded with zeros takes it (see Transmuter.Ops.mlx_attention/4).
+  # Otherwise the Nx core runs in chunks of query rows, because the fallback of MLX builds
+  # the scores of all rows at once. It is public for its test.
+  def attend(q, k, v, opts) do
+    type = Nx.type(q)
+
+    case emlx?(q) and opts.softcap == 0 and
+           mlx_attention(Nx.shape(q), Nx.shape(k), Nx.axis_size(v, 3), mask_kind(opts)) do
+      :fused ->
+        fused_attention(q, Nx.as_type(k, type), Nx.as_type(v, type), opts)
+
+      {:pad, size} ->
+        pad =
+          &Nx.pad(&1, 0, [{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, size - Nx.axis_size(&1, 3), 0}])
+
+        out = fused_attention(pad.(q), pad.(Nx.as_type(k, type)), pad.(Nx.as_type(v, type)), opts)
+        Nx.slice_along_axis(out, 0, Nx.axis_size(v, 3), axis: 3)
+
+      _plain ->
+        [q, k, v, opts.bias]
+        |> widen(fn [q, k, v, bias] ->
+          [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
+        end)
+        |> hd()
     end
   end
+
+  # The mask that fused_attention/4 gives the kernel: the masks of opts become one array.
+  defp mask_kind(%{bias: nil, hidden: nil, causal: true}), do: :causal
+  defp mask_kind(%{bias: nil, hidden: nil}), do: :none
+  defp mask_kind(_opts), do: :array
 
   @doc false
   # The attention core of the Nx operations. It is public for the tests of the chunks. When
