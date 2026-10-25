@@ -1,6 +1,6 @@
 defmodule Transmuter.Vision.Qwen2VLProcessor do
   @moduledoc """
-  Prepares the images and the prompt of Qwen2-VL and Qwen3-VL, as `Qwen2VLImageProcessor`, `Qwen2VLImageProcessorFast`, `Qwen2VLProcessor` and `Qwen3VLProcessor` of Python transformers do for images. `Transmuter.Vision.image_text_to_text/2` uses it.
+  Prepares the images and the prompt of Qwen2-VL, Qwen2.5-VL and Qwen3-VL, as `Qwen2VLImageProcessor`, `Qwen2VLImageProcessorFast`, `Qwen2VLProcessor`, `Qwen2_5_VLProcessor` and `Qwen3VLProcessor` of Python transformers do for images. `Transmuter.Vision.image_text_to_text/2` uses it.
 
   The steps for each image are:
 
