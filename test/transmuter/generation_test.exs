@@ -261,4 +261,25 @@ defmodule Transmuter.GenerationBitsTest do
 
     assert Generation.from_bits([0x7F800001, -1]) == [:nan, :nan]
   end
+
+  # A step frees the device tensors that it owns, except one whose buffer a kept tensor
+  # shares. A host tensor has no device buffer to free.
+  test "release/2 frees the dead device tensors that no kept tensor shares" do
+    backend = Transmuter.TestBackend.backend()
+    [dead, shared] = for value <- [1.0, 2.0], do: Nx.tensor([value], backend: backend)
+    host = Nx.tensor([3.0], backend: Nx.BinaryBackend)
+
+    assert Generation.release([dead, shared, host], [shared]) == :ok
+    assert freed?(dead)
+    refute freed?(shared)
+    refute freed?(host)
+  end
+
+  # A read of a freed tensor raises, with the error of the backend.
+  defp freed?(tensor) do
+    Nx.to_flat_list(tensor)
+    false
+  rescue
+    _error -> true
+  end
 end

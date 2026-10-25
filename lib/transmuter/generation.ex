@@ -68,6 +68,10 @@ defmodule Transmuter.Generation do
   In `:in_place` and `:append`, all rows share one buffer. Each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. In `:in_place`, the attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, the attention mask hides the free rows of each row, and the new rows go into the buffer at the length of each row. Both modes give the positions of each row in `position_ids`.
 
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
+
+  ## Device memory
+
+  A step makes large device tensors that die at the next step: the logits of all positions of a part of the prompt, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the logits of the last step after their token is selected, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
   alias Transmuter.{GraphBreaks, Serving}
@@ -859,7 +863,10 @@ defmodule Transmuter.Generation do
       take = fn list -> Enum.map(sources, &Enum.at(list, &1)) end
       %{state: state} = group
       index = Nx.tensor(sources, type: :s32, backend: Nx.BinaryBackend)
-      cache = Map.merge(state.cache, ctx.reorder.(Map.take(state.cache, state.written), index))
+      written = Map.take(state.cache, state.written)
+      reordered = ctx.reorder.(written, index)
+      release(Map.values(written), Map.values(reordered))
+      cache = Map.merge(state.cache, reordered)
 
       state = %{
         state
@@ -1012,6 +1019,10 @@ defmodule Transmuter.Generation do
     keep = n - (counts |> Enum.reject(&(&1 == 0)) |> Enum.min()) + 1
     {inputs, static} = step_inputs(ctx, state, tokens, keep)
     {inputs, state} = embed(ctx, state, inputs, tokens)
+
+    # The logits of the last step are selected from, or are those of an earlier part of
+    # the prompt, so nothing reads them now.
+    release(List.wrap(state.logits), [])
     outputs = ctx.run.(inputs, static)
 
     # Transmuter.run leaves out empty outputs, such as the present of a cache that does not
@@ -1022,13 +1033,19 @@ defmodule Transmuter.Generation do
           into: %{},
           do: {name, outputs["present." <> rest]}
 
-    present =
+    # The present replaces the cache entries that the step wrote. In :append, the new rows
+    # go into the buffers, and the present and the old buffers are dead after that.
+    buffers = Map.take(state.cache, Map.keys(present))
+
+    {present, dead} =
       if ctx.mode == :append do
         offsets = Nx.tensor(state.lengths, backend: Nx.BinaryBackend)
-        ctx.append.(Map.take(state.cache, Map.keys(present)), present, offsets)
+        {ctx.append.(buffers, present, offsets), Map.values(present) ++ Map.values(buffers)}
       else
-        present
+        {present, Map.values(buffers)}
       end
+
+    release(dead, Map.values(present))
 
     # A buffer keeps the real tokens of each row. The cache of :grow has all tokens.
     lengths =
@@ -1079,6 +1096,21 @@ defmodule Transmuter.Generation do
       end
 
     {Map.put(inputs, "inputs_embeds", embeds), %{state | cursors: cursors}}
+  end
+
+  @doc false
+  # Frees the device buffers of `dead`, tensors that generation made and that nothing reads
+  # after this point. A buffer that a tensor of `kept` shares stays, because a merged
+  # decoder can give a past back as its present. Host tensors need no release.
+  def release(dead, kept) do
+    shared = for %{data: data} <- kept, do: data
+
+    for tensor = %{data: data} <- dead,
+        not is_struct(data, Nx.BinaryBackend),
+        data not in shared,
+        do: Nx.backend_deallocate(tensor)
+
+    :ok
   end
 
   # The rows of each present cache after the buffer are the new rows, and they go into the
