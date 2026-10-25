@@ -69,12 +69,19 @@ defmodule Transmuter.Generation do
 
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
 
+  ## Logits
+
+  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone: Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static. At another operator, such as the `If` of a merged decoder or a Reshape, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
+
   ## Device memory
 
-  A step makes large device tensors that die at the next step: the logits of all positions of a part of the prompt, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the logits of the last step after their token is selected, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
+  A step makes large device tensors that die at the next step: the logits of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the logits of the last step after their token is selected, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
   alias Transmuter.{GraphBreaks, Serving}
+  alias Transmuter.Onnx.NodeProto
+
+  require Logger
 
   # Buffers have a capacity of a power of two, from this size.
   @min_capacity 256
@@ -99,6 +106,8 @@ defmodule Transmuter.Generation do
     max_new_tokens = opts[:max_new_tokens] || gen["max_new_tokens"] || @default_max_new_tokens
     eos = List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"])
     sampling? = Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling
+
+    model = keep_last_logits(model)
 
     %{
       model: model,
@@ -151,8 +160,7 @@ defmodule Transmuter.Generation do
 
         values = %{
           "attention_mask" => List.duplicate(List.duplicate(1, length), batch_size),
-          "position_ids" => List.duplicate(row, batch_size),
-          "num_logits_to_keep" => length
+          "position_ids" => List.duplicate(row, batch_size)
         }
 
         inputs =
@@ -167,8 +175,10 @@ defmodule Transmuter.Generation do
           end
 
         static =
-          for name <- ["use_cache_branch"], name in model.inputs, into: %{} do
-            {name, tensor.(name, [0])}
+          for {name, value} <- [{"use_cache_branch", [0]}, {"num_logits_to_keep", 0}],
+              name in model.inputs,
+              into: %{} do
+            {name, tensor.(name, value)}
           end
 
         {inputs, static}
@@ -373,6 +383,107 @@ defmodule Transmuter.Generation do
     end
   end
 
+  # The operators that can be between the lm_head and the logits: each acts on each position
+  # alone, with one input that is not static, such as a cast or the softcap of Gemma.
+  @per_position ~w(Cast Identity Tanh Add Sub Mul Div)
+
+  # Adds num_logits_to_keep to a decoder that does not declare it, with the nodes of the
+  # Gemma 3 exports before the lm_head: the hidden states keep their last num_logits_to_keep
+  # positions on axis 1, or all positions for 0. Generation reads the rank-3 logits, and the
+  # operators after the lm_head keep the shape, so axis 1 of its input is the sequence. The
+  # values from the lm_head to the logits have no other reader, so no other value changes.
+  defp keep_last_logits(model) do
+    producers = for node <- model.nodes, output <- node.output, into: %{}, do: {output, node}
+    reads = model.nodes |> Enum.flat_map(&Transmuter.dependencies/1) |> Enum.frequencies()
+    only_chain? = &(reads[&1] == 1 and &1 not in model.outputs)
+
+    with false <- "num_logits_to_keep" in model.inputs,
+         {:ok, lm_head} <- lm_head(model, {producers, only_chain?}, "logits") do
+      slice_hidden(model, lm_head)
+    else
+      true ->
+        model
+
+      {:bail, node} ->
+        Logger.debug(
+          "generation computes the logits of all positions, because the way from the logits to the lm_head stops at #{where(node)}"
+        )
+
+        model
+    end
+  end
+
+  defp where(nil), do: "a graph input"
+  defp where(node), do: "#{node.op_type} #{node.name}"
+
+  # The MatMul or MatMulNBits that gives the logits through operators of @per_position. Its
+  # input 0 is the hidden states, also when tied embeddings give its weight from a Transpose.
+  defp lm_head(model, graph = {producers, only_chain?}, name) do
+    case producers[name] do
+      node = %{op_type: op, input: [hidden | _]} when op in ["MatMul", "MatMulNBits"] ->
+        if static?(model, hidden), do: {:bail, node}, else: {:ok, node}
+
+      node = %{op_type: op} when op in @per_position ->
+        case Enum.reject(node.input, &(&1 == "" or static?(model, &1))) do
+          [input] ->
+            if only_chain?.(input),
+              do: lm_head(model, graph, input),
+              else: {:bail, producers[input]}
+
+          _inputs ->
+            {:bail, node}
+        end
+
+      node ->
+        {:bail, node}
+    end
+  end
+
+  defp static?(model, name),
+    do: Map.has_key?(model.params, name) or Map.has_key?(model.static, name)
+
+  defp slice_hidden(model, lm_head = %{input: [hidden | rest]}) do
+    name = &("transmuter.num_logits_to_keep." <> &1)
+    constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+
+    slice = [
+      %NodeProto{
+        op_type: "Neg",
+        name: name.("neg"),
+        input: ["num_logits_to_keep"],
+        output: [name.("neg")]
+      },
+      %NodeProto{
+        op_type: "Reshape",
+        name: name.("starts"),
+        input: [name.("neg"), name.("shape")],
+        output: [name.("starts")]
+      },
+      %NodeProto{
+        op_type: "Slice",
+        name: name.("slice"),
+        input: [hidden, name.("starts"), name.("ends"), name.("axes")],
+        output: [name.("hidden")]
+      },
+      %{lm_head | input: [name.("hidden") | rest]}
+    ]
+
+    constants = %{
+      name.("shape") => constant.([1]),
+      name.("ends") => constant.([2_147_483_647]),
+      name.("axes") => constant.([1])
+    }
+
+    %{
+      model
+      | nodes:
+          Enum.flat_map(model.nodes, &if(&1.output == lm_head.output, do: slice, else: [&1])),
+        static: Map.merge(model.static, constants),
+        inputs: model.inputs ++ ["num_logits_to_keep"],
+        input_types: Map.put(model.input_types, "num_logits_to_keep", {:s64, []})
+    }
+  end
+
   # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do
     producers = for node <- model.nodes, output <- node.output, into: %{}, do: {output, node}
@@ -419,9 +530,7 @@ defmodule Transmuter.Generation do
 
     runs =
       [0, 1]
-      |> Enum.map(
-        &step_inputs(ctx, %{state | lengths: List.duplicate(&1, batch_size)}, tokens, 1)
-      )
+      |> Enum.map(&step_inputs(ctx, %{state | lengths: List.duplicate(&1, batch_size)}, tokens))
       |> Enum.uniq_by(fn {_inputs, static} -> static end)
       |> Map.new(fn {inputs, static} ->
         names = ctx.model.inputs -- Map.keys(Map.merge(inputs, static))
@@ -589,12 +698,15 @@ defmodule Transmuter.Generation do
   end
 
   # Runs the prompts in parts of power-of-two lengths. Each prompt fills the parts from the
-  # last one, so the last token of each row is in the last part. Only the prompt takes image
-  # features, and the cursors start again for each group.
+  # last one, so the last token of each row is in the last part. The last part is no longer
+  # than the shortest prompt, so it ends each row at its last position. Only the prompt takes
+  # image features, and the cursors start again for each group.
   defp start(ctx, prompts, seeds, inputs, extras) do
-    longest = prompts |> Enum.map(&length/1) |> Enum.max()
+    lengths = for prompt <- prompts, prompt != [], do: length(prompt)
+    longest = Enum.max(lengths)
     state = initial_state(ctx, length(prompts), capacity(longest + ctx.max_new_tokens))
-    sizes = chunks(longest)
+    last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
+    sizes = chunks(longest - last) ++ [last]
 
     state =
       prompts
@@ -1010,14 +1122,13 @@ defmodule Transmuter.Generation do
   end
 
   # Gives each row its tokens of `parts` and padding tokens after them, so that all rows
-  # have the same number of tokens. The logits of the step start at the last real token of
-  # the shortest row, and `index` is the place of the last real token of each row in them.
+  # have the same number of tokens. The logits of the step end at the last position, and
+  # `index` is the place of the last real token of each row in them.
   defp step(ctx, state, parts) do
     counts = Enum.map(parts, &length/1)
     n = Enum.max(counts)
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
-    keep = n - (counts |> Enum.reject(&(&1 == 0)) |> Enum.min()) + 1
-    {inputs, static} = step_inputs(ctx, state, tokens, keep)
+    {inputs, static} = step_inputs(ctx, state, tokens)
     {inputs, state} = embed(ctx, state, inputs, tokens)
 
     # The logits of the last step are selected from, or are those of an earlier part of
@@ -1132,7 +1243,7 @@ defmodule Transmuter.Generation do
     end)
   end
 
-  defp step_inputs(ctx, state, tokens, keep) do
+  defp step_inputs(ctx, state, tokens) do
     n = length(hd(tokens))
 
     masks =
@@ -1153,8 +1264,7 @@ defmodule Transmuter.Generation do
     values = %{
       "input_ids" => tokens,
       "attention_mask" => masks,
-      "position_ids" => positions(ctx, state, n),
-      "num_logits_to_keep" => keep
+      "position_ids" => positions(ctx, state, n)
     }
 
     inputs =
@@ -1165,12 +1275,16 @@ defmodule Transmuter.Generation do
         {name, Nx.tensor(value, type: type, backend: Nx.BinaryBackend)}
       end
 
+    # The last token of each row is at the last position of the last part of the prompt (see
+    # start/5), and nothing reads the logits of the other parts, so a step keeps one position.
+    flag = if ctx.mode == :grow and hd(state.lengths) == 0, do: 0, else: 1
+
     static =
-      if "use_cache_branch" in ctx.model.inputs do
-        flag = if ctx.mode == :grow and hd(state.lengths) == 0, do: 0, else: 1
-        %{"use_cache_branch" => Nx.tensor([flag], type: :u8, backend: Nx.BinaryBackend)}
-      else
-        %{}
+      for {name, value} <- [{"use_cache_branch", [flag]}, {"num_logits_to_keep", 1}],
+          name in ctx.model.inputs,
+          into: %{} do
+        {type, _dims} = ctx.model.input_types[name]
+        {name, Nx.tensor(value, type: type, backend: Nx.BinaryBackend)}
       end
 
     {inputs, static}

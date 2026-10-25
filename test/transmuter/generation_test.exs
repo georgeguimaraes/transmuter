@@ -242,7 +242,75 @@ end
 defmodule Transmuter.GenerationBitsTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Transmuter.Generation
+  alias Transmuter.Onnx.NodeProto
+
+  # The lm_head of a decoder without num_logits_to_keep computes the logits of one position
+  # with the input that generation adds, through the softcap of Gemma. A Reshape after the
+  # lm_head, another reader of a value on the way to the logits, or an input that the graph
+  # already declares, leaves the graph as it is.
+  test "the context keeps the logits of the last positions before the lm_head" do
+    node = &%NodeProto{op_type: &1, name: &1, input: &2, output: &3}
+    host = &Nx.tensor(&1, backend: Nx.BinaryBackend)
+
+    softcap = [
+      node.("Gather", ["embed", "input_ids"], ["hidden"]),
+      node.("MatMul", ["hidden", "lm_head"], ["scores"]),
+      node.("Div", ["scores", "cap"], ["scaled"]),
+      node.("Tanh", ["scaled"], ["capped"]),
+      node.("Mul", ["capped", "cap"], ["logits"])
+    ]
+
+    model = %{
+      nodes: softcap,
+      params: %{"embed" => Nx.iota({5, 3}, type: :f32), "lm_head" => Nx.iota({3, 4}, type: :f32)},
+      static: %{"cap" => host.(30.0)},
+      inputs: ["input_ids", "position_ids"],
+      input_types: %{
+        "input_ids" => {:s64, [1, "length"]},
+        "position_ids" => {:s64, [1, "length"]}
+      },
+      outputs: ["logits"],
+      opset: 17,
+      backend: nil,
+      compute_type: nil
+    }
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => 0}}
+    inputs = %{"input_ids" => host.([[1, 4, 2]])}
+    %{"logits" => all} = Transmuter.run(model, model.params, inputs)
+
+    %{model: kept} = Generation.context(repo, model, [])
+    assert "num_logits_to_keep" in kept.inputs
+
+    for {keep, expected} <- [{1, all[[.., 2..2]]}, {2, all[[.., 1..2]]}, {0, all}] do
+      static = %{"num_logits_to_keep" => host.(keep)}
+      assert Transmuter.run(kept, kept.params, inputs, static)["logits"] == expected
+    end
+
+    flat = %{
+      model
+      | nodes: [node.("Reshape", ["capped", "shape"], ["logits"]) | Enum.drop(softcap, -1)],
+        static: Map.put(model.static, "shape", host.([1, -1, 4]))
+    }
+
+    declared = %{
+      model
+      | inputs: model.inputs ++ ["num_logits_to_keep"],
+        input_types: Map.put(model.input_types, "num_logits_to_keep", {:s64, []})
+    }
+
+    shared = %{model | nodes: softcap ++ [node.("Identity", ["scores"], ["copy"])]}
+
+    for {model, op} <- [{flat, "Reshape"}, {shared, "MatMul"}] do
+      log = capture_log(fn -> assert Generation.context(repo, model, []).model == model end)
+      assert log =~ "stops at #{op}"
+    end
+
+    assert Generation.context(repo, declared, []).model == declared
+  end
 
   # The selection gives f32 values as the integers of their bits. NaN and the infinities have
   # no float in Elixir, so they come back as the atoms of Nx.to_list/1.
