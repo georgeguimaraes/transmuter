@@ -517,6 +517,60 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  @qwen2_5_vl {:hf, "onnx-community/Qwen2.5-VL-3B-Instruct-ONNX"}
+
+  # Qwen2_5_VLProcessor differs from Qwen2VLProcessor only for videos, and its image processor
+  # is the Qwen2VLImageProcessor of Qwen2-VL with the same configuration, so the patches and
+  # the prompt are those of Qwen2-VL. The template starts with a system message, so
+  # <|vision_start|> is the token 14.
+  @tag ci_partition: 15
+  test "the Qwen2-VL processor gives the patches, the prompt and the positions of Qwen2.5-VL" do
+    repo = Transmuter.Repo.load!(@qwen2_5_vl)
+    processor = Qwen2VLProcessor.load!(repo)
+    tokenizer = Tokenizer.load!(repo)
+    image = StbImage.to_nx(@image)
+    content = [%{type: "image"}, %{type: "text", text: "Can you describe this image?"}]
+    prompt = ChatTemplate.render(repo, [%{role: "user", content: content}])
+
+    for {image, grid, expected, positions} <- [
+          {image, [1, 18, 22], [0.2661, 0.5435, -0.8403, -0.2963],
+           [[14, 15, 15, 26, 37], [14, 15, 23, 26, 37], [14, 15, 25, 26, 37]]},
+          {Nx.transpose(image, axes: [1, 0, 2]), [1, 22, 18], [0.2661, -0.201, -0.8403, -1.0317],
+           [[14, 15, 15, 26, 37], [14, 15, 25, 26, 37], [14, 15, 23, 26, 37]]}
+        ] do
+      {tensors, text} = Qwen2VLProcessor.process(processor, image, @opts[:backend])
+      pixels = Nx.backend_transfer(tensors["pixel_values"], Nx.BinaryBackend)
+      assert Nx.shape(pixels) == {396, 1176}
+      assert Nx.to_list(tensors["image_grid_thw"]) == [grid]
+
+      got =
+        for index <- [[0, 0], [1, 100], [-1, 1175], [200, 777]], do: Nx.to_number(pixels[index])
+
+      assert_all_close(got, expected)
+      assert_in_delta Nx.to_number(Nx.mean(Nx.abs(pixels))), 0.8945, 1.0e-4
+
+      {:ok, encoding} =
+        Tokenizers.Tokenizer.encode(
+          tokenizer.native,
+          String.replace(prompt, "<|image_pad|>", text)
+        )
+
+      ids = Tokenizers.Encoding.get_ids(encoding)
+      digest = :crypto.hash(:sha256, for(id <- ids, into: <<>>, do: <<id::little-64>>))
+
+      assert {length(ids), binary_part(Base.encode16(digest, case: :lower), 0, 16)} ==
+               {126, "5879c4bd9e8deede"}
+
+      # The positions of <|vision_start|>, the first and the last image token,
+      # <|vision_end|> and the last token, on each axis.
+      got =
+        for axis <- Qwen2VLProcessor.positions(processor, ids, [grid]),
+            do: Enum.map([14, 15, 113, 114, 125], &Enum.at(axis, &1))
+
+      assert got == positions
+    end
+  end
+
   @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
 
   @tag ci_partition: 15
@@ -643,6 +697,7 @@ defmodule Transmuter.VisionTest do
           {"HuggingFaceTB/SmolVLM-256M-Instruct", Idefics3Processor},
           {"onnx-community/Qwen2-VL-2B-Instruct", Qwen2VLProcessor},
           {"onnx-community/Qwen3-VL-2B-Instruct-ONNX", Qwen2VLProcessor},
+          {"onnx-community/Qwen2.5-VL-3B-Instruct-ONNX", Qwen2VLProcessor},
           {"mistralai/Ministral-3-3B-Instruct-2512-ONNX", PixtralProcessor},
           {"onnx-community/gemma-3-4b-it-ONNX", Gemma3Processor},
           {"onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration", Gemma3Processor},
@@ -1381,6 +1436,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @smolvlm {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"}
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
   @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
+  @qwen2_5_vl {:hf, "onnx-community/Qwen2.5-VL-3B-Instruct-ONNX"}
   @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
 
   # The reference is the beam search of transformers on the export's image features, see
@@ -1693,6 +1749,70 @@ defmodule Transmuter.VisionLargeModelTest do
     serving = Vision.image_text_to_text(@qwen3_vl, opts)
     results = Nx.Serving.run(serving, chats)
     assert Enum.map(results, fn %{results: [%{text: text}]} -> text end) == expected
+    assert Nx.Serving.run(serving, hd(chats)) == hd(results)
+  end
+
+  # The reference is ONNX Runtime on the same files: the fp32 vision encoder, the q4
+  # embeddings and the q4 decoder, with the 3-D positions of get_rope_index and each image
+  # encoded alone, see test/support/pipeline_references.py. The window attention of the
+  # vision encoder is inside the export. The fp32 vision encoder has 2.7 GB and the q4
+  # decoder 2 GB, and the model has 3.75B parameters, so CI leaves this test out.
+  @tag :large_model
+  test "image-text-to-text with Qwen2.5-VL matches ONNX Runtime alone and in a batch" do
+    tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
+
+    chats =
+      for content <- [
+            [
+              %{type: "image", image: @image},
+              %{type: "text", text: "Can you describe this image?"}
+            ],
+            [
+              %{type: "image", image: tall},
+              %{type: "text", text: "What animals are in the image?"}
+            ],
+            [%{type: "text", text: "What is the capital of France?"}],
+            [
+              %{type: "image", image: @image},
+              %{type: "image", image: tall},
+              %{type: "text", text: "What is different between the two images?"}
+            ]
+          ],
+          do: %{messages: [%{role: "user", content: content}]}
+
+    expected = [
+      "The image shows two cats lying on a pink surface. The cat on the left is a tabby cat with a striped",
+      "There are two cats in the image.",
+      "The capital of France is Paris."
+    ]
+
+    # The two chats with one image have 396 patches each, so they go into one batch. The chat
+    # with two images has 792 patches and runs with a padding row, as the first chat alone.
+    # The export encodes the images of one call with attention across the images in its
+    # layers with full attention, so ONNX Runtime encodes each image alone, as Transmuter.
+    # generation_config.json sets a repetition penalty of 1.05, which the reference does not
+    # apply: with it, the tokens of the prompt such as "a" and "." lose and the text differs
+    # from the 7th token.
+    opts =
+      [
+        variant: %{vision_encoder: :fp32, embed_tokens: :q4},
+        strategy: :greedy,
+        repetition_penalty: 1.0,
+        max_new_tokens: 24,
+        compile: [batch_size: 2]
+      ] ++ @opts
+
+    serving = Vision.image_text_to_text(@qwen2_5_vl, opts)
+    results = Nx.Serving.run(serving, chats)
+    [wide, tall, text, two] = Enum.map(results, fn %{results: [%{text: text}]} -> text end)
+    assert [wide, tall, text] == expected
+
+    # In ONNX Runtime, the 10th token of the chat with two images is a near tie: "lying" wins
+    # over "," by 0.028 in the logits. The logprobs of the 10 tokens are within 0.02 of ONNX
+    # Runtime, and the features of each image are within 2.7e-3 of ONNX Runtime, so the test
+    # checks the 9 tokens before the tie. ONNX Runtime continues with "lying on a pink surface
+    # with remote controls nearby. In the second image,".
+    assert String.starts_with?(two, "In the first image, there are two cats")
     assert Nx.Serving.run(serving, hd(chats)) == hd(results)
   end
 
