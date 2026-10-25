@@ -51,7 +51,8 @@ defmodule Transmuter do
 
     * `:backend` (`t:module/0` or `{t:module/0, keyword()}`) - moves the params
       to this backend after loading. For example, `EMLX.Backend` or
-      `{EXLA.Backend, client: :cuda}`. On the EMLX GPU, 4-bit and 8-bit
+      `{EXLA.Backend, client: :cuda}`. An EMLX backend without `:device` puts
+      the params on `EMLX.default_device/0`, where the EMLX compiler runs. On the EMLX GPU, 4-bit and 8-bit
       `MatMulNBits` weights stay packed as MLX quantized tensors (see
       `Transmuter.EMLX`). On every other backend, also the EMLX CPU, these
       weights become float weights of shape `{N, K}` when the model loads, with
@@ -1015,7 +1016,8 @@ defmodule Transmuter do
   end
 
   @doc false
-  # Moves the params of model to backend and returns the model with that backend.
+  # Moves the params of model to backend and returns the model with that backend. An EMLX
+  # backend without a :device gets the device of the EMLX compiler (see Transmuter.EMLX.backend/1).
   #
   # A compatible MatMulNBits node (see packable?/2) gets one {N, K} weight when the model
   # moves, so the graph does not unpack the weight on each call: an MLX quantized tensor on
@@ -1029,10 +1031,12 @@ defmodule Transmuter do
   def move(model, backend) do
     {module, _opts} = if is_atom(backend), do: {backend, []}, else: backend
 
-    {compatible?, weight} =
+    {backend, compatible?, weight} =
       if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
-        do: {&Transmuter.EMLX.compatible?/1, &Transmuter.EMLX.weight/6},
-        else: {fn _node -> true end, &dequantized_weight/6}
+        do:
+          {Transmuter.EMLX.backend(backend), &Transmuter.EMLX.compatible?/1,
+           &Transmuter.EMLX.weight/6},
+        else: {backend, fn _node -> true end, &dequantized_weight/6}
 
     packed = Enum.filter(model.nodes, &(packable?(&1, model) and compatible?.(&1)))
     packed_outputs = MapSet.new(packed, &hd(&1.output))

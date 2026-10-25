@@ -59,7 +59,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
 
     ## Options
 
-      * `:device` (`t:atom/0`) - the EMLX device. The default is `:gpu`.
+      * `:device` (`t:atom/0`) - the EMLX device. The default follows `EMLX.default_device/0`, which is `:gpu` unless the `:emlx` app env sets `:default_device`.
 
     ## Examples
 
@@ -67,8 +67,17 @@ if Code.ensure_loaded?(EMLX.Quantization) do
         model = Transmuter.EMLX.move(model, device: :gpu)
     """
     def move(model, opts \\ []) do
-      Transmuter.move(model, {EMLX.Backend, device: Keyword.get(opts, :device, :gpu)})
+      Transmuter.move(model, {EMLX.Backend, opts})
     end
+
+    @doc false
+    # The EMLX backend with a device. Without a :device, the params go to the device of the
+    # EMLX compiler, EMLX.default_device/0. EMLX.Backend puts them on the CPU, and the
+    # compiler then copies each param to the GPU on each call.
+    def backend(EMLX.Backend), do: backend({EMLX.Backend, []})
+
+    def backend({EMLX.Backend, opts}),
+      do: {EMLX.Backend, Keyword.put_new_lazy(opts, :device, &EMLX.default_device/0)}
 
     @doc false
     # A MatMulNBits weight that MLX holds as a quantized tensor.
@@ -83,8 +92,8 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     # The MLX quantized tensor of a MatMulNBits node, from the packed B and the scales and the
     # zero points on the device, or its float weights on the CPU.
     def weight(node, b, scales, zero_points, model, backend) do
-      {EMLX.Backend, opts} = if is_atom(backend), do: {backend, []}, else: backend
-      device = Keyword.get(opts, :device, :gpu)
+      {EMLX.Backend, opts} = backend
+      device = Keyword.fetch!(opts, :device)
       {k, n, bits, block} = Quantized.nbits_sizes(node)
 
       blocks = div(k, block)

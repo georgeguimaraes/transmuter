@@ -95,6 +95,29 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # EMLX.Backend alone puts tensors on the CPU, but the EMLX compiler runs on
+  # EMLX.default_device/0. So a backend without a :device moves the params to the device of
+  # the compiler, and the packed weight there runs in the compiled graph. A :device that the
+  # caller gives stays.
+  if Transmuter.TestBackend.compiler() == EMLX do
+    test "an EMLX backend without a device moves the params to the device of the compiler" do
+      path = Path.join(@fixtures, "MatMulNBits_b4_bs256_packed/model.onnx")
+      device = fn model -> model.params["B:packed"] |> EMLX.Backend.from_nx() |> elem(0) end
+
+      model = Transmuter.load!(path, backend: EMLX.Backend)
+      assert model.backend == {EMLX.Backend, device: EMLX.default_device()}
+      assert device.(model) == EMLX.default_device()
+
+      a = Nx.iota({1, 512}, type: :f32, backend: model.backend) |> Nx.divide(512)
+      out = Transmuter.compile(model, %{"A" => a}, compiler: EMLX).(%{"A" => a})
+      assert Nx.shape(out["Y"]) == {1, 40}
+
+      cpu = Transmuter.load!(path, backend: {EMLX.Backend, device: :cpu})
+      assert cpu.backend == {EMLX.Backend, device: :cpu}
+      assert device.(cpu) == :cpu
+    end
+  end
+
   # A move gives a MatMulNBits node its {N, K} weight once, on the device, in place of the
   # unpacking in the graph. The cases: 4-bit with packed zero points (the fixture), 4-bit
   # without zero points (the default zero point), 8-bit with zero points, and f16 scales with
