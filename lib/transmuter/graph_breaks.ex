@@ -88,6 +88,7 @@ defmodule Transmuter.GraphBreaks do
     {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
     {disk_cache, opts} = Keyword.pop(opts, :disk_cache)
     {tail, opts} = Keyword.pop(opts, :tail)
+    {donate, opts} = Keyword.pop(opts, :donate, [])
     constant = constant(model)
     extra = if tail, do: Map.keys(inputs) -- model.inputs, else: []
 
@@ -106,6 +107,7 @@ defmodule Transmuter.GraphBreaks do
       source: model[:source],
       nodes: List.to_tuple(model.nodes),
       tail: tail,
+      donate: donate,
       extra: extra,
       last_use: last_use(model, extra),
       defined: defined(model, extra),
@@ -480,10 +482,29 @@ defmodule Transmuter.GraphBreaks do
   # as a model without breaks always did. The compiled function keeps the trace function,
   # so it holds the number of nodes and not the plan. EXLA loads the program from a :cache
   # path that exists, and else compiles it and writes it there.
+  #
+  # Only a segment that is the whole graph takes the :donate inputs as donated arguments,
+  # because a later segment can read an input again, and the output of the same shape can
+  # be in another segment. When the trace shows that the first segment does not end the
+  # graph, the segment compiles again without them.
   defp compile_segment(plan, key = {pos, _shapes, _static_key}, fun, args, ref) do
+    donated = if pos == 0, do: Enum.filter(plan.donate, &Map.has_key?(args, &1)), else: []
+
+    case compile_segment(plan, key, fun, args, ref, donated) do
+      :undonate ->
+        Process.delete(ref)
+        compile_segment(plan, key, fun, args, ref, [])
+
+      result ->
+        result
+    end
+  end
+
+  defp compile_segment(plan, key = {pos, _shapes, _static_key}, fun, args, ref, donated) do
     count = tuple_size(plan.nodes)
     tail? = plan.tail != nil
-    path = disk_path(plan, key)
+    donated? = donated != []
+    path = disk_path(plan, key, donated)
     disk_cache = path && if(File.exists?(path), do: :hit, else: :miss)
 
     # The compiled function keeps this closure, so it takes values and not the plan.
@@ -493,6 +514,7 @@ defmodule Transmuter.GraphBreaks do
       stop_index = if stop == :end, do: count, else: stop
       short? = pos > 0 and stop_index - pos < @min_compiled_nodes
       if short? and not (stop == :end and tail?), do: throw({ref, :eager})
+      if donated? and stop != :end, do: throw({ref, :undonate})
       outputs
     end
 
@@ -505,6 +527,7 @@ defmodule Transmuter.GraphBreaks do
 
     {values, rest} = Map.split(args, params)
     values = params |> Enum.map(&Map.fetch!(values, &1)) |> List.to_tuple()
+    rest = donate(rest, donated)
 
     try do
       compiled =
@@ -527,11 +550,13 @@ defmodule Transmuter.GraphBreaks do
         reason: reason,
         out_names: out_names,
         produced: produced,
-        digests: digests(produced)
+        digests: digests(produced),
+        donated: donated
       }
 
       {entry, compiled && disk_cache}
     catch
+      {^ref, :undonate} -> :undonate
       {^ref, :induced, node, names} -> {:induced, node, names}
       {^ref, :real, node} -> {:real, node}
     end
@@ -551,8 +576,14 @@ defmodule Transmuter.GraphBreaks do
 
   # The version of the arguments of a program in the disk cache: since version 2, the params
   # come first, as a tuple. A program of another version has its arguments in another order.
-  defp disk_path(%{disk_cache: {path, model}}, key), do: path <> "-" <> hash({model, key, 2})
-  defp disk_path(_plan, _key), do: nil
+  # A program with donated arguments writes its outputs into them, so they are in the key.
+  defp disk_path(%{disk_cache: {path, model}}, key, donated),
+    do: path <> "-" <> hash({model, key, 2, donated})
+
+  defp disk_path(_plan, _key, _donated), do: nil
+
+  defp donate(args, names),
+    do: Enum.reduce(names, args, &Map.update!(&2, &1, fn t -> Nx.donatable(t) end))
 
   # EXLA keeps one program in each :cache path and checks only the shapes of its arguments.
   # So each segment gets its own path, from the graph and the key of the segment, and a
@@ -757,7 +788,7 @@ defmodule Transmuter.GraphBreaks do
          params,
          args
        ) do
-    outputs = compiled.(List.to_tuple(params), args) |> decode()
+    outputs = compiled.(List.to_tuple(params), donate(args, entry.donated)) |> decode()
     %{values: Map.merge(produced, Map.take(outputs, names)), static: entry.digests}
   end
 

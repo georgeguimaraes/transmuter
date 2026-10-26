@@ -75,7 +75,7 @@ defmodule Transmuter.Generation do
 
   ## Device memory
 
-  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
+  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and the buffers of `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
   alias Transmuter.{GraphBreaks, Serving}
@@ -600,7 +600,14 @@ defmodule Transmuter.Generation do
     # token and each prompt chunk.
     state = initial_state(ctx, batch_size, @min_capacity)
     tail = tail(ctx)
-    opts = [cache_size: ctx.max_new_tokens + @min_capacity, tail: tail] ++ defn_options
+    # In :in_place, the present of each entry of the cache has the shape of its past, so the
+    # step writes it into the buffer of the past.
+    donate = if ctx.mode == :in_place, do: ctx.cache, else: []
+
+    opts =
+      [cache_size: ctx.max_new_tokens + @min_capacity, tail: tail, donate: donate] ++
+        defn_options
+
     tokens = List.duplicate([0], batch_size)
     selection = selection_template(ctx, batch_size)
 
@@ -1339,13 +1346,16 @@ defmodule Transmuter.Generation do
           do: {name, outputs["present." <> rest]}
 
     # The present replaces the cache entries that the step wrote. In :append, the new rows
-    # go into the buffers, and the present and the old buffers are dead after that.
+    # go into the buffers, which the append program takes as donated, and the present and
+    # the old buffers are dead after that.
     buffers = Map.take(state.cache, Map.keys(present))
 
     {present, dead} =
       if ctx.mode == :append do
         offsets = Nx.tensor(state.lengths, backend: Nx.BinaryBackend)
-        {ctx.append.(buffers, present, offsets), Map.values(present) ++ Map.values(buffers)}
+
+        {ctx.append.(Nx.donatable(buffers), present, offsets),
+         Map.values(present) ++ Map.values(buffers)}
       else
         {present, Map.values(buffers)}
       end

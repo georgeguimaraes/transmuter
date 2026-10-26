@@ -419,6 +419,33 @@ defmodule TransmuterTest do
     end
   end
 
+  # A compiler with donation, such as EXLA, writes an output into a donated input, and the
+  # input is gone after the call. A graph with breaks keeps its inputs, because a later
+  # segment can read them again.
+  test "only a graph without breaks takes donated inputs" do
+    for {name, x, whole?} <- [
+          {"Cosh", Nx.iota({3, 5}, type: :f32, backend: @backend) |> Nx.divide(10), true},
+          {"Break_Range_long_tail", Nx.tensor([2.0, 1, 1, 1, 1, 1], backend: @backend), false}
+        ] do
+      model = load_fixture(name)
+      expected = Transmuter.run(model, model.params, %{"x" => x})["y"]
+      compiled = Transmuter.compile(model, %{"x" => x}, [donate: ["x"]] ++ @compiler)
+      donated = Nx.backend_copy(x, @backend)
+
+      assert_all_close(compiled.(%{"x" => donated})["y"], expected)
+
+      gone? =
+        try do
+          Nx.to_binary(donated)
+          false
+        rescue
+          RuntimeError -> true
+        end
+
+      assert gone? == (whole? and Transmuter.TestBackend.compiler() == EXLA)
+    end
+  end
+
   defp flush_compiles(count) do
     receive do
       :compiled -> flush_compiles(count + 1)

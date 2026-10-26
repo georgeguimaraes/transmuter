@@ -402,6 +402,12 @@ defmodule Transmuter do
       generation, are one call. The term names the function in the key of the
       EXLA disk cache. The default is `nil`.
 
+    * `:donate` (list of input names) - inputs whose buffers the compiled program can
+      reuse for its outputs of the same shape and type (see `Nx.donatable/1`). The
+      caller must not read these inputs after the call. Only a graph without breaks
+      donates them, and a compiler without donation, such as EMLX, keeps them. The
+      default is `[]`.
+
   All other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX` or
   `compiler: EXLA`.
 
