@@ -96,6 +96,7 @@ defmodule Transmuter do
     * `:backend` - the `:backend` option. An eager `run/4` computes large values that do not depend on the inputs, such as attention masks from shapes, on this backend
     * `:inputs` - the names of the graph inputs
     * `:outputs` - the names of the graph outputs
+    * `:output_types` - the type and the dimensions of each graph output, as `{type, dims}`. A symbolic dimension is its name
     * `:source` - the source, which `Transmuter.Telemetry` events give as metadata
     * `:noise` - the `:noise` option. Put `false` in a loaded model to give fixed values in place of random draws
 
@@ -209,6 +210,7 @@ defmodule Transmuter do
       inputs: inputs,
       input_types: Map.new(graph_inputs, &{&1.name, value_type(&1)}),
       outputs: Enum.map(graph.output, & &1.name),
+      output_types: Map.new(graph.output, &{&1.name, value_type(&1)}),
       opset: opset
     }
 
@@ -391,6 +393,14 @@ defmodule Transmuter do
       each graph segment. The default is `8`. Use a larger value when the inputs
       have many shapes that come back often, such as audio lengths in a speech
       service. Each cached shape uses memory.
+
+    * `:tail` (`{term, function}`) - a function of two maps, the graph outputs
+      and the extra inputs, that runs in the compiled program after the graph.
+      The extra inputs are the inputs that the model does not declare. The
+      compiled function then returns the map that the function gives, so a
+      step and the work on its outputs, such as the token selection of
+      generation, are one call. The term names the function in the key of the
+      EXLA disk cache. The default is `nil`.
 
   All other options go to `Nx.Defn.compile/3`, for example `compiler: EMLX` or
   `compiler: EXLA`.

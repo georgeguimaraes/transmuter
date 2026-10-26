@@ -13,7 +13,7 @@ defmodule Transmuter.GenerationTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
-  alias Transmuter.{Audio, Text}
+  alias Transmuter.{Audio, Generation, Text}
 
   # The best beam of "What is 2 + 2?" ends with eos at the eighth token while the other
   # beams still run. Greedy selection gives "2 + 2 is a classic arithmetic operation that
@@ -237,6 +237,49 @@ defmodule Transmuter.GenerationTest do
       Text.generation(repo, [variant: :fp32, num_beams: 3, stream: true] ++ @opts)
     end
   end
+
+  # In :grow, each length of the cache is a shape of the step. The prompt of 3 tokens runs as
+  # parts of 2 and 1 tokens. Each shape compiles one program, which also selects the token,
+  # and a second request compiles nothing. The prompt of 1 token has the shape of the step
+  # that the compile of the context gives, so it compiles nothing either.
+  @tag ci_partition: 10
+  test "each shape of a step compiles one program, with the selection in it" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    {repo, model, _tokenizer} = Transmuter.Serving.load!({:hf, "Xenova/gpt2"}, opts, :fp32)
+    id = make_ref()
+    pid = self()
+
+    handler = fn _event, _measurements, metadata, _config ->
+      if self() == pid and metadata.compiled do
+        inputs = for {name, shape} <- metadata.shapes, name in model.inputs, do: {name, shape}
+        send(pid, {:compiled, Map.new(inputs)})
+      end
+    end
+
+    :telemetry.attach(id, [:transmuter, :segment, :compile, :stop], handler, nil)
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 4)
+    ctx = Generation.compile(ctx, 1, @opts[:defn_options])
+    request = fn prompt -> Generation.generate(ctx, [prompt], [0]) end
+
+    first = request.([464, 3290, 286])
+    compiled = flush()
+    assert request.([464, 3290, 286]) == first
+    request.([464])
+    assert flush() == []
+
+    assert length(compiled) > 2
+    assert compiled == Enum.uniq(compiled)
+  end
+
+  defp flush do
+    receive do
+      {:compiled, shapes} -> [shapes | flush()]
+    after
+      0 -> []
+    end
+  end
 end
 
 defmodule Transmuter.GenerationBitsTest do
@@ -310,6 +353,16 @@ defmodule Transmuter.GenerationBitsTest do
     end
 
     assert Generation.context(repo, declared, []).model == declared
+
+    # The vocabulary size is the last dimension of the logits, else the vocab_size of the
+    # configuration.
+    typed = Map.put(model, :output_types, %{"logits" => {:f32, ["batch", "length", 4]}})
+    symbolic = Map.put(model, :output_types, %{"logits" => {:f32, ["batch", "length", "vocab"]}})
+    configured = %{repo | config: Map.put(repo.config, "vocab_size", 6)}
+
+    assert Generation.context(configured, typed, []).vocab == 4
+    assert Generation.context(configured, symbolic, []).vocab == 6
+    assert Generation.context(repo, symbolic, []).vocab == nil
   end
 
   # The selection gives f32 values as the integers of their bits. NaN and the infinities have

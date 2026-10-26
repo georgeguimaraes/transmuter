@@ -399,6 +399,26 @@ defmodule TransmuterTest do
     assert compiles.([1]) == 1
   end
 
+  # The tail runs in the segment after the break, also when that segment is shorter than a
+  # segment that compiles (Break_Range_computed_limit, two nodes), and takes an extra input.
+  test "a tail runs on the outputs of the last segment, which always compiles" do
+    for name <- ["Break_Range_long_tail", "Break_Range_computed_limit"] do
+      model = load_fixture(name)
+      x = Nx.tensor([2.0, 1, 1, 1, 1, 1], backend: @backend)
+      inputs = %{"x" => x, "factor" => Nx.tensor(3.0, backend: @backend)}
+      tail = fn outputs, extra -> %{"z" => Nx.multiply(outputs["y"], extra["factor"])} end
+
+      compiled =
+        Transmuter.compile(model, inputs, [tail: {:factor, tail}] ++ @counting_compiler)
+
+      %{"z" => z} = compiled.(inputs)
+      expected = Transmuter.run(model, model.params, %{"x" => x})["y"] |> Nx.multiply(3.0)
+
+      assert_all_close(z, expected)
+      assert flush_compiles(0) == 2
+    end
+  end
+
   defp flush_compiles(count) do
     receive do
       :compiled -> flush_compiles(count + 1)
