@@ -113,7 +113,7 @@ Transmuter runs the graph that is in the file, and nothing more. The graph of al
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 1.0"},
+    {:transmuter, "~> 2.0"},
     {:emlx, "~> 0.5"},
     {:tokenizers, "~> 0.5"}
   ]

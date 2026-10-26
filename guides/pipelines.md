@@ -9,7 +9,7 @@ The servings need the `tokenizers` package:
 ```elixir
 def deps do
   [
-    {:transmuter, "~> 1.0"},
+    {:transmuter, "~> 2.0"},
     {:emlx, "~> 0.5"},
     {:tokenizers, "~> 0.5"}
   ]
