@@ -317,7 +317,8 @@ defmodule Transmuter.Ops.Transformer do
   # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
   # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
   defp attention_core(node, [q, k, v | optional], opset) do
-    [mask, keep, divisor, split, merge] = optional(optional, 5)
+    [mask, keep, divisor, split, merge, keys] = optional(optional, 6)
+    keep = keep_keys(keep, keys, scores_shape(q, k))
     scale = attr(node, "scale")
 
     {scale, divisor} =
@@ -340,6 +341,26 @@ defmodule Transmuter.Ops.Transformer do
     else
       plain_core(node, [q, k, v, mask, keep, divisor, split, merge], scale, opset)
     end
+  end
+
+  # The key mask of a KV buffer, [batch, keys] with 1 for the keys to keep, joins keep in the
+  # layout of the scores: [batch, 1, 1, keys], or [batch * heads, 1, keys] when the heads are
+  # in the batch, as in the Whisper exports.
+  defp keep_keys(keep, nil, _scores), do: keep
+
+  defp keep_keys(keep, keys, scores) do
+    {batch, size} = Nx.shape(keys)
+    kept = keys |> Nx.not_equal(0) |> Nx.reshape({batch, 1, 1, size})
+
+    kept =
+      if tuple_size(scores) == 3,
+        do:
+          kept
+          |> Nx.broadcast({batch, div(elem(scores, 0), batch), 1, size})
+          |> Nx.reshape({elem(scores, 0), 1, size}),
+        else: kept
+
+    if keep, do: Nx.logical_and(Nx.not_equal(keep, 0), kept), else: kept
   end
 
   # The scores q · k of a core whose q and k have the same batch axes.
@@ -385,7 +406,7 @@ defmodule Transmuter.Ops.Transformer do
         end
 
       scores
-      |> where_kept(keep, attr(node, "fill"))
+      |> where_kept(keep, attr(node, "fill") || Nx.Constants.min_finite(Nx.type(scores)))
       |> add_optional(mask)
       |> then(&along_axis(%{node | op_type: "Softmax"}, &1, opset))
       |> reshape_optional(split)

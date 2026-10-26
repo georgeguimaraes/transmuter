@@ -305,6 +305,140 @@ defmodule Transmuter.GenerationTest do
     check.(second, long_ids, long_logprobs)
   end
 
+  # The merged Whisper decoder takes the length of its cache from the shape of the past. In
+  # :append, the rows of a batch with 5, 9 and 440 valid cache rows in a buffer of 512 rows get
+  # the logits of each row alone with a cache of exact length: the positions read the table of
+  # 448 rows at the valid rows, not at the capacity, and the key mask hides the free rows, also
+  # with the heads in the batch.
+  test "a merged decoder takes a buffer with its position offset and key mask" do
+    model =
+      Transmuter.load!({:hf, "Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx"},
+        backend: @opts[:backend],
+        outputs: &Generation.outputs/1
+      )
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => 50_256}}
+    ctx = Generation.context(repo, model, [], ["encoder_hidden_states"])
+    assert ctx.mode == :append
+
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    flag = &%{"use_cache_branch" => Nx.tensor([&1], type: :u8, backend: Nx.BinaryBackend)}
+    run = &Transmuter.run(&1, &1.params, Map.take(&2, &1.inputs), &3)
+
+    hidden =
+      Nx.iota({1, 1500, 384}, type: :f32, backend: @opts[:backend])
+      |> Nx.remainder(17)
+      |> Nx.subtract(8)
+      |> Nx.divide(8)
+
+    rows =
+      for prompt <- [Enum.to_list(100..104), Enum.to_list(200..208), Enum.to_list(300..739)] do
+        {inputs, _static} = Generation.prompt_inputs(model, 1, length(prompt))
+
+        inputs =
+          Map.merge(inputs, %{"input_ids" => host.([prompt]), "encoder_hidden_states" => hidden})
+
+        first = run.(model, inputs, flag.(0))
+
+        past =
+          for {"present." <> name, value} <- first,
+              into: %{},
+              do: {"past_key_values." <> name, value}
+
+        step = Map.merge(past, %{"input_ids" => host.([[50]]), "encoder_hidden_states" => hidden})
+        {past, length(prompt), run.(model, step, flag.(1))["logits"]}
+      end
+
+    buffers =
+      for name <- ctx.cache, into: %{} do
+        padded =
+          for {past, length, _logits} <- rows do
+            rows = if name in ctx.buffers, do: 512 - length, else: 0
+            Nx.pad(past[name], 0.0, [{0, 0, 0}, {0, 0, 0}, {0, rows, 0}, {0, 0, 0}])
+          end
+
+        {name, Nx.concatenate(padded)}
+      end
+
+    lengths = for {_past, length, _logits} <- rows, do: length
+    mask = host.(for v <- lengths, do: List.duplicate(1, v) ++ List.duplicate(0, 512 - v) ++ [1])
+
+    step =
+      Map.merge(buffers, %{
+        "input_ids" => host.([[50], [50], [50]]),
+        "encoder_hidden_states" => Nx.concatenate([hidden, hidden, hidden]),
+        "transmuter.position_offset" => host.(for v <- lengths, do: [v - 512]),
+        "transmuter.key_mask" => mask
+      })
+
+    static = Map.put(flag.(1), "num_logits_to_keep", host.(1))
+    logits = run.(ctx.model, step, static)["logits"]
+
+    for {{_past, _length, alone}, row} <- Enum.with_index(rows) do
+      diff = Nx.subtract(logits[row], alone[0]) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+      assert diff < 1.0e-3
+    end
+  end
+
+  # The GPT-2 export slices a causal table of 1024 rows at the length of its cache, so in
+  # :append the buffer and the new token must fit it: 900 + 32 tokens take a buffer of 1023
+  # rows, not 1024, and give the greedy tokens of the cache of exact length. 900 + 132 tokens
+  # raise at the step that does not fit.
+  test "a merged decoder keeps its buffer within its causal table" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    {repo, model, _tokenizer} = Transmuter.Serving.load!({:hf, "Xenova/gpt2"}, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    prompt = for i <- 1..900, do: rem(i * 37, 50_000)
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    flag = &%{"use_cache_branch" => Nx.tensor([&1], type: :u8, backend: Nx.BinaryBackend)}
+
+    # The greedy tokens of the loaded model, with the cache of exact length.
+    cache = Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
+    zero = Nx.tensor(0.0, backend: @opts[:backend])
+    placeholder = Map.new(cache, &{&1, Nx.broadcast(zero, {1, 12, 1, 64})})
+
+    step = fn tokens, past, length, branch ->
+      mask = host.([List.duplicate(1, length)])
+      inputs = Map.merge(past, %{"input_ids" => host.([tokens]), "attention_mask" => mask})
+      outputs = Transmuter.run(model, model.params, inputs, flag.(branch))
+      token = outputs["logits"][[0, -1]] |> Nx.argmax() |> Nx.to_number()
+
+      {token,
+       for(
+         {"present." <> name, value} <- outputs,
+         into: %{},
+         do: {"past_key_values." <> name, value}
+       )}
+    end
+
+    {first, past} = step.(prompt, placeholder, 900, 0)
+
+    {rest, _last} =
+      Enum.map_reduce(901..931, {first, past}, fn length, {token, past} ->
+        {next, past} = step.([token], past, length, 1)
+        {next, {next, past}}
+      end)
+
+    expected = [first | rest]
+
+    ctx = Generation.context(repo, model, max_new_tokens: 32)
+    assert {ctx.mode, ctx.max_capacity} == {:append, 1023}
+    compiled = Generation.compile(ctx, 1, @opts[:defn_options])
+    [tokens] = Generation.generate(compiled, [prompt], [0])
+    assert Enum.map(tokens, &hd/1) == expected
+
+    long =
+      Generation.compile(
+        Generation.context(repo, model, max_new_tokens: 132),
+        1,
+        @opts[:defn_options]
+      )
+
+    assert_raise ArgumentError, ~r/the 1023 rows/, fn ->
+      Generation.generate(long, [prompt], [0])
+    end
+  end
+
   test "beam search raises with sampling and with a stream" do
     repo = {:hf, "Xenova/gpt2"}
 

@@ -100,6 +100,7 @@ defmodule Transmuter.MixProject do
         Internals: [
           Transmuter.Serving,
           Transmuter.Generation,
+          Transmuter.Generation.MergedDecoder,
           Transmuter.Text.FillMask,
           Transmuter.Text.Generation,
           Transmuter.Text.QuestionAnswering,

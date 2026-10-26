@@ -8,9 +8,15 @@ defmodule Transmuter.Generation do
 
     * `:in_place` - the graph has GroupQueryAttention, which counts the valid rows of the cache from the values of the attention mask. The cache is a buffer as long as the attention mask, and the operator writes the new keys and values after the valid rows.
 
-    * `:append` - the graph declares `position_ids`. The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
+    * `:append` - the graph declares `position_ids`, or it is a merged decoder whose positions are reads of a table at the length of the cache plus the index of the token, as in GPT-2, Whisper, Marian and TrOCR (see "Merged decoders"). The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph computes the positions from the length of the cache. It has no `position_ids`, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0. The exports of optimum trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same). So the prompt of a merged decoder runs as one step on the branch without cache, and only the new tokens take the branch with cache.
+    * `:grow` - the graph computes the positions from the length of the cache in another way, such as the relative positions of T5 or a rotary angle, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step.
+
+  ## Merged decoders
+
+  A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The first step takes the branch without cache, because Nx has no tensors of length 0. The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same). So the prompt of a merged decoder runs as one step on the branch without cache, only the new tokens take the branch with cache, and the rows of a group have prompts of one length.
+
+  A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`.
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
@@ -78,6 +84,7 @@ defmodule Transmuter.Generation do
   A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. The embeddings of a step are freed after its call, and when a group ends, generation frees its cache and the rest of its state. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
+  alias Transmuter.Generation.MergedDecoder
   alias Transmuter.{GraphBreaks, Serving}
   alias Transmuter.Onnx.NodeProto
 
@@ -99,6 +106,10 @@ defmodule Transmuter.Generation do
   @lengths "transmuter.cache.lengths"
 
   @no_vocab "generation needs the vocabulary size: the logits output of the graph has no number in its last dimension, and the configuration has no vocab_size"
+
+  # The inputs that MergedDecoder.rewrite/1 adds.
+  @position_offset MergedDecoder.position_offset()
+  @key_mask MergedDecoder.key_mask()
 
   # Buffers have a capacity of a power of two, from this size.
   @min_capacity 256
@@ -124,7 +135,7 @@ defmodule Transmuter.Generation do
     eos = List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"])
     sampling? = Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling
 
-    model = keep_last_logits(model)
+    model = model |> keep_last_logits() |> MergedDecoder.rewrite()
 
     %{
       model: model,
@@ -133,6 +144,8 @@ defmodule Transmuter.Generation do
       embed: opts[:embed],
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
+      buffers: buffers(model),
+      max_capacity: model[:max_capacity],
       max_new_tokens: max_new_tokens,
       sampling?: sampling?,
       token_logprobs?: Keyword.get(opts, :token_logprobs, false),
@@ -359,7 +372,8 @@ defmodule Transmuter.Generation do
 
   defp remove(logits, mask), do: Nx.select(mask, Nx.Constants.min_finite(:f32), logits)
 
-  @inputs ~w(input_ids inputs_embeds attention_mask position_ids num_logits_to_keep use_cache_branch)
+  @inputs ~w(input_ids inputs_embeds attention_mask position_ids num_logits_to_keep use_cache_branch) ++
+            [@position_offset, @key_mask]
 
   defp mode(model, given, embed) do
     if "inputs_embeds" in model.inputs and embed == nil do
@@ -390,7 +404,7 @@ defmodule Transmuter.Generation do
       gqa ->
         :grow
 
-      "position_ids" in model.inputs ->
+      "position_ids" in model.inputs or @position_offset in model.inputs ->
         :append
 
       "use_cache_branch" in model.inputs ->
@@ -599,11 +613,11 @@ defmodule Transmuter.Generation do
     # with the batch size for the batch and 1 for other symbolic ones. Other shapes compile on
     # their first step and stay cached, and one request of :grow has a shape for each new
     # token and each prompt chunk.
-    state = initial_state(ctx, batch_size, @min_capacity)
+    state = initial_state(ctx, batch_size, capacity(ctx, 1))
     tail = tail(ctx)
-    # In :in_place and :append, the present of each entry of the cache has the shape of its
-    # past, so the step writes it into the buffer of the past.
-    donate = if ctx.mode in [:in_place, :append], do: ctx.cache, else: []
+    # In :in_place and :append, the present of each buffer has the shape of its past, so the
+    # step writes it into the buffer of the past.
+    donate = if ctx.mode in [:in_place, :append], do: ctx.buffers, else: []
 
     opts =
       [cache_size: ctx.max_new_tokens + @min_capacity, tail: tail, donate: donate] ++
@@ -676,7 +690,7 @@ defmodule Transmuter.Generation do
     beams? = ctx.num_beams > 1
     names = Map.keys(ctx.masks)
     count = Enum.count(ctx.processors, &is_tuple/1)
-    buffers = if ctx.mode == :append, do: ctx.cache, else: []
+    buffers = if ctx.mode == :append, do: ctx.buffers, else: []
 
     fun = fn outputs, extra ->
       outputs = write_rows(outputs, extra, buffers)
@@ -899,7 +913,10 @@ defmodule Transmuter.Generation do
   # The prompts of each group of rows that share a cache, with empty prompts for the other
   # rows. A buffer keeps the length of each row, so all prompts are one group.
   defp groups(ctx, prompts) do
-    key = if ctx.mode == :grow, do: &length/1, else: fn _prompt -> :buffer end
+    key =
+      if ctx.mode == :grow or merged?(ctx),
+        do: &length/1,
+        else: fn _prompt -> :buffer end
 
     for group <- prompts |> Enum.reject(&(&1 == [])) |> Enum.map(key) |> Enum.uniq() do
       Enum.map(prompts, &if(&1 != [] and key.(&1) == group, do: &1, else: []))
@@ -908,18 +925,18 @@ defmodule Transmuter.Generation do
 
   # Runs the prompts in parts of power-of-two lengths. Each prompt fills the parts from the
   # last one, so the last token of each row is in the last part. The last part is no longer
-  # than the shortest prompt, so it ends each row at its last position. A merged decoder in
-  # :grow runs the prompt as one part, on the branch without cache (see the module
-  # documentation). Only the prompt takes image features, and the cursors start again for each
-  # group.
+  # than the shortest prompt, so it ends each row at its last position. A merged decoder runs
+  # the prompt as one part, on the branch without cache (see the module documentation), and
+  # its groups have rows of one length. Only the prompt takes image features, and the cursors
+  # start again for each group.
   defp start(ctx, prompts, seeds, inputs, extras, scores \\ nil) do
     lengths = for prompt <- prompts, prompt != [], do: length(prompt)
     longest = Enum.max(lengths)
-    state = initial_state(ctx, length(prompts), capacity(longest + ctx.max_new_tokens))
+    state = initial_state(ctx, length(prompts), capacity(ctx, longest + ctx.max_new_tokens))
     last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
 
     sizes =
-      if ctx.mode == :grow and "use_cache_branch" in ctx.model.inputs,
+      if merged?(ctx),
         do: [longest],
         else: chunks(longest - last) ++ [last]
 
@@ -1303,16 +1320,20 @@ defmodule Transmuter.Generation do
         do: Bitwise.bsl(1, bit)
   end
 
-  defp capacity(length), do: max(@min_capacity, 2 ** ceil(:math.log2(length)))
+  # A power of two, at most the largest capacity of the decoder (see MergedDecoder).
+  defp capacity(ctx, length) do
+    capacity = max(@min_capacity, 2 ** ceil(:math.log2(length)))
+    min(capacity, ctx.max_capacity || capacity)
+  end
 
   defp initial_state(ctx, batch_size, capacity) do
-    # :grow starts with a placeholder row that the branch without cache does not read.
-    # The zeros are made on the backend of the compiler, so they do not cross from the host.
-    rows = if ctx.mode == :grow, do: 1, else: capacity
-
+    # A cache of exact length starts with a placeholder row that the branch without cache does
+    # not read. The zeros are made on the backend of the compiler, so they do not cross from
+    # the host.
     cache =
       Map.new(ctx.cache, fn name ->
         {type, [_batch, heads, _length, head_dim]} = ctx.model.input_types[name]
+        rows = if ctx.mode != :grow and name in ctx.buffers, do: capacity, else: 1
         zero = Nx.tensor(0, type: type, backend: ctx.backend)
         {name, Nx.broadcast(zero, {batch_size, heads, rows, head_dim})}
       end)
@@ -1338,6 +1359,13 @@ defmodule Transmuter.Generation do
   defp step(ctx, state, parts, selection) do
     counts = Enum.map(parts, &length/1)
     n = Enum.max(counts)
+    rows = Enum.max(state.lengths) + n
+
+    if ctx.mode != :grow and rows > state.capacity do
+      raise ArgumentError,
+            "generation needs #{rows} rows of cache, more than the #{state.capacity} rows that the static tables of the decoder fit"
+    end
+
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
     {inputs, static} = step_inputs(ctx, state, tokens)
     {inputs, state} = embed(ctx, state, inputs, tokens)
@@ -1381,7 +1409,8 @@ defmodule Transmuter.Generation do
           do: {name, outputs["present." <> rest]}
 
     # The present replaces the cache entries that the step wrote, and their old buffers are
-    # dead. In :append, the tail wrote the new rows into the buffers (see tail/1).
+    # dead. In :append, the tail wrote the new rows into the buffers (see tail/1). The
+    # cross-attention cache of a merged decoder is not a buffer, so its present replaces it.
     buffers = Map.take(state.cache, Map.keys(present))
     release(Map.values(buffers), Map.values(present))
 
@@ -1450,19 +1479,22 @@ defmodule Transmuter.Generation do
     :ok
   end
 
-  # The rows of each present after its buffer are the new rows, and they go into the buffer
-  # after the valid rows of each batch row. The present that the step gives is then the
-  # buffer.
+  # The last rows of each present, as many as the tokens of the step, are the new rows:
+  # after the buffer on the branch with cache, or all rows on the branch without cache of a
+  # merged decoder. They go into the buffer after the valid rows of each batch row. The
+  # present that the step gives is then the buffer.
   defp write_rows(outputs, _inputs, []), do: outputs
 
   defp write_rows(outputs, inputs, buffers) do
+    rows = Nx.axis_size(inputs["input_ids"] || inputs["inputs_embeds"], 1)
+
     for "past_key_values." <> rest = name <- buffers,
         present = outputs["present." <> rest],
         present != nil,
         into: outputs do
       buffer = inputs[name]
-      {batch_size, _heads, capacity, _dim} = Nx.shape(buffer)
-      new = Nx.slice_along_axis(present, capacity, Nx.axis_size(present, 2) - capacity, axis: 2)
+      {batch_size, _heads, _capacity, _dim} = Nx.shape(buffer)
+      new = Nx.slice_along_axis(present, Nx.axis_size(present, 2) - rows, rows, axis: 2)
 
       buffer =
         Enum.reduce(0..(batch_size - 1), buffer, fn i, buffer ->
@@ -1477,15 +1509,21 @@ defmodule Transmuter.Generation do
   defp step_inputs(ctx, state, tokens) do
     n = length(hd(tokens))
 
+    # The first step of a merged decoder takes the branch without cache, which reads no past.
+    cached? = not (merged?(ctx) and Enum.all?(state.lengths, &(&1 == 0)))
+
     masks =
       for past <- state.lengths do
         case ctx.mode do
           :in_place ->
             List.duplicate(1, past + n) ++ List.duplicate(0, state.capacity - past - n)
 
-          :append ->
+          :append when cached? ->
             List.duplicate(1, past) ++
               List.duplicate(0, state.capacity - past) ++ List.duplicate(1, n)
+
+          :append ->
+            List.duplicate(1, n)
 
           :grow ->
             List.duplicate(1, past + n)
@@ -1495,7 +1533,9 @@ defmodule Transmuter.Generation do
     values = %{
       "input_ids" => tokens,
       "attention_mask" => masks,
-      "position_ids" => positions(ctx, state, n)
+      "position_ids" => positions(ctx, state, n),
+      @position_offset => for(past <- state.lengths, do: [past - state.capacity]),
+      @key_mask => masks
     }
 
     inputs =
@@ -1508,7 +1548,7 @@ defmodule Transmuter.Generation do
 
     # The last token of each row is at the last position of the last part of the prompt (see
     # start/6), and nothing reads the logits of the other parts, so a step keeps one position.
-    flag = if ctx.mode == :grow and hd(state.lengths) == 0, do: 0, else: 1
+    flag = if cached?, do: 1, else: 0
 
     static =
       for {name, value} <- [{"use_cache_branch", [flag]}, {"num_logits_to_keep", 1}],
@@ -1519,6 +1559,22 @@ defmodule Transmuter.Generation do
       end
 
     {inputs, static}
+  end
+
+  # The cache entries in buffers: all of them, or the self-attention cache of a merged decoder
+  # that MergedDecoder.rewrite/1 moved to :append.
+  defp buffers(model) do
+    if @position_offset in model.inputs,
+      do: MergedDecoder.buffers(model),
+      else: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
+  end
+
+  # A merged decoder has a branch without cache and a branch with cache (use_cache_branch).
+  # The prompt rule and the groups by length apply to the merged decoders in :grow and to those
+  # that MergedDecoder.rewrite/1 moves to :append.
+  defp merged?(ctx) do
+    "use_cache_branch" in ctx.model.inputs and
+      (ctx.mode == :grow or @position_offset in ctx.model.inputs)
   end
 
   # The positions of the tokens at the indices past..past + n - 1 of each row: the given
