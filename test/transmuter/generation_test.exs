@@ -385,58 +385,135 @@ defmodule Transmuter.GenerationTest do
   # rows, not 1024, and give the greedy tokens of the cache of exact length. 900 + 132 tokens
   # raise at the step that does not fit.
   test "a merged decoder keeps its buffer within its causal table" do
+    {repo, model} = gpt2()
+    prompt = for i <- 1..900, do: rem(i * 37, 50_000)
+    ctx = Generation.context(repo, model, max_new_tokens: 32)
+    assert {ctx.mode, ctx.max_capacity} == {:append, 1023}
+
+    [tokens] =
+      Generation.generate(Generation.compile(ctx, 1, @opts[:defn_options]), [prompt], [0])
+
+    assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 32)
+
+    long = Generation.context(repo, model, max_new_tokens: 132)
+    long = Generation.compile(long, 1, @opts[:defn_options])
+
+    assert_raise ArgumentError, ~r/the 1023 rows/, fn ->
+      Generation.generate(long, [prompt], [0])
+    end
+  end
+
+  # A merged decoder that the rewrite moves to :append starts at 32 rows, and other decoders
+  # at 256 rows. In GPT-2, a batch of 3 prompts of 30 tokens takes 64 rows (the prompt and a
+  # margin of 16 rows), which grow to 128 rows at the step of the 65th row, and each row gives
+  # the greedy tokens of the cache of exact length. In SmolLM2, prompts of 240 tokens take 256
+  # rows, which grow to 512 rows. The capacities are those of the compiled steps, with the
+  # first one from Generation.compile/3.
+  test "the buffers start at the capacity of the decoder and grow when a step does not fit" do
+    {repo, model} = gpt2()
+    prompts = for row <- 1..3, do: for(i <- 1..30, do: rem(i * 37 * row, 50_000))
+    {rows, capacities} = capacities(repo, model, prompts)
+    assert capacities == [32, 64, 128]
+
+    for {tokens, prompt} <- Enum.zip(rows, prompts) do
+      assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 40)
+    end
+
+    opts = [outputs: &Generation.outputs/1, variant: :q4] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :q4)
+    prompts = for row <- 1..2, do: for(i <- 1..240, do: rem(i * 37 * row, 49_000))
+    assert {_rows, [256, 512]} = capacities(%{repo | generation_config: %{}}, model, prompts)
+  end
+
+  # In :in_place, GroupQueryAttention counts the valid rows of each row from the mask, so a
+  # growth must keep the rows and the mask of each row. A prompt of 240 tokens takes 256 rows,
+  # which grow to 512 rows. In a batch with a prompt of 500 tokens, the buffer starts at 1024
+  # rows and does not grow, and the prompt gives the same tokens.
+  test "a growth of the buffers in :in_place keeps the tokens of each row" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    assert Generation.context(repo, model, []).mode == :in_place
+    prompt = for i <- 1..240, do: rem(i * 37, 49_000)
+    long = for i <- 1..500, do: rem(i * 53, 49_000)
+
+    assert {[grown], [256, 512]} = capacities(repo, model, [prompt])
+    assert {[fits, _long], [256, 1024]} = capacities(repo, model, [prompt, long])
+    assert Enum.map(grown, &hd/1) == Enum.map(fits, &hd/1)
+  end
+
+  # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
+  # in the compiled steps.
+  defp capacities(repo, model, prompts) do
+    id = make_ref()
+    pid = self()
+
+    handler = fn _event, _measurements, metadata, _config ->
+      for {"past_key_values." <> _, {{_batch, _heads, capacity, _dim}, _type}} <- metadata.shapes,
+          self() == pid,
+          do: send(pid, {:capacity, capacity})
+    end
+
+    :telemetry.attach(id, [:transmuter, :segment, :compile, :stop], handler, nil)
+    ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 40)
+    ctx = Generation.compile(ctx, length(prompts), @opts[:defn_options])
+    rows = Generation.generate(ctx, prompts, List.duplicate(0, length(prompts)))
+    :telemetry.detach(id)
+    {rows, received_capacities()}
+  end
+
+  defp received_capacities do
+    receive do
+      {:capacity, capacity} -> Enum.uniq(Enum.sort([capacity | received_capacities()]))
+    after
+      0 -> []
+    end
+  end
+
+  defp gpt2 do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
     {repo, model, _tokenizer} = Transmuter.Serving.load!({:hf, "Xenova/gpt2"}, opts, :fp32)
-    repo = %{repo | generation_config: %{}}
-    prompt = for i <- 1..900, do: rem(i * 37, 50_000)
-    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
-    flag = &%{"use_cache_branch" => Nx.tensor([&1], type: :u8, backend: Nx.BinaryBackend)}
+    {%{repo | generation_config: %{}}, model}
+  end
 
-    # The greedy tokens of the loaded model, with the cache of exact length.
+  # The greedy tokens of a GPT-2 merged decoder as loaded, with a cache of exact length: the
+  # prompt without cache, then one token at a time.
+  defp exact_greedy(model, prompt, count) do
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
     cache = Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
     zero = Nx.tensor(0.0, backend: @opts[:backend])
     placeholder = Map.new(cache, &{&1, Nx.broadcast(zero, {1, 12, 1, 64})})
 
     step = fn tokens, past, length, branch ->
+      flag = Nx.tensor([branch], type: :u8, backend: Nx.BinaryBackend)
       mask = host.([List.duplicate(1, length)])
       inputs = Map.merge(past, %{"input_ids" => host.([tokens]), "attention_mask" => mask})
-      outputs = Transmuter.run(model, model.params, inputs, flag.(branch))
+      outputs = Transmuter.run(model, model.params, inputs, %{"use_cache_branch" => flag})
       token = outputs["logits"][[0, -1]] |> Nx.argmax() |> Nx.to_number()
 
-      {token,
-       for(
-         {"present." <> name, value} <- outputs,
-         into: %{},
-         do: {"past_key_values." <> name, value}
-       )}
+      past =
+        for {"present." <> name, value} <- outputs,
+            into: %{},
+            do: {"past_key_values." <> name, value}
+
+      {token, past}
     end
 
-    {first, past} = step.(prompt, placeholder, 900, 0)
+    {first, past} = step.(prompt, placeholder, length(prompt), 0)
 
     {rest, _last} =
-      Enum.map_reduce(901..931, {first, past}, fn length, {token, past} ->
-        {next, past} = step.([token], past, length, 1)
-        {next, {next, past}}
-      end)
-
-    expected = [first | rest]
-
-    ctx = Generation.context(repo, model, max_new_tokens: 32)
-    assert {ctx.mode, ctx.max_capacity} == {:append, 1023}
-    compiled = Generation.compile(ctx, 1, @opts[:defn_options])
-    [tokens] = Generation.generate(compiled, [prompt], [0])
-    assert Enum.map(tokens, &hd/1) == expected
-
-    long =
-      Generation.compile(
-        Generation.context(repo, model, max_new_tokens: 132),
-        1,
-        @opts[:defn_options]
+      Enum.map_reduce(
+        (length(prompt) + 1)..(length(prompt) + count - 1)//1,
+        {first, past},
+        fn length, {token, past} ->
+          {next, past} = step.([token], past, length, 1)
+          {next, {next, past}}
+        end
       )
 
-    assert_raise ArgumentError, ~r/the 1023 rows/, fn ->
-      Generation.generate(long, [prompt], [0])
-    end
+    [first | rest]
   end
 
   test "beam search raises with sampling and with a stream" do

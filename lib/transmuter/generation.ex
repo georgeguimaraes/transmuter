@@ -73,6 +73,8 @@ defmodule Transmuter.Generation do
 
   In `:in_place` and `:append`, all rows share one buffer. Each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. In `:in_place`, the attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, the attention mask hides the free rows of each row, and the new rows go into the buffer at the length of each row. Both modes give the positions of each row in `position_ids`.
 
+  The buffer starts with a capacity of a power of two that fits the longest prompt and 16 more rows. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A merged decoder that `Transmuter.Generation.MergedDecoder` moves to `:append` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables.
+
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
 
   ## Logits
@@ -111,8 +113,12 @@ defmodule Transmuter.Generation do
   @position_offset MergedDecoder.position_offset()
   @key_mask MergedDecoder.key_mask()
 
-  # Buffers have a capacity of a power of two, from this size.
+  # Buffers have a capacity of a power of two, from this size, or from the smaller size for a
+  # merged decoder that MergedDecoder moves to :append (see "Batches"). The capacity starts at
+  # the longest prompt and a margin, and grows when a step does not fit (see grow/3).
   @min_capacity 256
+  @merged_min_capacity 32
+  @capacity_margin 16
 
   # max_length of GenerationConfig and max_new_tokens of the pipelines in Python transformers.
   @default_max_length 20
@@ -145,6 +151,7 @@ defmodule Transmuter.Generation do
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
       buffers: buffers(model),
+      min_capacity: min_capacity(model),
       max_capacity: model[:max_capacity],
       max_new_tokens: max_new_tokens,
       sampling?: sampling?,
@@ -653,7 +660,9 @@ defmodule Transmuter.Generation do
       |> compile_embed(batch_size, defn_options)
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
-    Map.put(ctx, :reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
+    ctx
+    |> Map.put(:grow, GraphBreaks.jit(&grow_rows/2, defn_options))
+    |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
   end
 
   # The settings of the selection, and the processes of the processors with the masks in their
@@ -932,7 +941,7 @@ defmodule Transmuter.Generation do
   defp start(ctx, prompts, seeds, inputs, extras, scores \\ nil) do
     lengths = for prompt <- prompts, prompt != [], do: length(prompt)
     longest = Enum.max(lengths)
-    state = initial_state(ctx, length(prompts), capacity(ctx, longest + ctx.max_new_tokens))
+    state = initial_state(ctx, length(prompts), capacity(ctx, longest + @capacity_margin))
     last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
 
     sizes =
@@ -1320,9 +1329,12 @@ defmodule Transmuter.Generation do
         do: Bitwise.bsl(1, bit)
   end
 
+  defp min_capacity(model),
+    do: if(@position_offset in model.inputs, do: @merged_min_capacity, else: @min_capacity)
+
   # A power of two, at most the largest capacity of the decoder (see MergedDecoder).
   defp capacity(ctx, length) do
-    capacity = max(@min_capacity, 2 ** ceil(:math.log2(length)))
+    capacity = max(ctx.min_capacity, 2 ** ceil(:math.log2(length)))
     min(capacity, ctx.max_capacity || capacity)
   end
 
@@ -1361,10 +1373,8 @@ defmodule Transmuter.Generation do
     n = Enum.max(counts)
     rows = Enum.max(state.lengths) + n
 
-    if ctx.mode != :grow and rows > state.capacity do
-      raise ArgumentError,
-            "generation needs #{rows} rows of cache, more than the #{state.capacity} rows that the static tables of the decoder fit"
-    end
+    state =
+      if ctx.mode != :grow and rows > state.capacity, do: grow(ctx, state, rows), else: state
 
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
     {inputs, static} = step_inputs(ctx, state, tokens)
@@ -1477,6 +1487,30 @@ defmodule Transmuter.Generation do
         do: Nx.backend_deallocate(tensor)
 
     :ok
+  end
+
+  # Gives the buffers the capacity of the next power of two that fits the rows of a step, up to
+  # the largest capacity of the decoder. One compiled function pads all buffers with free
+  # rows, which the masks hide, and each growth compiles the steps of one more capacity.
+  defp grow(ctx, state, rows) do
+    capacity = capacity(ctx, rows)
+
+    if rows > capacity do
+      raise ArgumentError,
+            "generation needs #{rows} rows of cache, more than the #{capacity} rows that the static tables of the decoder fit"
+    end
+
+    buffers = Map.take(state.cache, ctx.buffers)
+    grown = ctx.grow.(buffers, Nx.iota({capacity}, backend: Nx.BinaryBackend))
+    release(Map.values(buffers), Map.values(grown))
+    %{state | cache: Map.merge(state.cache, grown), capacity: capacity}
+  end
+
+  defp grow_rows(cache, capacity) do
+    Map.new(cache, fn {name, buffer} ->
+      free = Nx.axis_size(capacity, 0) - Nx.axis_size(buffer, 2)
+      {name, Nx.pad(buffer, 0, [{0, 0, 0}, {0, 0, 0}, {0, free, 0}, {0, 0, 0}])}
+    end)
   end
 
   # The last rows of each present, as many as the tokens of the step, are the new rows:
