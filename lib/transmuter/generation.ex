@@ -75,7 +75,7 @@ defmodule Transmuter.Generation do
 
   ## Device memory
 
-  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
+  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. The embeddings of a step are freed after its call, and when a group ends, generation frees its cache and the rest of its state. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
   alias Transmuter.{GraphBreaks, Serving}
@@ -969,8 +969,16 @@ defmodule Transmuter.Generation do
     notify.(group)
 
     if Enum.all?(group.done),
-      do: group,
+      do: finish(group),
       else: decode(ctx, advance(ctx, group), remaining - 1, notify)
+  end
+
+  # Frees the device tensors that the group owns when it ends: its cache, its last selection
+  # and selection state, its masks and its keys.
+  defp finish(group = %{state: state}) do
+    own = [state.selected, state.seen, state.step, group.keys | Map.values(state.cache)]
+    release(own ++ Map.values(group.masks), [])
+    group
   end
 
   defp select(ctx, group, remaining) do
@@ -1010,6 +1018,9 @@ defmodule Transmuter.Generation do
 
     %{items: items} = search_steps(ctx, group, items, 0)
 
+    # The rows of each prompt are copies of its inputs that the search owns.
+    release(Map.values(inputs), [])
+
     for item <- items do
       case item.finished do
         [] -> []
@@ -1048,6 +1059,7 @@ defmodule Transmuter.Generation do
       |> Enum.unzip()
 
     if Enum.all?(items, & &1.done?) do
+      finish(group)
       %{items: items}
     else
       beams = Enum.concat(beams)
@@ -1352,6 +1364,9 @@ defmodule Transmuter.Generation do
 
     outputs = ctx.run.(Map.merge(inputs, selection), static)
 
+    # The embeddings of the tokens come from ctx.embed, and nothing reads them after the call.
+    release(List.wrap(inputs["inputs_embeds"]), [])
+
     # The tokens and the step that the last step gave are the inputs of this step, or those
     # of a part of the prompt that nothing reads. The parts of the prompt take theirs from
     # start/6.
@@ -1412,7 +1427,9 @@ defmodule Transmuter.Generation do
         mask = for row <- rows, do: Enum.map(row, &elem(&1, 1))
         index = Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend)
         mask = Nx.tensor(mask, type: :u8, backend: Nx.BinaryBackend)
-        ctx.merge.(embeds, state.features, index, mask)
+        merged = ctx.merge.(embeds, state.features, index, mask)
+        release([embeds], [merged])
+        merged
       end
 
     {Map.put(inputs, "inputs_embeds", embeds), %{state | cursors: cursors}}

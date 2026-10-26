@@ -544,3 +544,58 @@ defmodule Transmuter.GenerationBitsTest do
     _error -> true
   end
 end
+
+defmodule Transmuter.GenerationMemoryTest do
+  # The memory of the EXLA client is shared by all processes, so this test runs alone. It has
+  # no :ci_partition tag, so it runs in EXLA partition 1, and an --only of a partition cannot
+  # select it on EMLX.
+  use ExUnit.Case, async: false
+
+  @moduletag :hub
+  @moduletag :exla
+  @moduletag timeout: 900_000
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  alias Transmuter.Generation
+
+  # Generation frees the device tensors that it makes: the dead cache of each step, and the
+  # cache and the rest of the state of a group when it ends. So after a request, the client
+  # holds what it held before, within a margin for its own buffers. EMLX 0.5 frees an MLX array
+  # only when the BEAM collects its tensor, also after Nx.backend_deallocate/1, so the test
+  # runs on EXLA.
+  test "a request leaves no device memory, with greedy selection and with beams" do
+    opts = [outputs: &Generation.outputs/1, variant: :q4] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :q4)
+    client = EXLA.Client.fetch!(Keyword.fetch!(elem(@opts[:backend], 1), :client))
+    allocated = fn -> EXLA.Client.get_memory_statistics(client).allocated end
+
+    for num_beams <- [1, 2] do
+      ctx = Generation.context(repo, model, max_new_tokens: 8, num_beams: num_beams)
+      ctx = Generation.compile(ctx, 2 * num_beams, @opts[:defn_options])
+      request = fn -> Generation.generate(ctx, [[1, 9690, 198], [1, 9690, 198, 2683]], [0, 0]) end
+
+      request.()
+
+      # A garbage collection would free dropped tensors too, so the request runs in a process
+      # with a heap large enough that it does not collect.
+      test = self()
+
+      Process.spawn(
+        fn ->
+          before = allocated.()
+          request.()
+          send(test, {:left, allocated.() - before})
+        end,
+        min_heap_size: 10_000_000
+      )
+
+      assert_receive {:left, left}, 300_000
+      assert left < 4_000_000
+    end
+  end
+end
