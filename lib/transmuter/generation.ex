@@ -75,7 +75,7 @@ defmodule Transmuter.Generation do
 
   ## Device memory
 
-  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of `:append` and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and the buffers of `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
+  A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
   """
 
   alias Transmuter.{GraphBreaks, Serving}
@@ -96,6 +96,7 @@ defmodule Transmuter.Generation do
   @selected "transmuter.select.selected"
   @next_seen "transmuter.select.next_seen"
   @next_step "transmuter.select.next_step"
+  @lengths "transmuter.cache.lengths"
 
   @no_vocab "generation needs the vocabulary size: the logits output of the graph has no number in its last dimension, and the configuration has no vocab_size"
 
@@ -600,9 +601,9 @@ defmodule Transmuter.Generation do
     # token and each prompt chunk.
     state = initial_state(ctx, batch_size, @min_capacity)
     tail = tail(ctx)
-    # In :in_place, the present of each entry of the cache has the shape of its past, so the
-    # step writes it into the buffer of the past.
-    donate = if ctx.mode == :in_place, do: ctx.cache, else: []
+    # In :in_place and :append, the present of each entry of the cache has the shape of its
+    # past, so the step writes it into the buffer of the past.
+    donate = if ctx.mode in [:in_place, :append], do: ctx.cache, else: []
 
     opts =
       [cache_size: ctx.max_new_tokens + @min_capacity, tail: tail, donate: donate] ++
@@ -638,9 +639,7 @@ defmodule Transmuter.Generation do
       |> compile_embed(batch_size, defn_options)
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
-    ctx
-    |> Map.put(:append, GraphBreaks.jit(&append_rows/3, defn_options))
-    |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
+    Map.put(ctx, :reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
   end
 
   # The settings of the selection, and the processes of the processors with the masks in their
@@ -669,14 +668,18 @@ defmodule Transmuter.Generation do
 
   # The selection of a step runs in the compiled program after the decoder. It takes the
   # logits from the outputs and the extra inputs of selection/3, and gives the selection in
-  # place of the logits. The term of the tail names it in the key of the EXLA disk cache.
+  # place of the logits. In :append, the tail also writes the new rows of each present into
+  # the buffer of its past, so the present that the step gives is the buffer. The term of
+  # the tail names it in the key of the EXLA disk cache.
   defp tail(ctx) do
     settings = settings(ctx)
     beams? = ctx.num_beams > 1
     names = Map.keys(ctx.masks)
     count = Enum.count(ctx.processors, &is_tuple/1)
+    buffers = if ctx.mode == :append, do: ctx.cache, else: []
 
     fun = fn outputs, extra ->
+      outputs = write_rows(outputs, extra, buffers)
       {logits, outputs} = Map.pop!(outputs, "logits")
       masks = Map.new(names, &{&1, extra[@mask <> Atom.to_string(&1)]})
 
@@ -747,7 +750,11 @@ defmodule Transmuter.Generation do
       scores: List.duplicate(0.0, rows)
     }
 
-    ctx |> selection(group) |> Map.put(@offset, zeros.(:s32, {rows}))
+    selection = ctx |> selection(group) |> Map.put(@offset, zeros.(:s32, {rows}))
+
+    if ctx.mode == :append,
+      do: Map.put(selection, @lengths, zeros.(:s32, {rows})),
+      else: selection
   end
 
   # The extra inputs of the selection of a step, from the group: the tokens that the
@@ -1330,7 +1337,20 @@ defmodule Transmuter.Generation do
     # The selection of the last step is read, or is that of an earlier part of the prompt,
     # so nothing reads it now.
     release(List.wrap(state.selected), [])
-    outputs = ctx.run.(Map.merge(inputs, Map.put(selection, @offset, offsets)), static)
+    selection = Map.put(selection, @offset, offsets)
+
+    # In :append, the new rows of each row go into the buffer after its valid rows.
+    selection =
+      if ctx.mode == :append,
+        do:
+          Map.put(
+            selection,
+            @lengths,
+            Nx.tensor(state.lengths, type: :s32, backend: Nx.BinaryBackend)
+          ),
+        else: selection
+
+    outputs = ctx.run.(Map.merge(inputs, selection), static)
 
     # The tokens and the step that the last step gave are the inputs of this step, or those
     # of a part of the prompt that nothing reads. The parts of the prompt take theirs from
@@ -1345,22 +1365,10 @@ defmodule Transmuter.Generation do
           into: %{},
           do: {name, outputs["present." <> rest]}
 
-    # The present replaces the cache entries that the step wrote. In :append, the new rows
-    # go into the buffers, which the append program takes as donated, and the present and
-    # the old buffers are dead after that.
+    # The present replaces the cache entries that the step wrote, and their old buffers are
+    # dead. In :append, the tail wrote the new rows into the buffers (see tail/1).
     buffers = Map.take(state.cache, Map.keys(present))
-
-    {present, dead} =
-      if ctx.mode == :append do
-        offsets = Nx.tensor(state.lengths, backend: Nx.BinaryBackend)
-
-        {ctx.append.(Nx.donatable(buffers), present, offsets),
-         Map.values(present) ++ Map.values(buffers)}
-      else
-        {present, Map.values(buffers)}
-      end
-
-    release(dead, Map.values(present))
+    release(Map.values(buffers), Map.values(present))
 
     # A buffer keeps the real tokens of each row. The cache of :grow has all tokens.
     lengths =
@@ -1425,23 +1433,28 @@ defmodule Transmuter.Generation do
     :ok
   end
 
-  # The rows of each present cache after the buffer are the new rows, and they go into the
-  # buffer after the valid rows of each batch row. One compiled function writes all of
-  # them, because each eager slice is a call to the device.
-  defp append_rows(cache, present, offsets) do
-    Map.new(cache, fn {name, buffer} ->
+  # The rows of each present after its buffer are the new rows, and they go into the buffer
+  # after the valid rows of each batch row. The present that the step gives is then the
+  # buffer.
+  defp write_rows(outputs, _inputs, []), do: outputs
+
+  defp write_rows(outputs, inputs, buffers) do
+    for "past_key_values." <> rest = name <- buffers,
+        present = outputs["present." <> rest],
+        present != nil,
+        into: outputs do
+      buffer = inputs[name]
       {batch_size, _heads, capacity, _dim} = Nx.shape(buffer)
-      rows = Nx.axis_size(present[name], 2) - capacity
-      new = Nx.slice_along_axis(present[name], capacity, rows, axis: 2)
+      new = Nx.slice_along_axis(present, capacity, Nx.axis_size(present, 2) - capacity, axis: 2)
 
       buffer =
         Enum.reduce(0..(batch_size - 1), buffer, fn i, buffer ->
           row = Nx.slice_along_axis(new, i, 1, axis: 0)
-          Nx.put_slice(buffer, [i, 0, offsets[i], 0], row)
+          Nx.put_slice(buffer, [i, 0, inputs[@lengths][i], 0], row)
         end)
 
-      {name, buffer}
-    end)
+      {"present." <> rest, buffer}
+    end
   end
 
   defp step_inputs(ctx, state, tokens) do

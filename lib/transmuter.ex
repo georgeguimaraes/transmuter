@@ -395,12 +395,13 @@ defmodule Transmuter do
       service. Each cached shape uses memory.
 
     * `:tail` (`{term, function}`) - a function of two maps, the graph outputs
-      and the extra inputs, that runs in the compiled program after the graph.
-      The extra inputs are the inputs that the model does not declare. The
-      compiled function then returns the map that the function gives, so a
-      step and the work on its outputs, such as the token selection of
-      generation, are one call. The term names the function in the key of the
-      EXLA disk cache. The default is `nil`.
+      and all inputs of the call, that runs in the compiled program after the
+      graph. The second map has the inputs that the model declares and the
+      extra inputs, which the model does not declare. The compiled function
+      then returns the map that the function gives, so a step and the work on
+      its outputs, such as the token selection of generation, are one call.
+      The term names the function in the key of the EXLA disk cache. The
+      default is `nil`.
 
     * `:donate` (list of input names) - inputs whose buffers the compiled program can
       reuse for its outputs of the same shape and type (see `Nx.donatable/1`). The

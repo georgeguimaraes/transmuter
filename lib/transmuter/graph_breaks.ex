@@ -10,7 +10,7 @@ defmodule Transmuter.GraphBreaks do
 
   A graph without breaks keeps, for the input shapes of each call, the key of its compiled segment and the names of its arguments. A call with these shapes gives its inputs and the params to the segment, without a walk over the names of the graph. It keeps one entry for each input shape. The map has no bound of its own, but an entry goes away with its segment when the cache evicts it, so it holds no more than the cache of segments.
 
-  With the `:tail` option of `Transmuter.compile/3`, the segment that ends the graph also runs a function on the graph outputs and on the extra inputs, the inputs of the call that the model does not declare. The call then gives the outputs of that function. This segment always compiles, also when it has fewer nodes than a segment that runs eagerly.
+  With the `:tail` option of `Transmuter.compile/3`, the segment that ends the graph also runs a function on the graph outputs and on the inputs of the call: the inputs that the model declares, and the extra inputs, which it does not declare. The call then gives the outputs of that function. This segment always compiles, also when it has fewer nodes than a segment that runs eagerly.
   """
 
   alias Nx.Defn.{Compiler, Composite}
@@ -109,7 +109,7 @@ defmodule Transmuter.GraphBreaks do
       tail: tail,
       donate: donate,
       extra: extra,
-      last_use: last_use(model, extra),
+      last_use: last_use(model, if(tail, do: model.inputs ++ extra, else: [])),
       defined: defined(model, extra),
       constant: constant,
       shaped: shaped(model, constant, static_inputs),
@@ -632,9 +632,9 @@ defmodule Transmuter.GraphBreaks do
   end
 
   # The segment that ends the graph returns the outputs of the tail, which takes the graph
-  # outputs and the extra inputs.
+  # outputs and the inputs of the call.
   defp final(plan = %{tail: {_key, fun}}, env, :end, _live),
-    do: fun.(Map.take(env, plan.model.outputs), Map.take(env, plan.extra))
+    do: fun.(Map.take(env, plan.model.outputs), Map.take(env, plan.model.inputs ++ plan.extra))
 
   defp final(_plan, _env, _stop, live), do: live
 
@@ -953,8 +953,8 @@ defmodule Transmuter.GraphBreaks do
   end
 
   # The index of the last node that reads each name. Graph outputs, the random key and the
-  # extra inputs of the tail stay live to the end.
-  defp last_use(model, extra) do
+  # inputs that the tail reads stay live to the end.
+  defp last_use(model, tail_inputs) do
     reads =
       for {node, i} <- Enum.with_index(model.nodes),
           name <- Transmuter.dependencies(node),
@@ -963,7 +963,7 @@ defmodule Transmuter.GraphBreaks do
           do: (acc -> Map.put(acc, name, i))
 
     Enum.reduce(
-      [Transmuter.random_input() | model.outputs ++ extra],
+      [Transmuter.random_input() | model.outputs ++ tail_inputs],
       reads,
       &Map.put(&2, &1, :infinity)
     )
