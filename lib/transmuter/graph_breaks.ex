@@ -6,7 +6,9 @@ defmodule Transmuter.GraphBreaks do
 
   Static values are those of the model, the static inputs, promoted values and values folded from them. A promoted value, or a value folded from it, enters a segment as an argument, so its value is not in the key. It stays static when a node of that segment needs its host value. The plan learns these names for each position from its traces. A node can need the host value of an argument that follows only from static values of the call. Then the break is induced, and the names where the way enters the segment stay static at that position. When a small value of an earlier segment is among them, the host gets a copy of it when the segment starts. A node that still breaks after a retry is a real break, and it costs one more trace on each miss of its segment. Values that follow only from shapes and static inputs stay static. Everything else enters a segment as an argument.
 
-  A graph without breaks keeps, for the input shapes of each call, the key of its compiled segment and the names of its arguments. A call with these shapes merges its inputs into the params and calls the segment, without a walk over the names of the graph. It keeps one entry for each input shape. The map has no bound of its own, but an entry goes away with its segment when the cache evicts it, so it holds no more than the cache of segments.
+  A compiled segment takes the params that it reads as a tuple, in a fixed order, and its other arguments as a map. So a call does not merge the params into a map.
+
+  A graph without breaks keeps, for the input shapes of each call, the key of its compiled segment and the names of its arguments. A call with these shapes gives its inputs and the params to the segment, without a walk over the names of the graph. It keeps one entry for each input shape. The map has no bound of its own, but an entry goes away with its segment when the cache evicts it, so it holds no more than the cache of segments.
 
   With the `:tail` option of `Transmuter.compile/3`, the segment that ends the graph also runs a function on the graph outputs and on the extra inputs, the inputs of the call that the model does not declare. The call then gives the outputs of that function. This segment always compiles, also when it has fewer nodes than a segment that runs eagerly.
   """
@@ -150,9 +152,9 @@ defmodule Transmuter.GraphBreaks do
   end
 
   # A graph without breaks keeps, for the shapes of each call, the key of its compiled
-  # segment and the names of its arguments. A call with known shapes merges its inputs into
-  # the params and calls the segment, so it does not walk the names of the graph. Inputs of
-  # other shapes compile on their first call. EMLX traces again in a call whose quantized
+  # segment and the names of its arguments. A call with known shapes gives its inputs and
+  # the params to the segment, so it does not walk the names of the graph. Inputs of other
+  # shapes compile on their first call. EMLX traces again in a call whose quantized
   # params it has not compiled, so the call runs in the graph of the plan.
   defp fast(plan, inputs, static_inputs) do
     inputs = call_inputs(plan, inputs)
@@ -175,12 +177,10 @@ defmodule Transmuter.GraphBreaks do
   # The other arguments are params, and the plan keeps them. An input without device data,
   # such as an empty value, is a static value of the segment, so only the inputs that are
   # arguments go into the call.
-  defp run_fast(plan, entry, %{params: params, names: names}, inputs) do
+  defp run_fast(plan, entry, %{names: names}, inputs) do
     with_graph(plan, fn ->
-      args =
-        inputs |> Map.take(names) |> encode() |> Map.merge(Map.take(plan.model.params, params))
-
-      %{values: values} = run_compiled(entry, args)
+      params = Enum.map(entry.params, &Map.fetch!(plan.model.params, &1))
+      %{values: values} = call_compiled(entry, params, inputs |> Map.take(names) |> encode())
       outputs(Map.merge(inputs, values), plan, output_names(plan, entry))
     end)
   end
@@ -202,13 +202,9 @@ defmodule Transmuter.GraphBreaks do
         {key, _args, _statics} = key(plan, state, 0, host_names(plan, 0))
         inputs = call_inputs(plan, inputs)
 
-        {per_call, params} =
-          Map.split_with(args, &Map.has_key?(inputs, arg_name(elem(&1, 0))))
-
         fast = %{
           key: key,
-          params: Map.keys(params),
-          names: Enum.map(per_call, &arg_name(elem(&1, 0)))
+          names: args |> Map.drop(entry.params) |> Map.keys() |> Enum.map(&arg_name/1)
         }
 
         shapes = input_shapes(inputs)
@@ -500,10 +496,20 @@ defmodule Transmuter.GraphBreaks do
       outputs
     end
 
+    params =
+      args |> Map.keys() |> Enum.filter(&Map.has_key?(plan.model.params, &1)) |> Enum.sort()
+
+    program = fn values, args ->
+      bounded.(Map.merge(args, Map.new(Enum.zip(params, Tuple.to_list(values)))))
+    end
+
+    {values, rest} = Map.split(args, params)
+    values = params |> Enum.map(&Map.fetch!(values, &1)) |> List.to_tuple()
+
     try do
       compiled =
         try do
-          compile_program(plan, path, bounded, args)
+          compile_program(plan, path, program, [values, rest])
         catch
           {^ref, :eager} -> nil
         end
@@ -516,6 +522,7 @@ defmodule Transmuter.GraphBreaks do
 
       entry = %{
         compiled: compiled,
+        params: params,
         stop: stop,
         reason: reason,
         out_names: out_names,
@@ -534,10 +541,17 @@ defmodule Transmuter.GraphBreaks do
   # values, each cached segment would keep the device tensors of its first call.
   defp compile_program(plan, path, fun, args) do
     opts = if path, do: Keyword.put(plan.opts, :cache, path), else: plan.opts
-    Nx.Defn.compile(fun, [Composite.traverse(args, &Nx.to_template/1)], opts)
+
+    Nx.Defn.compile(
+      fun,
+      Enum.map(args, &Composite.traverse(&1, fn t -> Nx.to_template(t) end)),
+      opts
+    )
   end
 
-  defp disk_path(%{disk_cache: {path, model}}, key), do: path <> "-" <> hash({model, key})
+  # The version of the arguments of a program in the disk cache: since version 2, the params
+  # come first, as a tuple. A program of another version has its arguments in another order.
+  defp disk_path(%{disk_cache: {path, model}}, key), do: path <> "-" <> hash({model, key, 2})
   defp disk_path(_plan, _key), do: nil
 
   # EXLA keeps one program in each :cache path and checks only the shapes of its arguments.
@@ -733,8 +747,17 @@ defmodule Transmuter.GraphBreaks do
     end
   end
 
-  defp run_compiled(entry = %{compiled: compiled, out_names: names, produced: produced}, args) do
-    outputs = compiled.(args) |> decode()
+  defp run_compiled(entry, args) do
+    {params, args} = Map.split(args, entry.params)
+    call_compiled(entry, Enum.map(entry.params, &Map.fetch!(params, &1)), args)
+  end
+
+  defp call_compiled(
+         entry = %{compiled: compiled, out_names: names, produced: produced},
+         params,
+         args
+       ) do
+    outputs = compiled.(List.to_tuple(params), args) |> decode()
     %{values: Map.merge(produced, Map.take(outputs, names)), static: entry.digests}
   end
 
