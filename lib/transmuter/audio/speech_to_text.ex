@@ -383,11 +383,8 @@ defmodule Transmuter.Audio.SpeechToText do
   # the tokens after `above`. Then, when the timestamps together are more probable than each
   # text token, the step selects a timestamp.
   defp timestamp_processor(%{timestamp_begin: begin, eos: eos}, max_initial) do
-    state = fn %{generated: generated} ->
-      Nx.tensor(bounds(generated, begin, eos, max_initial), type: :s32, backend: Nx.BinaryBackend)
-    end
-
-    process = fn logits, bounds ->
+    fn logits, row ->
+      bounds = bounds(row, begin, eos, max_initial)
       ids = Nx.iota(Nx.shape(logits))
       min = Nx.Constants.min_finite(:f32)
       timestamp? = Nx.greater_equal(ids, begin)
@@ -410,35 +407,47 @@ defmodule Transmuter.Audio.SpeechToText do
         logits
       )
     end
-
-    {state, process}
   end
 
   @no_limit 2 ** 31 - 1
 
-  # The first token is a timestamp of at most `max_initial`.
-  defp bounds([], begin, _eos, nil), do: [begin, begin, @no_limit]
-  defp bounds([], begin, _eos, max_initial), do: [begin, begin, begin + max_initial]
+  # The bounds of the next token from the new tokens of the row: the smallest token, the
+  # smallest timestamp, and the largest token. The first token is a timestamp of at most
+  # `max_initial`. Timestamps come in pairs, except before eos, and do not decrease. A pair is
+  # followed by text, a single timestamp by a timestamp or eos.
+  defp bounds(row, begin, eos, max_initial) do
+    %{tokens: tokens, count: count, prompt: prompt} = row
+    at = &Nx.take(tokens, Nx.max(Nx.subtract(count, &1), 0))
+    generated = Nx.subtract(count, prompt)
+    last? = Nx.greater_equal(at.(1), begin)
+    penultimate? = Nx.logical_or(Nx.equal(generated, 1), Nx.greater_equal(at.(2), begin))
+    single? = Nx.logical_and(last?, Nx.logical_not(penultimate?))
 
-  # Timestamps come in pairs, except before eos, and do not decrease. A pair is followed by
-  # text, a single timestamp by a timestamp or eos.
-  defp bounds(generated = [last | rest], begin, eos, _max_initial) do
-    last? = last >= begin
-    penultimate? = match?([], rest) or hd(rest) >= begin
-    single? = last? and not penultimate?
+    # The latest timestamp of the new tokens, at the largest position that has one.
+    positions = Nx.iota(Nx.shape(tokens))
+    new? = Nx.logical_and(Nx.greater_equal(positions, prompt), Nx.less(positions, count))
+    timestamp? = Nx.logical_and(new?, Nx.greater_equal(tokens, begin))
+    latest = Nx.reduce_max(Nx.select(timestamp?, positions, -1))
+    timestamp = Nx.take(tokens, Nx.max(latest, 0))
 
     from =
-      case Enum.find(generated, &(&1 >= begin)) do
-        nil -> begin
-        timestamp when single? -> timestamp
-        timestamp -> timestamp + 1
-      end
+      Nx.select(
+        Nx.less(latest, 0),
+        begin,
+        Nx.select(single?, timestamp, Nx.add(timestamp, 1))
+      )
 
-    [
-      if(single?, do: eos, else: 0),
+    first = [begin, begin, if(max_initial, do: begin + max_initial, else: @no_limit)]
+
+    later = [
+      Nx.select(single?, eos, 0),
       from,
-      if(last? and penultimate?, do: begin - 1, else: @no_limit)
+      Nx.select(Nx.logical_and(last?, penultimate?), begin - 1, @no_limit)
     ]
+
+    Enum.zip_with(first, later, &Nx.select(Nx.equal(generated, 0), &1, &2))
+    |> Nx.stack()
+    |> Nx.as_type(:s32)
   end
 
   # _decode_asr of the Whisper tokenizer: the windows are {tokens, [size, left, right]} in

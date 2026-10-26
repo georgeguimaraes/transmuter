@@ -148,6 +148,55 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # no_repeat_ngram_size reads the tokens of each row on the device, where each step writes
+  # its new token after the tokens of the row. In a batch whose prompts have different
+  # lengths, each row gets its tokens alone, also with beams, whose tokens move with their
+  # rows, and no row repeats a 3-gram of its prompt and new tokens.
+  @tag ci_partition: 10
+  test "no_repeat_ngram_size gives each row of a batch its tokens alone, also with beams" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    prompts = [[504, 3575, 282, 4649, 314, 504, 3575], [504, 2365], [42, 43, 44, 45, 46]]
+
+    for num_beams <- [1, 2] do
+      ctx =
+        Generation.context(repo, model,
+          no_repeat_ngram_size: 3,
+          max_new_tokens: 24,
+          num_beams: num_beams
+        )
+
+      batch = Generation.compile(ctx, 3 * num_beams, @opts[:defn_options])
+      single = Generation.compile(ctx, num_beams, @opts[:defn_options])
+      tokens = Generation.generate(batch, prompts, [0, 0, 0])
+
+      assert tokens == Enum.flat_map(prompts, &Generation.generate(single, [&1], [0]))
+
+      for {prompt, new} <- Enum.zip(prompts, tokens) do
+        ngrams = Enum.chunk_every(prompt ++ Enum.map(new, &hd/1), 3, 1, :discard)
+        assert Enum.uniq(ngrams) == ngrams
+      end
+    end
+
+    # A row of more than 256 tokens does not fit the first places of the tokens, so they grow
+    # with the buffers of the cache. min_new_tokens keeps the row from ending before that.
+    ctx =
+      Generation.context(repo, model,
+        no_repeat_ngram_size: 3,
+        max_new_tokens: 260,
+        min_new_tokens: 260
+      )
+
+    [new] =
+      Generation.generate(Generation.compile(ctx, 1, @opts[:defn_options]), [hd(prompts)], [0])
+
+    ngrams = Enum.chunk_every(hd(prompts) ++ Enum.map(new, &hd/1), 3, 1, :discard)
+
+    assert length(new) == 260
+    assert Enum.uniq(ngrams) == ngrams
+  end
+
   # The log-probabilities of the tokens, from the token log-probabilities sections of
   # test/support/pipeline_references.py. ONNX Runtime on the same exports gives each value
   # within 4.4e-5 for gpt2 and 1.2e-4 for whisper-tiny.en. compute_transition_scores of the

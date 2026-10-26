@@ -45,7 +45,7 @@ defmodule Transmuter.Generation do
 
   ## Processors
 
-  The `:processors` key of the context is the list of processors, which apply in order after the repetition penalty and before the temperature. `context/4` puts the processors of `generation_config.json` in it, and a task can add its own processors at the end. A processor is `{state, process}`. Before each step, `state` takes a map of one row and gives a tensor of the same shape at each step. The map has the token ids of the prompt in `:prompt`, the new token ids in `:generated` (the last token first), and the size of the vocabulary in `:vocab`. `process` takes the logits and that tensor of one row in the compiled selection, and gives the new logits.
+  The `:processors` key of the context is the list of processors, which apply in order after the repetition penalty and before the temperature. `context/4` puts the processors of `generation_config.json` in it, and a task can add its own processors at the end. A processor is a function of the logits of one row and a map of that row, and gives the new logits. It runs in the compiled selection, and the map has device tensors: the token ids of the row in `:tokens` (the prompt and the new tokens, then free places up to the capacity), the number of these tokens in `:count`, and the length of the prompt in `:prompt`. So the processors read the tokens on the device, and the host builds no state for them at each step.
 
   The atoms `:bad_words` and `:suppress_tokens` in the list are the places of two masks that do not change between steps: the bad words of one token and `suppress_tokens`. Generation makes these masks once for each group of rows.
 
@@ -99,7 +99,9 @@ defmodule Transmuter.Generation do
   @offset "transmuter.select.offset"
   @seen "transmuter.select.seen"
   @mask "transmuter.select.mask."
-  @state "transmuter.select.state."
+  @history "transmuter.select.history"
+  @count "transmuter.select.count"
+  @prompt_count "transmuter.select.prompt_count"
   @keys "transmuter.select.keys"
   @step "transmuter.select.step"
   @scores "transmuter.select.scores"
@@ -107,6 +109,8 @@ defmodule Transmuter.Generation do
   @selected "transmuter.select.selected"
   @next_seen "transmuter.select.next_seen"
   @next_step "transmuter.select.next_step"
+  @next_history "transmuter.select.next_history"
+  @next_count "transmuter.select.next_count"
   @lengths "transmuter.cache.lengths"
 
   @no_vocab "generation needs the vocabulary size: the logits output of the graph has no number in its last dimension, and the configuration has no vocab_size"
@@ -311,17 +315,17 @@ defmodule Transmuter.Generation do
     # the length of the prompt.
     {min_length?, min_length} =
       if min_new_tokens,
-        do: {min_new_tokens > 0, &(length(&1) + min_new_tokens)},
+        do: {min_new_tokens > 0, &Nx.add(&1, min_new_tokens)},
         else: {min_length > 0, fn _prompt -> min_length end}
 
     [
       ngram_size > 0 && no_repeat_ngram(ngram_size),
       :bad_words,
       min_length? && eos != [] && min_length(min_length, eos),
-      forced_bos != nil && forced(&(length(&1.prompt) + length(&1.generated) == 1), [forced_bos]),
+      forced_bos != nil && forced(&Nx.equal(&1.count, 1), [forced_bos]),
       # The row has max_length - 1 tokens, where max_length is the prompt and max_new_tokens.
       forced_eos != nil &&
-        forced(&(length(&1.generated) == max_new_tokens - 1), List.wrap(forced_eos)),
+        forced(&Nx.equal(generated(&1), max_new_tokens - 1), List.wrap(forced_eos)),
       :suppress_tokens,
       begin_suppress != [] && begin_suppress(begin_suppress, forced_bos != nil)
     ]
@@ -329,55 +333,64 @@ defmodule Transmuter.Generation do
   end
 
   # NoRepeatNGramLogitsProcessor: the last token of each n-gram whose first n - 1 tokens are the
-  # last n - 1 tokens of the row.
+  # last n - 1 tokens of the row. Window i of the tokens is an n-gram when it ends before the
+  # count of the row. Its last token goes into a mask with one more place, where the windows
+  # that do not match put their mark.
   defp no_repeat_ngram(size) do
-    state = fn %{prompt: prompt, generated: generated, vocab: vocab} ->
-      tokens = prompt ++ Enum.reverse(generated)
-      last = Enum.take(tokens, 1 - size)
+    fn logits, row ->
+      vocab = Nx.axis_size(logits, 0)
+      windows = Nx.axis_size(row.tokens, 0) - size + 1
+      column = &Nx.slice_along_axis(row.tokens, &1, windows, axis: 0)
+      last = &Nx.take(row.tokens, Nx.max(Nx.add(Nx.subtract(row.count, size - 1), &1), 0))
+
+      match =
+        Enum.reduce(
+          0..(size - 2)//1,
+          Nx.less_equal(Nx.add(Nx.iota({windows}), size), row.count),
+          fn k, match ->
+            Nx.logical_and(match, Nx.equal(column.(k), last.(k)))
+          end
+        )
+
+      index = Nx.select(match, column.(size - 1), vocab)
 
       banned =
-        for ngram <- Enum.chunk_every(tokens, size, 1, :discard),
-            Enum.take(ngram, size - 1) == last,
-            uniq: true,
-            do: [List.last(ngram)]
+        Nx.broadcast(Nx.tensor(0, type: :u8), {vocab + 1})
+        |> Nx.indexed_put(Nx.new_axis(index, 1), Nx.broadcast(Nx.tensor(1, type: :u8), {windows}))
+        |> Nx.slice_along_axis(0, vocab, axis: 0)
 
-      mark(none({vocab}), banned)
+      remove(logits, banned)
     end
-
-    {state, &remove/2}
   end
 
-  # MinLengthLogitsProcessor, with the minimum length of the row from its prompt.
+  # MinLengthLogitsProcessor, with the minimum length of the row from the length of its prompt.
   defp min_length(min_length, eos) do
-    state = fn %{prompt: prompt, generated: generated} ->
-      flag(length(prompt) + length(generated) < min_length.(prompt))
+    fn logits, row ->
+      short = Nx.less(row.count, min_length.(row.prompt))
+      remove(logits, Nx.logical_and(short, any_of(logits, eos)))
     end
-
-    {state, &remove(&1, Nx.logical_and(&2, any_of(&1, eos)))}
   end
 
   # ForcedBOSTokenLogitsProcessor and ForcedEOSTokenLogitsProcessor: when `at?` is true for the
   # row, the forced tokens get 0 and the other tokens are removed.
   defp forced(at?, ids) do
-    process = fn logits, at ->
+    fn logits, row ->
       forced = Nx.select(any_of(logits, ids), 0.0, Nx.Constants.min_finite(:f32))
-      Nx.select(at, forced, logits)
+      Nx.select(at?.(row), forced, logits)
     end
-
-    {&flag(at?.(&1)), process}
   end
 
   # SuppressTokensAtBeginLogitsProcessor. Its begin_index in transformers is the length of
   # the prompt, plus 1 after a forced bos token of a prompt of one token.
   defp begin_suppress(ids, forced_bos?) do
-    state = fn %{prompt: prompt, generated: generated} ->
-      flag(length(generated) == if(forced_bos? and length(prompt) == 1, do: 1, else: 0))
+    fn logits, row ->
+      begin = if forced_bos?, do: Nx.equal(row.prompt, 1), else: 0
+      at = Nx.equal(generated(row), begin)
+      remove(logits, Nx.logical_and(at, any_of(logits, ids)))
     end
-
-    {state, &remove(&1, Nx.logical_and(&2, any_of(&1, ids)))}
   end
 
-  defp flag(value), do: Nx.tensor(if(value, do: 1, else: 0), type: :u8, backend: Nx.BinaryBackend)
+  defp generated(row), do: Nx.subtract(row.count, row.prompt)
 
   defp any_of(logits, ids) do
     iota = Nx.iota(Nx.shape(logits))
@@ -638,7 +651,7 @@ defmodule Transmuter.Generation do
         defn_options
 
     tokens = List.duplicate([0], batch_size)
-    selection = selection_template(ctx, batch_size)
+    selection = selection_template(ctx, batch_size, state.capacity)
 
     runs =
       [0, 1]
@@ -687,13 +700,7 @@ defmodule Transmuter.Generation do
     ])
     |> Map.put(:num_beams, ctx.num_beams)
     |> Map.put(:candidates, candidates(ctx))
-    |> Map.put(
-      :processes,
-      Enum.map(ctx.processors, fn
-        {_state, process} -> process
-        mask -> mask
-      end)
-    )
+    |> Map.put(:processes, ctx.processors)
   end
 
   # The selection of a step runs in the compiled program after the decoder. It takes the
@@ -705,7 +712,6 @@ defmodule Transmuter.Generation do
     settings = settings(ctx)
     beams? = ctx.num_beams > 1
     names = Map.keys(ctx.masks)
-    count = Enum.count(ctx.processors, &is_tuple/1)
     buffers = if ctx.mode == :append, do: ctx.buffers, else: []
 
     fun = fn outputs, extra ->
@@ -713,15 +719,15 @@ defmodule Transmuter.Generation do
       {logits, outputs} = Map.pop!(outputs, "logits")
       masks = Map.new(names, &{&1, extra[@mask <> Atom.to_string(&1)]})
 
-      states =
-        List.to_tuple(for i <- 0..(count - 1)//1, do: extra[@state <> Integer.to_string(i)])
-
       # The new tokens of the step go into the tokens that the repetition penalty applies to,
-      # and the next step takes these from the device. A row without a new token has -1.
+      # and after the tokens of each row, which the processors read. The next step takes both
+      # from the device. A row without a new token has -1.
       seen = extra[@seen]
       {rows, vocab} = Nx.shape(seen)
       new = Nx.equal(Nx.iota({rows, vocab}, axis: 1), Nx.new_axis(extra[@tokens], 1))
       seen = seen |> Nx.logical_or(new) |> Nx.as_type(Nx.type(seen))
+      row = append_token(extra[@history], extra[@count], extra[@tokens])
+      row = Map.put(row, :prompt, extra[@prompt_count])
 
       # The last real token of each row is offset positions before the last position of the
       # step, and the logits keep the last positions of the step.
@@ -733,14 +739,14 @@ defmodule Transmuter.Generation do
 
       selected =
         if beams?,
-          do: select_beams(logits, index, seen, masks, states, extra[@scores], settings),
+          do: select_beams(logits, index, seen, masks, row, extra[@scores], settings),
           else:
             select_tokens(
               logits,
               index,
               seen,
               masks,
-              states,
+              row,
               extra[@keys],
               extra[@step],
               settings
@@ -750,9 +756,22 @@ defmodule Transmuter.Generation do
       |> Map.put(@selected, selected)
       |> Map.put(@next_seen, seen)
       |> Map.put(@next_step, Nx.add(extra[@step], 1))
+      |> Map.put(@next_history, row.tokens)
+      |> Map.put(@next_count, row.count)
     end
 
     {{:select, settings}, fun}
+  end
+
+  # Writes the new token of each row after its tokens, and counts it. A row without a new
+  # token (-1) keeps its tokens.
+  defp append_token(tokens, count, new) do
+    {rows, capacity} = Nx.shape(tokens)
+    added = Nx.greater_equal(new, 0)
+    at = Nx.equal(Nx.iota({rows, capacity}, axis: 1), Nx.new_axis(count, 1))
+    write = Nx.logical_and(at, Nx.new_axis(added, 1))
+    tokens = Nx.select(write, Nx.new_axis(new, 1), tokens)
+    %{tokens: tokens, count: Nx.add(count, Nx.as_type(added, Nx.type(count)))}
   end
 
   # The vocabulary size: the last dimension of the logits output of the graph, or else the
@@ -767,11 +786,17 @@ defmodule Transmuter.Generation do
   end
 
   # The extra inputs of the selection for the compile, with zeros.
-  defp selection_template(ctx, rows) do
+  defp selection_template(ctx, rows, capacity) do
     zeros = &Nx.broadcast(Nx.tensor(0, type: &1, backend: Nx.BinaryBackend), &2)
 
     group = %{
-      state: %{seen: none({rows, ctx.vocab}), step: zeros.(:u32, {})},
+      state: %{
+        seen: none({rows, ctx.vocab}),
+        step: zeros.(:u32, {}),
+        history: zeros.(:s32, {rows, capacity}),
+        count: zeros.(:s32, {rows}),
+        prompt_count: zeros.(:s32, {rows})
+      },
       masks: token_masks(ctx),
       keys: zeros.(:u32, {rows, 2}),
       prompts: List.duplicate([0], rows),
@@ -794,11 +819,6 @@ defmodule Transmuter.Generation do
   defp selection(ctx, group) do
     masks = for {name, mask} <- group.masks, into: %{}, do: {@mask <> Atom.to_string(name), mask}
 
-    states =
-      for {state, i} <- Enum.with_index(processor_states(ctx, group)),
-          into: %{},
-          do: {@state <> Integer.to_string(i), state}
-
     other =
       if ctx.num_beams > 1,
         do: %{@scores => Nx.tensor(group.scores, type: :f32, backend: Nx.BinaryBackend)},
@@ -809,11 +829,13 @@ defmodule Transmuter.Generation do
     %{
       @seen => group.state.seen,
       @step => group.state.step,
+      @history => group.state.history,
+      @count => group.state.count,
+      @prompt_count => group.state.prompt_count,
       @keys => group.keys,
       @tokens => Nx.tensor(tokens, type: :s32, backend: Nx.BinaryBackend)
     }
     |> Map.merge(masks)
-    |> Map.merge(states)
     |> Map.merge(other)
   end
 
@@ -949,6 +971,7 @@ defmodule Transmuter.Generation do
     lengths = for prompt <- prompts, prompt != [], do: length(prompt)
     longest = Enum.max(lengths)
     state = initial_state(ctx, length(prompts), capacity(ctx, longest + @capacity_margin))
+    state = fit(ctx, state, longest)
     last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
 
     sizes =
@@ -962,8 +985,21 @@ defmodule Transmuter.Generation do
     seen = mark(none({length(prompts), ctx.vocab}), prompt_ids)
     step = Nx.tensor(0, type: :u32, backend: Nx.BinaryBackend)
 
+    # The tokens of each row, which the processors read: the prompt, and the new tokens after
+    # it, which the selection of each step writes on the device.
+    history =
+      prompts
+      |> Enum.map(&(&1 ++ List.duplicate(0, state.capacity - length(&1))))
+      |> Nx.tensor(type: :s32, backend: Nx.BinaryBackend)
+
+    count = Nx.tensor(Enum.map(prompts, &length/1), type: :s32, backend: Nx.BinaryBackend)
+
     initial =
-      Map.new([seen: seen, step: step], fn {k, t} -> {k, Nx.backend_transfer(t, ctx.backend)} end)
+      Map.new([seen: seen, step: step, history: history, count: count], fn {k, t} ->
+        {k, Nx.backend_transfer(t, ctx.backend)}
+      end)
+
+    state = %{state | prompt_count: Nx.backend_copy(count, ctx.backend)}
 
     group = %{
       state: Map.merge(state, initial),
@@ -1009,7 +1045,8 @@ defmodule Transmuter.Generation do
   # Frees the device tensors that the group owns when it ends: its cache, its last selection
   # and selection state, its masks and its keys.
   defp finish(group = %{state: state}) do
-    own = [state.selected, state.seen, state.step, group.keys | Map.values(state.cache)]
+    own = [state.selected, state.seen, state.step, state.history, state.count, state.prompt_count]
+    own = [group.keys | own] ++ Map.values(state.cache)
     release(own ++ Map.values(group.masks), [])
     group
   end
@@ -1107,6 +1144,7 @@ defmodule Transmuter.Generation do
           scores: Enum.map(beams, & &1.score)
       }
 
+      group = %{group | state: fit(ctx, group.state, 1)}
       selection = selection(ctx, group)
       group = %{group | state: step(ctx, group.state, Enum.map(new, &List.wrap/1), selection)}
       search_steps(ctx, group, items, step + 1)
@@ -1207,16 +1245,6 @@ defmodule Transmuter.Generation do
     bits
   end
 
-  # The state of each processor for the rows of the group.
-  defp processor_states(ctx, group) do
-    rows =
-      Enum.zip_with(group.prompts, group.ids, &%{prompt: &1, generated: &2, vocab: ctx.vocab})
-
-    for {state, _process} <- ctx.processors do
-      rows |> Enum.map(state) |> Nx.stack()
-    end
-  end
-
   # Gives each row the cache, the tokens and the other state of its source row. The cache
   # entries that the last step did not write, such as the cross-attention cache, are the same
   # for all beams of a prompt, so they keep their rows.
@@ -1227,15 +1255,26 @@ defmodule Transmuter.Generation do
       take = fn list -> Enum.map(sources, &Enum.at(list, &1)) end
       %{state: state} = group
       index = Nx.tensor(sources, type: :s32, backend: Nx.BinaryBackend)
-      written = state.cache |> Map.take(state.written) |> Map.put(@seen, state.seen)
-      {seen, reordered} = Map.pop!(ctx.reorder.(written, index), @seen)
-      release(Map.values(written), [seen | Map.values(reordered)])
+
+      rows = %{
+        @seen => state.seen,
+        @history => state.history,
+        @count => state.count,
+        @prompt_count => state.prompt_count
+      }
+
+      written = state.cache |> Map.take(state.written) |> Map.merge(rows)
+      {moved, reordered} = Map.split(ctx.reorder.(written, index), Map.keys(rows))
+      release(Map.values(written), Map.values(moved) ++ Map.values(reordered))
       cache = Map.merge(state.cache, reordered)
 
       state = %{
         state
         | cache: cache,
-          seen: seen,
+          seen: moved[@seen],
+          history: moved[@history],
+          count: moved[@count],
+          prompt_count: moved[@prompt_count],
           cursors: take.(state.cursors),
           positions: take.(state.positions),
           lengths: take.(state.lengths)
@@ -1298,6 +1337,7 @@ defmodule Transmuter.Generation do
 
   # The step of the new tokens gives the selection for the remaining tokens.
   defp advance(ctx, group) do
+    group = %{group | state: fit(ctx, group.state, 1)}
     selection = selection(ctx, group)
     %{group | state: step(ctx, group.state, Enum.map(group.new, &List.wrap/1), selection)}
   end
@@ -1368,7 +1408,10 @@ defmodule Transmuter.Generation do
       capacity: capacity,
       selected: nil,
       seen: nil,
-      step: nil
+      step: nil,
+      history: nil,
+      count: nil,
+      prompt_count: nil
     }
   end
 
@@ -1378,11 +1421,6 @@ defmodule Transmuter.Generation do
   defp step(ctx, state, parts, selection) do
     counts = Enum.map(parts, &length/1)
     n = Enum.max(counts)
-    rows = Enum.max(state.lengths) + n
-
-    state =
-      if ctx.mode != :grow and rows > state.capacity, do: grow(ctx, state, rows), else: state
-
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
     {inputs, static} = step_inputs(ctx, state, tokens)
     {inputs, state} = embed(ctx, state, inputs, tokens)
@@ -1415,7 +1453,7 @@ defmodule Transmuter.Generation do
     # The tokens and the step that the last step gave are the inputs of this step, or those
     # of a part of the prompt that nothing reads. The parts of the prompt take theirs from
     # start/6.
-    release([state.seen, state.step], [])
+    release([state.seen, state.step, state.history, state.count], [])
 
     # Transmuter.run leaves out empty outputs, such as the present of a cache that does not
     # change, so that cache keeps its value.
@@ -1444,7 +1482,9 @@ defmodule Transmuter.Generation do
         lengths: lengths,
         selected: outputs[@selected],
         seen: outputs[@next_seen],
-        step: outputs[@next_step]
+        step: outputs[@next_step],
+        history: outputs[@next_history],
+        count: outputs[@next_count]
     }
   end
 
@@ -1514,9 +1554,18 @@ defmodule Transmuter.Generation do
     :ok
   end
 
+  # Grows the state when the next step of n tokens does not fit, before the selection of the
+  # step reads the tokens of the rows from the state.
+  defp fit(ctx, state, n) when is_integer(n) do
+    rows = Enum.max(state.lengths) + n
+    if rows > state.capacity, do: grow(ctx, state, rows), else: state
+  end
+
   # Gives the buffers the capacity of the next power of two that fits the rows of a step, up to
   # the largest capacity of the decoder. One compiled function pads all buffers with free
-  # rows, which the masks hide, and each growth compiles the steps of one more capacity.
+  # rows, which the masks hide, and each growth compiles the steps of one more capacity. The
+  # tokens of the rows, which the processors read, have the same capacity and grow with the
+  # buffers, also in :grow, where the cache has its exact length and only the tokens grow.
   defp grow(ctx, state, rows) do
     capacity = capacity(ctx, rows)
 
@@ -1525,16 +1574,24 @@ defmodule Transmuter.Generation do
             "generation needs #{rows} rows of cache, more than the #{capacity} rows that the static tables of the decoder fit"
     end
 
-    buffers = Map.take(state.cache, ctx.buffers)
-    grown = ctx.grow.(buffers, Nx.iota({capacity}, backend: Nx.BinaryBackend))
-    release(Map.values(buffers), Map.values(grown))
-    %{state | cache: Map.merge(state.cache, grown), capacity: capacity}
+    buffers = if ctx.mode == :grow, do: %{}, else: Map.take(state.cache, ctx.buffers)
+    old = Map.put(buffers, @history, state.history)
+
+    {history, grown} =
+      Map.pop!(ctx.grow.(old, Nx.iota({capacity}, backend: Nx.BinaryBackend)), @history)
+
+    release(Map.values(old), [history | Map.values(grown)])
+    %{state | cache: Map.merge(state.cache, grown), history: history, capacity: capacity}
   end
 
-  defp grow_rows(cache, capacity) do
-    Map.new(cache, fn {name, buffer} ->
-      free = Nx.axis_size(capacity, 0) - Nx.axis_size(buffer, 2)
-      {name, Nx.pad(buffer, 0, [{0, 0, 0}, {0, 0, 0}, {0, free, 0}, {0, 0, 0}])}
+  # The rows are axis 2 of a buffer, {batch, heads, rows, dim}, and axis 1 of the tokens,
+  # {batch, rows}.
+  defp grow_rows(tensors, capacity) do
+    Map.new(tensors, fn {name, tensor} ->
+      axis = if Nx.rank(tensor) == 2, do: 1, else: 2
+      free = Nx.axis_size(capacity, 0) - Nx.axis_size(tensor, axis)
+      padding = List.replace_at(List.duplicate({0, 0, 0}, Nx.rank(tensor)), axis, {0, free, 0})
+      {name, Nx.pad(tensor, 0, padding)}
     end)
   end
 
@@ -1660,13 +1717,12 @@ defmodule Transmuter.Generation do
   # are slow. EMLX evaluates each output of a compiled function separately, so the function
   # gives one s32 output: the token of each row, and with token_logprobs the bits of its
   # log-probability.
-  defp select_tokens(logits, index, seen, masks, states, keys, step, settings) do
-    [logits, index, seen, keys | states] =
-      Enum.map([logits, index, seen, keys | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
-
+  defp select_tokens(logits, index, seen, masks, row, keys, step, settings) do
+    [logits, index, seen, keys] = Enum.map([logits, index, seen, keys], &Nx.vectorize(&1, :rows))
+    row = Map.new(row, fn {name, tensor} -> {name, Nx.vectorize(tensor, :rows)} end)
     logits = Nx.take(logits, index)
     key = Transmuter.Random.fold_in(keys, step)
-    {scores, token} = select_token(logits, seen, masks, states, key, settings)
+    {scores, token} = select_token(logits, seen, masks, row, key, settings)
     token = Nx.as_type(token, :s32)
 
     values =
@@ -1683,8 +1739,8 @@ defmodule Transmuter.Generation do
   # context with the masks in their places, temperature, top-k, top-p. Removed tokens get the
   # smallest finite value, because EMLX 0.5 does not compile infinite constants. Returns the
   # scores that the token comes from and the token.
-  defp select_token(logits, seen, masks, states, key, settings) do
-    logits = logits |> Nx.as_type(:f32) |> process(seen, masks, states, settings)
+  defp select_token(logits, seen, masks, row, key, settings) do
+    logits = logits |> Nx.as_type(:f32) |> process(seen, masks, row, settings)
 
     if settings.sampling? do
       scores =
@@ -1702,7 +1758,7 @@ defmodule Transmuter.Generation do
   # The processors before the temperature: the repetition penalty, the processors of the
   # context with the masks in their places, and the log-softmax of renormalize_logits, which
   # changes the scores of beam search but not the token of greedy or sampling selection.
-  defp process(logits, seen, masks, states, settings) do
+  defp process(logits, seen, masks, row, settings) do
     penalty = settings.repetition_penalty
 
     penalized =
@@ -1710,10 +1766,10 @@ defmodule Transmuter.Generation do
 
     logits = Nx.select(seen, penalized, logits)
 
-    {logits, []} =
-      Enum.reduce(settings.processes, {logits, states}, fn
-        mask, {logits, states} when is_atom(mask) -> {remove(logits, masks[mask]), states}
-        process, {logits, [state | states]} -> {process.(logits, state), states}
+    logits =
+      Enum.reduce(settings.processes, logits, fn
+        mask, logits when is_atom(mask) -> remove(logits, masks[mask])
+        process, logits -> process.(logits, row)
       end)
 
     if settings.renormalize?, do: log_softmax(logits), else: logits
@@ -1727,16 +1783,18 @@ defmodule Transmuter.Generation do
   # The score of a candidate is the log-softmax of the logits after the processors, plus the
   # score of its beam, as in _beam_search of transformers. Removed tokens of beams at -1e9
   # stay at the smallest finite value, so the sum is never infinite.
-  defp select_beams(logits, index, seen, masks, states, scores, settings) do
-    [logits, index, seen, scores | states] =
-      Enum.map([logits, index, seen, scores | Tuple.to_list(states)], &Nx.vectorize(&1, :rows))
+  defp select_beams(logits, index, seen, masks, row, scores, settings) do
+    [logits, index, seen, scores] =
+      Enum.map([logits, index, seen, scores], &Nx.vectorize(&1, :rows))
+
+    row = Map.new(row, fn {name, tensor} -> {name, Nx.vectorize(tensor, :rows)} end)
 
     step_scores =
       logits
       |> Nx.take(index)
       |> Nx.as_type(:f32)
       |> log_softmax()
-      |> process(seen, masks, states, settings)
+      |> process(seen, masks, row, settings)
 
     sums = step_scores |> Nx.add(scores) |> Nx.max(Nx.Constants.min_finite(:f32))
     sums = Nx.devectorize(sums, keep_names: false)
