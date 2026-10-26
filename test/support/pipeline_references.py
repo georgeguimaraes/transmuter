@@ -289,6 +289,37 @@ for repo, options in [("openai/whisper-tiny.en", {}), ("openai/whisper-base", {"
     output = WhisperForConditionalGeneration.from_pretrained(repo).generate(features, do_sample=False, num_beams=1, **options)
     print(repo, options, repr(processor.batch_decode(output, skip_special_tokens=True)[0]))
 
+# The merged decoder of Xenova/whisper-tiny.en after decoder prompts of 7, 10 and 12 tokens.
+# Its branch with cache has no causal mask, so the reference runs the prompt as one step
+# without cache and each new token as one step with cache: ONNX Runtime on the Xenova files,
+# with the features of WhisperFeatureExtractor, greedy, without logits processors, 12 new
+# tokens and the log-softmax of each one.
+from transformers import WhisperFeatureExtractor
+
+repo = "Xenova/whisper-tiny.en"
+directory = snapshot_download(repo, allow_patterns=["onnx/encoder_model.onnx", "onnx/decoder_model_merged.onnx"], local_dir=tempfile.mkdtemp(dir=scratch.name))
+features = WhisperFeatureExtractor.from_pretrained(repo)(audio, sampling_rate=16000, return_tensors="np").input_features
+encoder = ort.InferenceSession(f"{directory}/onnx/encoder_model.onnx", providers=["CPUExecutionProvider"])
+hidden = encoder.run(None, {"input_features": features})[0]
+session = ort.InferenceSession(f"{directory}/onnx/decoder_model_merged.onnx", providers=["CPUExecutionProvider"])
+names = [o.name for o in session.get_outputs()]
+start = [50257, 50362, 1770, 13, 2264, 346, 353]
+for prompt in [start, start + [318, 262, 46329], start + [318, 262, 46329, 286, 262]]:
+    cache = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32) for i in session.get_inputs() if i.name.startswith("past_key_values.")}
+    step, branch, tokens, logprobs = prompt, False, [], []
+    for _ in range(12):
+        outputs = dict(zip(names, session.run(None, {"input_ids": np.array([step], np.int64), "encoder_hidden_states": hidden, "use_cache_branch": np.array([branch]), **cache})))
+        logits = outputs["logits"][0, -1].astype(np.float64)
+        token = int(logits.argmax())
+        tokens.append(token)
+        logprobs.append(round(float(logits[token] - logits.max() - np.log(np.exp(logits - logits.max()).sum())), 4))
+        # A step with cache gives an empty present for the cross-attention cache.
+        cache = {k.replace("present", "past_key_values"): (v if v.size > 0 else cache[k.replace("present", "past_key_values")]) for k, v in outputs.items() if k.startswith("present")}
+        step, branch = [token], True
+        if token == 50256:
+            break
+    print("whisper-tiny.en decoder prompt of", len(prompt), "tokens, onnxruntime", tokens, logprobs)
+
 # Long audio: the first 5 samples, 62.46 s, in test/fixtures/librispeech_long.f32, which this
 # part writes. The pipeline runs windows of 30 s with 5 s of context on each side.
 dataset = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")

@@ -10,7 +10,7 @@ defmodule Transmuter.Generation do
 
     * `:append` - the graph declares `position_ids`. The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph computes the positions from the length of the cache. It has no `position_ids`, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0.
+    * `:grow` - the graph computes the positions from the length of the cache. It has no `position_ids`, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step. The first step takes the branch without cache of a merged decoder (`use_cache_branch`), because Nx has no tensors of length 0. The exports of optimum trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same). So the prompt of a merged decoder runs as one step on the branch without cache, and only the new tokens take the branch with cache.
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
@@ -894,14 +894,20 @@ defmodule Transmuter.Generation do
 
   # Runs the prompts in parts of power-of-two lengths. Each prompt fills the parts from the
   # last one, so the last token of each row is in the last part. The last part is no longer
-  # than the shortest prompt, so it ends each row at its last position. Only the prompt takes
-  # image features, and the cursors start again for each group.
+  # than the shortest prompt, so it ends each row at its last position. A merged decoder in
+  # :grow runs the prompt as one part, on the branch without cache (see the module
+  # documentation). Only the prompt takes image features, and the cursors start again for each
+  # group.
   defp start(ctx, prompts, seeds, inputs, extras, scores \\ nil) do
     lengths = for prompt <- prompts, prompt != [], do: length(prompt)
     longest = Enum.max(lengths)
     state = initial_state(ctx, length(prompts), capacity(longest + ctx.max_new_tokens))
     last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
-    sizes = chunks(longest - last) ++ [last]
+
+    sizes =
+      if ctx.mode == :grow and "use_cache_branch" in ctx.model.inputs,
+        do: [longest],
+        else: chunks(longest - last) ++ [last]
 
     # The tokens that the repetition penalty applies to: the prompt and the new tokens. The
     # selection of each step adds its tokens on the device.

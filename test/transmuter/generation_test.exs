@@ -226,6 +226,85 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # The branch with cache of the merged Whisper decoder has no causal mask, so a step of several
+  # tokens there gives wrong logits, also in ONNX Runtime. The decoder prompts have 7, 10 and 12
+  # tokens, so parts of power-of-two lengths would run 2 or 4 of them on that branch. The
+  # references are ONNX Runtime with the prompt as one step without cache and each new token as
+  # one step with cache, greedy and without logits processors, see the speech-to-text section of
+  # test/support/pipeline_references.py. The log-probabilities show the wrong logits, also when
+  # the tokens do not change.
+  test "a merged decoder runs its prompt as one step on the branch without cache" do
+    {repo, encoder, decoder} =
+      Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/whisper-tiny.en"}, @opts)
+
+    featurizer = Audio.SpeechToText.featurizer(repo)
+    audio = Nx.from_binary(File.read!("test/fixtures/librispeech_0.f32"), :f32)
+
+    audio =
+      audio |> Nx.pad(0.0, [{0, featurizer.n_samples - Nx.size(audio), 0}]) |> Nx.new_axis(0)
+
+    features =
+      Audio.SpeechToText.features(
+        audio,
+        featurizer.filters,
+        featurizer.window,
+        featurizer.hop_length
+      )
+
+    encode = Transmuter.compile(encoder, %{"input_features" => features}, @opts[:defn_options])
+    %{"last_hidden_state" => hidden} = encode.(%{"input_features" => features})
+
+    opts = [max_new_tokens: 12, token_logprobs: true]
+
+    ctx =
+      Generation.context(%{repo | generation_config: %{}}, decoder, opts, [
+        "encoder_hidden_states"
+      ])
+
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    hidden = Nx.concatenate([hidden, hidden])
+    start = [50_257, 50_362, 1770, 13, 2264, 346, 353]
+
+    cases = [
+      {start, [318, 262, 46_329, 286, 262, 3504, 6097, 11, 290, 356, 389, 9675],
+       [-0.0092, -0.0068, -0.2222, -0.0025, -0.0041, -0.2631] ++
+         [-0.0701, -0.604, -0.0067, -0.0022, -0.2702, -0.0022]},
+      {start ++ [318, 262, 46_329],
+       [286, 262, 3504, 6097, 11, 290, 356, 389, 9675, 284, 7062, 465],
+       [-0.0025, -0.0041, -0.2631, -0.0701, -0.604, -0.0067] ++
+         [-0.0022, -0.2702, -0.0022, -0.0036, -0.0011, -0.0271]},
+      {start ++ [318, 262, 46_329, 286, 262],
+       [3504, 6097, 11, 290, 356, 389, 9675, 284, 7062, 465, 21_443, 13],
+       [-0.2631, -0.0701, -0.604, -0.0067, -0.0022, -0.2702] ++
+         [-0.0022, -0.0036, -0.0011, -0.0271, -0.4642, -0.1263]}
+    ]
+
+    check = fn tokens, ids, logprobs ->
+      assert Enum.map(tokens, &hd/1) == ids
+
+      for {[_id, logprob], expected} <- Enum.zip(tokens, logprobs) do
+        assert_in_delta logprob, expected, 1.0e-3
+      end
+    end
+
+    for {prompt, ids, logprobs} <- cases do
+      [tokens, []] =
+        Generation.generate(ctx, [prompt, []], [0, 0], %{"encoder_hidden_states" => hidden})
+
+      check.(tokens, ids, logprobs)
+    end
+
+    # Rows with prompts of 7 and 12 tokens run as two groups, because :grow groups the rows by
+    # the length of the cache, so each row gives its tokens alone.
+    [{short, short_ids, short_logprobs}, _, {long, long_ids, long_logprobs}] = cases
+
+    [first, second] =
+      Generation.generate(ctx, [short, long], [0, 0], %{"encoder_hidden_states" => hidden})
+
+    check.(first, short_ids, short_logprobs)
+    check.(second, long_ids, long_logprobs)
+  end
+
   test "beam search raises with sampling and with a stream" do
     repo = {:hf, "Xenova/gpt2"}
 
@@ -238,10 +317,11 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # In :grow, each length of the cache is a shape of the step. The prompt of 3 tokens runs as
-  # parts of 2 and 1 tokens. Each shape compiles one program, which also selects the token,
-  # and a second request compiles nothing. The prompt of 1 token has the shape of the step
-  # that the compile of the context gives, so it compiles nothing either.
+  # In :grow, each length of the cache is a shape of the step. The prompt of 2 tokens runs as
+  # one step on the branch without cache. Each shape compiles one program, which also selects
+  # the token, and a second request compiles nothing. The prompt of 1 token has the shape of
+  # the step that the compile of the context gives, and its later steps have the lengths of the
+  # first request, so it compiles nothing either.
   @tag ci_partition: 10
   test "each shape of a step compiles one program, with the selection in it" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -263,9 +343,9 @@ defmodule Transmuter.GenerationTest do
     ctx = Generation.compile(ctx, 1, @opts[:defn_options])
     request = fn prompt -> Generation.generate(ctx, [prompt], [0]) end
 
-    first = request.([464, 3290, 286])
+    first = request.([464, 3290])
     compiled = flush()
-    assert request.([464, 3290, 286]) == first
+    assert request.([464, 3290]) == first
     request.([464])
     assert flush() == []
 
