@@ -89,13 +89,13 @@ model = Transmuter.load!(source, backend: {EXLA.Backend, client: :host})
 run = Transmuter.compile(model, inputs, compiler: EXLA, client: :host)
 ```
 
-On NVIDIA GPUs of the Ampere generation and later, XLA computes the f32 matrix products in TF32 by default. TF32 keeps 10 bits of the mantissa, so the results differ from ONNX Runtime by about 1e-3. For f32 precision, set these environment variables before the BEAM starts:
+On NVIDIA GPUs of the Ampere generation and later, XLA computes the f32 matrix products in TF32 by default. TF32 keeps 10 bits of the mantissa, so the results differ from ONNX Runtime by about 1e-3. Also, XLA compiles the f32 division on the GPU as `div.full`, which can differ from the correctly rounded result by up to 2 units in the last place. For f32 precision, set these environment variables before the BEAM starts:
 
 ```bash
-NVIDIA_TF32_OVERRIDE=0 XLA_FLAGS=--xla_gpu_enable_triton_gemm=false
+NVIDIA_TF32_OVERRIDE=0 XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_backend_extra_options=-nvptx-prec-divf32=2"
 ```
 
-On an RTX 3060, the test suite passes with both variables. Without them, 15 tests that compare with reference values fail.
+The last option makes the f32 division correctly rounded, as on the CPU. A small error of a division can change a result: Grounding DINO marks a box as valid when `(index + 0.5) / size` is above 0.01 and below 0.99, and on its 50x50 level the border cells are exactly 0.01 and 0.99. With `div.full`, some of these cells become valid on the GPU only, and the Grounding DINO test fails. On an RTX 3060, the division option did not make the tests slower. Without the first two settings, 15 tests that compare with reference values fail.
 
 A model loaded with `backend: {EXLA.Backend, client: :cuda}` dequantizes its `MatMulNBits` weights once, when it loads (see the section above). The graph of a model loaded without a backend unpacks the weights on each call, and XLA then holds f32 copies of them as temporary buffers. Qwen3-1.7B q4 (`onnx-community/Qwen3-1.7B-ONNX`) on an RTX 3060, with a prompt of 128 tokens and greedy decoding, both runs with the same text:
 
