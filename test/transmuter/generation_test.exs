@@ -287,8 +287,8 @@ defmodule Transmuter.GenerationBitsTest do
 
   import ExUnit.CaptureLog
 
-  alias Transmuter.Generation
-  alias Transmuter.Onnx.NodeProto
+  alias Transmuter.{Generation, GraphBreaks}
+  alias Transmuter.Onnx.{AttributeProto, GraphProto, NodeProto, ValueInfoProto}
 
   # The lm_head of a decoder without num_logits_to_keep computes the logits of one position
   # with the input that generation adds, through the softcap of Gemma. A Reshape after the
@@ -347,7 +347,67 @@ defmodule Transmuter.GenerationBitsTest do
 
     shared = %{model | nodes: softcap ++ [node.("Identity", ["scores"], ["copy"])]}
 
-    for {model, op} <- [{flat, "Reshape"}, {shared, "MatMul"}] do
+    # A merged decoder gives the logits from an If, whose branches each get a cut. A branch
+    # can give its value the name of the If output, as in the exports of optimum.
+    branch = fn nodes ->
+      %GraphProto{node: nodes, output: [%ValueInfoProto{name: hd(List.last(nodes).output)}]}
+    end
+
+    merged = fn cache_branch ->
+      if_node = %{
+        node.("If", ["use_cache_branch"], ["logits"])
+        | attribute: [
+            %AttributeProto{name: "then_branch", type: :GRAPH, g: branch.(cache_branch)},
+            %AttributeProto{
+              name: "else_branch",
+              type: :GRAPH,
+              g: branch.([node.("MatMul", ["hidden", "lm_head"], ["logits"])])
+            }
+          ]
+      }
+
+      %{
+        model
+        | nodes: [hd(softcap), if_node],
+          inputs: model.inputs ++ ["use_cache_branch"],
+          input_types: Map.put(model.input_types, "use_cache_branch", {:u8, [1]})
+      }
+    end
+
+    cached = [
+      node.("MatMul", ["hidden", "lm_head"], ["cached_scores"]),
+      node.("Div", ["cached_scores", "cap"], ["cached"])
+    ]
+
+    merged_model = merged.(cached)
+    %{model: kept} = Generation.context(repo, merged_model, [])
+
+    for flag <- [0, 1], {keep, positions} <- [{1, 2..2}, {2, 1..2}, {0, 0..2}] do
+      static = %{"use_cache_branch" => Nx.tensor([flag], type: :u8, backend: Nx.BinaryBackend)}
+      %{"logits" => all} = Transmuter.run(merged_model, model.params, inputs, static)
+      static = Map.put(static, "num_logits_to_keep", host.(keep))
+      assert Transmuter.run(kept, kept.params, inputs, static)["logits"] == all[[.., positions]]
+
+      # The static inputs select the branch and fold the slice, so the graph does not break.
+      compiler = Transmuter.TestBackend.compiler_opts()
+      {compiled, segments} = GraphBreaks.run_once(kept, inputs, static, compiler)
+      assert [%{start: 0, stop: :end}] = segments
+      compiled = Nx.backend_transfer(compiled["logits"], Nx.BinaryBackend)
+      assert Nx.to_number(Nx.all_close(compiled, all[[.., positions]])) == 1
+    end
+
+    flat_branch = merged.([node.("Reshape", ["hidden", "shape"], ["cached"])])
+    flat_branch = %{flat_branch | static: flat.static}
+
+    # A branch value with the name of a static value of the outer graph is not static.
+    shadowed = merged.([node.("Identity", ["hidden"], ["cap"]) | cached])
+
+    for {model, op} <- [
+          {flat, "Reshape"},
+          {shared, "MatMul"},
+          {flat_branch, "Reshape"},
+          {shadowed, "Div"}
+        ] do
       log = capture_log(fn -> assert Generation.context(repo, model, []).model == model end)
       assert log =~ "stops at #{op}"
     end

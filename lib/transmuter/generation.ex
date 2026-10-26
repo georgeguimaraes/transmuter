@@ -71,7 +71,7 @@ defmodule Transmuter.Generation do
 
   ## Logits
 
-  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone: Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static. At another operator, such as the `If` of a merged decoder or a Reshape, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
+  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own Slice before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
 
   ## Device memory
 
@@ -408,15 +408,15 @@ defmodule Transmuter.Generation do
   # Gemma 3 exports before the lm_head: the hidden states keep their last num_logits_to_keep
   # positions on axis 1, or all positions for 0. Generation reads the rank-3 logits, and the
   # operators after the lm_head keep the shape, so axis 1 of its input is the sequence. The
-  # values from the lm_head to the logits have no other reader, so no other value changes.
+  # values from the lm_head to the logits have no other use, so no other value changes. An If
+  # gives each branch the shape of its output, so each branch that gives the logits gets its
+  # own cut, as in the merged decoders of optimum.
   defp keep_last_logits(model) do
-    producers = for node <- model.nodes, output <- node.output, into: %{}, do: {output, node}
-    reads = model.nodes |> Enum.flat_map(&Transmuter.dependencies/1) |> Enum.frequencies()
-    only_chain? = &(reads[&1] == 1 and &1 not in model.outputs)
+    static = MapSet.new(Map.keys(model.params) ++ Map.keys(model.static))
 
     with false <- "num_logits_to_keep" in model.inputs,
-         {:ok, lm_head} <- lm_head(model, {producers, only_chain?}, "logits") do
-      slice_hidden(model, lm_head)
+         {:ok, lm_heads} <- follow(scope(model.nodes, model.outputs, static), "logits", nil) do
+      slice_hidden(model, MapSet.new(lm_heads))
     else
       true ->
         model
@@ -433,22 +433,56 @@ defmodule Transmuter.Generation do
   defp where(nil), do: "a graph input"
   defp where(node), do: "#{node.op_type} #{node.name}"
 
-  # The MatMul or MatMulNBits that gives the logits through operators of @per_position. Its
-  # input 0 is the hidden states, also when tied embeddings give its weight from a Transpose.
-  defp lm_head(model, graph = {producers, only_chain?}, name) do
-    case producers[name] do
+  # A graph or a branch of an If: the node of each value, the uses of each value (the nodes
+  # that read it and the outputs of the graph), and the static values: the constants of the
+  # graph and the static values of the outer graphs that the graph does not make again.
+  defp scope(nodes, outputs, outer) do
+    producers = for node <- nodes, output <- node.output, into: %{}, do: {output, node}
+
+    {constants, made} =
+      Enum.split_with(producers, fn {_name, node} -> node.op_type == "Constant" end)
+
+    static =
+      outer
+      |> MapSet.difference(MapSet.new(made, &elem(&1, 0)))
+      |> MapSet.union(MapSet.new(constants, &elem(&1, 0)))
+
+    %{
+      producers: producers,
+      uses: Enum.frequencies(Enum.flat_map(nodes, &Transmuter.dependencies/1) ++ outputs),
+      static: static
+    }
+  end
+
+  # The MatMul or MatMulNBits nodes that give the logits through operators of @per_position
+  # and the branches of If nodes. Input 0 of each is the hidden states, also when tied
+  # embeddings give its weight from a Transpose.
+  defp lm_heads(scope, name) do
+    case scope.producers[name] do
       node = %{op_type: op, input: [hidden | _]} when op in ["MatMul", "MatMulNBits"] ->
-        if static?(model, hidden), do: {:bail, node}, else: {:ok, node}
+        if hidden in scope.static, do: {:bail, node}, else: {:ok, [node]}
+
+      node = %{op_type: "If"} ->
+        index = Enum.find_index(node.output, &(&1 == name))
+
+        Enum.reduce_while(node.attribute, {:ok, []}, fn
+          %{g: nil}, acc ->
+            {:cont, acc}
+
+          %{g: graph}, {:ok, found} ->
+            outputs = Enum.map(graph.output, & &1.name)
+            static = MapSet.union(scope.static, MapSet.new(graph.initializer, & &1.name))
+
+            case follow(scope(graph.node, outputs, static), Enum.at(outputs, index), node) do
+              {:ok, lm_heads} -> {:cont, {:ok, lm_heads ++ found}}
+              bail -> {:halt, bail}
+            end
+        end)
 
       node = %{op_type: op} when op in @per_position ->
-        case Enum.reject(node.input, &(&1 == "" or static?(model, &1))) do
-          [input] ->
-            if only_chain?.(input),
-              do: lm_head(model, graph, input),
-              else: {:bail, producers[input]}
-
-          _inputs ->
-            {:bail, node}
+        case Enum.reject(node.input, &(&1 == "" or &1 in scope.static)) do
+          [input] -> follow(scope, input, node)
+          _inputs -> {:bail, node}
         end
 
       node ->
@@ -456,14 +490,18 @@ defmodule Transmuter.Generation do
     end
   end
 
-  defp static?(model, name),
-    do: Map.has_key?(model.params, name) or Map.has_key?(model.static, name)
+  # Continues at a value that the scope makes and uses only on the way to the logits.
+  defp follow(scope, name, node) do
+    if scope.uses[name] == 1 and Map.has_key?(scope.producers, name),
+      do: lm_heads(scope, name),
+      else: {:bail, scope.producers[name] || node}
+  end
 
-  defp slice_hidden(model, lm_head = %{input: [hidden | rest]}) do
+  defp slice_hidden(model, lm_heads) do
     name = &("transmuter.num_logits_to_keep." <> &1)
     constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
 
-    slice = [
+    starts = [
       %NodeProto{
         op_type: "Neg",
         name: name.("neg"),
@@ -475,14 +513,7 @@ defmodule Transmuter.Generation do
         name: name.("starts"),
         input: [name.("neg"), name.("shape")],
         output: [name.("starts")]
-      },
-      %NodeProto{
-        op_type: "Slice",
-        name: name.("slice"),
-        input: [hidden, name.("starts"), name.("ends"), name.("axes")],
-        output: [name.("hidden")]
-      },
-      %{lm_head | input: [name.("hidden") | rest]}
+      }
     ]
 
     constants = %{
@@ -493,13 +524,37 @@ defmodule Transmuter.Generation do
 
     %{
       model
-      | nodes:
-          Enum.flat_map(model.nodes, &if(&1.output == lm_head.output, do: slice, else: [&1])),
+      | nodes: starts ++ cut(model.nodes, lm_heads, name),
         static: Map.merge(model.static, constants),
         inputs: model.inputs ++ ["num_logits_to_keep"],
         input_types: Map.put(model.input_types, "num_logits_to_keep", {:s64, []})
     }
   end
+
+  # Puts a Slice of the hidden states before each lm_head, also in the branches of If nodes.
+  # A branch reads the starts and the constants of the slice from the outer graph. The nodes
+  # are found by value, because a branch can give its value the name of the If output.
+  defp cut(nodes, lm_heads, name) do
+    Enum.flat_map(nodes, fn node ->
+      if MapSet.member?(lm_heads, node) do
+        [hidden | rest] = node.input
+        kept = name.(hidden)
+        slice = [hidden, name.("starts"), name.("ends"), name.("axes")]
+
+        [
+          %NodeProto{op_type: "Slice", name: kept, input: slice, output: [kept]},
+          %{node | input: [kept | rest]}
+        ]
+      else
+        [%{node | attribute: Enum.map(node.attribute, &cut_branch(&1, lm_heads, name))}]
+      end
+    end)
+  end
+
+  defp cut_branch(attribute = %{g: graph}, lm_heads, name) when graph != nil,
+    do: %{attribute | g: %{graph | node: cut(graph.node, lm_heads, name)}}
+
+  defp cut_branch(attribute, _lm_heads, _name), do: attribute
 
   # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do
