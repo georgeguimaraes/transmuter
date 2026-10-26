@@ -84,6 +84,8 @@ defmodule Transmuter.Generation do
   ## Device memory
 
   A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. The embeddings of a step are freed after its call, and when a group ends, generation frees its cache and the rest of its state. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
+
+  A backend that frees a released buffer only when the BEAM collects its tensor, such as EMLX 0.5 (see elixir-nx/emlx#159), still keeps the dead caches of the steps until a collection. A loop with little host garbage collects rarely, so these caches pile up. So the generation process collects its garbage after it releases 256 MB of device buffers. A small cache then rarely costs a collection, and a large one gets one before its dead copies take much memory.
   """
 
   alias Transmuter.Generation.MergedDecoder
@@ -119,6 +121,11 @@ defmodule Transmuter.Generation do
   @min_capacity 256
   @merged_min_capacity 32
   @capacity_margin 16
+
+  # The bytes of released device buffers after which the generation process collects its
+  # garbage, and the key of their count in the process dictionary.
+  @collect_bytes 256 * 1024 * 1024
+  @released {__MODULE__, :released}
 
   # max_length of GenerationConfig and max_new_tokens of the pipelines in Python transformers.
   @default_max_length 20
@@ -1481,10 +1488,28 @@ defmodule Transmuter.Generation do
   def release(dead, kept) do
     shared = for %{data: data} <- kept, do: data
 
-    for tensor = %{data: data} <- dead,
-        not is_struct(data, Nx.BinaryBackend),
-        data not in shared,
-        do: Nx.backend_deallocate(tensor)
+    freed =
+      for tensor = %{data: data} <- dead,
+          not is_struct(data, Nx.BinaryBackend),
+          data not in shared do
+        Nx.backend_deallocate(tensor)
+        Nx.byte_size(tensor)
+      end
+
+    collect(Enum.sum(freed))
+  end
+
+  # The process collects its garbage after it releases @collect_bytes of device buffers, see
+  # the device memory section of the module documentation.
+  defp collect(bytes) do
+    released = Process.get(@released, 0) + bytes
+
+    if released >= @collect_bytes do
+      :erlang.garbage_collect()
+      Process.put(@released, 0)
+    else
+      Process.put(@released, released)
+    end
 
     :ok
   end
