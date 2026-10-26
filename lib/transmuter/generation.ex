@@ -71,9 +71,9 @@ defmodule Transmuter.Generation do
 
   `generate/4` takes a batch of prompts. Each row has its own length, sampling key and stop. A step gives the same number of tokens to each row. A row with fewer tokens gets padding tokens after its tokens, and a finished row gets only padding tokens. The next token of a row comes from the logits of its last real token. An empty prompt is a padding row, which gives no tokens.
 
-  In `:in_place` and `:append`, all rows share one buffer. Each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. In `:in_place`, the attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, the attention mask hides the free rows of each row, and the new rows go into the buffer at the length of each row. Both modes give the positions of each row in `position_ids`.
+  In `:in_place` and `:append`, all rows share one buffer. In `:in_place`, each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. The attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, all rows of a step write their new rows at one offset: the sum of the lengths of the earlier steps. So one update of each buffer writes the step, in place of one update for each row. A row with fewer tokens than the step, such as a shorter part of a prompt or a finished row, leaves gap rows after its tokens. The host keeps the valid rows of each row, and the attention mask has ones only for them and for the new tokens, so it hides the gap rows and the free rows. Both modes give the positions of each row in `position_ids`, from the tokens of the row and not from its rows in the buffer.
 
-  The buffer starts with a capacity of a power of two that fits the longest prompt and 16 more rows. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A merged decoder that `Transmuter.Generation.MergedDecoder` moves to `:append` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables.
+  The buffer starts with a capacity of a power of two that fits the longest prompt and 16 more rows. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A merged decoder that `Transmuter.Generation.MergedDecoder` moves to `:append` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
 
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
 
@@ -111,7 +111,7 @@ defmodule Transmuter.Generation do
   @next_step "transmuter.select.next_step"
   @next_history "transmuter.select.next_history"
   @next_count "transmuter.select.next_count"
-  @lengths "transmuter.cache.lengths"
+  @write_at "transmuter.cache.write_at"
 
   @no_vocab "generation needs the vocabulary size: the logits output of the graph has no number in its last dimension, and the configuration has no vocab_size"
 
@@ -808,7 +808,7 @@ defmodule Transmuter.Generation do
     selection = ctx |> selection(group) |> Map.put(@offset, zeros.(:s32, {rows}))
 
     if ctx.mode == :append,
-      do: Map.put(selection, @lengths, zeros.(:s32, {rows})),
+      do: Map.put(selection, @write_at, zeros.(:s32, {})),
       else: selection
   end
 
@@ -1277,7 +1277,8 @@ defmodule Transmuter.Generation do
           prompt_count: moved[@prompt_count],
           cursors: take.(state.cursors),
           positions: take.(state.positions),
-          lengths: take.(state.lengths)
+          lengths: take.(state.lengths),
+          valid: take.(state.valid)
       }
 
       %{
@@ -1405,6 +1406,8 @@ defmodule Transmuter.Generation do
       cursors: List.duplicate(0, batch_size),
       positions: List.duplicate({[], 0}, batch_size),
       lengths: List.duplicate(0, batch_size),
+      used: 0,
+      valid: List.duplicate([], batch_size),
       capacity: capacity,
       selected: nil,
       seen: nil,
@@ -1434,14 +1437,15 @@ defmodule Transmuter.Generation do
     release(List.wrap(state.selected), [])
     selection = Map.put(selection, @offset, offsets)
 
-    # In :append, the new rows of each row go into the buffer after its valid rows.
+    # In :append, the new rows of all rows go into the buffer after the rows of the earlier
+    # steps.
     selection =
       if ctx.mode == :append,
         do:
           Map.put(
             selection,
-            @lengths,
-            Nx.tensor(state.lengths, type: :s32, backend: Nx.BinaryBackend)
+            @write_at,
+            Nx.tensor(state.used, type: :s32, backend: Nx.BinaryBackend)
           ),
         else: selection
 
@@ -1480,6 +1484,8 @@ defmodule Transmuter.Generation do
       | cache: Map.merge(state.cache, present),
         written: Map.keys(present),
         lengths: lengths,
+        used: state.used + n,
+        valid: Enum.zip_with(state.valid, counts, &add_rows(&1, state.used, &2)),
         selected: outputs[@selected],
         seen: outputs[@next_seen],
         step: outputs[@next_step],
@@ -1557,7 +1563,7 @@ defmodule Transmuter.Generation do
   # Grows the state when the next step of n tokens does not fit, before the selection of the
   # step reads the tokens of the rows from the state.
   defp fit(ctx, state, n) when is_integer(n) do
-    rows = Enum.max(state.lengths) + n
+    rows = if ctx.mode == :append, do: state.used + n, else: Enum.max(state.lengths) + n
     if rows > state.capacity, do: grow(ctx, state, rows), else: state
   end
 
@@ -1597,8 +1603,8 @@ defmodule Transmuter.Generation do
 
   # The last rows of each present, as many as the tokens of the step, are the new rows:
   # after the buffer on the branch with cache, or all rows on the branch without cache of a
-  # merged decoder. They go into the buffer after the valid rows of each batch row. The
-  # present that the step gives is then the buffer.
+  # merged decoder. They go into the buffer at the write offset of the step, for all batch
+  # rows in one update. The present that the step gives is then the buffer.
   defp write_rows(outputs, _inputs, []), do: outputs
 
   defp write_rows(outputs, inputs, buffers) do
@@ -1608,18 +1614,30 @@ defmodule Transmuter.Generation do
         present = outputs["present." <> rest],
         present != nil,
         into: outputs do
-      buffer = inputs[name]
-      {batch_size, _heads, _capacity, _dim} = Nx.shape(buffer)
       new = Nx.slice_along_axis(present, Nx.axis_size(present, 2) - rows, rows, axis: 2)
-
-      buffer =
-        Enum.reduce(0..(batch_size - 1), buffer, fn i, buffer ->
-          row = Nx.slice_along_axis(new, i, 1, axis: 0)
-          Nx.put_slice(buffer, [i, 0, inputs[@lengths][i], 0], row)
-        end)
-
-      {"present." <> rest, buffer}
+      {"present." <> rest, Nx.put_slice(inputs[name], [0, 0, inputs[@write_at], 0], new)}
     end
+  end
+
+  # The valid rows of a row in the buffer of :append are ranges {start, count}, the newest
+  # first. A step adds the real tokens of the row at its write offset, as a new range or as
+  # the end of the newest range.
+  defp add_rows(ranges, _at, 0), do: ranges
+
+  defp add_rows([{start, count} | rest], at, n) when start + count == at,
+    do: [{start, count + n} | rest]
+
+  defp add_rows(ranges, at, n), do: [{at, n} | ranges]
+
+  # The mask of the buffer of a row: ones at its valid rows, and zeros at its gap rows and
+  # the free rows.
+  defp valid_mask(ranges, capacity) do
+    {mask, first} =
+      Enum.reduce(ranges, {[], capacity}, fn {start, count}, {mask, stop} ->
+        {List.duplicate(1, count) ++ List.duplicate(0, stop - start - count) ++ mask, start}
+      end)
+
+    List.duplicate(0, first) ++ mask
   end
 
   defp step_inputs(ctx, state, tokens) do
@@ -1629,14 +1647,13 @@ defmodule Transmuter.Generation do
     cached? = not (merged?(ctx) and Enum.all?(state.lengths, &(&1 == 0)))
 
     masks =
-      for past <- state.lengths do
+      for {past, valid} <- Enum.zip(state.lengths, state.valid) do
         case ctx.mode do
           :in_place ->
             List.duplicate(1, past + n) ++ List.duplicate(0, state.capacity - past - n)
 
           :append when cached? ->
-            List.duplicate(1, past) ++
-              List.duplicate(0, state.capacity - past) ++ List.duplicate(1, n)
+            valid_mask(valid, state.capacity) ++ List.duplicate(1, n)
 
           :append ->
             List.duplicate(1, n)

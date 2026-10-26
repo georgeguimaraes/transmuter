@@ -493,6 +493,44 @@ defmodule Transmuter.GenerationTest do
     assert Enum.map(grown, &hd/1) == Enum.map(fits, &hd/1)
   end
 
+  # In :append, all rows of a step write at one offset, so the parts of prompts of 229, 31 and
+  # 4 tokens leave gap rows in the shorter rows. The longest row ends early, at a token of its
+  # own answer that the middle row does not give. The offset then passes the length of each
+  # row, and the buffers grow from 256 to 512 rows for the 40 steps of the middle row. Each
+  # row gives the tokens that it gives alone, where it has no gap rows.
+  @essay "The printing press changed Europe in the fifteenth century. Before it, scribes copied each book by hand, and a single copy of a long text could take months. Johannes Gutenberg combined movable metal type, an oil-based ink and a screw press adapted from wine making. His workshop in Mainz printed a Bible around 1455, and within fifty years presses ran in more than two hundred cities. Books became cheaper, and more people learned to read. Scholars could compare identical copies of a text, so errors were easier to find and correct. Pamphlets spread news and arguments quickly, and the Reformation used them to reach ordinary readers. Printers also standardized spelling and grammar, because they wanted their books to sell in many regions. Over time, the press helped science, as researchers shared tables, maps and drawings that stayed the same in every copy. Newspapers appeared in the seventeenth century, and by the nineteenth century steam-powered presses printed thousands of pages each hour. Today historians still debate how fast these changes came, but most agree that the press made knowledge easier to keep. In the next part of this essay, we look at"
+  @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
+  @tag ci_partition: 10
+  test "rows of :append keep their tokens with gap rows, a row that ends early and a growth" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    assert Generation.context(repo, model, []).mode == :append
+
+    prompts =
+      for text <- [@essay, @fox, "Once upon a time"] do
+        {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+        Transmuter.Tokenizer.ids(tokenizer, encoding)
+      end
+
+    assert Enum.map(prompts, &length/1) == [229, 31, 4]
+    [long, middle, _short] = prompts
+    {[answer], _capacities} = capacities(repo, model, [long])
+    {[other], _capacities} = capacities(repo, model, [middle])
+    other = Enum.map(other, &hd/1)
+    eos = answer |> Enum.map(&hd/1) |> Enum.drop(4) |> Enum.find(&(&1 not in other))
+    repo = %{repo | generation_config: %{"eos_token_id" => eos}}
+
+    {rows, capacities} = capacities(repo, model, prompts)
+    alone = for prompt <- prompts, do: hd(elem(capacities(repo, model, [prompt]), 0))
+
+    assert rows == alone
+    assert length(hd(rows)) < 40
+    assert length(Enum.at(rows, 1)) == 40
+    assert capacities == [256, 512]
+  end
+
   # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
   # in the compiled steps.
   defp capacities(repo, model, prompts) do

@@ -219,7 +219,7 @@ The prompts of a batch can have different lengths. Each row has its own length i
 The mode of the KV cache decides how the rows share the cache:
 
 - When GroupQueryAttention writes the cache in place, the attention mask of each row tells the operator how many rows of the cache are valid. The operator writes the new keys and values of each row after its valid rows.
-- With `position_ids`, the attention mask hides the free rows of each row, and the new rows go into the buffer after the valid rows of each row.
+- With `position_ids`, all rows of a step write their new rows at one place in the buffer, after the rows of the earlier steps. A row with fewer tokens than the step leaves gap rows there. The attention mask of each row hides its gap rows and the free rows.
 - A decoder that grows its cache gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
