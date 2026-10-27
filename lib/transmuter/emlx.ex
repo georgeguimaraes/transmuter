@@ -80,6 +80,16 @@ if Code.ensure_loaded?(EMLX.Quantization) do
       do: {EMLX.Backend, Keyword.put_new_lazy(opts, :device, &EMLX.default_device/0)}
 
     @doc false
+    # Evaluates a tensor that EMLX ops made, and the scales and biases of a quantized tensor.
+    # Until then, MLX keeps it as an expression, and a compiled call that reads it computes
+    # the expression again each time.
+    def evaluate(tensor = %Nx.Tensor{data: %EMLX.Backend{ref: ref, quantization_config: config}}) do
+      parts = if config, do: Enum.reject([config.scales, config.biases], &is_nil/1), else: []
+      for part <- [ref | Enum.map(parts, &EMLX.Backend.from_nx/1)], do: EMLX.eval(part)
+      tensor
+    end
+
+    @doc false
     # A MatMulNBits weight that MLX holds as a quantized tensor.
     def compatible?(node) do
       {k, _n, bits, block} = Quantized.nbits_sizes(node)

@@ -214,10 +214,17 @@ defmodule Transmuter do
       opset: opset
     }
 
-    # The params move before they get compute_type, so the device converts them. On
-    # Nx.BinaryBackend, the 153M f16 weights of vit-gpt2 take 14 s to convert.
-    model = if backend = opts[:backend], do: move(model, backend), else: model
-    params = Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)
+    # A backend gets the params before they get compute_type, so the device converts them (see
+    # move/2). On Nx.BinaryBackend, the 153M f16 weights of vit-gpt2 take 14 s to convert.
+    model =
+      if backend = opts[:backend],
+        do: move(model, backend),
+        else: %{
+          model
+          | params: Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)
+        }
+
+    params = model.params
 
     # The strings and bytes that ModelProto.decode!/1 gives are parts of the binary of the
     # whole file. A part that stays in the model, such as a name of a param or of a node, or
@@ -1048,12 +1055,17 @@ defmodule Transmuter do
   def move(model, backend) do
     {module, _opts} = if is_atom(backend), do: {backend, []}, else: backend
 
-    {backend, compatible?, weight} =
+    {backend, compatible?, weight, evaluate} =
       if module == EMLX.Backend and Code.ensure_loaded?(Transmuter.EMLX),
         do:
           {Transmuter.EMLX.backend(backend), &Transmuter.EMLX.compatible?/1,
-           &Transmuter.EMLX.weight/6},
-        else: {backend, fn _node -> true end, &dequantized_weight/6}
+           &Transmuter.EMLX.weight/6, &Transmuter.EMLX.evaluate/1},
+        else: {backend, fn _node -> true end, &dequantized_weight/6, & &1}
+
+    # Each param gets the compute_type of the model on the device. A param that the device
+    # computes, such as an upcast or the scales of a packed weight, is evaluated when it is
+    # made, one at a time, so the steps read its values and only one expression is alive.
+    finish = &(&1 |> upcast(model[:compute_type]) |> evaluate.())
 
     packed = Enum.filter(model.nodes, &(packable?(&1, model) and compatible?.(&1)))
     packed_outputs = MapSet.new(packed, &hd(&1.output))
@@ -1097,7 +1109,9 @@ defmodule Transmuter do
       |> Map.new(fn node = %{input: [_a, b_name, scales | rest]} ->
         b = model.params |> Map.fetch!(b_name) |> DeferredTensor.value()
         zero_points = device[Enum.at(rest, 0, "")]
-        {packed_name(b_name), weight.(node, b, device[scales], zero_points, model, backend)}
+
+        {packed_name(b_name),
+         finish.(weight.(node, b, device[scales], zero_points, model, backend))}
       end)
 
     # A scales or zero points name that another node also reads, such as those of tied
@@ -1108,8 +1122,8 @@ defmodule Transmuter do
     params =
       for name <- kept, into: weights do
         if MapSet.member?(shared, name),
-          do: {name, Nx.backend_copy(device[name], backend)},
-          else: {name, device[name]}
+          do: {name, finish.(Nx.backend_copy(device[name], backend))},
+          else: {name, finish.(device[name])}
       end
 
     static = Map.drop(model.static, MapSet.to_list(freed))
