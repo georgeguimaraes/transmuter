@@ -732,9 +732,10 @@ defmodule Transmuter.GenerationTest do
   # The Qwen3-MoE and Gemma 3 exports of onnxruntime-genai count the valid rows of
   # GroupQueryAttention from the length of the attention mask. Generation gives them the sum of
   # the mask, so they run in :in_place. The same decoder with one more node that reads the
-  # length of the cache stays in :grow, as Apertus does. The first layer gets a window of 8
-  # rows, which the prompts of 5, 12 and 20 tokens and their 16 new tokens pass. In a batch,
-  # each row gives its tokens alone, and the tokens of :grow with log-probabilities within 1e-4.
+  # length of the cache, which no position uses, stays in :grow. The first layer gets a window
+  # of 8 rows, which the prompts of 5, 12 and 20 tokens and their 16 new tokens pass. In a
+  # batch, each row gives its tokens alone, and the tokens of :grow with log-probabilities
+  # within 1e-4.
   @tag ci_partition: 10
   test "GroupQueryAttention that counts its rows from the mask length runs in :in_place" do
     for {source, component} <- [
@@ -1073,6 +1074,175 @@ defmodule Transmuter.GenerationBitsTest do
     assert Generation.context(configured, typed, []).vocab == 4
     assert Generation.context(configured, symbolic, []).vocab == 6
     assert Generation.context(repo, symbolic, []).vocab == nil
+  end
+
+  # A decoder in the form of the Apertus export: GroupQueryAttention counts its rows from the
+  # length of the mask, and the positions come from the length of the past, Range(L, L + n),
+  # cast to a float for a sinusoid that the embeddings add. MergedDecoder gives the cast the
+  # position offset, so the decoder runs in :in_place, with the prompts of each length in a
+  # group of their own. The prompt of 20 tokens runs in parts of 16 and 4 tokens, and its 16
+  # new tokens grow the buffers from 32 to 64 rows. In a batch, each row gives the greedy
+  # tokens of the same decoder without a cache, computed with Nx, and log-probabilities within
+  # 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
+  # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
+  # reads a slice of the shape of the past keeps the decoder in :grow.
+  test "a decoder without an If takes positions from the length of its past with the offset" do
+    node = &%NodeProto{op_type: &1, name: hd(&3), input: &2, output: &3}
+    int = &%AttributeProto{name: &1, type: :INT, i: &2}
+    host = &Nx.tensor(&1, backend: Nx.BinaryBackend)
+    weight = &(Nx.iota(&1, type: :f32, backend: Nx.BinaryBackend) |> Nx.multiply(&2) |> Nx.sin())
+    past = ["past_key_values.0.key", "past_key_values.0.value"]
+
+    params = %{
+      "embed" => weight.({50, 8}, 0.7),
+      "wq" => weight.({8, 8}, 1.3),
+      "wk" => weight.({8, 4}, 2.1),
+      "wv" => weight.({8, 4}, 0.9),
+      "wo" => weight.({8, 50}, 1.7),
+      "freq" => host.([[1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015, 0.008]])
+    }
+
+    attention = %{
+      node.("GroupQueryAttention", ~w(q k v) ++ past ++ ~w(seqlens_k total_length), [
+        "attended",
+        "present.0.key",
+        "present.0.value"
+      ])
+      | attribute: [int.("num_heads", 2), int.("kv_num_heads", 1)]
+    }
+
+    nodes = [
+      node.("Gather", ["embed", "input_ids"], ["hidden"]),
+      node.("Shape", [hd(past)], ["past_shape"]),
+      node.("Gather", ["past_shape", "two"], ["past"]),
+      node.("Shape", ["input_ids"], ["ids_shape"]),
+      node.("Gather", ["ids_shape", "one"], ["new"]),
+      node.("Gather", ["ids_shape", "zero"], ["batch"]),
+      node.("Add", ["past", "new"], ["end"]),
+      node.("Range", ["past", "end", "one"], ["positions"]),
+      %{node.("Cast", ["positions"], ["float_positions"]) | attribute: [int.("to", 1)]},
+      node.("Unsqueeze", ["float_positions", "axis_1"], ["column"]),
+      node.("Mul", ["column", "freq"], ["angles"]),
+      node.("Sin", ["angles"], ["wave"]),
+      node.("Add", ["hidden", "wave"], ["input"]),
+      node.("MatMul", ["input", "wq"], ["q"]),
+      node.("MatMul", ["input", "wk"], ["k"]),
+      node.("MatMul", ["input", "wv"], ["v"]),
+      node.("Shape", ["attention_mask"], ["mask_shape"]),
+      node.("Gather", ["mask_shape", "one"], ["total"]),
+      node.("Sub", ["total", "one"], ["last"]),
+      node.("Unsqueeze", ["last", "axis_0"], ["last_row"]),
+      node.("Unsqueeze", ["batch", "axis_0"], ["batch_shape"]),
+      node.("Expand", ["last_row", "batch_shape"], ["seqlens"]),
+      %{node.("Cast", ["seqlens"], ["seqlens_k"]) | attribute: [int.("to", 6)]},
+      %{node.("Cast", ["total"], ["total_length"]) | attribute: [int.("to", 6)]},
+      attention,
+      node.("Shape", ["attended"], ["attended_shape"]),
+      node.("Gather", ["attended_shape", "two"], ["width"]),
+      node.("Unsqueeze", ["width", "axis_0"], ["width_end"]),
+      node.("Slice", ["attended", "axis_0", "width_end", "axis_2"], ["kept"]),
+      node.("MatMul", ["kept", "wo"], ["logits"])
+    ]
+
+    cache_type = {:f32, ["batch", 1, "past", 4]}
+
+    model = %{
+      nodes: nodes,
+      params: params,
+      static: %{
+        "zero" => host.(0),
+        "one" => host.(1),
+        "two" => host.(2),
+        "axis_0" => host.([0]),
+        "axis_1" => host.([1]),
+        "axis_2" => host.([2])
+      },
+      inputs: ["input_ids", "attention_mask"] ++ past,
+      input_types:
+        Map.merge(Map.new(past, &{&1, cache_type}), %{
+          "input_ids" => {:s64, ["batch", "length"]},
+          "attention_mask" => {:s64, ["batch", "total"]}
+        }),
+      outputs: ["logits", "present.0.key", "present.0.value"],
+      opset: 17,
+      backend: nil,
+      compute_type: nil
+    }
+
+    # The same decoder over all tokens of a row, without a cache.
+    exact = fn tokens ->
+      count = length(tokens)
+      positions = Nx.iota({count, 1}, type: :f32, backend: Nx.BinaryBackend)
+
+      input =
+        Nx.add(
+          Nx.take(params["embed"], host.(tokens)),
+          Nx.sin(Nx.multiply(positions, params["freq"]))
+        )
+
+      [k, v] = for w <- ["wk", "wv"], do: Nx.dot(input, params[w])
+      causal = Nx.greater(Nx.iota({count, count}, axis: 1), Nx.iota({count, count}, axis: 0))
+
+      heads =
+        for head <- [0, 1] do
+          q = Nx.slice_along_axis(Nx.dot(input, params["wq"]), head * 4, 4, axis: 1)
+
+          scores =
+            Nx.select(
+              causal,
+              Nx.Constants.neg_infinity(:f32),
+              Nx.divide(Nx.dot(q, Nx.transpose(k)), 2)
+            )
+
+          weights = Nx.exp(Nx.subtract(scores, Nx.reduce_max(scores, axes: [1], keep_axes: true)))
+          Nx.dot(Nx.divide(weights, Nx.sum(weights, axes: [1], keep_axes: true)), v)
+        end
+
+      Nx.dot(Nx.concatenate(heads, axis: 1), params["wo"])[-1]
+    end
+
+    greedy = fn prompt ->
+      {_tokens, row} =
+        Enum.reduce(1..16, {prompt, []}, fn _step, {tokens, row} ->
+          logits = exact.(tokens)
+          token = logits |> Nx.argmax() |> Nx.to_number()
+          shifted = Nx.subtract(logits, Nx.reduce_max(logits))
+          logprob = Nx.to_number(Nx.subtract(shifted[token], Nx.log(Nx.sum(Nx.exp(shifted)))))
+          {tokens ++ [token], row ++ [[token, logprob]]}
+        end)
+
+      row
+    end
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => -1, "vocab_size" => 50}}
+    context = &Generation.context(repo, &1, max_new_tokens: 16, token_logprobs: true)
+    ctx = context.(model)
+    assert ctx.mode == :in_place
+    assert Generation.MergedDecoder.position_offset() in ctx.model.inputs
+    refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
+
+    start = int.("start", 2)
+
+    grow = %{
+      model
+      | nodes: nodes ++ [%{node.("Shape", [hd(past)], ["reads"]) | attribute: [start]}]
+    }
+
+    assert capture_log([level: :debug], fn -> assert context.(grow).mode == :grow end) =~
+             "because Shape reads reads the cache or its length"
+
+    prompts =
+      for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
+
+    ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
+    rows = Generation.generate(ctx, prompts, [0, 0, 0])
+
+    for {row, prompt} <- Enum.zip(rows, prompts) do
+      expected = greedy.(prompt)
+      assert Enum.map(row, &hd/1) == Enum.map(expected, &hd/1)
+      diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+      assert diff < 1.0e-4, "#{diff}"
+    end
   end
 
   # The selection gives f32 values as the integers of their bits. NaN and the infinities have

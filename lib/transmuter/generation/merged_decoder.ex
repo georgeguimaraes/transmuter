@@ -1,12 +1,12 @@
 defmodule Transmuter.Generation.MergedDecoder do
   @moduledoc """
-  Moves a merged decoder of optimum without `position_ids` from a cache of exact length (`:grow`) to a buffer (`:append`), see "Merged decoders" in `Transmuter.Generation`.
+  Moves a decoder without `position_ids` that takes its positions from the length of its past, such as a merged decoder of optimum or Apertus, from a cache of exact length (`:grow`) to a buffer, see "Merged decoders" in `Transmuter.Generation`.
 
-  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. It adds two inputs:
+  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. A decoder without an `If` gets the rewrite on its graph when a node other than GroupQueryAttention reads the past, as the rotary positions of Apertus. GroupQueryAttention writes its new rows into the buffer and hides its free rows, so it needs no key mask, and no other node may read its present. The rewrite adds two inputs:
 
     * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when every read is a `Gather` of a position table whose index has a leading axis of size 1 (as the positions of GPT-2), no later `Reshape` or `Expand` has a static first dimension of 1, and no prefix (below) takes the rows of the buffer as positions. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
 
-    * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
+    * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The key mask is an input only when a node reads it. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
   A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast to a float of another value of L, a 2-D static table read on axis 0 with another index of L, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2). A `Slice` from 0 to a shift of L with step 1 of a tensor that the graph made, whose content has no L or only comparisons of L, is a prefix: with a buffer it keeps C + n rows in place of v + n, which hold every row that a step reads, such as the causal mask of moonshine, which compares the positions of L with the key index. A prefix of a static table, such as the rotary table of the merged llama2.c that its nested `If` nodes squeeze, keeps the decoder in `:grow`.
 
@@ -17,7 +17,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   require Logger
 
-  alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Onnx.{AttributeProto, GraphProto, NodeProto}
 
   @position_offset "transmuter.position_offset"
   @key_mask "transmuter.key_mask"
@@ -34,13 +34,8 @@ defmodule Transmuter.Generation.MergedDecoder do
   `model` itself when the rules do not hold.
   """
   def rewrite(model) do
-    gqa? = Enum.any?(model.nodes, &(&1.op_type == "GroupQueryAttention"))
-    past? = &String.starts_with?(&1, "past_key_values.")
-
-    with false <- "position_ids" in model.inputs or gqa?,
-         {branch, graph} <- cache_if(model),
-         nil <-
-           Enum.find(model.nodes -- [branch], &Enum.any?(Transmuter.dependencies(&1), past?)),
+    with false <- "position_ids" in model.inputs,
+         {branch, graph} <- cache_graph(model),
          {:ok, cores} <- buffer_cores(model, graph),
          {:ok, [_ | _] = reads, limit, prefixes} <- past_uses(model, graph) do
       per_row? = per_row?(model, graph, reads, prefixes)
@@ -254,15 +249,15 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   # The axis of the length in the outputs of a node that reads a tensor of the lengths map or
-  # takes its shape from L. An attention core gives the shape of its queries, and a Gather the
-  # shape of its index.
+  # takes its shape from L. An attention gives the shape of its queries, and a Gather the shape
+  # of its index.
   defp track(node, lengths, kinds) do
     data = if node.op_type == "Gather", do: Enum.take(node.input, 1), else: node.input
     axes = for name <- data, Map.has_key?(lengths, name), uniq: true, do: lengths[name]
 
     axis =
       case {node.op_type, axes} do
-        {op, _} when op in ["Shape", "Size", "AttentionCore"] -> nil
+        {op, _} when op in ["Shape", "Size", "AttentionCore", "GroupQueryAttention"] -> nil
         {_op, []} -> if shaped?(node, kinds), do: :unknown
         {op, [{_, _} = axis]} when op in ["Concat", "Cast", "Identity"] -> axis
         {"Transpose", [{_, _} = axis]} -> transposed(node, axis)
@@ -345,6 +340,10 @@ defmodule Transmuter.Generation.MergedDecoder do
         {:bail, node}
 
       deps == [] ->
+        {:kinds, %{}}
+
+      # The total length and the counts of the rows of GroupQueryAttention index the buffer.
+      node.op_type == "GroupQueryAttention" and Enum.all?(deps, &(elem(&1, 0) in [5, 6])) ->
         {:kinds, %{}}
 
       key_positions?(walk, node, deps) ->
@@ -633,6 +632,10 @@ defmodule Transmuter.Generation.MergedDecoder do
       node.op_type == "AttentionCore" and read -- [1, 2] == [] ->
         if(1 in read, do: :core, else: :none)
 
+      # GroupQueryAttention writes its new rows into the buffer and hides its free rows.
+      node.op_type == "GroupQueryAttention" and read -- [3, 4] == [] ->
+        :none
+
       # The folded heads of a core must keep the batch first, as the key mask does.
       node.op_type == "Transpose" and
           Enum.any?(node.attribute, &(&1.name == "perm" and hd(&1.ints) != 0)) ->
@@ -643,6 +646,30 @@ defmodule Transmuter.Generation.MergedDecoder do
 
       true ->
         {:bail, node}
+    end
+  end
+
+  # The graph of the positions: the branch with cache of a merged decoder, which alone reads the
+  # past, or the graph of a decoder without an If whose nodes other than GroupQueryAttention
+  # read the past, such as the rotary positions of Apertus. GroupQueryAttention counts its rows
+  # from the mask (see Transmuter.Generation), so another node may not read its present.
+  defp cache_graph(model) do
+    reads? = fn node, names -> Enum.any?(Transmuter.dependencies(node), names) end
+    past? = &String.starts_with?(&1, "past_key_values.")
+    gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+    presents = MapSet.new(Enum.flat_map(gqas, &Enum.drop(&1.output, 1)))
+    others = model.nodes -- gqas
+
+    case cache_if(model) do
+      {branch, graph} ->
+        Enum.find(model.nodes -- [branch], &reads?.(&1, past?)) || {branch, graph}
+
+      nil ->
+        cond do
+          node = Enum.find(others, &reads?.(&1, fn name -> name in presents end)) -> node
+          Enum.any?(others, &reads?.(&1, past?)) -> {nil, %GraphProto{node: model.nodes}}
+          true -> nil
+        end
     end
   end
 
@@ -674,24 +701,33 @@ defmodule Transmuter.Generation.MergedDecoder do
         end
       )
 
-    graph = %{graph | node: nodes}
-
-    attribute =
-      Enum.map(branch.attribute, &if(&1.name == "then_branch", do: %{&1 | g: graph}, else: &1))
+    # The key mask is an input when a node reads it. GroupQueryAttention hides its free rows
+    # itself, so Apertus takes only the offset.
+    masked? = Enum.any?(nodes, &(@key_mask in &1.input))
+    added = if masked?, do: [@position_offset, @key_mask], else: [@position_offset]
+    offset = if(per_row?, do: ["batch_size", 1], else: [])
+    types = %{@position_offset => {:s64, offset}, @key_mask => {:s64, ["batch_size", "keys"]}}
 
     %{
       model
-      | nodes:
-          Enum.map(model.nodes, &if(&1 == branch, do: %{branch | attribute: attribute}, else: &1)),
+      | nodes: replace_graph(model.nodes, branch, nodes),
         static:
           Map.merge(model.static, %{name.("zero") => constant.(0), name.("one") => constant.(1)}),
-        inputs: model.inputs ++ [@position_offset, @key_mask],
-        input_types:
-          Map.merge(model.input_types, %{
-            @position_offset => {:s64, if(per_row?, do: ["batch_size", 1], else: [])},
-            @key_mask => {:s64, ["batch_size", "keys"]}
-          })
+        inputs: model.inputs ++ added,
+        input_types: Map.merge(model.input_types, Map.take(types, added))
     }
+  end
+
+  defp replace_graph(_nodes, nil, graph_nodes), do: graph_nodes
+
+  defp replace_graph(nodes, branch, graph_nodes) do
+    attribute =
+      Enum.map(
+        branch.attribute,
+        &if(&1.name == "then_branch", do: %{&1 | g: %{&1.g | node: graph_nodes}}, else: &1)
+      )
+
+    Enum.map(nodes, &if(&1 == branch, do: %{branch | attribute: attribute}, else: &1))
   end
 
   defp offset_input(node, input, name) do
