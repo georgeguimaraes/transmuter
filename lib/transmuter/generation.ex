@@ -103,12 +103,10 @@ defmodule Transmuter.Generation do
   @count "transmuter.select.count"
   @prompt_count "transmuter.select.prompt_count"
   @keys "transmuter.select.keys"
-  @step "transmuter.select.step"
   @scores "transmuter.select.scores"
   @tokens "transmuter.select.tokens"
   @selected "transmuter.select.selected"
   @next_seen "transmuter.select.next_seen"
-  @next_step "transmuter.select.next_step"
   @next_history "transmuter.select.next_history"
   @next_count "transmuter.select.next_count"
   @write_at "transmuter.cache.write_at"
@@ -740,24 +738,11 @@ defmodule Transmuter.Generation do
       selected =
         if beams?,
           do: select_beams(logits, index, seen, masks, row, extra[@scores], settings),
-          else:
-            select_tokens(
-              logits,
-              index,
-              seen,
-              masks,
-              row,
-              extra[@keys],
-              extra[@step],
-              settings
-            )
-
-      step = Nx.add(extra[@step], 1)
+          else: select_tokens(logits, index, seen, masks, row, extra[@keys], settings)
 
       outputs
-      |> Map.put(@selected, anchor(selected, [seen, step, row.tokens, row.count]))
+      |> Map.put(@selected, anchor(selected, [seen, row.tokens, row.count]))
       |> Map.put(@next_seen, seen)
-      |> Map.put(@next_step, step)
       |> Map.put(@next_history, row.tokens)
       |> Map.put(@next_count, row.count)
     end
@@ -808,7 +793,6 @@ defmodule Transmuter.Generation do
     group = %{
       state: %{
         seen: none({rows, ctx.vocab}),
-        step: zeros.(:u32, {}),
         history: zeros.(:s32, {rows, capacity}),
         count: zeros.(:s32, {rows}),
         prompt_count: zeros.(:s32, {rows})
@@ -829,7 +813,7 @@ defmodule Transmuter.Generation do
   end
 
   # The extra inputs of the selection of a step, from the group: the tokens that the
-  # repetition penalty applies to and the number of the step, which stay on the device, the
+  # repetition penalty applies to and the tokens of each row, which stay on the device, the
   # new tokens of the step, the masks, the state of each processor, the keys of sampling,
   # and the scores of beam search.
   defp selection(ctx, group) do
@@ -844,7 +828,6 @@ defmodule Transmuter.Generation do
 
     %{
       @seen => group.state.seen,
-      @step => group.state.step,
       @history => group.state.history,
       @count => group.state.count,
       @prompt_count => group.state.prompt_count,
@@ -948,7 +931,7 @@ defmodule Transmuter.Generation do
           notify = &notify(on_token, prompts, &1, ctx.token_logprobs?)
 
           group =
-            decode(ctx, start(ctx, prompts, seeds, inputs, extras), ctx.max_new_tokens, notify)
+            decode(ctx, start(ctx, prompts, seeds, inputs, extras), notify)
 
           Enum.zip_with(group.ids, group.logprobs, &tokens/2)
         else
@@ -999,7 +982,6 @@ defmodule Transmuter.Generation do
     # selection of each step adds its tokens on the device.
     prompt_ids = for {prompt, i} <- Enum.with_index(prompts), id <- prompt, do: [i, id]
     seen = mark(none({length(prompts), ctx.vocab}), prompt_ids)
-    step = Nx.tensor(0, type: :u32, backend: Nx.BinaryBackend)
 
     # The tokens of each row, which the processors read: the prompt, and the new tokens after
     # it, which the selection of each step writes on the device.
@@ -1011,7 +993,7 @@ defmodule Transmuter.Generation do
     count = Nx.tensor(Enum.map(prompts, &length/1), type: :s32, backend: Nx.BinaryBackend)
 
     initial =
-      Map.new([seen: seen, step: step, history: history, count: count], fn {k, t} ->
+      Map.new([seen: seen, history: history, count: count], fn {k, t} ->
         {k, Nx.backend_transfer(t, ctx.backend)}
       end)
 
@@ -1049,25 +1031,25 @@ defmodule Transmuter.Generation do
     %{group | state: %{state | features: nil}}
   end
 
-  defp decode(ctx, group, remaining, notify) do
-    group = select(ctx, group, remaining)
+  defp decode(ctx, group, notify) do
+    group = select(ctx, group)
     notify.(group)
 
     if Enum.all?(group.done),
       do: finish(group),
-      else: decode(ctx, advance(ctx, group), remaining - 1, notify)
+      else: decode(ctx, advance(ctx, group), notify)
   end
 
   # Frees the device tensors that the group owns when it ends: its cache, its last selection
   # and selection state, its masks and its keys.
   defp finish(group = %{state: state}) do
-    own = [state.selected, state.seen, state.step, state.history, state.count, state.prompt_count]
+    own = [state.selected, state.seen, state.history, state.count, state.prompt_count]
     own = [group.keys | own] ++ Map.values(state.cache)
     release(own ++ Map.values(group.masks), [])
     group
   end
 
-  defp select(ctx, group, remaining) do
+  defp select(ctx, group) do
     {new, logprobs} =
       group.state.selected
       |> Nx.to_list()
@@ -1076,11 +1058,15 @@ defmodule Transmuter.Generation do
       end)
       |> Enum.unzip()
 
+    # A row ends at an eos token or with its own max_new_tokens tokens.
+    ids = push(group.ids, new, new)
+    done = Enum.zip_with(new, ids, &(&1 == nil or length(&2) == ctx.max_new_tokens))
+
     %{
       group
       | new: new,
-        done: Enum.map(new, &(&1 == nil or remaining == 1)),
-        ids: push(group.ids, new, new),
+        done: done,
+        ids: ids,
         logprobs: push(group.logprobs, new, logprobs)
     }
   end
@@ -1427,7 +1413,6 @@ defmodule Transmuter.Generation do
       capacity: capacity,
       selected: nil,
       seen: nil,
-      step: nil,
       history: nil,
       count: nil,
       prompt_count: nil
@@ -1470,10 +1455,10 @@ defmodule Transmuter.Generation do
     # The embeddings of the tokens come from ctx.embed, and nothing reads them after the call.
     release(List.wrap(inputs["inputs_embeds"]), [])
 
-    # The tokens and the step that the last step gave are the inputs of this step, or those
-    # of a part of the prompt that nothing reads. The parts of the prompt take theirs from
-    # start/6.
-    release([state.seen, state.step, state.history, state.count], [])
+    # The seen tokens, the tokens and the count of each row that the last step gave are the
+    # inputs of this step, or those of a part of the prompt that nothing reads. The parts of
+    # the prompt take theirs from start/6.
+    release([state.seen, state.history, state.count], [])
 
     # Transmuter.run leaves out empty outputs, such as the present of a cache that does not
     # change, so that cache keeps its value.
@@ -1504,7 +1489,6 @@ defmodule Transmuter.Generation do
         valid: Enum.zip_with(state.valid, counts, &add_rows(&1, state.used, &2)),
         selected: outputs[@selected],
         seen: outputs[@next_seen],
-        step: outputs[@next_step],
         history: outputs[@next_history],
         count: outputs[@next_count]
     }
@@ -1745,16 +1729,17 @@ defmodule Transmuter.Generation do
   end
 
   # Selects the token of each row from its logits at `index`. The key of a step is the key
-  # of the row folded with the number of the step. The function runs in the compiled
+  # of the row folded with the number of new tokens of the row, so the tokens of a row do not
+  # depend on the step at which the row starts. The function runs in the compiled
   # program of the step (see tail/1), because eager random numbers over a large vocabulary
   # are slow. EMLX evaluates each output of a compiled function separately, so the function
   # gives one s32 output: the token of each row, and with token_logprobs the bits of its
   # log-probability.
-  defp select_tokens(logits, index, seen, masks, row, keys, step, settings) do
+  defp select_tokens(logits, index, seen, masks, row, keys, settings) do
     [logits, index, seen, keys] = Enum.map([logits, index, seen, keys], &Nx.vectorize(&1, :rows))
     row = Map.new(row, fn {name, tensor} -> {name, Nx.vectorize(tensor, :rows)} end)
     logits = Nx.take(logits, index)
-    key = Transmuter.Random.fold_in(keys, step)
+    key = Transmuter.Random.fold_in(keys, generated(row))
     {scores, token} = select_token(logits, seen, masks, row, key, settings)
     token = Nx.as_type(token, :s32)
 
