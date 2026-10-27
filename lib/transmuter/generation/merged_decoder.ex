@@ -8,12 +8,14 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
-  A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast to a float of another value of L, such as the relative positions of T5, a 2-D static table read on axis 0 with another index, such as the positions of M2M100 from the padding mask, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2). A `Slice` from 0 to a shift of L with step 1 of a tensor that the graph made, whose content has no L or only comparisons of L, is a prefix: with a buffer it keeps C + n rows in place of v + n, which hold every row that a step reads, such as the causal mask of moonshine, which compares the positions of L with the key index. A prefix of a static table, such as the rotary table of the merged llama2.c that its nested `If` nodes squeeze, keeps the decoder in `:grow`.
+  A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast to a float of another value of L, a 2-D static table read on axis 0 with another index, such as the positions of M2M100 from the padding mask, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2). A `Slice` from 0 to a shift of L with step 1 of a tensor that the graph made, whose content has no L or only comparisons of L, is a prefix: with a buffer it keeps C + n rows in place of v + n, which hold every row that a step reads, such as the causal mask of moonshine, which compares the positions of L with the key index. A prefix of a static table, such as the rotary table of the merged llama2.c that its nested `If` nodes squeeze, keeps the decoder in `:grow`.
+
+  A `Range` from 0 to a shift of L, with a step without L, gives the positions of all keys of a step, as the relative positions of T5. With a buffer, its index is the row of the buffer, and the new rows come after the C rows of the buffer. So the rewrite keeps the `Range` and maps each of its values to a position through the key mask: the cumulative count of the valid rows, minus 1, over the union of the rows of the step, and the offset after the last key. A row that has ended has a prefix of the valid rows of the active rows, so the union is the mask of the active rows, and a valid row gets its position and a new row v + i. The `Range` keeps its start, limit and step, so its output keeps its length. The walk follows these positions through moves, arithmetic and comparisons with values without L, float casts and reads of static tables, such as the bucket table of T5. A use that mixes them with other values of L, such as the causal mask of moonshine, which compares the key index with the positions of L, keeps that range as an index of the buffer, and the walk runs again (at most once for each range).
   """
 
   require Logger
 
-  alias Transmuter.Onnx.NodeProto
+  alias Transmuter.Onnx.{AttributeProto, NodeProto}
 
   @position_offset "transmuter.position_offset"
   @key_mask "transmuter.key_mask"
@@ -89,7 +91,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   # map gives the axis of that length from the end and the rank, or :unknown: axis 2 of 4 for
   # the buffers of the cache, axis 1 of 2 for the attention mask, and the axes after Concat,
   # Cast, Identity and Transpose.
-  defp past_uses(model, graph) do
+  defp past_uses(model, graph, index_ranges \\ MapSet.new()) do
     scope = static_scope(model, graph)
     lengths = Map.new(buffers(model), &{&1, {-2, 4}})
 
@@ -102,9 +104,12 @@ defmodule Transmuter.Generation.MergedDecoder do
     |> Enum.reduce_while({[], %{}, lengths, nil}, fn node, {reads, kinds, lengths, limit} ->
       lengths = Map.merge(lengths, track(node, lengths, kinds))
 
-      case past_use(%{scope: scope, lengths: lengths}, node, kinds) do
+      case past_use(%{scope: scope, lengths: lengths, index: index_ranges}, node, kinds) do
         {:read, node} ->
           {:cont, {[node | reads], kinds, lengths, limit}}
+
+        {:positions, node, outputs} ->
+          {:cont, {[node | reads], Map.merge(kinds, outputs), lengths, limit}}
 
         {:kinds, outputs} ->
           {:cont, {reads, Map.merge(kinds, outputs), lengths, limit}}
@@ -118,8 +123,18 @@ defmodule Transmuter.Generation.MergedDecoder do
     end)
     |> case do
       {:bail, _node} = bail -> bail
+      {:mixed, ranges, node} -> index_space(model, graph, index_ranges, ranges, node)
       {reads, _kinds, _lengths, limit} -> {:ok, reads, limit}
     end
+  end
+
+  # A use mixes key positions with L, so their ranges stay in the index space of the buffer,
+  # and the walk runs again. Each range changes at most once: a range that mixes again stops
+  # the rewrite.
+  defp index_space(model, graph, index_ranges, ranges, node) do
+    if MapSet.subset?(ranges, index_ranges),
+      do: {:bail, node},
+      else: past_uses(model, graph, MapSet.union(index_ranges, ranges))
   end
 
   # The axis of the length in the outputs of a node that reads a tensor of the lengths map or
@@ -205,7 +220,7 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
-  defp past_use(%{scope: scope}, node, kinds) do
+  defp past_use(walk = %{scope: scope}, node, kinds) do
     deps = for {name, i} <- Enum.with_index(node.input), kind = kinds[name], do: {i, kind}
     outer? = Enum.any?(Transmuter.dependencies(node) -- node.input, &Map.has_key?(kinds, &1))
 
@@ -215,6 +230,9 @@ defmodule Transmuter.Generation.MergedDecoder do
 
       deps == [] ->
         {:kinds, %{}}
+
+      key_positions?(walk, node, deps) ->
+        {:positions, node, outputs(node, {:position, MapSet.new(node.output)})}
 
       node.op_type in ["Gather", "Slice", "GatherElements", "GatherND"] ->
         gather_use(scope, node, kinds, deps)
@@ -297,8 +315,14 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     # Comparisons and causal tables are masks, which hold for the rows of a buffer.
     values = Enum.reject(value_kinds, &(&1 == :bool or match?({:causal, _, _}, &1)))
+    {positions, others} = Enum.split_with(values, &match?({:position, _}, &1))
+
+    ranges =
+      Enum.reduce(positions, MapSet.new(), fn {:position, r}, acc -> MapSet.union(acc, r) end)
 
     cond do
+      positions != [] and others != [] -> {:mixed, ranges, node}
+      positions != [] -> position_use(node, ranges)
       node.op_type in @comparisons -> {:kinds, outputs(node, :bool)}
       values == [] -> {:kinds, %{}}
       node.op_type == "Cast" and float_cast?(node) -> float_use(node, deps)
@@ -307,6 +331,28 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   defp outputs(node, kind), do: Map.new(node.output, &{&1, kind})
+
+  # The positions of all keys of a step: a Range from 0 to a shift of L with a step without L,
+  # unless an earlier walk found that a use compares or mixes it with L (see value_use/2), as
+  # the causal mask of moonshine compares the key index with the positions of L.
+  defp key_positions?(walk, node = %{op_type: "Range", input: [start, _limit | _]}, deps) do
+    value = walk.scope.values[start]
+
+    deps == [{1, :shift}] and value != nil and Nx.to_flat_list(value) == [0] and
+      not MapSet.member?(walk.index, hd(node.output))
+  end
+
+  defp key_positions?(_walk, _node, _deps), do: false
+
+  # A use of key positions (see key_positions?/3) alone: a float cast or a comparison ends
+  # them, and other operators keep them positions.
+  defp position_use(node, ranges) do
+    cond do
+      node.op_type in @comparisons -> {:kinds, outputs(node, :bool)}
+      node.op_type == "Cast" and float_cast?(node) -> {:kinds, %{}}
+      true -> {:kinds, outputs(node, {:position, ranges})}
+    end
+  end
 
   # A float cast of a shift of L gets the offset on its input (see offset_reads/4), so its
   # float value no longer depends on the buffer. A float cast of another value of L stops the
@@ -347,6 +393,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     cond do
       Nx.rank(table) == 2 and position_index?(scope, node, kinds) ->
         {:read, node}
+
+      node.op_type == "Gather" and match?({:position, _}, kinds[Enum.at(node.input, 1)]) ->
+        {:kinds, %{}}
 
       node.op_type == "Slice" and causal?(table) ->
         causal_slice(scope, node, kinds, {Nx.rank(table), Nx.axis_size(table, -1)})
@@ -552,6 +601,48 @@ defmodule Transmuter.Generation.MergedDecoder do
         name: node.name,
         input: [table, value.("index")],
         output: [out]
+      }
+    ]
+  end
+
+  # Each value of the Range is a row of the buffer and the new rows, which maps to its position
+  # through the key mask: the cumulative count of the valid rows, minus 1, over the union of
+  # the rows. A row that has ended has a prefix of the valid rows of the active rows, so the
+  # union is the mask of the active rows, and a free row gets a position that the key mask
+  # hides. An index after the last key continues from the last new row with the offset. The
+  # Range keeps its start, limit and step, so the output keeps its length.
+  defp shift_read(node = %{op_type: "Range", input: [start | _]}, name) do
+    value = &name.(hd(node.output) <> "." <> &1)
+
+    step = fn op, inputs, out, attribute ->
+      %NodeProto{
+        op_type: op,
+        name: value.(out),
+        input: inputs,
+        output: [value.(out)],
+        attribute: attribute
+      }
+    end
+
+    [
+      %{node | output: [value.("index")]},
+      step.("ReduceMax", [@key_mask, name.("zero")], "valid", [
+        %AttributeProto{name: "keepdims", type: :INT, i: 0}
+      ]),
+      step.("CumSum", [value.("valid"), name.("zero")], "count", []),
+      step.("Sub", [value.("count"), name.("one")], "map", []),
+      step.("Size", [value.("map")], "keys", []),
+      step.("Sub", [value.("keys"), name.("one")], "last", []),
+      step.("Min", [value.("index"), value.("last")], "clamped", []),
+      step.("Gather", [value.("map"), value.("clamped")], "mapped", []),
+      step.("Less", [value.("index"), value.("keys")], "inside", []),
+      step.("Add", [value.("index"), @position_offset], "after", []),
+      step.("Where", [value.("inside"), value.("mapped"), value.("after")], "positions", []),
+      %NodeProto{
+        op_type: "CastLike",
+        name: node.name,
+        input: [value.("positions"), start],
+        output: node.output
       }
     ]
   end

@@ -524,6 +524,60 @@ defmodule Transmuter.GenerationTest do
     assert capacities == [256, 512]
   end
 
+  # The merged T5 decoder reads the positions of all keys for its relative bias, and the
+  # rewrite takes them from the union of the key masks of the rows. Row 0 ends early, at a
+  # token of its own answer that row 1 does not give, so its key mask has fewer valid rows
+  # for the later steps of row 1. Each row gives the tokens that it gives alone.
+  @tag ci_partition: 10
+  test "the relative bias of T5 takes the positions of the active rows" do
+    {repo, encoder, decoder} =
+      Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/t5-small"}, @opts)
+
+    tokenizer = Transmuter.Serving.tokenizer(repo, [])
+
+    ids =
+      for text <- [
+            "translate English to German: The house is wonderful.",
+            "summarize: Scientists found a new species of frog in the rainforest. It is small."
+          ] do
+        {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+        Transmuter.Tokenizer.ids(tokenizer, encoding)
+      end
+
+    width = ids |> Enum.map(&length/1) |> Enum.max()
+    pad = &(&1 ++ List.duplicate(&2, width - length(&1)))
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    mask = host.(for row <- ids, do: pad.(List.duplicate(1, length(row)), 0))
+    inputs = %{"input_ids" => host.(Enum.map(ids, &pad.(&1, 0))), "attention_mask" => mask}
+    %{"last_hidden_state" => states} = Transmuter.run(encoder, encoder.params, inputs)
+    given = %{"encoder_hidden_states" => states, "encoder_attention_mask" => mask}
+    row = fn i -> Map.new(given, fn {k, t} -> {k, Nx.slice_along_axis(t, i, 1, axis: 0)} end) end
+
+    generate = fn repo, rows ->
+      inputs = if rows == [0, 1], do: given, else: row.(hd(rows))
+      ctx = Generation.context(repo, decoder, [max_new_tokens: 40], Map.keys(given))
+      assert ctx.mode == :append
+      ctx = Generation.compile(ctx, length(rows), @opts[:defn_options])
+      starts = List.duplicate([0], length(rows))
+      Generation.generate(ctx, starts, List.duplicate(0, length(rows)), inputs)
+    end
+
+    # Without an eos token, each row gives 40 tokens.
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    [answer] = generate.(repo, [0])
+    [other] = generate.(repo, [1])
+    other = Enum.map(other, &hd/1)
+    eos = answer |> Enum.map(&hd/1) |> Enum.drop(4) |> Enum.find(&(&1 not in other))
+    repo = %{repo | generation_config: %{"eos_token_id" => eos}}
+
+    rows = generate.(repo, [0, 1])
+    alone = for i <- [0, 1], do: hd(generate.(repo, [i]))
+
+    assert rows == alone
+    assert length(hd(rows)) < 40
+    assert length(Enum.at(rows, 1)) == 40
+  end
+
   # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
   # in the compiled steps.
   defp capacities(repo, model, prompts) do
