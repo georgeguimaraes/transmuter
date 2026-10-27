@@ -524,6 +524,65 @@ defmodule Transmuter.GenerationTest do
     assert capacities == [256, 512]
   end
 
+  # A request joins a running group with admit/5: its prompt runs in the same steps as the
+  # next tokens of the other rows. The key of a row folds the number of new tokens of the
+  # row, so a request that joins at a later step gives the tokens that it gives alone, with
+  # greedy selection and with sampling. A row that ends early is free for the next request,
+  # which also gives its tokens alone. Both cache modes of buffers run the same requests.
+  @tag ci_partition: 10
+  test "requests that join a running group give the tokens that they give alone" do
+    sources = [
+      {{:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}, :append},
+      {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, :in_place}
+    ]
+
+    for {source, mode} <- sources,
+        opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts,
+        {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32),
+        strategy <- [:greedy, :sampling] do
+      repo = %{repo | generation_config: %{}}
+      ctx = Generation.context(repo, model, strategy: strategy, max_new_tokens: 10)
+      assert ctx.mode == mode
+
+      [fox, story, rainbow] =
+        for text <- [@fox, "Once upon a time", "Explain how a rainbow forms."] do
+          {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+          Transmuter.Tokenizer.ids(tokenizer, encoding)
+        end
+
+      single = Generation.compile(ctx, 1, @opts[:defn_options])
+
+      alone = fn prompt, seed ->
+        single |> Generation.generate([prompt], [seed]) |> hd() |> Enum.map(&hd/1)
+      end
+
+      request = &%{row: &1, prompt: &2, seed: &3, budget: &4}
+      ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+
+      # The fox runs alone for 3 steps, then the story joins. The story ends after 4 tokens,
+      # and the rainbow takes its row while the fox still runs.
+      group =
+        ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, fox, 7, 10)]))
+
+      group = Enum.reduce(1..3, group, fn _step, group -> Generation.next(ctx, group) end)
+      group = Generation.admit(ctx, group, [request.(1, story, 11, 4)])
+      group = run_until(ctx, group, &Enum.at(&1.done, 1))
+      story_tokens = row_tokens(group, 1)
+      group = Generation.admit(ctx, group, [request.(1, rainbow, 13, 10)])
+      group = run_until(ctx, group, &Enum.all?(&1.done))
+
+      assert row_tokens(group, 0) == alone.(fox, 7)
+      assert story_tokens == Enum.take(alone.(story, 11), 4)
+      assert row_tokens(group, 1) == alone.(rainbow, 13)
+    end
+  end
+
+  defp run_until(ctx, group, done?) do
+    if done?.(group), do: group, else: run_until(ctx, Generation.next(ctx, group), done?)
+  end
+
+  defp row_tokens(group, row), do: group.ids |> Enum.at(row) |> Enum.reverse()
+
   # The merged T5 decoder reads the positions of all keys for its relative bias, and the
   # rewrite takes them from the union of the key masks of the rows. Row 0 ends early, at a
   # token of its own answer that row 1 does not give, so its key mask has fewer valid rows

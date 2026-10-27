@@ -681,6 +681,7 @@ defmodule Transmuter.Generation do
     ctx
     |> Map.put(:grow, GraphBreaks.jit(&grow_rows/2, defn_options))
     |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
+    |> Map.put(:admit_rows, GraphBreaks.jit(&write_admitted/3, defn_options))
   end
 
   # The settings of the selection, and the processes of the processors with the masks in their
@@ -928,10 +929,15 @@ defmodule Transmuter.Generation do
     ids =
       for prompts <- groups(ctx, prompts) do
         if ctx.num_beams == 1 do
-          notify = &notify(on_token, prompts, &1, ctx.token_logprobs?)
+          longest = prompts |> Enum.map(&length/1) |> Enum.max()
 
           group =
-            decode(ctx, start(ctx, prompts, seeds, inputs, extras), notify)
+            ctx
+            |> open(length(prompts), longest + @capacity_margin)
+            |> then(&admit(ctx, &1, requests(ctx, prompts, seeds, extras), inputs, features))
+            |> then(
+              &decode(ctx, &1, fn group -> notify(on_token, group, ctx.token_logprobs?) end)
+            )
 
           Enum.zip_with(group.ids, group.logprobs, &tokens/2)
         else
@@ -960,84 +966,192 @@ defmodule Transmuter.Generation do
     end
   end
 
-  # Runs the prompts in parts of power-of-two lengths. Each prompt fills the parts from the
-  # last one, so the last token of each row is in the last part. The last part is no longer
-  # than the shortest prompt, so it ends each row at its last position. A merged decoder runs
-  # the prompt as one part, on the branch without cache (see the module documentation), and
-  # its groups have rows of one length. Only the prompt takes image features, and the cursors
-  # start again for each group.
-  defp start(ctx, prompts, seeds, inputs, extras, scores \\ nil) do
-    lengths = for prompt <- prompts, prompt != [], do: length(prompt)
-    longest = Enum.max(lengths)
-    state = initial_state(ctx, length(prompts), capacity(ctx, longest + @capacity_margin))
-    state = fit(ctx, state, longest)
-    last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
+  # The requests of the rows of `prompts` that have a prompt: the row, its prompt, its seed,
+  # its budget of new tokens, its positions and the cursor of its image features.
+  defp requests(ctx, prompts, seeds, extras) do
+    for {{prompt, seed}, row} <- Enum.with_index(Enum.zip(prompts, seeds)), prompt != [] do
+      %{
+        row: row,
+        prompt: prompt,
+        seed: seed,
+        budget: ctx.max_new_tokens,
+        position: Enum.at(extras.positions, row),
+        cursor: Enum.at(extras.cursors, row)
+      }
+    end
+  end
 
-    sizes =
-      if merged?(ctx),
-        do: [longest],
-        else: chunks(longest - last) ++ [last]
+  @doc false
+  # A group of `rows` empty rows, with buffers for `length` rows of cache. An empty row has no
+  # request and is done. admit/5 gives requests to rows, and next/2 runs the steps.
+  def open(ctx, rows, length \\ @capacity_margin) do
+    state = initial_state(ctx, rows, capacity(ctx, length))
+    zeros = &Nx.broadcast(Nx.tensor(0, type: &1, backend: ctx.backend), &2)
 
-    # The tokens that the repetition penalty applies to: the prompt and the new tokens. The
-    # selection of each step adds its tokens on the device.
-    prompt_ids = for {prompt, i} <- Enum.with_index(prompts), id <- prompt, do: [i, id]
-    seen = mark(none({length(prompts), ctx.vocab}), prompt_ids)
+    state = %{
+      state
+      | seen: Nx.backend_transfer(none({rows, ctx.vocab}), ctx.backend),
+        history: zeros.(:s32, {rows, state.capacity}),
+        count: zeros.(:s32, {rows}),
+        prompt_count: zeros.(:s32, {rows})
+    }
 
-    # The tokens of each row, which the processors read: the prompt, and the new tokens after
-    # it, which the selection of each step writes on the device.
-    history =
-      prompts
-      |> Enum.map(&(&1 ++ List.duplicate(0, state.capacity - length(&1))))
-      |> Nx.tensor(type: :s32, backend: Nx.BinaryBackend)
-
-    count = Nx.tensor(Enum.map(prompts, &length/1), type: :s32, backend: Nx.BinaryBackend)
-
-    initial =
-      Map.new([seen: seen, history: history, count: count], fn {k, t} ->
-        {k, Nx.backend_transfer(t, ctx.backend)}
-      end)
-
-    state = %{state | prompt_count: Nx.backend_copy(count, ctx.backend)}
-
-    group = %{
-      state: Map.merge(state, initial),
+    %{
+      state: state,
       masks:
         Map.new(token_masks(ctx), fn {name, mask} ->
           {name, Nx.backend_transfer(mask, ctx.backend)}
         end),
-      keys: seeds |> Enum.map(&Nx.Random.key/1) |> Nx.stack() |> Nx.backend_transfer(ctx.backend),
-      prompts: prompts,
-      ids: Enum.map(prompts, fn _ -> [] end),
-      logprobs: Enum.map(prompts, fn _ -> [] end),
-      new: Enum.map(prompts, fn _ -> nil end),
-      done: Enum.map(prompts, &(&1 == [])),
-      scores: scores
+      keys: zeros.(:u32, {rows, 2}),
+      prompts: List.duplicate([], rows),
+      ids: List.duplicate([], rows),
+      logprobs: List.duplicate([], rows),
+      new: List.duplicate(nil, rows),
+      done: List.duplicate(true, rows),
+      budgets: List.duplicate(0, rows),
+      scores: nil
     }
+  end
 
-    # Each part of the prompt starts from the tokens of the prompt and step 0, and the last
-    # part gives the state of the first new token.
-    selection = selection(ctx, group)
+  @doc false
+  # Gives each request of `requests` its row, runs the prompts and reads the first token of
+  # each new row (see prefill/5). A request is a map with the row, the prompt, the seed and
+  # the budget of new tokens, and can have the positions of the prompt and the cursor of its
+  # image features. The other rows that have not ended take their next token in
+  # the same steps. `inputs` and `features` are the inputs and the image features of the
+  # prompts, which only the first requests of a group can have.
+  def admit(ctx, group, requests, inputs \\ %{}, features \\ nil) do
+    ctx |> prefill(group, requests, inputs, features) |> then(&select(ctx, &1))
+  end
+
+  @doc false
+  # Runs the step of the new token of each row that has not ended, and reads its next token.
+  def next(ctx, group), do: select(ctx, advance(ctx, group))
+
+  # Runs the prompts of `requests` in parts of power-of-two lengths. Each prompt fills the
+  # parts from the last one, so the last token of each prompt is in the last part. A row that
+  # has a new token from an earlier step takes it in the last part, and has no tokens in the
+  # other parts. The last part is no longer than the tokens of each row in it, so it ends each
+  # row at its last position, where the step keeps the logits. A merged decoder runs the
+  # prompt as one part, on the branch without cache (see the module documentation), and its
+  # groups have rows of one length, so in :grow and with a merged decoder, requests join only
+  # a group without other rows.
+  defp prefill(ctx, group, requests, inputs, features) do
+    pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
+
+    if (ctx.mode == :grow or merged?(ctx)) and Enum.any?(pending) do
+      raise ArgumentError,
+            "requests can join a group with other rows only in :in_place and :append without a merged decoder"
+    end
+
+    # A row with a new token has one token in these steps.
+    joining = Map.new(requests, &{&1.row, &1})
+    lengths = Enum.map(requests, &length(&1.prompt)) ++ for(token <- pending, token, do: 1)
+    longest = Enum.max(lengths)
+    last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
+    sizes = if merged?(ctx), do: [longest], else: chunks(longest - last) ++ [last]
+
+    group =
+      Enum.reduce(requests, group, fn request, group ->
+        %{
+          group
+          | prompts: List.replace_at(group.prompts, request.row, request.prompt),
+            ids: List.replace_at(group.ids, request.row, []),
+            logprobs: List.replace_at(group.logprobs, request.row, []),
+            new: List.replace_at(group.new, request.row, nil),
+            done: List.replace_at(group.done, request.row, false),
+            budgets: List.replace_at(group.budgets, request.row, request.budget),
+            state: %{
+              group.state
+              | lengths: List.replace_at(group.state.lengths, request.row, 0),
+                valid: List.replace_at(group.state.valid, request.row, []),
+                positions:
+                  List.replace_at(
+                    group.state.positions,
+                    request.row,
+                    Map.get(request, :position, {[], 0})
+                  ),
+                cursors:
+                  List.replace_at(group.state.cursors, request.row, Map.get(request, :cursor, 0))
+            }
+        }
+      end)
+
+    group = %{group | state: fit(ctx, group.state, Enum.sum(sizes))}
+    group = admit_rows(ctx, group, requests)
+
+    # The parts of each row: the parts of its prompt, its new token in the last part, or no
+    # tokens. The selection of each part starts from the state after admit_rows/3, and only
+    # the last part adds the new tokens of the rows to it.
+    parts =
+      for {token, row} <- Enum.with_index(pending) do
+        case joining do
+          %{^row => request} -> split_from_end(request.prompt, sizes)
+          _other -> List.duplicate([], length(sizes) - 1) ++ [List.wrap(token)]
+        end
+      end
+
+    before = selection(ctx, %{group | new: List.duplicate(nil, length(pending))})
+
+    selections =
+      List.duplicate(before, length(sizes) - 1) ++ [selection(ctx, %{group | new: pending})]
+
+    # The steps release the state of the step before, so they start without the state that the
+    # selections read, which is released after the last part.
+    own = Map.take(group.state, [:seen, :history, :count])
+    state = Map.merge(group.state, %{seen: nil, history: nil, count: nil, features: features})
+    state = %{state | inputs: Map.merge(state.inputs, inputs)}
 
     state =
-      prompts
-      |> Enum.map(&split_from_end(&1, sizes))
+      parts
       |> Enum.zip_with(& &1)
-      |> Enum.reduce(
-        Map.merge(state, Map.put(extras, :inputs, inputs)),
-        &step(ctx, &2, &1, selection)
-      )
+      |> Enum.zip(selections)
+      |> Enum.reduce(state, fn {parts, selection}, state -> step(ctx, state, parts, selection) end)
 
-    release(Map.values(initial), [])
+    release(Map.values(own), [])
     %{group | state: %{state | features: nil}}
   end
 
-  defp decode(ctx, group, notify) do
-    group = select(ctx, group)
-    notify.(group)
+  # Writes the device state of the rows of `requests`: the seen tokens and the tokens of its
+  # prompt, its count and prompt count, and the key of its seed.
+  defp admit_rows(ctx, group, requests) do
+    capacity = group.state.capacity
+    prompt_ids = for {request, i} <- Enum.with_index(requests), id <- request.prompt, do: [i, id]
+    counts = Enum.map(requests, &length(&1.prompt))
+    host = &Nx.tensor(&1, type: :s32, backend: Nx.BinaryBackend)
 
-    if Enum.all?(group.done),
-      do: finish(group),
-      else: decode(ctx, advance(ctx, group), notify)
+    values = %{
+      seen: mark(none({length(requests), ctx.vocab}), prompt_ids),
+      history:
+        host.(Enum.map(requests, &(&1.prompt ++ List.duplicate(0, capacity - length(&1.prompt))))),
+      count: host.(counts),
+      prompt_count: host.(counts),
+      keys: requests |> Enum.map(&Nx.Random.key(&1.seed)) |> Nx.stack()
+    }
+
+    old =
+      group.state
+      |> Map.take([:seen, :history, :count, :prompt_count])
+      |> Map.put(:keys, group.keys)
+
+    written = ctx.admit_rows.(old, host.(Enum.map(requests, & &1.row)), values)
+    release(Map.values(old), [])
+    {keys, written} = Map.pop!(written, :keys)
+    %{group | keys: keys, state: Map.merge(group.state, written)}
+  end
+
+  # The rows in `index` get the rows of `values`.
+  defp write_admitted(tensors, index, values) do
+    Map.new(tensors, fn {name, tensor} ->
+      {name,
+       Nx.indexed_put(tensor, Nx.new_axis(index, 1), Nx.as_type(values[name], Nx.type(tensor)))}
+    end)
+  end
+
+  # The selection of each step, until each row has ended.
+  defp decode(ctx, group, notify) do
+    notify.(group)
+    if Enum.all?(group.done), do: finish(group), else: decode(ctx, next(ctx, group), notify)
   end
 
   # Frees the device tensors that the group owns when it ends: its cache, its last selection
@@ -1058,9 +1172,13 @@ defmodule Transmuter.Generation do
       end)
       |> Enum.unzip()
 
-    # A row ends at an eos token or with its own max_new_tokens tokens.
+    # A row ends at an eos token or with the new tokens of its budget.
     ids = push(group.ids, new, new)
-    done = Enum.zip_with(new, ids, &(&1 == nil or length(&2) == ctx.max_new_tokens))
+
+    done =
+      Enum.zip_with([new, ids, group.budgets], fn [token, ids, budget] ->
+        token == nil or length(ids) == budget
+      end)
 
     %{
       group
@@ -1085,7 +1203,17 @@ defmodule Transmuter.Generation do
     # The first beam of each prompt starts at 0 and the others at -1e9, so the first step
     # selects only from the first beam.
     scores = Enum.flat_map(prompts, fn _ -> [0.0 | List.duplicate(-1.0e9, beams - 1)] end)
-    group = start(ctx, repeat.(prompts), repeat.(seeds), inputs, extras, scores)
+    rows = repeat.(prompts)
+    longest = rows |> Enum.map(&length/1) |> Enum.max()
+
+    group =
+      ctx
+      |> open(length(rows), longest + @capacity_margin)
+      |> Map.put(:scores, scores)
+      |> then(
+        &prefill(ctx, &1, requests(ctx, rows, repeat.(seeds), extras), inputs, extras.features)
+      )
+
     items = Enum.map(prompts, &%{finished: [], open?: true, done?: &1 == []})
 
     %{items: items} = search_steps(ctx, group, items, 0)
@@ -1307,11 +1435,11 @@ defmodule Transmuter.Generation do
 
   # The rows of other groups have no token and are not finished. The log-probability of a new
   # token is the first one of its row.
-  defp notify(nil, _prompts, _group, _logprobs?), do: :ok
+  defp notify(nil, _group, _logprobs?), do: :ok
 
-  defp notify(on_token, prompts, group, logprobs?) do
+  defp notify(on_token, group, logprobs?) do
     {tokens, finished} =
-      Enum.zip_with([prompts, group.new, group.done], fn
+      Enum.zip_with([group.prompts, group.new, group.done], fn
         [[], _token, _done?] -> {-1, 0}
         [_prompt, token, done?] -> {token || -1, if(done?, do: 1, else: 0)}
       end)
