@@ -827,6 +827,39 @@ defmodule Transmuter.GenerationBitsTest do
     refute freed?(host)
   end
 
+  # The two stages of largest/2 give the values and indices of Nx.top_k, in the compiled
+  # programs of the test backend. Ties take the lower index first in one chunk and across
+  # chunks. The last chunk of a row of 5123 values (chunks of 128) has 3 values, fewer than
+  # k = 8, and its padding has the smallest value, as do the -inf values of a row with 2 finite
+  # values. With k = 300, the chunks have 512 values, and a row of 200 values is one chunk.
+  test "largest/2 gives the values and indices of Nx.top_k" do
+    opts = Transmuter.TestBackend.compiler_opts()
+    {random, _key} = Nx.Random.normal(Nx.Random.key(7), shape: {2, 5123})
+    top = Nx.reduce_max(random)
+    put = fn tensor, at, value -> Nx.put_slice(tensor, [0, at], Nx.broadcast(value, {2, 1})) end
+    min = Nx.Constants.min_finite(:f32)
+    masked = Nx.broadcast(min, {2, 5123}) |> put.(5, 1.0) |> put.(5121, 2.0) |> put.(1700, 1.0)
+
+    inf =
+      Nx.broadcast(Nx.Constants.neg_infinity(:f32), {2, 5123}) |> put.(7, 1.0) |> put.(5122, 1.0)
+
+    for {tensor, k} <- [
+          {random, 8},
+          {random |> put.(100, top) |> put.(101, top) |> put.(102, top), 8},
+          {random |> put.(100, top) |> put.(2600, top) |> put.(5120, top), 8},
+          {masked, 8},
+          {inf, 8},
+          {random, 300},
+          {Nx.slice_along_axis(random, 0, 200, axis: 1), 150}
+        ] do
+      tensor = Nx.backend_transfer(tensor, Transmuter.TestBackend.backend())
+      {values, indices} = Nx.Defn.jit(&Generation.largest(&1, k), opts).(tensor)
+      {expected, at} = Nx.Defn.jit(&Nx.top_k(&1, k: k), opts).(tensor)
+      assert Nx.to_flat_list(values) == Nx.to_flat_list(expected)
+      assert Nx.to_flat_list(indices) == Nx.to_flat_list(at)
+    end
+  end
+
   # A read of a freed tensor raises, with the error of the backend.
   defp freed?(tensor) do
     Nx.to_flat_list(tensor)

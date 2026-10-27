@@ -1817,7 +1817,7 @@ defmodule Transmuter.Generation do
     sums = Nx.devectorize(sums, keep_names: false)
     {rows, vocab} = Nx.shape(sums)
     shape = {div(rows, settings.num_beams), settings.num_beams * vocab}
-    {values, indices} = Nx.top_k(Nx.reshape(sums, shape), k: settings.candidates)
+    {values, indices} = largest(Nx.reshape(sums, shape), settings.candidates)
     indices = Nx.as_type(indices, :s32)
 
     columns =
@@ -1843,8 +1843,32 @@ defmodule Transmuter.Generation do
     Nx.stack(columns, axis: 1)
   end
 
+  @doc false
+  # Nx.top_k on the last axis in two stages: the top k of each chunk of the row, then the top k
+  # of the chunk results. On CUDA, XLA computes the top_k of each row in one thread block or in
+  # one sort, so a long row in few rows, such as the candidates of beam search or the vocabulary
+  # of a sampled row, uses a small part of the GPU. A chunk has the power of two at or above the square root of the row length, and at
+  # least k values, so a row of up to that length is one chunk. The padding of the last chunk
+  # has the smallest value of the tensor, and the top_k of each stage gives the lower index
+  # first among equal values, so a real value wins each tie with the padding, and the result
+  # is that of Nx.top_k.
+  def largest(tensor, k) do
+    n = Nx.axis_size(tensor, -1)
+    power = &(2 ** ceil(:math.log2(&1)))
+    size = min(max(power.(:math.sqrt(n)), power.(k)), n)
+    chunks = div(n + size - 1, size)
+    rest = tensor.shape |> Tuple.delete_at(tuple_size(tensor.shape) - 1) |> Tuple.to_list()
+    padding = List.duplicate({0, 0, 0}, length(rest)) ++ [{0, chunks * size - n, 0}]
+    padded = Nx.pad(tensor, Nx.reduce_min(Nx.devectorize(tensor)), padding)
+    {values, indices} = Nx.top_k(Nx.reshape(padded, List.to_tuple(rest ++ [chunks, size])), k: k)
+    indices = Nx.add(indices, Nx.multiply(Nx.iota({chunks, 1}), size))
+    flat = List.to_tuple(rest ++ [chunks * k])
+    {values, at} = Nx.top_k(Nx.reshape(values, flat), k: k)
+    {values, Nx.take_along_axis(Nx.reshape(indices, flat), at, axis: -1)}
+  end
+
   defp top_k(logits, k) when k > 0 and k < elem(logits.shape, 0) do
-    {values, _} = Nx.top_k(logits, k: k)
+    {values, _} = largest(logits, k)
     Nx.select(Nx.less(logits, values[-1]), Nx.Constants.min_finite(:f32), logits)
   end
 
