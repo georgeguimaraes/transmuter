@@ -400,9 +400,16 @@ defmodule TransmuterTest do
   end
 
   # The tail runs in the segment after the break, also when that segment is shorter than a
-  # segment that compiles (Break_Range_computed_limit, two nodes), and takes an extra input.
+  # segment that compiles (Break_Range_computed_limit, two nodes) or has no nodes, because the
+  # break node ends the graph (Break_inside_If and Break_NonZero_computed), and takes an extra
+  # input.
   test "a tail runs on the outputs of the last segment, which always compiles" do
-    for name <- ["Break_Range_long_tail", "Break_Range_computed_limit"] do
+    for name <- [
+          "Break_Range_long_tail",
+          "Break_Range_computed_limit",
+          "Break_inside_If",
+          "Break_NonZero_computed"
+        ] do
       model = load_fixture(name)
       x = Nx.tensor([2.0, 1, 1, 1, 1, 1], backend: @backend)
       inputs = %{"x" => x, "factor" => Nx.tensor(3.0, backend: @backend)}

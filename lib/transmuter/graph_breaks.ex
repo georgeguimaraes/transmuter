@@ -301,7 +301,9 @@ defmodule Transmuter.GraphBreaks do
   defp static?(plan, state, name),
     do: Map.has_key?(state.static, name) or Map.has_key?(plan.model.static, name)
 
-  defp run(plan, state, pos) when pos >= tuple_size(plan.nodes), do: state
+  # A plan with a tail ends with a compiled segment also when a break node ends the graph:
+  # that segment has no nodes and runs only the tail.
+  defp run(plan = %{tail: nil}, state, pos) when pos >= tuple_size(plan.nodes), do: state
 
   defp run(plan, state, pos) do
     case segment(plan, state, pos) do
