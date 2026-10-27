@@ -6,11 +6,11 @@ defmodule Transmuter.Generation do
 
   The cache works in one of three modes, from the structure of the graph:
 
-    * `:in_place` - the graph has GroupQueryAttention, which counts the valid rows of the cache from the values of the attention mask. The cache is a buffer as long as the attention mask, and the operator writes the new keys and values after the valid rows.
+    * `:in_place` - the graph has GroupQueryAttention, which counts the valid rows of the cache from the values of the attention mask. Generation gives a GroupQueryAttention that counts them from the length of the mask, as in Gemma 3, the sum of the mask in place of that count, when no other node reads the cache or its length. The cache is a buffer as long as the attention mask, and the operator writes the new keys and values after the valid rows.
 
     * `:append` - the graph declares `position_ids`, or it is a merged decoder whose positions are reads of a table at the length of the cache plus the index of the token, as in GPT-2, Whisper, Marian and TrOCR (see "Merged decoders"). The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph computes the positions from the length of the cache in another way, such as the relative positions of T5 or a rotary angle, or its GroupQueryAttention counts the valid rows from the length of the attention mask, as in Gemma 3. The cache has its exact length, so each length is a new shape that compiles on its first step.
+    * `:grow` - the graph computes the positions from the length of the cache in another way, such as the relative positions of T5 or a rotary angle, or a node other than GroupQueryAttention reads the cache or its length, as the rotary positions of Apertus do. The cache has its exact length, so each length is a new shape that compiles on its first step.
 
   ## Merged decoders
 
@@ -90,7 +90,7 @@ defmodule Transmuter.Generation do
 
   alias Transmuter.Generation.MergedDecoder
   alias Transmuter.{GraphBreaks, Serving}
-  alias Transmuter.Onnx.NodeProto
+  alias Transmuter.Onnx.{AttributeProto, NodeProto}
 
   require Logger
 
@@ -150,7 +150,7 @@ defmodule Transmuter.Generation do
     eos = List.wrap(gen["eos_token_id"] || repo.config["eos_token_id"])
     sampling? = Keyword.get(opts, :strategy, if(gen["do_sample"], do: :sampling)) == :sampling
 
-    model = model |> keep_last_logits() |> MergedDecoder.rewrite()
+    model = model |> keep_last_logits() |> MergedDecoder.rewrite() |> count_rows()
 
     %{
       model: model,
@@ -422,7 +422,7 @@ defmodule Transmuter.Generation do
 
     cond do
       # A buffer as long as the mask works when GroupQueryAttention counts the valid rows
-      # from the values of the mask. Gemma 3 counts them from its length.
+      # from the values of the mask (see count_rows/1).
       gqa && reads_values?(model, Enum.at(gqa.input, 5), "attention_mask") ->
         :in_place
 
@@ -595,6 +595,60 @@ defmodule Transmuter.Generation do
     do: %{attribute | g: %{graph | node: cut(graph.node, lm_heads, name)}}
 
   defp cut_branch(attribute, _lm_heads, _name), do: attribute
+
+  # GroupQueryAttention takes the valid rows of each sequence less one in seqlens_k. Gemma 3
+  # counts them from the length of the attention mask. When no other node reads the cache or
+  # its length, the rows come from the sum of the mask, as in Qwen3. The decoder then runs in
+  # :in_place, where the mask of a row has ones for its valid rows and the new tokens.
+  defp count_rows(model) do
+    gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+    by_length = Enum.reject(gqas, &reads_values?(model, Enum.at(&1.input, 5), "attention_mask"))
+    cache = Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
+    cache = MapSet.new(cache ++ Enum.flat_map(gqas, &Enum.drop(&1.output, 1)))
+    reads_cache? = &Enum.any?(Transmuter.dependencies(&1), fn name -> name in cache end)
+
+    with [_ | _] <- by_length,
+         nil <- Enum.find(model.nodes -- gqas, reads_cache?) do
+      name = &("transmuter.seqlens_k." <> &1)
+      constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+
+      rows = [
+        %NodeProto{
+          op_type: "ReduceSum",
+          name: name.("rows"),
+          input: ["attention_mask", name.("axes")],
+          output: [name.("rows")],
+          attribute: [%AttributeProto{name: "keepdims", type: :INT, i: 0}]
+        },
+        %NodeProto{
+          op_type: "Sub",
+          name: name.("last"),
+          input: [name.("rows"), name.("one")],
+          output: [name.("last")]
+        }
+      ]
+
+      nodes =
+        Enum.map(model.nodes, fn node ->
+          if node in by_length,
+            do: %{node | input: List.replace_at(node.input, 5, name.("last"))},
+            else: node
+        end)
+
+      constants = %{name.("axes") => constant.([1]), name.("one") => constant.(1)}
+      %{model | nodes: rows ++ nodes, static: Map.merge(model.static, constants)}
+    else
+      [] ->
+        model
+
+      node ->
+        Logger.debug(
+          "generation keeps a cache of exact length, because #{where(node)} reads the cache or its length"
+        )
+
+        model
+    end
+  end
 
   # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do

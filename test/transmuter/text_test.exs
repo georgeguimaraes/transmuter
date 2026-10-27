@@ -349,8 +349,9 @@ defmodule Transmuter.TextTest do
            )
   end
 
-  test "Gemma 3 generates with a cache of exact length" do
-    # Its GroupQueryAttention counts the cache rows from the length of the attention mask.
+  test "Gemma 3 generates with a buffer of the KV cache" do
+    # Its GroupQueryAttention counts the cache rows from the length of the attention mask, and
+    # generation gives it the sum of the mask, so it runs in :in_place.
     serving =
       Transmuter.Text.generation(
         {:hf, "onnx-community/gemma-3-270m-it-ONNX"},

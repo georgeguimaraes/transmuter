@@ -14,6 +14,7 @@ defmodule Transmuter.GenerationTest do
   ]
 
   alias Transmuter.{Audio, Generation, Text}
+  alias Transmuter.Onnx.{AttributeProto, NodeProto}
 
   # The best beam of "What is 2 + 2?" ends with eos at the eighth token while the other
   # beams still run. Greedy selection gives "2 + 2 is a classic arithmetic operation that
@@ -635,6 +636,80 @@ defmodule Transmuter.GenerationTest do
     assert rows == alone
     assert length(hd(rows)) < 40
     assert length(Enum.at(rows, 1)) == 40
+  end
+
+  # The Qwen3-MoE and Gemma 3 exports of onnxruntime-genai count the valid rows of
+  # GroupQueryAttention from the length of the attention mask. Generation gives them the sum of
+  # the mask, so they run in :in_place. The same decoder with one more node that reads the
+  # length of the cache stays in :grow, as Apertus does. The first layer gets a window of 8
+  # rows, which the prompts of 5, 12 and 20 tokens and their 16 new tokens pass. In a batch,
+  # each row gives its tokens alone, and the tokens of :grow with log-probabilities within 1e-4.
+  @tag ci_partition: 10
+  test "GroupQueryAttention that counts its rows from the mask length runs in :in_place" do
+    for {source, component} <- [
+          {"onnx-internal-testing/tiny-random-Qwen3MoeForCausalLM", "model"},
+          {"onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration",
+           "decoder_model_merged"}
+        ] do
+      repo = Transmuter.Repo.load!({:hf, source})
+      repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+      model_opts = Keyword.take(@opts, [:backend])
+      outputs = [outputs: &Generation.outputs/1]
+      model = Transmuter.Repo.load_component!(repo, component, :fp32, outputs ++ model_opts)
+
+      embed =
+        if component == "decoder_model_merged",
+          do: [
+            embed: Transmuter.Repo.load_component!(repo, "embed_tokens", :fp32, model_opts),
+            image_token: repo.config["image_token_index"]
+          ],
+          else: []
+
+      window = %AttributeProto{name: "local_window_size", type: :INT, i: 8}
+      first = Enum.find_index(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+
+      model =
+        update_in(model.nodes, fn nodes ->
+          List.update_at(nodes, first, fn node ->
+            attributes = Enum.reject(node.attribute, &(&1.name == window.name))
+            %{node | attribute: [window | attributes]}
+          end)
+        end)
+
+      [past | _] = Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
+      reads = %NodeProto{op_type: "Shape", name: "reads", input: [past], output: ["length"]}
+      grow = %{model | nodes: model.nodes ++ [reads]}
+
+      context = fn model ->
+        opts = [strategy: :greedy, max_new_tokens: 16, token_logprobs: true] ++ embed
+        Generation.context(repo, model, opts)
+      end
+
+      generate = fn model, prompts ->
+        ctx = Generation.compile(context.(model), length(prompts), @opts[:defn_options])
+        Generation.generate(ctx, prompts, List.duplicate(0, length(prompts)))
+      end
+
+      assert context.(model).mode == :in_place
+
+      assert ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+               assert context.(grow).mode == :grow
+             end) =~ "because Shape reads reads the cache or its length"
+
+      prompts = for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: i * 37 * row)
+      rows = generate.(model, prompts)
+      assert Enum.map(rows, &length/1) == [16, 16, 16]
+      assert rows |> Enum.map(fn row -> Enum.map(row, &hd/1) end) |> Enum.uniq() |> length() > 1
+
+      for {row, prompt} <- Enum.zip(rows, prompts) do
+        tokens = Enum.map(row, &hd/1)
+        assert Enum.map(hd(generate.(model, [prompt])), &hd/1) == tokens, source
+        [exact] = generate.(grow, [prompt])
+        assert Enum.map(exact, &hd/1) == tokens, source
+        diff = Enum.zip_with(row, exact, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+        assert diff < 1.0e-4, "#{source}: #{diff}"
+      end
+    end
   end
 
   # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
