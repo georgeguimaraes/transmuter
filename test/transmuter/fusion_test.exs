@@ -246,6 +246,49 @@ defmodule Transmuter.FusionTest do
     assert_same_outputs(model, Map.put(inputs, "sqrt_d", Nx.tensor(8.0)))
   end
 
+  # The padding row of a batch hides all its keys with the smallest f32 value, through an
+  # additive mask as in the HF BERT exports or through a Where. The graph gives that row a
+  # uniform softmax, and so must the kernel, which scales the mask on the GPU.
+  test "a row whose keys are all hidden gets the softmax of the graph", %{tmp_dir: dir} do
+    lowest = Nx.Constants.min_finite(:f32)
+
+    additive = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Mul", ["qk", "scale"], ["scores"]),
+      node("Add", ["scores", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: -1),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    kept = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Where", ["keep", "qk", "fill"], ["kept"]),
+      node("Softmax", ["kept"], ["probs"], axis: -1),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    # 16 queries take the full kernel of MLX, which has the scale of the mask.
+    key = Nx.Random.key(4)
+    {q, key} = Nx.Random.normal(key, shape: {2, 4, 16, 64})
+    {k, key} = Nx.Random.normal(key, shape: {2, 4, 16, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {2, 4, 16, 64})
+
+    keep =
+      Nx.less(Nx.iota({2, 1, 1, 16}, axis: 3), Nx.tensor([12, 0]) |> Nx.reshape({2, 1, 1, 1}))
+
+    mask = Nx.select(keep, 0.0, lowest)
+    constants = %{"scale" => Nx.tensor(0.125), "fill" => lowest}
+
+    for {nodes, given} <- [{additive, %{"mask" => mask}}, {kept, %{"keep" => keep}}] do
+      names = ["q", "k", "v" | Map.keys(given)]
+      model = write(dir, nodes, constants, names, ["y"])
+      assert ops(model) == ["Transpose", "AttentionCore"]
+      assert_same_outputs(model, Map.merge(%{"q" => q, "k" => k, "v" => v}, given))
+    end
+  end
+
   defp ops(path), do: Enum.map(Transmuter.load!(path).nodes, & &1.op_type)
 
   # The fused model gives the outputs of the graph without the rewrite, on Nx.BinaryBackend

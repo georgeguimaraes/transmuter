@@ -778,17 +778,28 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   # The kernel takes one additive mask of rank 4 in the type of q. It is built from the masks
-  # without a tensor of zeros, which an eager run would allocate on the default backend.
+  # without a tensor of zeros, which an eager run would allocate on the default backend. The
+  # GPU kernel multiplies the mask by log2(e), which is less than 2, for its exp2. So a mask
+  # value below half the smallest finite value becomes -inf there, and a row whose keys are
+  # all hidden gives NaN. The mask stops at half the smallest finite value, which still gives
+  # a hidden key no weight, and a row whose keys are all hidden gets the uniform softmax of
+  # the graph.
   defp fused_attention(q, k, v, opts) do
     {s, t} = {Nx.axis_size(q, 2), Nx.axis_size(k, 2)}
     type = Nx.type(q)
     {bias, hidden} = masks(opts, s, t)
-    bias = bias && Nx.as_type(bias, type)
+
+    lowest =
+      Nx.tensor(Nx.to_number(Nx.Constants.min_finite(type, backend: Nx.BinaryBackend)) / 2,
+        type: type
+      )
+
+    bias = bias && bias |> Nx.as_type(type) |> Nx.max(lowest)
     shape = broadcast_shape([{1, 1, 1, t} | for(m <- [bias, hidden], m, do: Nx.shape(m))])
 
     mask =
       if hidden,
-        do: Nx.select(Nx.broadcast(hidden, shape), Nx.Constants.min_finite(type), bias || 0),
+        do: Nx.select(Nx.broadcast(hidden, shape), lowest, bias || 0),
         else: Nx.broadcast(bias, shape)
 
     EMLX.Fast.scaled_dot_product_attention(q, k, v, opts.scale, mask)
