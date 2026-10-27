@@ -96,9 +96,25 @@ defmodule Transmuter.Ops.Shape do
       else: Nx.tile(a, repeats)
   end
 
+  # A reshape, as for Unsqueeze: a compiled Nx.squeeze of a squeeze raises when an axis of the
+  # inner squeeze comes after an axis of the outer one (merge_squeeze/3 of Nx.Defn.Expr, nx
+  # 1.0.0), as in the two squeezes of the rotary table of the merged llama2.c export.
   defp op(node = %{op_type: "Squeeze"}, [a | rest]) do
-    axes = values_or_attr(node, List.first(rest), "axes")
-    if axes, do: Nx.squeeze(a, axes: axes), else: Nx.squeeze(a)
+    dims = a |> Nx.shape() |> Tuple.to_list()
+
+    axes =
+      case values_or_attr(node, List.first(rest), "axes") do
+        nil -> for {1, axis} <- Enum.with_index(dims), do: axis
+        axes -> Enum.map(axes, &normalize_axis(&1, length(dims)))
+      end
+
+    unless Enum.all?(axes, &(Enum.at(dims, &1) == 1)) do
+      raise ArgumentError,
+            "Squeeze takes axes of size 1, got #{inspect(axes)} of #{inspect(dims)}"
+    end
+
+    shape = for {dim, axis} <- Enum.with_index(dims), axis not in axes, do: dim
+    Nx.reshape(a, List.to_tuple(shape))
   end
 
   defp op(%{op_type: "Size"}, [a]), do: a |> shape_of() |> Tuple.product() |> static_tensor(:s64)

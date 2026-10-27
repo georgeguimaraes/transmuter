@@ -1638,3 +1638,10 @@ case("Conv_patches_3d", [node("Conv", ["x", "w"], ["y"], strides=[2, 3, 3], pads
 case("ConvInteger_patches", [node("ConvInteger", ["x", "w", "xz", "wz"], ["y"], strides=[16, 16])],
      {"x": r.integers(0, 256, (1, 3, 32, 48)).astype(np.uint8)},
      {"w": r.integers(0, 256, (4, 3, 16, 16)).astype(np.uint8), "xz": np.array(128, np.uint8), "wz": np.array(7, np.uint8)})
+
+# ---------- shape ----------
+
+# A Squeeze of a Squeeze whose inner axis comes after the outer axis, as the two squeezes of the
+# rotary table in the merged llama2.c export. In a compiled function, Nx merges the two squeezes.
+case("Squeeze_of_squeeze", [node("Squeeze", ["x", "inner"], ["s"]), node("Squeeze", ["s", "outer"], ["y"])],
+     {"x": np.arange(6, dtype=np.float32).reshape(1, 1, 2, 3)}, {"inner": i64(1), "outer": i64(0)})
