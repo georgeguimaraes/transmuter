@@ -476,8 +476,8 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   defp shift_read(node = %{op_type: "AttentionCore"}, _name) do
-    padding = List.duplicate("", 8 - length(node.input))
-    [%{node | input: node.input ++ padding ++ [@key_mask]}]
+    padding = List.duplicate("", max(9 - length(node.input), 0))
+    [%{node | input: List.replace_at(node.input ++ padding, 8, @key_mask)}]
   end
 
   defp shift_read(node = %{op_type: "Gather", input: [table, index]}, name) do

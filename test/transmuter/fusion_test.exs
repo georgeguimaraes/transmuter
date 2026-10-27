@@ -246,6 +246,77 @@ defmodule Transmuter.FusionTest do
     assert_same_outputs(model, Map.put(inputs, "sqrt_d", Nx.tensor(8.0)))
   end
 
+  # The forms of other exports: the scaled q and k of scaled_dot_product_attention, with a
+  # factor from the head size as in Florence-2 and moonshine or a factor that the compiled
+  # function does not know, T5 with a Cast of the masked scores, and llama2.c with two Casts
+  # of the probabilities.
+  test "the attention cores of Florence-2, T5 and llama2.c become AttentionCore",
+       %{tmp_dir: dir} do
+    head_size = [
+      node("Shape", ["q"], ["q_shape"]),
+      node("Gather", ["q_shape", "three"], ["head_size"]),
+      node("Cast", ["head_size"], ["head_size_f"], to: 1),
+      node("Pow", ["head_size_f", "quarter"], ["root"]),
+      node("Reciprocal", ["root"], ["factor"])
+    ]
+
+    scaled = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("Mul", ["q", "factor"], ["qs"]),
+      node("Mul", ["kt", "factor"], ["ks"]),
+      node("MatMul", ["qs", "ks"], ["qk"]),
+      node("Add", ["qk", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: -1),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    t5 = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Add", ["qk", "mask"], ["masked"]),
+      node("Cast", ["masked"], ["masked_f"], to: 1),
+      node("Softmax", ["masked_f"], ["probs"], axis: -1),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    llama = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Div", ["qk", "sqrt_d"], ["scores"]),
+      node("Add", ["scores", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: -1),
+      node("Cast", ["probs"], ["probs_f"], to: 1),
+      node("Cast", ["probs_f"], ["probs_ff"], to: 1),
+      node("MatMul", ["probs_ff", "v"], ["y"])
+    ]
+
+    constants = %{
+      "three" => Nx.tensor(3, type: :s64),
+      "quarter" => Nx.tensor(0.25),
+      "sqrt_d" => Nx.tensor(8.0)
+    }
+
+    key = Nx.Random.key(3)
+    {q, key} = Nx.Random.normal(key, shape: {2, 4, 3, 64})
+    {k, key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+    mask = Nx.tensor([[0, 0, 0, -1.0e9, -1.0e9], [0, 0, 0, 0, 0]]) |> Nx.reshape({2, 1, 1, 5})
+    inputs = %{"q" => q, "k" => k, "v" => v, "mask" => mask}
+
+    for {nodes, given, ops} <- [
+          {head_size ++ scaled, %{},
+           ~w(AttentionCore Cast Gather Pow Reciprocal Shape Transpose)},
+          {scaled, %{"factor" => Nx.tensor(0.3536)}, ~w(AttentionCore Transpose)},
+          {t5, %{}, ~w(AttentionCore Transpose)},
+          {llama, %{}, ~w(AttentionCore Transpose)}
+        ] do
+      names = ["q", "k", "v", "mask" | Map.keys(given)]
+      model = write(dir, nodes, constants, names, ["y"])
+      assert Enum.sort(ops(model)) == ops
+      assert_same_outputs(model, Map.merge(inputs, given))
+    end
+  end
+
   # The padding row of a batch hides all its keys with the smallest f32 value, through an
   # additive mask as in the HF BERT exports or through a Where. The graph gives that row a
   # uniform softmax, and so must the kernel, which scales the mask on the GPU.

@@ -6,7 +6,7 @@ defmodule Transmuter.Fusion do
 
     * `Pow(x, 2)`, `ReduceMean`, `Add(eps)`, `Sqrt`, then `x / sqrt`, `x * (1 / sqrt)` or `x * Reciprocal(sqrt)`, then `Mul(weight)` becomes `SimplifiedLayerNormalization`.
     * `ReduceMean`, `Sub`, the RMSNorm of the difference, then `Mul(gamma)` and `Add(beta)` becomes `LayerNormalization`.
-    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, an optional `Cast` to a float type, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, `Softmax`, an optional `Cast` to a float type, an optional pair of `Reshape` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way.
+    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, optional `Cast`s to float types, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, optional `Cast`s to float types, `Softmax`, optional `Cast`s to float types, an optional pair of `Reshape` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way, T5 exports cast the masked scores, and llama2.c exports cast the probabilities two times. When q and k are both a `Mul` by a factor, as the scaled q and k of `scaled_dot_product_attention` in the Florence-2 and moonshine exports, the factors become inputs of `AttentionCore`.
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
@@ -200,23 +200,25 @@ defmodule Transmuter.Fusion do
     end
   end
 
-  # The probabilities are Softmax(scores + mask), optionally through a Cast to a float type,
+  # The probabilities are Softmax(scores + mask), optionally through Casts to float types,
   # and the mask is optional. The inputs of AttentionCore are q, k, v, the mask, the keys to
   # keep, the divisor of the scores and the shapes of a Reshape pair of the probabilities,
-  # with "" for a missing one.
+  # with "" for a missing one. Factors of q and k follow at 9 and 10, after the key mask of a
+  # KV buffer (see Transmuter.Generation.MergedDecoder).
   defp attention(ctx, matmul = %{input: [probs, v]}) do
     {probs, split, merge, reshaped} = reshape_pair(ctx, probs)
 
     with {softmax, cast} <- through_cast(ctx, probs, "Softmax"),
          {logits, mask, masked} <- masked(ctx, hd(softmax.input)),
-         {qk = %{input: [q, k]}, scores} <- scores(ctx, logits) do
+         {qk, scores} <- scores(ctx, logits) do
       default_axis = if ctx.opset >= 13, do: -1, else: 1
+      [q, k, factors] = scores.operands
 
       node = %NodeProto{
         op_type: "AttentionCore",
         domain: "transmuter",
         name: matmul.name,
-        input: [q, k, v, mask, scores.keep, scores.divisor, split, merge],
+        input: [q, k, v, mask, scores.keep, scores.divisor, split, merge] ++ factors,
         output: matmul.output,
         attribute: [
           %AttributeProto{name: "scale", type: :FLOAT, f: scores.scale},
@@ -246,15 +248,17 @@ defmodule Transmuter.Fusion do
   end
 
   defp masked(ctx, z) do
-    with add = %{} <- op(ctx, z, "Add"),
+    {sum, cast} = through_cast(ctx, z)
+
+    with add = %{} <- op(ctx, sum, "Add"),
          [logits, mask] <- Enum.find(orders(add.input), &scores(ctx, hd(&1))) do
-      {logits, mask, [add]}
+      {logits, mask, [add | cast]}
     else
       _ -> {z, "", []}
     end
   end
 
-  # The scores are MatMul(q, k), an optional scale, an optional Cast to a float type, and an
+  # The scores are MatMul(q, k), an optional scale, optional Casts to float types, and an
   # optional Where that keeps the scores of some keys and gives the others a fill of at most
   # -1.0e4, which gives them no weight. Returns the MatMul and the parts of the scores.
   defp scores(ctx, name) do
@@ -263,16 +267,35 @@ defmodule Transmuter.Fusion do
     {product, scale, divisor, scaled} = scaled(ctx, name)
 
     if qk = op(ctx, product, "MatMul") do
+      {operands, factored} = factors(ctx, qk.input)
+
       {qk,
        %{
+         operands: operands,
          scale: scale,
          divisor: divisor,
          keep: keep,
          fill: fill,
-         nodes: kept ++ cast ++ scaled
+         nodes: kept ++ cast ++ scaled ++ factored
        }}
     end
   end
+
+  # q and k that are both a Mul that only the MatMul reads give their other operands and
+  # their factors, as the scaled q and k of scaled_dot_product_attention. The factor is a
+  # constant operand, or else the second one. Returns [q, k, the factor inputs] and the Muls.
+  defp factors(ctx, [q, k]) do
+    muls = Enum.map([q, k], &op(ctx, &1, "Mul"))
+
+    if Enum.all?(muls, &(&1 && ctx.uses[hd(&1.output)] == 1)) do
+      [[q, q_factor], [k, k_factor]] = Enum.map(muls, &factored(ctx, &1.input))
+      {[q, k, ["", q_factor, k_factor]], muls}
+    else
+      {[q, k, []], []}
+    end
+  end
+
+  defp factored(ctx, [a, b]), do: if(scalar(ctx, a), do: [b, a], else: [a, b])
 
   defp kept(ctx, name) do
     with where = %{input: [keep, scores, fill]} <- op(ctx, name, "Where"),
@@ -283,19 +306,19 @@ defmodule Transmuter.Fusion do
     end
   end
 
-  # The node of op_type that computes name, directly or through a Cast to a float type.
+  # The node of op_type that computes name, directly or through Casts to float types.
   defp through_cast(ctx, name, op_type) do
     {inner, cast} = through_cast(ctx, name)
     if node = op(ctx, inner, op_type), do: {node, cast}
   end
 
   defp through_cast(ctx, name) do
-    case op(ctx, name, "Cast") do
-      cast = %{input: [inner]} ->
-        if Ops.attr(cast, "to") in @float_types, do: {inner, [cast]}, else: {name, []}
-
-      nil ->
-        {name, []}
+    with cast = %{input: [inner]} <- op(ctx, name, "Cast"),
+         true <- Ops.attr(cast, "to") in @float_types do
+      {inner, casts} = through_cast(ctx, inner)
+      {inner, [cast | casts]}
+    else
+      _ -> {name, []}
     end
   end
 

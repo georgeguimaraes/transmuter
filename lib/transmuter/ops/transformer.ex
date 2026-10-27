@@ -8,7 +8,7 @@ defmodule Transmuter.Ops.Transformer do
 
   Without the kernel, the attention core builds the scores of the query rows, in f32 or in the wider float type of q and k. When the scores of all rows take more than 256 MiB, the core runs on chunks of query rows, one chunk at a time. The rows split into the fewest chunks whose scores fit in 256 MiB, with the same number of rows in each chunk. A chunk has at least one row, so when the scores of one row take more than 256 MiB, the scores of a chunk take more too. Each row has its own softmax over all keys, so the chunks give the values of all rows at once. For example, a 1540x1540 image in the vision encoder of Ministral 3 has 12100 query rows and scores of 9.4 GB, which become 35 chunks of 346 rows and 268 MB.
 
-  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor and the two shapes of a `Reshape` pair of the probabilities. Its `k` is the right operand of the first `MatMul`. It runs as the shared attention core, the kernel on EMLX or the chunks of query rows, when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities. The other layouts keep the plain operations of the graph and build the scores of all rows at once: the `MatMul` broadcasting, a divisor tensor, a softmax along another axis and a `Reshape` pair do not split by query row.
+  `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor, the two shapes of a `Reshape` pair of the probabilities, the key mask of a KV buffer (see `Transmuter.Generation.MergedDecoder`) and the factors of q and k, which multiply q and k before their product. Its `k` is the right operand of the first `MatMul`. A factor that the host can read becomes part of the scale. It runs as the shared attention core, the kernel on EMLX or the chunks of query rows, when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities. The other layouts keep the plain operations of the graph and build the scores of all rows at once: the `MatMul` broadcasting, a divisor tensor, a softmax along another axis and a `Reshape` pair do not split by query row.
   """
 
   alias Nx.Defn.Expr
@@ -317,9 +317,10 @@ defmodule Transmuter.Ops.Transformer do
   # A divisor that the host can read becomes part of the scale. The keys where keep is 0 get
   # the fill, at most -1.0e4, which the shared core replaces with the smallest finite value.
   defp attention_core(node, [q, k, v | optional], opset) do
-    [mask, keep, divisor, split, merge, keys] = optional(optional, 6)
+    [mask, keep, divisor, split, merge, keys, q_factor, k_factor] = optional(optional, 8)
     keep = keep_keys(keep, keys, scores_shape(q, k))
-    scale = attr(node, "scale")
+    {scale, q} = factored(attr(node, "scale"), q, q_factor)
+    {scale, k} = factored(scale, k, k_factor)
 
     {scale, divisor} =
       case divisor && known?(divisor) && Nx.size(divisor) == 1 &&
@@ -340,6 +341,18 @@ defmodule Transmuter.Ops.Transformer do
       if batched?, do: Nx.squeeze(out, axes: [0]), else: out
     else
       plain_core(node, [q, k, v, mask, keep, divisor, split, merge], scale, opset)
+    end
+  end
+
+  # A factor of q or k that the host can read joins the scale. Another factor multiplies
+  # the operand, as the Mul of the graph did.
+  defp factored(scale, x, nil), do: {scale, x}
+
+  defp factored(scale, x, factor) do
+    case known?(factor) && Nx.size(factor) == 1 &&
+           factor |> known!("the factor") |> Nx.reshape({}) |> Nx.to_number() do
+      f when is_number(f) -> {scale * f, x}
+      _other -> {scale, Nx.multiply(x, factor)}
     end
   end
 
