@@ -752,15 +752,31 @@ defmodule Transmuter.Generation do
               settings
             )
 
+      step = Nx.add(extra[@step], 1)
+
       outputs
-      |> Map.put(@selected, selected)
+      |> Map.put(@selected, anchor(selected, [seen, step, row.tokens, row.count]))
       |> Map.put(@next_seen, seen)
-      |> Map.put(@next_step, Nx.add(extra[@step], 1))
+      |> Map.put(@next_step, step)
       |> Map.put(@next_history, row.tokens)
       |> Map.put(@next_count, row.count)
     end
 
     {{:select, settings}, fun}
+  end
+
+  # The host reads only the selection, and the next step reads the other outputs of the
+  # step. On EMLX 0.5, each of these stays an expression until the next step evaluates it, in
+  # a wait of its own (elixir-nx/emlx#158 removes this). So the selection gets 0 times the first
+  # value of each integer output, and the read of the selection evaluates them in the same
+  # wait. 0 times an integer is 0, so the selection does not change. A float output has no
+  # part in it, because 0 times NaN or infinity is NaN.
+  defp anchor(selected, outputs) do
+    for tensor <- outputs, Nx.Type.integer?(Nx.type(tensor)), reduce: selected do
+      selected ->
+        first = tensor |> Nx.reshape({Nx.size(tensor)}) |> Nx.slice([0], [1])
+        Nx.add(selected, Nx.multiply(Nx.as_type(first, Nx.type(selected)), 0))
+    end
   end
 
   # Writes the new token of each row after its tokens, and counts it. A row without a new
