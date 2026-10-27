@@ -177,7 +177,8 @@ The serving works with any decoder export that has a KV cache. It reads the shap
 
 - Exports with GroupQueryAttention that counts the valid rows from the values of the attention mask, such as the `onnx-community` exports of Qwen3 and SmolLM2, write the cache in place.
 - Exports that declare `position_ids` keep the cache in a buffer with masked free rows.
-- Merged decoders without `position_ids`, such as `Xenova/gpt2`, grow the cache by one row for each token. Gemma 3 also grows the cache, because its GroupQueryAttention counts the valid rows from the length of the attention mask. Each cache length is a new shape, which compiles on its first step and stays cached. So the first request is slower. With `Xenova/gpt2` and 64 new tokens on an Apple silicon GPU, the first request takes 2.9 s and later requests take 0.4 s.
+- Merged decoders without `position_ids`, such as `Xenova/gpt2`, also keep the cache in a buffer. `Transmuter.Generation.MergedDecoder` gives their positions the valid rows of the buffer.
+- Other decoders, such as Gemma 4 E2B, where a node reads the cache, grow the cache by one row for each token. Each cache length is a new shape, which compiles on its first step and stays cached. So the first request is slower.
 
 `Transmuter.Generation` describes the three modes of the cache.
 
@@ -211,8 +212,9 @@ Set `compile: [batch_size: n]` to generate for up to `n` inputs in one loop. The
 |---|---|---|---|
 | `HuggingFaceTB/SmolLM2-135M-Instruct` (q4) | 128 tokens/s | 337 tokens/s | 529 tokens/s |
 | `onnx-community/Qwen3-0.6B-ONNX` (q4) | 86 tokens/s | 199 tokens/s | 268 tokens/s |
+| `Xenova/gpt2` (fp32) | 166 tokens/s | 401 tokens/s | 497 tokens/s |
 
-The table shows the total tokens per second of 16 concurrent requests to a started serving with `batch_timeout: 10`, with greedy selection and up to 128 new tokens for each request. The values are the median of 5 runs with EMLX on an Apple M2 Pro GPU, from `bench/generation_throughput.exs`. A batch runs until its longest row stops, so the gain is smaller when the lengths of the answers are very different.
+The table shows the total tokens per second of 16 concurrent requests to a started serving with `batch_timeout: 10`, with greedy selection and up to 128 new tokens for each request. The values are the median of 5 runs with EMLX on an Apple M2 Pro GPU, from `bench/generation_throughput.exs`. The prompts of `Xenova/gpt2` have 7 different lengths. A batch runs until its longest row stops, so the gain is smaller when the lengths of the answers are very different.
 
 The prompts of a batch can have different lengths. Each row has its own length in the KV cache, its own positions, its own sampling key and its own stop at the eos token. A row that stops gets padding tokens until the batch ends. When fewer inputs than `n` arrive, padding rows fill the batch. With greedy selection, and with sampling from a seed, each input gives the same text as when it runs alone.
 
@@ -222,7 +224,7 @@ The mode of the KV cache decides how the rows share the cache:
 - With `position_ids`, all rows of a step write their new rows at one place in the buffer, after the rows of the earlier steps. A row with fewer tokens than the step leaves gap rows there. The attention mask of each row hides its gap rows and the free rows.
 - A decoder that grows its cache gets its positions from the length of the cache, which is the same for all rows.
 
-Only some decoders run prompts of different lengths in one step. A decoder that grows its cache needs one length for all rows. A merged decoder of optimum, such as `Xenova/gpt2`, runs its prompt as one step on its branch without cache (see "Merged decoders" in `Transmuter.Generation`), also when it writes a buffer. For these decoders, the serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` (fp32) gave 165 tokens/s with `batch_size: 1`, 134 tokens/s with `batch_size: 4` and 141 tokens/s with `batch_size: 8`, so the batch was slower than one input at a time. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
+A decoder that grows its cache needs one length for all rows. For such a decoder, the serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. A merged decoder of optimum runs the prompt of each length as one step on its branch without cache (see "Merged decoders" in `Transmuter.Generation`). When it reads its positions from a table, as `Xenova/gpt2` does, the rows of all prompt lengths then decode together, while the sum of the prompt lengths and the new tokens fits the static tables of the decoder. Other merged decoders, such as M2M100 and Whisper, run a group for each prompt length. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 

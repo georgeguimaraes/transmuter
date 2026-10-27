@@ -14,9 +14,9 @@ defmodule Transmuter.Generation do
 
   ## Merged decoders
 
-  A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The first step takes the branch without cache, because Nx has no tensors of length 0. The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same). So the prompt of a merged decoder runs as one step on the branch without cache, only the new tokens take the branch with cache, and the rows of a group have prompts of one length.
+  A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The first step takes the branch without cache, because Nx has no tensors of length 0. The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same). So the prompt of a merged decoder runs as one step on the branch without cache, and only the new tokens take the branch with cache. The prompts of a batch run as one step for each prompt length, from the longest to the shortest, and each row takes its first token from the step of its prompt.
 
-  A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`.
+  A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`. When the valid rows have one value for each row, as in GPT-2, the rows of prompts of different lengths run together, and the steps of the other prompt lengths leave gap rows in each row. A group takes the next prompt length while the sum of its prompt lengths and the new tokens fits the static tables of the decoder, else the length starts a new group. When they have one value for all rows, as in M2M100 and Whisper, the prompts of each length run as one group, as in `:grow` (see "Batches").
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its first step computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. Later steps give an empty present for this cache, so the cache keeps its value.
 
@@ -73,13 +73,13 @@ defmodule Transmuter.Generation do
 
   In `:in_place` and `:append`, all rows share one buffer. In `:in_place`, each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. The attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, all rows of a step write their new rows at one offset: the sum of the lengths of the earlier steps. So one update of each buffer writes the step, in place of one update for each row. A row with fewer tokens than the step, such as a shorter part of a prompt or a finished row, leaves gap rows after its tokens. The host keeps the valid rows of each row, and the attention mask has ones only for them and for the new tokens, so it hides the gap rows and the free rows. Both modes give the positions of each row in `position_ids`, from the tokens of the row and not from its rows in the buffer.
 
-  The buffer starts with a capacity of a power of two that fits the longest prompt and 16 more rows. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A merged decoder that `Transmuter.Generation.MergedDecoder` moves to `:append` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
+  The buffer starts with a capacity of a power of two that fits the rows of the prompt steps and 16 more rows. These rows are the longest prompt, or with a merged decoder the sum of the prompt lengths of the group. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A merged decoder that `Transmuter.Generation.MergedDecoder` moves to `:append` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
 
-  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
+  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group. A merged decoder in `:append` with one position offset for all rows also runs a group for each prompt length (see "Merged decoders").
 
   ## Logits
 
-  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own Slice before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
+  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A merged decoder runs the whole prompt of a row in the step of its length, so the prompt ends at the last position of that step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own Slice before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
 
   ## Device memory
 
@@ -119,7 +119,7 @@ defmodule Transmuter.Generation do
 
   # Buffers have a capacity of a power of two, from this size, or from the smaller size for a
   # merged decoder that MergedDecoder moves to :append (see "Batches"). The capacity starts at
-  # the longest prompt and a margin, and grows when a step does not fit (see grow/3).
+  # the rows of the prompt parts and a margin, and grows when a step does not fit (see grow/3).
   @min_capacity 256
   @merged_min_capacity 32
   @capacity_margin 16
@@ -707,7 +707,14 @@ defmodule Transmuter.Generation do
 
     runs =
       [0, 1]
-      |> Enum.map(&step_inputs(ctx, %{state | lengths: List.duplicate(&1, batch_size)}, tokens))
+      |> Enum.map(
+        &step_inputs(
+          ctx,
+          %{state | lengths: List.duplicate(&1, batch_size)},
+          tokens,
+          List.duplicate(1, batch_size)
+        )
+      )
       |> Enum.uniq_by(fn {_inputs, static} -> static end)
       |> Map.new(fn {inputs, static} ->
         names = ctx.model.inputs -- Map.keys(Map.merge(inputs, static))
@@ -983,11 +990,11 @@ defmodule Transmuter.Generation do
     ids =
       for prompts <- groups(ctx, prompts) do
         if ctx.num_beams == 1 do
-          longest = prompts |> Enum.map(&length/1) |> Enum.max()
+          lengths = for prompt <- prompts, prompt != [], do: length(prompt)
 
           group =
             ctx
-            |> open(length(prompts), longest + @capacity_margin)
+            |> open(length(prompts), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
             |> then(&admit(ctx, &1, requests(ctx, prompts, seeds, extras), inputs, features))
             |> then(
               &decode(ctx, &1, fn group -> notify(on_token, group, ctx.token_logprobs?) end)
@@ -1008,16 +1015,39 @@ defmodule Transmuter.Generation do
     do: Enum.max(List.flatten(axes), fn -> -1 end) + 1 - length(List.first(axes, []))
 
   # The prompts of each group of rows that share a cache, with empty prompts for the other
-  # rows. A buffer keeps the length of each row, so all prompts are one group.
+  # rows. A group has the prompts of one length when the rows of a step need one length of the
+  # cache (see one_length?/1). Otherwise a buffer keeps the length of each row, and a group
+  # takes the next prompt length while the rows of its prompt parts and its new tokens fit the
+  # largest capacity of the decoder.
   defp groups(ctx, prompts) do
-    key =
-      if ctx.mode == :grow or merged?(ctx),
-        do: &length/1,
-        else: fn _prompt -> :buffer end
+    lengths = prompts |> Enum.reject(&(&1 == [])) |> Enum.map(&length/1) |> Enum.uniq()
 
-    for group <- prompts |> Enum.reject(&(&1 == [])) |> Enum.map(key) |> Enum.uniq() do
-      Enum.map(prompts, &if(&1 != [] and key.(&1) == group, do: &1, else: []))
+    chunk = fn length, group ->
+      if group == [] or (not one_length?(ctx) and fits?(ctx, [length | group])),
+        do: {:cont, [length | group]},
+        else: {:cont, group, [length]}
     end
+
+    for group <- Enum.chunk_while(lengths, [], chunk, &{:cont, &1, []}) do
+      Enum.map(prompts, &if(length(&1) in group, do: &1, else: []))
+    end
+  end
+
+  defp fits?(ctx, lengths) do
+    rows = Enum.sum(part_sizes(ctx, lengths)) + ctx.max_new_tokens - 1
+    rows <= (ctx.max_capacity || rows)
+  end
+
+  # The lengths of the prompt parts of rows with these numbers of tokens: one part for each
+  # length with a merged decoder, else parts of power-of-two lengths with a last part no
+  # longer than the shortest row.
+  defp part_sizes(ctx, lengths) do
+    longest = Enum.max(lengths)
+    last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
+
+    if merged?(ctx),
+      do: lengths |> Enum.uniq() |> Enum.sort(:desc),
+      else: chunks(longest - last) ++ [last]
   end
 
   # The requests of the rows of `prompts` that have a prompt: the row, its prompt, its seed,
@@ -1086,24 +1116,23 @@ defmodule Transmuter.Generation do
   # parts from the last one, so the last token of each prompt is in the last part. A row that
   # has a new token from an earlier step takes it in the last part, and has no tokens in the
   # other parts. The last part is no longer than the tokens of each row in it, so it ends each
-  # row at its last position, where the step keeps the logits. A merged decoder runs the
-  # prompt as one part, on the branch without cache (see the module documentation), and its
-  # groups have rows of one length, so in :grow and with a merged decoder, requests join only
-  # a group without other rows.
+  # row at its last position, where the step keeps the logits. A merged decoder runs each
+  # prompt as one part, on the branch without cache (see the module documentation): one part
+  # for each prompt length. So when the rows of a step need one length of the cache, and with
+  # a merged decoder, requests join only a group without other rows. Each row takes its first
+  # token from the part where its prompt ends.
   defp prefill(ctx, group, requests, inputs, features) do
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
-    if (ctx.mode == :grow or merged?(ctx)) and Enum.any?(pending) do
+    if (one_length?(ctx) or merged?(ctx)) and Enum.any?(pending) do
       raise ArgumentError,
-            "requests can join a group with other rows only in :in_place and :append without a merged decoder"
+            "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder"
     end
 
     # A row with a new token has one token in these steps.
     joining = Map.new(requests, &{&1.row, &1})
     lengths = Enum.map(requests, &length(&1.prompt)) ++ for(token <- pending, token, do: 1)
-    longest = Enum.max(lengths)
-    last = min(List.last(chunks(longest)), hd(chunks(Enum.min(lengths))))
-    sizes = if merged?(ctx), do: [longest], else: chunks(longest - last) ++ [last]
+    sizes = part_sizes(ctx, lengths)
 
     group =
       Enum.reduce(requests, group, fn request, group ->
@@ -1140,7 +1169,7 @@ defmodule Transmuter.Generation do
     parts =
       for {token, row} <- Enum.with_index(pending) do
         case joining do
-          %{^row => request} -> split_from_end(request.prompt, sizes)
+          %{^row => request} -> prompt_parts(ctx, request.prompt, sizes)
           _other -> List.duplicate([], length(sizes) - 1) ++ [List.wrap(token)]
         end
       end
@@ -1156,14 +1185,53 @@ defmodule Transmuter.Generation do
     state = Map.merge(group.state, %{seen: nil, history: nil, count: nil, features: features})
     state = %{state | inputs: Map.merge(state.inputs, inputs)}
 
-    state =
+    # The part where the prompt of each row of the selection ends, counted from the last part,
+    # whose selection gives its first token. The selection has one row for the num_beams rows
+    # of each prompt. The rows that end in an earlier part take its selection.
+    ends =
+      parts
+      |> Enum.take_every(ctx.num_beams)
+      |> Enum.map(fn row -> Enum.find_index(Enum.reverse(row), &(&1 != [])) end)
+
+    count = length(sizes)
+
+    {state, picked} =
       parts
       |> Enum.zip_with(& &1)
       |> Enum.zip(selections)
-      |> Enum.reduce(state, fn {parts, selection}, state -> step(ctx, state, parts, selection) end)
+      |> Enum.with_index()
+      |> Enum.reduce({state, []}, fn {{parts, selection}, k}, {state, picked} ->
+        state = step(ctx, state, parts, selection)
+        rows = for {last, row} <- Enum.with_index(ends), last == count - 1 - k, last > 0, do: row
+        {state, if(rows == [], do: picked, else: [{rows, Nx.to_list(state.selected)} | picked])}
+      end)
 
     release(Map.values(own), [])
-    %{group | state: %{state | features: nil}}
+    %{group | state: %{state | features: nil, selected: selected(state.selected, picked)}}
+  end
+
+  # The parts of a prompt: the parts of power-of-two lengths that fill from the last one, or for
+  # a merged decoder the whole prompt in the part of its length.
+  defp prompt_parts(ctx, prompt, sizes) do
+    if merged?(ctx),
+      do: Enum.map(sizes, &if(&1 == length(prompt), do: prompt, else: [])),
+      else: split_from_end(prompt, sizes)
+  end
+
+  # The selection of each row from the part where its prompt ends. `picked` has the rows of the
+  # selection and the selection of each earlier part where prompts end. The other rows keep the
+  # selection of the last part, which stays on the device when no earlier part has rows.
+  defp selected(last, []), do: last
+
+  defp selected(last, picked) do
+    rows =
+      Enum.reduce(picked, Nx.to_list(last), fn {ended, selected}, rows ->
+        Enum.reduce(ended, rows, &List.replace_at(&2, &1, Enum.at(selected, &1)))
+      end)
+
+    tensor = Nx.tensor(rows, type: Nx.type(last), backend: Nx.BinaryBackend)
+    release([last], [])
+    tensor
   end
 
   # Writes the device state of the rows of `requests`: the seen tokens and the tokens of its
@@ -1258,11 +1326,11 @@ defmodule Transmuter.Generation do
     # selects only from the first beam.
     scores = Enum.flat_map(prompts, fn _ -> [0.0 | List.duplicate(-1.0e9, beams - 1)] end)
     rows = repeat.(prompts)
-    longest = rows |> Enum.map(&length/1) |> Enum.max()
+    lengths = for row <- rows, row != [], do: length(row)
 
     group =
       ctx
-      |> open(length(rows), longest + @capacity_margin)
+      |> open(length(rows), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
       |> Map.put(:scores, scores)
       |> then(
         &prefill(ctx, &1, requests(ctx, rows, repeat.(seeds), extras), inputs, extras.features)
@@ -1608,7 +1676,7 @@ defmodule Transmuter.Generation do
     counts = Enum.map(parts, &length/1)
     n = Enum.max(counts)
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
-    {inputs, static} = step_inputs(ctx, state, tokens)
+    {inputs, static} = step_inputs(ctx, state, tokens, counts)
     {inputs, state} = embed(ctx, state, inputs, tokens)
 
     # The selection takes the logits at the last real token of each row, which is this many
@@ -1822,11 +1890,16 @@ defmodule Transmuter.Generation do
     List.duplicate(0, first) ++ mask
   end
 
-  defp step_inputs(ctx, state, tokens) do
+  defp step_inputs(ctx, state, tokens, counts) do
     n = length(hd(tokens))
 
-    # The first step of a merged decoder takes the branch without cache, which reads no past.
-    cached? = not (merged?(ctx) and Enum.all?(state.lengths, &(&1 == 0)))
+    # The prompt of a merged decoder takes the branch without cache, which reads no past: a step
+    # whose rows with tokens have no rows in the cache.
+    cached? =
+      not (merged?(ctx) and
+             Enum.all?(Enum.zip(state.lengths, counts), fn {past, count} ->
+               past == 0 or count == 0
+             end))
 
     masks =
       for {past, valid} <- Enum.zip(state.lengths, state.valid) do
@@ -1849,7 +1922,7 @@ defmodule Transmuter.Generation do
       "input_ids" => tokens,
       "attention_mask" => masks,
       "position_ids" => positions(ctx, state, n),
-      @position_offset => state.used - state.capacity,
+      @position_offset => position_offset(ctx, state),
       @key_mask => masks
     }
 
@@ -1885,12 +1958,29 @@ defmodule Transmuter.Generation do
   end
 
   # A merged decoder has a branch without cache and a branch with cache (use_cache_branch).
-  # The prompt rule and the groups by length apply to the merged decoders in :grow and to those
-  # that MergedDecoder.rewrite/1 moves to :append.
+  # The prompt rule applies to the merged decoders in :grow and to those that
+  # MergedDecoder.rewrite/1 moves to :append.
   defp merged?(ctx) do
     "use_cache_branch" in ctx.model.inputs and
       (ctx.mode == :grow or @position_offset in ctx.model.inputs)
   end
+
+  # The offset of the positions of a merged decoder in :append (see MergedDecoder): the valid
+  # rows of each row less the capacity, or one value for all rows. In a group of one prompt
+  # length, the valid rows of each row are the rows of all steps.
+  defp position_offset(ctx, state) do
+    if per_row_offset?(ctx),
+      do: for(past <- state.lengths, do: [past - state.capacity]),
+      else: state.used - state.capacity
+  end
+
+  defp per_row_offset?(ctx),
+    do: match?({_type, [_ | _]}, ctx.model.input_types[@position_offset])
+
+  # The rows of a step need one length of the cache in :grow, where the positions come from it,
+  # and with one position offset for all rows.
+  defp one_length?(ctx),
+    do: ctx.mode == :grow or match?({_type, []}, ctx.model.input_types[@position_offset])
 
   # The positions of the tokens at the indices past..past + n - 1 of each row: the given
   # positions of the prompt, and after them the index plus the delta of the row. A decoder

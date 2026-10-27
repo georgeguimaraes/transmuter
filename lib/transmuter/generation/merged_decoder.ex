@@ -2,9 +2,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   @moduledoc """
   Moves a merged decoder of optimum without `position_ids` from a cache of exact length (`:grow`) to a buffer (`:append`), see "Merged decoders" in `Transmuter.Generation`.
 
-  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. Generation runs a merged decoder in groups of rows with one prompt length, and the rows of a group have no gap rows in the buffer, so all rows of a step have the same v, and buffer row j holds position j. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. It adds two inputs:
+  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. It adds two inputs:
 
-    * `transmuter.position_offset`, v - C, a scalar for all rows. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer.
+    * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when every read is a `Gather` of a position table whose index has a leading axis of size 1 (as the positions of GPT-2), no later `Reshape` or `Expand` has a static first dimension of 1, and no prefix (below) takes the rows of the buffer as positions. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
 
     * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
@@ -29,8 +29,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   def key_mask, do: @key_mask
 
   @doc """
-  Returns `model` with the position offset and the key mask in the branch with cache, and its
-  largest capacity in `:max_capacity`, or `model` itself when the rules do not hold.
+  Returns `model` with the position offset and the key mask in the branch with cache, its
+  largest capacity in `:max_capacity` and the shape of its offset in `:per_row_offset`, or
+  `model` itself when the rules do not hold.
   """
   def rewrite(model) do
     gqa? = Enum.any?(model.nodes, &(&1.op_type == "GroupQueryAttention"))
@@ -38,12 +39,16 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     with false <- "position_ids" in model.inputs or gqa?,
          {branch, graph} <- cache_if(model),
-         nil <- Enum.find(model.nodes -- [branch], &Enum.any?(Transmuter.dependencies(&1), past?)),
+         nil <-
+           Enum.find(model.nodes -- [branch], &Enum.any?(Transmuter.dependencies(&1), past?)),
          {:ok, cores} <- buffer_cores(model, graph),
-         {:ok, [_ | _] = reads, limit} <- past_uses(model, graph) do
+         {:ok, [_ | _] = reads, limit, prefixes} <- past_uses(model, graph) do
+      per_row? = per_row?(model, graph, reads, prefixes)
+
       model
-      |> offset_reads(branch, graph, Map.new(reads ++ cores, &read_entry/1))
+      |> offset_reads(branch, graph, Map.new(reads ++ cores, &read_entry/1), per_row?)
       |> Map.put(:max_capacity, limit && limit - 1)
+      |> Map.put(:per_row_offset, per_row?)
     else
       {:bail, node} ->
         exact_cache(model, node)
@@ -55,6 +60,104 @@ defmodule Transmuter.Generation.MergedDecoder do
         model
     end
   end
+
+  # The offset is one value for each row, of shape {batch, 1}, when the rows of a step can have
+  # different valid rows: every read is a Gather of a position table whose index has a leading
+  # axis of size 1, so the offset gives the index the batch and keeps its rank, no later Reshape
+  # or Expand has a static first dimension of 1, and no prefix takes the rows of the buffer as
+  # positions. Otherwise it is one value for all rows, and Generation runs one group for each
+  # prompt length.
+  defp per_row?(model, graph, reads, prefixes) do
+    scope = static_scope(model, graph)
+    producers = for node <- graph.node, output <- node.output, into: %{}, do: {output, node}
+
+    reason =
+      cond do
+        prefixes != [] ->
+          {"a prefix of the rows of the buffer", hd(prefixes)}
+
+        read = Enum.find(reads, &(not batch_index?(&1, producers, scope))) ->
+          {"a read that needs one offset for all rows", read_node(read)}
+
+        node = batch_reshape(graph, reads, scope) ->
+          {"a reshape to a batch of 1", node}
+
+        true ->
+          nil
+      end
+
+    case reason do
+      nil ->
+        true
+
+      {what, node} ->
+        Logger.debug(
+          "generation runs one group for each prompt length of the merged decoder, because of #{what} at #{where(node)}"
+        )
+
+        false
+    end
+  end
+
+  # A Gather on axis 0 whose index has a leading axis of size 1: an Unsqueeze on axis 0, or a
+  # Reshape to a shape whose first static value is 1 or -1, with more values after it.
+  defp batch_index?(
+         node = %NodeProto{op_type: "Gather", input: [_table, index]},
+         producers,
+         scope
+       ) do
+    axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
+    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+
+    axis == 0 and
+      case producers[index] do
+        %{op_type: "Unsqueeze", input: [_data, axes]} ->
+          list.(axes) == [0]
+
+        %{op_type: "Unsqueeze", attribute: attribute} ->
+          Enum.any?(attribute, &(&1.name == "axes" and &1.ints == [0]))
+
+        %{op_type: "Reshape", input: [_data, shape]} ->
+          leading_one?(shape, producers, list)
+
+        _other ->
+          false
+      end
+  end
+
+  defp batch_index?(_read, _producers, _scope), do: false
+
+  defp leading_one?(shape, producers, list) do
+    case {list.(shape), producers[shape]} do
+      {[first, _ | _], _producer} -> first in [1, -1]
+      {nil, %{op_type: "Concat", input: [first, _ | _]}} -> list.(first) in [[1], [-1]]
+      _other -> false
+    end
+  end
+
+  # A Reshape or Expand after a read, to a static shape whose first value is 1.
+  defp batch_reshape(graph, reads, scope) do
+    after_reads = MapSet.new(reads, &hd(read_node(&1).output))
+
+    graph.node
+    |> Enum.reduce_while(after_reads, fn node, after_reads ->
+      shape = Enum.at(node.input, 1, "")
+      first = scope.values[shape] && scope.values[shape] |> Nx.to_flat_list() |> List.first()
+
+      cond do
+        not Enum.any?(node.input, &MapSet.member?(after_reads, &1)) -> {:cont, after_reads}
+        node.op_type in ["Reshape", "Expand"] and first == 1 -> {:halt, node}
+        true -> {:cont, MapSet.union(after_reads, MapSet.new(node.output))}
+      end
+    end)
+    |> case do
+      %NodeProto{} = node -> node
+      _after_reads -> nil
+    end
+  end
+
+  defp read_node({node, _input}), do: node
+  defp read_node(node), do: node
 
   # A read is a node, or a node and the input that takes the offset (see candidate/3).
   defp read_entry({node, input}), do: {node, input}
@@ -110,21 +213,25 @@ defmodule Transmuter.Generation.MergedDecoder do
         else: lengths
 
     graph.node
-    |> Enum.reduce_while({[], %{}, lengths, nil}, fn node, {reads, kinds, lengths, limit} ->
+    |> Enum.reduce_while({[], %{}, lengths, nil, []}, fn node,
+                                                         {reads, kinds, lengths, limit, prefixes} ->
       lengths = Map.merge(lengths, track(node, lengths, kinds))
 
       case past_use(%{scope: scope, lengths: lengths, index: index_ranges}, node, kinds) do
         {:read, node} ->
-          {:cont, {[node | reads], kinds, lengths, limit}}
+          {:cont, {[node | reads], kinds, lengths, limit, prefixes}}
 
         {:positions, node, outputs} ->
-          {:cont, {[node | reads], Map.merge(kinds, outputs), lengths, limit}}
+          {:cont, {[node | reads], Map.merge(kinds, outputs), lengths, limit, prefixes}}
 
         {:kinds, outputs} ->
-          {:cont, {reads, Map.merge(kinds, outputs), lengths, limit}}
+          {:cont, {reads, Map.merge(kinds, outputs), lengths, limit, prefixes}}
+
+        {:prefix, outputs} ->
+          {:cont, {reads, Map.merge(kinds, outputs), lengths, limit, [node | prefixes]}}
 
         {:limit, size, outputs} ->
-          {:cont, {reads, Map.merge(kinds, outputs), lengths, min(limit, size)}}
+          {:cont, {reads, Map.merge(kinds, outputs), lengths, min(limit, size), prefixes}}
 
         bail ->
           {:halt, bail}
@@ -133,7 +240,7 @@ defmodule Transmuter.Generation.MergedDecoder do
     |> case do
       {:bail, _node} = bail -> bail
       {:mixed, ranges, node} -> index_space(model, graph, index_ranges, ranges, node)
-      {reads, _kinds, _lengths, limit} -> {:ok, reads, limit}
+      {reads, _kinds, _lengths, limit, prefixes} -> {:ok, reads, limit, prefixes}
     end
   end
 
@@ -279,7 +386,7 @@ defmodule Transmuter.Generation.MergedDecoder do
         causal_slice(scope, node, kinds, Tuple.delete_at(data, 0))
 
       data in [nil, :bool] and prefix?(scope, node, kinds) ->
-        {:kinds, if(data, do: outputs(node, data), else: %{})}
+        {:prefix, if(data, do: outputs(node, data), else: %{})}
 
       Enum.any?(deps, &(elem(&1, 0) > 0)) ->
         {:bail, node}
@@ -551,7 +658,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   # Adds the offset to the index of each position read and to the input of each float cast of
   # a shift of L. The reads are found by value, as in cut/3.
-  defp offset_reads(model, branch, graph, reads) do
+  defp offset_reads(model, branch, graph, reads, per_row?) do
     name = &(@position_offset <> "." <> &1)
     constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
 
@@ -581,7 +688,7 @@ defmodule Transmuter.Generation.MergedDecoder do
         inputs: model.inputs ++ [@position_offset, @key_mask],
         input_types:
           Map.merge(model.input_types, %{
-            @position_offset => {:s64, []},
+            @position_offset => {:s64, if(per_row?, do: ["batch_size", 1], else: [])},
             @key_mask => {:s64, ["batch_size", "keys"]}
           })
     }

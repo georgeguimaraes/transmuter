@@ -152,7 +152,8 @@ defmodule Transmuter.GenerationTest do
   # no_repeat_ngram_size reads the tokens of each row on the device, where each step writes
   # its new token after the tokens of the row. In a batch whose prompts have different
   # lengths, each row gets its tokens alone, also with beams, whose tokens move with their
-  # rows, and no row repeats a 3-gram of its prompt and new tokens.
+  # rows, and no row repeats a 3-gram of its prompt and new tokens. In gpt2, the prompt of each
+  # length runs as its own step, and the rows of the other lengths have no token in it.
   @tag ci_partition: 10
   test "no_repeat_ngram_size gives each row of a batch its tokens alone, also with beams" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -160,7 +161,7 @@ defmodule Transmuter.GenerationTest do
     {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
     prompts = [[504, 3575, 282, 4649, 314, 504, 3575], [504, 2365], [42, 43, 44, 45, 46]]
 
-    for num_beams <- [1, 2] do
+    for {repo, model} <- [{repo, model}, gpt2()], num_beams <- [1, 2] do
       ctx =
         Generation.context(repo, model,
           no_repeat_ngram_size: 3,
@@ -423,6 +424,72 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # A merged decoder whose position offset is one value for each row runs the prompt of each
+  # length as one step without cache, and then decodes all rows in one group. gpt2 reads its
+  # positions from a table, so 3 prompts of 30, 12 and 5 tokens give the greedy tokens of a
+  # cache of exact length, in 3 prompt steps and 39 decode steps. With one group for each
+  # length, the same run takes 3 groups of 40 steps.
+  @tag ci_partition: 5
+  test "a merged decoder with an offset for each row decodes prompts of different lengths together" do
+    {repo, model} = gpt2()
+
+    prompts =
+      for {length, row} <- [{30, 1}, {12, 2}, {5, 3}],
+          do: for(i <- 1..length, do: rem(i * 37 * row, 50_000))
+
+    ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 40)
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+    {rows, calls} = count_calls(fn -> Generation.generate(ctx, prompts, [0, 0, 0]) end)
+
+    for {tokens, prompt} <- Enum.zip(rows, prompts) do
+      assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 40)
+    end
+
+    assert calls == 3 + 39
+  end
+
+  # The result of `fun` and the compiled calls that it made.
+  defp count_calls(fun) do
+    pid = self()
+    id = make_ref()
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :call, :stop],
+      fn _event, _measurements, _metadata, _config -> if self() == pid, do: send(pid, :call) end,
+      nil
+    )
+
+    result = fun.()
+    :telemetry.detach(id)
+    {result, receive_calls()}
+  end
+
+  defp receive_calls do
+    receive do
+      :call -> 1 + receive_calls()
+    after
+      0 -> 0
+    end
+  end
+
+  # The position offset is one value for each row only when every use of it reads a position
+  # table (see MergedDecoder). The relative bias of T5 takes the key positions from the union
+  # of the key masks, which has no gap rows, and moonshine adds the offset to a rotary angle
+  # and keeps a prefix of its causal mask, so both keep one offset for all rows and one group
+  # for each prompt length.
+  test "only a merged decoder that reads position tables gets a position offset for each row" do
+    for {source, per_row?} <- [
+          {{:hf, "Xenova/gpt2", "onnx/decoder_model_merged.onnx"}, true},
+          {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, false},
+          {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, false}
+        ] do
+      rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite()
+      assert "transmuter.position_offset" in rewritten.inputs, inspect(source)
+      assert rewritten[:per_row_offset] == per_row?, inspect(source)
+    end
+  end
+
   # The GPT-2 export slices a causal table of 1024 rows at the length of its cache, so in
   # :append the buffer and the new token must fit it: 900 + 32 tokens take a buffer of 1023
   # rows, not 1024, and give the greedy tokens of the cache of exact length. 900 + 132 tokens
@@ -444,6 +511,30 @@ defmodule Transmuter.GenerationTest do
     assert_raise ArgumentError, ~r/the 1023 rows/, fn ->
       Generation.generate(long, [prompt], [0])
     end
+  end
+
+  # In one group, the prompt step of each length writes its own rows of the buffer of GPT-2,
+  # so the rows of a group are the sum of its prompt lengths and the new tokens. Prompts of 600,
+  # 500 and 400 tokens with 16 new tokens need 1515 rows in one group, more than the 1023 rows
+  # of the causal table. So 600 runs alone, and 500 and 400 run as a group of 915 rows: 1 + 15
+  # and 2 + 15 steps, and each row gives the greedy tokens of the cache of exact length.
+  @tag ci_partition: 5
+  test "a merged decoder starts a new group when the prompt lengths do not fit its causal table" do
+    {repo, model} = gpt2()
+
+    prompts =
+      for {length, row} <- [{600, 1}, {500, 2}, {400, 3}],
+          do: for(i <- 1..length, do: rem(i * 37 * row, 50_000))
+
+    ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 16)
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+    {rows, calls} = count_calls(fn -> Generation.generate(ctx, prompts, [0, 0, 0]) end)
+
+    for {tokens, prompt} <- Enum.zip(rows, prompts) do
+      assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 16)
+    end
+
+    assert calls == 1 + 15 + 2 + 15
   end
 
   # A merged decoder that the rewrite moves to :append starts at 32 rows, and other decoders
