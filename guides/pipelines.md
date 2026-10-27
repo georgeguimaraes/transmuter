@@ -209,10 +209,10 @@ Set `compile: [batch_size: n]` to generate for up to `n` inputs in one loop. The
 
 | Model | `batch_size: 1` | `batch_size: 4` | `batch_size: 8` |
 |---|---|---|---|
-| `HuggingFaceTB/SmolLM2-135M-Instruct` (q4) | 152 tokens/s | 214 tokens/s | 318 tokens/s |
-| `onnx-community/Qwen3-0.6B-ONNX` (q4) | 89 tokens/s | 112 tokens/s | 122 tokens/s |
+| `HuggingFaceTB/SmolLM2-135M-Instruct` (q4) | 128 tokens/s | 337 tokens/s | 529 tokens/s |
+| `onnx-community/Qwen3-0.6B-ONNX` (q4) | 86 tokens/s | 199 tokens/s | 268 tokens/s |
 
-The table shows the total tokens per second of 16 concurrent requests to a started serving with `batch_timeout: 10`, with greedy selection and up to 128 new tokens for each request. The values are the median of 3 or more runs with EMLX on an Apple M2 Pro GPU. A batch runs until its longest row stops, so the gain is smaller when the lengths of the answers are very different.
+The table shows the total tokens per second of 16 concurrent requests to a started serving with `batch_timeout: 10`, with greedy selection and up to 128 new tokens for each request. The values are the median of 5 runs with EMLX on an Apple M2 Pro GPU, from `bench/generation_throughput.exs`. A batch runs until its longest row stops, so the gain is smaller when the lengths of the answers are very different.
 
 The prompts of a batch can have different lengths. Each row has its own length in the KV cache, its own positions, its own sampling key and its own stop at the eos token. A row that stops gets padding tokens until the batch ends. When fewer inputs than `n` arrive, padding rows fill the batch. With greedy selection, and with sampling from a seed, each input gives the same text as when it runs alone.
 
@@ -220,7 +220,9 @@ The mode of the KV cache decides how the rows share the cache:
 
 - When GroupQueryAttention writes the cache in place, the attention mask of each row tells the operator how many rows of the cache are valid. The operator writes the new keys and values of each row after its valid rows.
 - With `position_ids`, all rows of a step write their new rows at one place in the buffer, after the rows of the earlier steps. A row with fewer tokens than the step leaves gap rows there. The attention mask of each row hides its gap rows and the free rows.
-- A decoder that grows its cache gets its positions from the length of the cache. That length is the same for all rows, so only prompts of the same length can share a cache. The serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` gave 133 tokens/s with `batch_size: 1` and 148 tokens/s with `batch_size: 8`. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
+- A decoder that grows its cache gets its positions from the length of the cache, which is the same for all rows.
+
+Only some decoders run prompts of different lengths in one step. A decoder that grows its cache needs one length for all rows. A merged decoder of optimum, such as `Xenova/gpt2`, runs its prompt as one step on its branch without cache (see "Merged decoders" in `Transmuter.Generation`), also when it writes a buffer. For these decoders, the serving runs a group for each prompt length, one group after the other, and each step of a group runs all rows of the batch. So a batch is faster only for the prompts that have the same length. For 16 prompts with 7 different lengths, `Xenova/gpt2` (fp32) gave 165 tokens/s with `batch_size: 1`, 134 tokens/s with `batch_size: 4` and 141 tokens/s with `batch_size: 8`, so the batch was slower than one input at a time. The prompts of text-to-text and speech-to-text have one length, so all their rows run as one group. With streaming, the rows of a later group get their first token when the groups before it finish.
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 
