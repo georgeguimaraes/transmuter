@@ -355,10 +355,9 @@ defmodule Transmuter.GenerationTest do
   end
 
   # The merged Whisper decoder takes the length of its cache from the shape of the past. In
-  # :append, the rows of a batch with 5, 9 and 440 valid cache rows in a buffer of 512 rows get
-  # the logits of each row alone with a cache of exact length: the positions read the table of
-  # 448 rows at the valid rows, not at the capacity, and the key mask hides the free rows, also
-  # with the heads in the batch.
+  # :append, a row with 5, 9 or 440 valid cache rows in a buffer of 512 rows gets the logits of
+  # the cache of exact length: the positions read the table of 448 rows at the valid rows, not
+  # at the capacity, and the key mask hides the free rows, also with the heads in the batch.
   test "a merged decoder takes a buffer with its position offset and key mask" do
     model =
       Transmuter.load!({:hf, "Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx"},
@@ -398,33 +397,27 @@ defmodule Transmuter.GenerationTest do
         {past, length(prompt), run.(model, step, flag.(1))["logits"]}
       end
 
-    buffers =
-      for name <- ctx.cache, into: %{} do
-        padded =
-          for {past, length, _logits} <- rows do
-            rows = if name in ctx.buffers, do: 512 - length, else: 0
-            Nx.pad(past[name], 0.0, [{0, 0, 0}, {0, 0, 0}, {0, rows, 0}, {0, 0, 0}])
-          end
-
-        {name, Nx.concatenate(padded)}
-      end
-
-    lengths = for {_past, length, _logits} <- rows, do: length
-    mask = host.(for v <- lengths, do: List.duplicate(1, v) ++ List.duplicate(0, 512 - v) ++ [1])
-
-    step =
-      Map.merge(buffers, %{
-        "input_ids" => host.([[50], [50], [50]]),
-        "encoder_hidden_states" => Nx.concatenate([hidden, hidden, hidden]),
-        "transmuter.position_offset" => host.(for v <- lengths, do: [v - 512]),
-        "transmuter.key_mask" => mask
-      })
-
+    # Each row runs alone in a buffer of 512 rows, as generation runs the rows of one length.
     static = Map.put(flag.(1), "num_logits_to_keep", host.(1))
-    logits = run.(ctx.model, step, static)["logits"]
 
-    for {{_past, _length, alone}, row} <- Enum.with_index(rows) do
-      diff = Nx.subtract(logits[row], alone[0]) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+    for {past, length, alone} <- rows do
+      buffers =
+        for name <- ctx.cache, into: %{} do
+          free = if name in ctx.buffers, do: 512 - length, else: 0
+          {name, Nx.pad(past[name], 0.0, [{0, 0, 0}, {0, 0, 0}, {0, free, 0}, {0, 0, 0}])}
+        end
+
+      step =
+        Map.merge(buffers, %{
+          "input_ids" => host.([[50]]),
+          "encoder_hidden_states" => hidden,
+          "transmuter.position_offset" => host.(length - 512),
+          "transmuter.key_mask" =>
+            host.([List.duplicate(1, length) ++ List.duplicate(0, 512 - length) ++ [1]])
+        })
+
+      logits = run.(ctx.model, step, static)["logits"]
+      diff = Nx.subtract(logits[0], alone[0]) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
       assert diff < 1.0e-3
     end
   end

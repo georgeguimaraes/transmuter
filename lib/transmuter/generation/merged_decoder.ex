@@ -2,13 +2,13 @@ defmodule Transmuter.Generation.MergedDecoder do
   @moduledoc """
   Moves a merged decoder of optimum without `position_ids` from a cache of exact length (`:grow`) to a buffer (`:append`), see "Merged decoders" in `Transmuter.Generation`.
 
-  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v of the row. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. It adds two inputs:
+  Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. Generation runs a merged decoder in groups of rows with one prompt length, and the rows of a group have no gap rows in the buffer, so all rows of a step have the same v, and buffer row j holds position j. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. It adds two inputs:
 
-    * `transmuter.position_offset`, v - C for each row. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. A `Slice` becomes a `Gather` of the range of its start and end, because each row has its own offset.
+    * `transmuter.position_offset`, v - C, a scalar for all rows. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer.
 
     * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
-  A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast of L to a float, such as the relative positions of T5 or a rotary angle, a 2-D static table read on axis 0 with another index, such as the positions of M2M100 from the padding mask, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2).
+  A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast to a float of another value of L, such as the relative positions of T5, a 2-D static table read on axis 0 with another index, such as the positions of M2M100 from the padding mask, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2). A `Slice` from 0 to a shift of L with step 1 of a tensor that the graph made, whose content has no L or only comparisons of L, is a prefix: with a buffer it keeps C + n rows in place of v + n, which hold every row that a step reads, such as the causal mask of moonshine, which compares the positions of L with the key index. A prefix of a static table, such as the rotary table of the merged llama2.c that its nested `If` nodes squeeze, keeps the decoder in `:grow`.
   """
 
   require Logger
@@ -227,9 +227,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
-  # A read of a static table, a dimension of a shape, a slice of a causal table, or L as an
-  # index into another tensor, such as a rotary table that the graph makes, which stops the
-  # rewrite.
+  # A read of a static table, a dimension of a shape, a slice of a causal table, a prefix of a
+  # mask, or L as an index into another tensor, such as a rotary table that the graph makes,
+  # which stops the rewrite.
   defp gather_use(scope, node, kinds, deps) do
     data = kinds[hd(node.input)]
 
@@ -243,6 +243,9 @@ defmodule Transmuter.Generation.MergedDecoder do
       match?({:causal, _, _}, data) and node.op_type == "Slice" ->
         causal_slice(scope, node, kinds, Tuple.delete_at(data, 0))
 
+      data in [nil, :bool] and prefix?(scope, node, kinds) ->
+        {:kinds, if(data, do: outputs(node, data), else: %{})}
+
       Enum.any?(deps, &(elem(&1, 0) > 0)) ->
         {:bail, node}
 
@@ -250,6 +253,18 @@ defmodule Transmuter.Generation.MergedDecoder do
         value_use(node, deps)
     end
   end
+
+  # A Slice from 0 to a shift of L with step 1, a prefix. With a buffer it keeps C + n rows in
+  # place of v + n, which hold every row that a step reads, and it shifts nothing. Its output
+  # keeps the kind of its data.
+  defp prefix?(scope, %{op_type: "Slice", input: [_data, starts, ends | rest]}, kinds) do
+    steps = Enum.at(rest, 1, "")
+    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+    all? = fn name, value -> list.(name) != nil and Enum.all?(list.(name), &(&1 == value)) end
+    all?.(starts, 0) and kinds[ends] == :shift and (steps == "" or all?.(steps, 1))
+  end
+
+  defp prefix?(_scope, _node, _kinds), do: false
 
   # A dimension of a shape: the length is a shift of L, another dimension does not depend on it.
   defp dims(scope, node = %{op_type: op, input: [shape | rest]}, kinds) do
@@ -286,12 +301,19 @@ defmodule Transmuter.Generation.MergedDecoder do
     cond do
       node.op_type in @comparisons -> {:kinds, outputs(node, :bool)}
       values == [] -> {:kinds, %{}}
-      node.op_type == "Cast" and float_cast?(node) -> {:bail, node}
+      node.op_type == "Cast" and float_cast?(node) -> float_use(node, deps)
       true -> {:kinds, outputs(node, kind(node, deps))}
     end
   end
 
   defp outputs(node, kind), do: Map.new(node.output, &{&1, kind})
+
+  # A float cast of a shift of L gets the offset on its input (see offset_reads/4), so its
+  # float value no longer depends on the buffer. A float cast of another value of L stops the
+  # rewrite.
+  defp float_use(node, deps) do
+    if Enum.all?(deps, &(elem(&1, 1) == :shift)), do: {:read, node}, else: {:bail, node}
+  end
 
   # L + c, c + L and L - c are shifts, c - L is not.
   defp kind(%{op_type: "Add"}, [{_i, :shift}]), do: :shift
@@ -442,9 +464,8 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
-  # Adds the offset of each row to the index of each position read. A Slice becomes a Gather
-  # of the range of its start and end, because each row has its own offset. The reads are
-  # found by value, as in cut/3.
+  # Adds the offset to the index of each position read and to the input of each float cast of
+  # a shift of L. The reads are found by value, as in cut/3.
   defp offset_reads(model, branch, graph, reads) do
     name = &(@position_offset <> "." <> &1)
     constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
@@ -469,7 +490,7 @@ defmodule Transmuter.Generation.MergedDecoder do
         inputs: model.inputs ++ [@position_offset, @key_mask],
         input_types:
           Map.merge(model.input_types, %{
-            @position_offset => {:s64, ["batch_size", 1]},
+            @position_offset => {:s64, []},
             @key_mask => {:s64, ["batch_size", "keys"]}
           })
     }
@@ -494,6 +515,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     ]
   end
 
+  # A Slice becomes a Gather of the range of its start and end. A Slice from a start with the
+  # offset, a value of the call, would have a size that the compiler cannot know, which breaks
+  # the graph. The range of the static start and end keeps the size static.
   defp shift_read(node = %{op_type: "Slice", input: [table, starts, ends | _]}, name) do
     out = hd(node.output)
     value = &name.(out <> "." <> &1)
@@ -529,6 +553,20 @@ defmodule Transmuter.Generation.MergedDecoder do
         input: [table, value.("index")],
         output: [out]
       }
+    ]
+  end
+
+  defp shift_read(node = %{op_type: "Cast", input: [value]}, name) do
+    shifted = name.(hd(node.output))
+
+    [
+      %NodeProto{
+        op_type: "Add",
+        name: shifted,
+        input: [value, @position_offset],
+        output: [shifted]
+      },
+      %{node | input: [shifted]}
     ]
   end
 

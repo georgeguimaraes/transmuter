@@ -1667,7 +1667,7 @@ defmodule Transmuter.Generation do
       "input_ids" => tokens,
       "attention_mask" => masks,
       "position_ids" => positions(ctx, state, n),
-      @position_offset => for(past <- state.lengths, do: [past - state.capacity]),
+      @position_offset => state.used - state.capacity,
       @key_mask => masks
     }
 
