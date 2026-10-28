@@ -37,7 +37,7 @@ defmodule Transmuter.Generation do
 
   The decoder of a vision language model, such as SmolVLM or Qwen2-VL, declares `inputs_embeds` in place of `input_ids`. Its context has the model of the embeddings in `:embed` (`embed_tokens.onnx`) and the id of the image token in `:image_token`. Each step turns its tokens into embeddings with that model, so the steps are the same as for `input_ids`.
 
-  The task gives the features of the images to `generate/5` in `:image_features`. They are the features of the image tokens of all rows, in order, as `masked_scatter` in Python transformers uses them. A row starts at the features after those of the rows before it. In the steps of the prompt, the features replace the embeddings of the image tokens, and a cursor of each row counts the image tokens that the row used. Parts of the prompt without image tokens and the steps of new tokens only embed their tokens.
+  The task gives the features of the images to `generate/5` in `:image_features`. They are the features of the image tokens of all rows, in order, as `masked_scatter` in Python transformers uses them. A row starts at the features after those of the rows before it. In the steps of the prompt, the features replace the embeddings of the image tokens, and a cursor of each row counts the image tokens that the row used. Parts of the prompt without image tokens and the steps of new tokens only embed their tokens. A new token takes no features, also when it is the image token, as in Python transformers.
 
   A request that joins a group with other rows (see "Batches") has its own features. The group then keeps the features of the image tokens that its running rows have left, and the features of the new requests after them. So the features of a group are at most those of the prompts that run, also after many joins.
 
@@ -1164,29 +1164,36 @@ defmodule Transmuter.Generation do
   end
 
   # The image features of a group after `requests` join it, and the cursor of each row in
-  # them. A row that has not ended keeps the features of the image tokens of its prompt that
-  # are left, and the features of the requests follow. So a group never keeps the features of
-  # a prompt that has run, also after many joins. A tensor that requests share goes in once,
-  # and their cursors stay in it.
+  # them: the index of the features of its next image token and the end of its features. A
+  # row that has not ended keeps the features of the image tokens of its prompt that are left,
+  # and the features of the requests follow. So a group never keeps the features of a prompt
+  # that has run, also after many joins. A tensor that requests share goes in once, and their
+  # cursors stay in it.
   defp join_features(ctx, group, requests) do
+    image_tokens = &Enum.count(&1, fn id -> id == ctx.image_token end)
+
     kept =
-      for {{left, cursor, done?}, row} <-
+      for {{left, {next, _end}, done?}, row} <-
             Enum.with_index(Enum.zip([group.left, group.state.cursors, group.done])),
-          count = Enum.count(left, &(&1 == ctx.image_token)),
+          count = image_tokens.(left),
           not done? and count > 0,
-          do: {row, Nx.slice_along_axis(group.state.features, cursor, count, axis: 0)}
+          do: {row, count, Nx.slice_along_axis(group.state.features, next, count, axis: 0)}
 
     shared = for %{features: tensor} <- requests, tensor != nil, uniq: true, do: tensor
-    pieces = Enum.map(kept, &elem(&1, 1)) ++ shared
+    pieces = Enum.map(kept, &elem(&1, 2)) ++ shared
     {starts, _size} = Enum.map_reduce(pieces, 0, &{&2, &2 + Nx.axis_size(&1, 0)})
     {kept_starts, shared_starts} = Enum.split(starts, length(kept))
     offsets = Map.new(Enum.zip(shared, shared_starts))
 
-    moved = Enum.zip_with(kept, kept_starts, fn {row, _slice}, start -> {row, start} end)
+    moved =
+      Enum.zip_with(kept, kept_starts, fn {row, count, _slice}, start ->
+        {row, {start, start + count}}
+      end)
 
     joined =
       for request <- requests do
-        {request.row, Map.get(offsets, request[:features], 0) + Map.get(request, :cursor, 0)}
+        start = Map.get(offsets, request[:features], 0) + Map.get(request, :cursor, 0)
+        {request.row, {start, start + image_tokens.(request.prompt)}}
       end
 
     cursors =
@@ -1796,7 +1803,7 @@ defmodule Transmuter.Generation do
       written: [],
       inputs: %{},
       features: nil,
-      cursors: List.duplicate(0, batch_size),
+      cursors: List.duplicate({0, 0}, batch_size),
       positions: List.duplicate({[], 0}, batch_size),
       lengths: List.duplicate(0, batch_size),
       used: 0,
@@ -1893,7 +1900,8 @@ defmodule Transmuter.Generation do
 
   # A decoder with inputs_embeds gets the embeddings of the tokens. In a part of the prompt
   # with image tokens, the features of the images replace their embeddings. The cursor of
-  # a row is the index of the features of its next image token.
+  # a row is the index of the features of its next image token and the end of its features,
+  # so the image tokens after its prompt, which the row generates, keep their embeddings.
   defp embed(%{embed: nil}, state, inputs, _tokens), do: {inputs, state}
 
   defp embed(ctx, state, inputs, tokens) do
@@ -1902,8 +1910,11 @@ defmodule Transmuter.Generation do
     {rows, cursors} =
       Enum.zip_with(tokens, state.cursors, fn row, cursor ->
         Enum.map_reduce(row, cursor, fn
-          id, cursor when id == ctx.image_token -> {{cursor, 1}, cursor + 1}
-          _id, cursor -> {{0, 0}, cursor}
+          id, {next, stop} when id == ctx.image_token and next < stop ->
+            {{next, 1}, {next + 1, stop}}
+
+          _id, cursor ->
+            {{0, 0}, cursor}
         end)
       end)
       |> Enum.unzip()

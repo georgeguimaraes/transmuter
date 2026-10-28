@@ -1151,6 +1151,51 @@ defmodule Transmuter.GenerationTest do
     assert Enum.at(group.state.lengths, 0) == 0
   end
 
+  # The first row ends its prompt in the first step, and the test gives it the image token as
+  # its new token, while the second row still has image tokens left. The new image token keeps
+  # its embedding, as alone, where the group has no features after the prompt. It does not
+  # take the features after those of its prompt, which are the features of the second row.
+  @tag ci_partition: 10
+  test "a new image token of a row takes no image features" do
+    source = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
+    variant = %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32}
+    opts = [variant: variant, strategy: :greedy, max_new_tokens: 4, token_logprobs: true]
+    {ctx, _tokenizer, task} = ImageTextToText.task(source, opts ++ @opts)
+    prepare = task.prepare.(@opts[:defn_options])
+    backend = Nx.Defn.to_backend(@opts[:defn_options])
+    image = %{type: "image", image: StbImage.read_file!("test/fixtures/cats.png")}
+
+    [short, long] =
+      for {content, row} <- [
+            {[image, %{type: "text", text: "What is this?"}], 0},
+            {[%{type: "text", text: @fox <> " " <> @fox}, image], 1}
+          ] do
+        [run] = task.preprocess.(%{messages: [%{role: "user", content: content}]})
+
+        tensors =
+          Map.new(run.tensors, fn {name, tensor} ->
+            {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
+          end)
+
+        %{image_features: features} = prepare.(tensors, [run.prompt])
+        %{row: row, prompt: run.prompt, seed: 0, budget: 4, features: features}
+      end
+
+    image_token = &%{&1 | new: List.replace_at(&1.new, 0, ctx.image_token)}
+    logprob = &(&1.logprobs |> hd() |> List.flatten() |> hd())
+
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    group = Generation.admit(single, Generation.open(single, 1), [short])
+    group = run_until(single, group, &(hd(&1.new) != nil))
+    alone = logprob.(Generation.next(single, image_token.(group)))
+
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    group = Generation.next(ctx, Generation.admit(ctx, Generation.open(ctx, 2), [short, long]))
+    assert hd(group.new) != nil
+    assert ctx.image_token in Enum.at(group.left, 1)
+    assert_in_delta logprob.(Generation.next(ctx, image_token.(group))), alone, 1.0e-4
+  end
+
   defp steps_until(ctx, group, done?, steps \\ 0) do
     if done?.(group),
       do: {group, steps},
