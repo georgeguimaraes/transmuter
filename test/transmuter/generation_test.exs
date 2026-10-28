@@ -541,8 +541,8 @@ defmodule Transmuter.GenerationTest do
   # at 256 rows. In GPT-2, a batch of 3 prompts of 30 tokens takes 64 rows (the prompt and a
   # margin of 16 rows), which grow to 128 rows at the step of the 65th row, and each row gives
   # the greedy tokens of the cache of exact length. In SmolLM2, prompts of 240 tokens take 256
-  # rows, which grow to 512 rows. The capacities are those of the compiled steps, with the
-  # first one from Generation.compile/3.
+  # rows, which grow by 64 rows to 320 rows, not to the next power of two. The capacities are
+  # those of the compiled steps, with the first one from Generation.compile/3.
   test "the buffers start at the capacity of the decoder and grow when a step does not fit" do
     {repo, model} = gpt2()
     prompts = for row <- 1..3, do: for(i <- 1..30, do: rem(i * 37 * row, 50_000))
@@ -557,12 +557,12 @@ defmodule Transmuter.GenerationTest do
     source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
     {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :q4)
     prompts = for row <- 1..2, do: for(i <- 1..240, do: rem(i * 37 * row, 49_000))
-    assert {_rows, [256, 512]} = capacities(%{repo | generation_config: %{}}, model, prompts)
+    assert {_rows, [256, 320]} = capacities(%{repo | generation_config: %{}}, model, prompts)
   end
 
   # In :in_place, GroupQueryAttention counts the valid rows of each row from the mask, so a
   # growth must keep the rows and the mask of each row. A prompt of 240 tokens takes 256 rows,
-  # which grow to 512 rows. In a batch with a prompt of 500 tokens, the buffer starts at 1024
+  # which grow to 320 rows. In a batch with a prompt of 500 tokens, the buffer starts at 640
   # rows and does not grow, and the prompt gives the same tokens.
   test "a growth of the buffers in :in_place keeps the tokens of each row" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -573,15 +573,56 @@ defmodule Transmuter.GenerationTest do
     prompt = for i <- 1..240, do: rem(i * 37, 49_000)
     long = for i <- 1..500, do: rem(i * 53, 49_000)
 
-    assert {[grown], [256, 512]} = capacities(repo, model, [prompt])
-    assert {[fits, _long], [256, 1024]} = capacities(repo, model, [prompt, long])
+    assert {[grown], [256, 320]} = capacities(repo, model, [prompt])
+    assert {[fits, _long], [256, 640]} = capacities(repo, model, [prompt, long])
     assert Enum.map(grown, &hd/1) == Enum.map(fits, &hd/1)
+  end
+
+  # The step of a growth is a quarter of the power of two below the rows, at least 64 rows. An
+  # answer of 600 tokens to a prompt of 10 tokens grows by 64 rows up to 512 rows, and then by
+  # 128 rows, so it compiles 6 capacities. Steps of 64 rows would compile 7, and powers of two
+  # 3, with steps that run at up to twice the rows that they need. A group opened for 1 to 256
+  # rows has the smallest capacity, and the step changes after each power of two. A group
+  # needs a compiled context.
+  @tag ci_partition: 4
+  test "the buffers grow by a quarter of the power of two below their rows" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    prompt = for i <- 1..10, do: rem(i * 37, 49_000)
+    limits = [max_new_tokens: 600, min_new_tokens: 600]
+
+    assert {[tokens], [256, 320, 384, 448, 512, 640]} =
+             capacities(%{repo | generation_config: %{}}, model, [prompt], limits)
+
+    assert length(tokens) == 600
+
+    ctx = Generation.context(%{repo | generation_config: %{}}, model, [])
+
+    assert_raise ArgumentError, ~r/needs a context from compile/, fn ->
+      Generation.open(ctx, 1)
+    end
+
+    ctx = Generation.compile(ctx, 1, @opts[:defn_options])
+
+    for {rows, capacity} <- [
+          {1, 256},
+          {256, 256},
+          {257, 320},
+          {512, 512},
+          {513, 640},
+          {1025, 1280}
+        ] do
+      group = Generation.open(ctx, 1, rows)
+      assert group.state.capacity == capacity, inspect(rows)
+      Generation.finish(group)
+    end
   end
 
   # In :append, all rows of a step write at one offset, so the parts of prompts of 229, 31 and
   # 4 tokens leave gap rows in the shorter rows. The longest row ends early, at a token of its
   # own answer that the middle row does not give. The offset then passes the length of each
-  # row, and the buffers grow from 256 to 512 rows for the 40 steps of the middle row. Each
+  # row, and the buffers grow from 256 to 320 rows for the 40 steps of the middle row. Each
   # row gives the tokens that it gives alone, where it has no gap rows.
   @essay "The printing press changed Europe in the fifteenth century. Before it, scribes copied each book by hand, and a single copy of a long text could take months. Johannes Gutenberg combined movable metal type, an oil-based ink and a screw press adapted from wine making. His workshop in Mainz printed a Bible around 1455, and within fifty years presses ran in more than two hundred cities. Books became cheaper, and more people learned to read. Scholars could compare identical copies of a text, so errors were easier to find and correct. Pamphlets spread news and arguments quickly, and the Reformation used them to reach ordinary readers. Printers also standardized spelling and grammar, because they wanted their books to sell in many regions. Over time, the press helped science, as researchers shared tables, maps and drawings that stayed the same in every copy. Newspapers appeared in the seventeenth century, and by the nineteenth century steam-powered presses printed thousands of pages each hour. Today historians still debate how fast these changes came, but most agree that the press made knowledge easier to keep. In the next part of this essay, we look at"
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
@@ -613,7 +654,7 @@ defmodule Transmuter.GenerationTest do
     assert rows == alone
     assert length(hd(rows)) < 40
     assert length(Enum.at(rows, 1)) == 40
-    assert capacities == [256, 512]
+    assert capacities == [256, 320]
   end
 
   # A request joins a running group with admit/5: its prompt runs in the same steps as the
@@ -806,7 +847,7 @@ defmodule Transmuter.GenerationTest do
 
   # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
   # in the compiled steps.
-  defp capacities(repo, model, prompts) do
+  defp capacities(repo, model, prompts, opts \\ [max_new_tokens: 40]) do
     id = make_ref()
     pid = self()
 
@@ -817,7 +858,7 @@ defmodule Transmuter.GenerationTest do
     end
 
     :telemetry.attach(id, [:transmuter, :segment, :compile, :stop], handler, nil)
-    ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 40)
+    ctx = Generation.context(repo, model, [strategy: :greedy] ++ opts)
     ctx = Generation.compile(ctx, length(prompts), @opts[:defn_options])
     rows = Generation.generate(ctx, prompts, List.duplicate(0, length(prompts)))
     :telemetry.detach(id)

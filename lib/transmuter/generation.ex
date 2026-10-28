@@ -73,7 +73,7 @@ defmodule Transmuter.Generation do
 
   In `:in_place` and `:append`, all rows share one buffer. In `:in_place`, each row writes its keys and values after its own valid rows, so the padding tokens of a step go into rows that the next step overwrites. The attention mask of a row has ones for its valid rows and the new tokens, and GroupQueryAttention gets the write position of each row from the sum of the mask. In `:append`, all rows of a step write their new rows at one offset: the sum of the lengths of the earlier steps. So one update of each buffer writes the step, in place of one update for each row. A row with fewer tokens than the step, such as a shorter part of a prompt or a finished row, leaves gap rows after its tokens. The host keeps the valid rows of each row, and the attention mask has ones only for them and for the new tokens, so it hides the gap rows and the free rows. Both modes give the positions of each row in `position_ids`, from the tokens of the row and not from its rows in the buffer.
 
-  The buffer starts with a capacity of a power of two that fits the rows of the prompt steps and 16 more rows. These rows are the longest prompt, or with a merged decoder the sum of the prompt lengths of the group. When a step does not fit, the buffers grow to the next power of two, and the steps compile for the new capacity. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 448 tokens to a short prompt compiles them at 256 and 512 rows. A decoder with the position offset of `Transmuter.Generation.MergedDecoder` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
+  The buffer starts with a capacity that fits the rows of the prompt steps and 16 more rows: the smallest capacity, or above it a multiple of a step. The step is a quarter of the power of two below the rows, at least 64 rows: 64 rows up to 512, 128 rows up to 1024, 256 rows up to 2048. These rows are the longest prompt, or with a merged decoder the sum of the prompt lengths of the group. When a step does not fit, the buffers grow to the next capacity, and the steps compile for it. Each step reads the whole buffers, so the small steps keep them near the rows that the longest row needs: a row of 300 rows runs its steps at 320 rows, not at 512. The step grows with the rows, so a long answer compiles four capacities for each doubling of its rows: the first answer of 1024 tokens compiles 12 shapes in place of 6 with powers of two, about 13 s more on CUDA. A process compiles each capacity one time, so later answers do not pay it. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 600 tokens to a short prompt compiles them at 256, 320, 384, 448, 512 and 640 rows. A decoder with the position offset of `Transmuter.Generation.MergedDecoder` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
 
   In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group. A merged decoder in `:append` with one position offset for all rows also runs a group for each prompt length (see "Merged decoders").
 
@@ -117,11 +117,18 @@ defmodule Transmuter.Generation do
   @position_offset MergedDecoder.position_offset()
   @key_mask MergedDecoder.key_mask()
 
-  # Buffers have a capacity of a power of two, from this size, or from the smaller size for a
-  # decoder with the position offset of MergedDecoder (see "Batches"). The capacity starts at
+  # Buffers have a capacity of this size, or of the smaller size for a decoder with the
+  # position offset of MergedDecoder, or above it a multiple of the step of @capacity_step
+  # (see "Batches"). The capacity starts at
   # the rows of the prompt parts and a margin, and grows when a step does not fit (see grow/3).
   @min_capacity 256
   @merged_min_capacity 32
+
+  # Above the smallest capacity, the buffers grow by a step of a quarter of the power of two
+  # below the rows, at least this many rows: 64 rows up to 512, 128 up to 1024, and so on. So
+  # a group runs at most a quarter more rows than it needs, and a long answer compiles four
+  # capacities for each doubling of its rows.
+  @capacity_step 64
   @capacity_margin 16
 
   # The bytes of released device buffers after which the generation process collects its
@@ -1071,6 +1078,10 @@ defmodule Transmuter.Generation do
   # A group of `rows` empty rows, with buffers for `length` rows of cache. An empty row has no
   # request and is done. admit/5 gives requests to rows, and next/2 runs the steps.
   def open(ctx, rows, length \\ @capacity_margin) do
+    unless Map.has_key?(ctx, :backend) do
+      raise ArgumentError, "a group needs a context from compile/3, got a context of context/4"
+    end
+
     state = initial_state(ctx, rows, capacity(ctx, length))
     zeros = &Nx.broadcast(Nx.tensor(0, type: &1, backend: ctx.backend), &2)
 
@@ -1634,9 +1645,18 @@ defmodule Transmuter.Generation do
   defp min_capacity(model),
     do: if(@position_offset in model.inputs, do: @merged_min_capacity, else: @min_capacity)
 
-  # A power of two, at most the largest capacity of the decoder (see MergedDecoder).
-  defp capacity(ctx, length) do
-    capacity = max(ctx.min_capacity, 2 ** ceil(:math.log2(length)))
+  # The smallest capacity, or above it a multiple of the step of @capacity_step, at most the
+  # largest capacity of the decoder (see MergedDecoder).
+  defp capacity(ctx, rows) do
+    capacity =
+      if rows <= ctx.min_capacity do
+        ctx.min_capacity
+      else
+        below = 2 ** (length(Integer.digits(rows - 1, 2)) - 1)
+        step = max(@capacity_step, div(below, 4))
+        div(rows + step - 1, step) * step
+      end
+
     min(capacity, ctx.max_capacity || capacity)
   end
 
@@ -1819,8 +1839,8 @@ defmodule Transmuter.Generation do
     if rows > state.capacity, do: grow(ctx, state, rows), else: state
   end
 
-  # Gives the buffers the capacity of the next power of two that fits the rows of a step, up to
-  # the largest capacity of the decoder. One compiled function pads all buffers with free
+  # Gives the buffers the capacity of capacity/2 that fits the rows of a step, up to the
+  # largest capacity of the decoder. One compiled function pads all buffers with free
   # rows, which the masks hide, and each growth compiles the steps of one more capacity. The
   # tokens of the rows, which the processors read, have the same capacity and grow with the
   # buffers, also in :grow, where the cache has its exact length and only the tokens grow.
