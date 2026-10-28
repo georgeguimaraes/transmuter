@@ -9,7 +9,8 @@
 # Prints, for the measured requests:
 #   - tokens/s: all new tokens, divided by the time from the first arrival to the last end;
 #   - first token: the time from the arrival to the first chunk of text (p50 and p95);
-#   - between tokens: the time of a step for each running row (p50 and p95). For the server,
+#   - between tokens: the time of a step for each running row (p50, p95, p99 and the largest).
+#     The joins are few of all steps, so p99 and the largest show them. For the server,
 #     from the step events, where a step with prompt parts that join counts for the rows
 #     that already ran. For the serving, the time between two compiled calls of one batch;
 #   - tokens per call: all new tokens, divided by the compiled calls.
@@ -197,7 +198,7 @@ splits =
 f = &:erlang.float_to_binary(&1 / 1, decimals: 1)
 
 IO.puts(
-  "RESULT #{name} #{mode} rate #{rate}: #{f.(tokens / (span / 1000))} tokens/s, first token p50 #{percentile.(first, 0.5)} ms p95 #{percentile.(first, 0.95)} ms, between tokens p50 #{f.(percentile.(between, 0.5))} ms p95 #{f.(percentile.(between, 0.95))} ms, #{f.(tokens / length(calls))} tokens per call, #{tokens} tokens"
+  "RESULT #{name} #{mode} rate #{rate}: #{f.(tokens / (span / 1000))} tokens/s, first token p50 #{percentile.(first, 0.5)} ms p95 #{percentile.(first, 0.95)} ms, between tokens p50 #{f.(percentile.(between, 0.5))} ms p95 #{f.(percentile.(between, 0.95))} ms p99 #{f.(percentile.(between, 0.99))} ms max #{f.(Enum.max(between))} ms, #{f.(tokens / length(calls))} tokens per call, #{tokens} tokens"
 )
 
 # The steps without and with requests that join, the compiled calls in each, and the mean

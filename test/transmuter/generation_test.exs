@@ -400,7 +400,7 @@ defmodule Transmuter.GenerationTest do
       end
 
     # Each row runs alone in a buffer of 512 rows, as generation runs the rows of one length.
-    static = Map.put(flag.(1), "num_logits_to_keep", host.(1))
+    static = flag.(1)
 
     for {past, length, alone} <- rows do
       buffers =
@@ -414,6 +414,7 @@ defmodule Transmuter.GenerationTest do
           "input_ids" => host.([[50]]),
           "encoder_hidden_states" => hidden,
           "transmuter.position_offset" => host.(length - 512),
+          "transmuter.logit_index" => host.([[[0]]]),
           "transmuter.key_mask" =>
             host.([List.duplicate(1, length) ++ List.duplicate(0, 512 - length) ++ [1]])
         })
@@ -765,8 +766,8 @@ defmodule Transmuter.GenerationTest do
   end
 
   # A request that joins writes its prompt parts at the write offset, so a join can pass the
-  # capacity. The first row has a prompt of 200 tokens and runs 45 steps, so the offset is 245
-  # of 256 rows. The prompt of 20 tokens that joins then needs 20 rows in its parts, so the
+  # capacity. The first row has a prompt of 200 tokens, which runs in steps of 128, 64 and 8
+  # tokens, and then 45 steps of one token, so the offset is 245 of 256 rows. The prompt of 20 tokens that joins then needs 20 rows in its parts, so the
   # admit compacts the buffers into 320 rows before it writes them. Each row gives the tokens
   # that it gives alone.
   @tag ci_partition: 10
@@ -791,8 +792,9 @@ defmodule Transmuter.GenerationTest do
     {group, capacities} =
       compiled_capacities(fn ->
         group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, long, 60)])
-        group = Enum.reduce(1..45, group, fn _step, group -> Generation.next(ctx, group) end)
+        group = Enum.reduce(1..48, group, fn _step, group -> Generation.next(ctx, group) end)
         assert {group.state.used, group.state.capacity} == {245, 256}
+        assert group.state.used + length(joining) > group.state.capacity
         group = Generation.admit(ctx, group, [request.(1, joining, 10)])
         run_until(ctx, group, &Enum.all?(&1.done))
       end)
@@ -896,6 +898,155 @@ defmodule Transmuter.GenerationTest do
     result = fun.()
     :telemetry.detach(id)
     {result, received_capacities()}
+  end
+
+  # A row that decodes takes a new token in each step of a join. A prompt of 37 tokens runs
+  # in steps of 32, 4 and 1 tokens, and a prompt of 300 tokens in steps of at most 64 tokens
+  # (64, 64, 64, 64, 32, 8 and 4), so the row that decodes gets 3 and then 7 tokens during the
+  # joins. The prompt of 300 tokens is longer than the 256 rows of the buffers, so the admit
+  # grows them before it writes the tokens of the prompt. Each
+  # row gives the tokens that it gives alone, with greedy selection and with sampling. The rows
+  # run 80 tokens and the joins 16, with no eos before, so the row that decodes runs through
+  # both joins.
+  @tag ci_partition: 10
+  test "a row that decodes takes a new token in each step of a join" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, "Once upon a time")
+    story = Transmuter.Tokenizer.ids(tokenizer, encoding)
+    short = for i <- 1..37, do: rem(i * 37, 49_000)
+    long = for i <- 1..300, do: rem(i * 53, 49_000)
+
+    for strategy <- [:greedy, :sampling] do
+      limits = [max_new_tokens: 80, min_new_tokens: 80]
+      ctx = Generation.context(repo, model, [strategy: strategy] ++ limits)
+      single = Generation.compile(ctx, 1, @opts[:defn_options])
+      alone = &(single |> Generation.generate([&1], [&2]) |> hd() |> Enum.map(fn [id] -> id end))
+      ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+      request = &%{row: &1, prompt: &2, seed: &3, budget: &4}
+
+      group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, story, 7, 80)])
+      group = run_until(ctx, group, &(length(Enum.at(&1.ids, 0)) == 2))
+
+      group = Generation.admit(ctx, group, [request.(1, short, 11, 16)])
+      {group, steps} = steps_until(ctx, group, &(Enum.at(&1.ids, 1) != []))
+      assert {steps, length(Enum.at(group.ids, 0))} == {3, 2 + 3}
+      group = run_until(ctx, group, &Enum.at(&1.done, 1))
+      short_tokens = row_tokens(group, 1)
+
+      group = Generation.admit(ctx, group, [request.(1, long, 13, 16)])
+      before = length(Enum.at(group.ids, 0))
+      {group, steps} = steps_until(ctx, group, &(Enum.at(&1.ids, 1) != []))
+      assert {steps, length(Enum.at(group.ids, 0))} == {7, before + 7}
+      group = run_until(ctx, group, &Enum.all?(&1.done))
+
+      assert row_tokens(group, 0) == alone.(story, 7), inspect(strategy)
+      assert short_tokens == Enum.take(alone.(short, 11), 16), inspect(strategy)
+      assert row_tokens(group, 1) == Enum.take(alone.(long, 13), 16), inspect(strategy)
+    end
+  end
+
+  # Each row of a step reads the logits at its own last token. Prompts of 1, 4 and 16 tokens
+  # run in one step of 16 tokens, so their last tokens are at positions 0, 3 and 15, and each
+  # row gives the greedy tokens that it gives alone. The decoder gets the gather before its
+  # lm_head. The same decoder with the num_logits_to_keep of the Gemma 3 exports before its
+  # lm_head and a Reshape after it gets no gather, so it keeps all positions and the selection
+  # reads each row at its offset.
+  test "the rows of a step read the logits at their own last token" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    prompts = for n <- [1, 4, 16], do: for(i <- 1..n, do: rem(i * 53, 49_000))
+
+    for {model, gather?} <- [{model, true}, {keeps_logits(model), false}] do
+      {ctx, _log} =
+        ExUnit.CaptureLog.with_log(fn -> Generation.context(repo, model, max_new_tokens: 8) end)
+
+      assert "transmuter.logit_index" in ctx.model.inputs == gather?
+      batch = Generation.compile(ctx, 3, @opts[:defn_options])
+      single = Generation.compile(ctx, 1, @opts[:defn_options])
+      alone = for prompt <- prompts, do: hd(Generation.generate(single, [prompt], [0]))
+      assert Generation.generate(batch, prompts, [0, 0, 0]) == alone, inspect(gather?)
+    end
+  end
+
+  # A decoder with num_logits_to_keep: a Slice keeps the last positions of the hidden states
+  # before the node that gives the logits, as in the Gemma 3 exports, and a Reshape after that
+  # node stops the walk of keep_last_logits/1.
+  defp keeps_logits(model) do
+    node = &%NodeProto{op_type: &1, name: hd(&3), input: &2, output: &3}
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    index = Enum.find_index(model.nodes, &("logits" in &1.output))
+    lm_head = Enum.at(model.nodes, index)
+    [hidden | rest] = lm_head.input
+
+    nodes = [
+      node.("Neg", ["num_logits_to_keep"], ["keep.neg"]),
+      node.("Reshape", ["keep.neg", "keep.one"], ["keep.starts"]),
+      node.("Slice", [hidden, "keep.starts", "keep.ends", "keep.axes"], ["keep.hidden"]),
+      %{lm_head | input: ["keep.hidden" | rest], output: ["keep.scores"]},
+      node.("Reshape", ["keep.scores", "keep.shape"], ["logits"])
+    ]
+
+    constants = %{
+      "keep.one" => host.([1]),
+      "keep.ends" => host.([2_147_483_647]),
+      "keep.axes" => host.([1]),
+      "keep.shape" => host.([0, 0, -1])
+    }
+
+    %{
+      model
+      | nodes: model.nodes |> List.replace_at(index, nodes) |> List.flatten(),
+        static: Map.merge(model.static, constants),
+        inputs: model.inputs ++ ["num_logits_to_keep"],
+        input_types: Map.put(model.input_types, "num_logits_to_keep", {:s64, []})
+    }
+  end
+
+  # A row that runs its prompt in parts counts the tokens of its prompt that are left. Row 0
+  # (1200 tokens of prompt) ends 2 steps after a prompt of 1000 tokens joins, which writes 64
+  # tokens in each of these steps. shrink/2 then keeps the 1280 rows of the buffers, because
+  # the joining row needs 1000 rows. If it counted only the 128 rows written, it would compact
+  # into 256 rows and grow again in the next steps. Each row gives the tokens that it gives
+  # alone.
+  @tag ci_partition: 10
+  test "a row with a part of its prompt left keeps the buffers that its prompt needs" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    ctx = Generation.context(repo, model, max_new_tokens: 8, min_new_tokens: 8)
+    assert ctx.mode == :append
+
+    [long, joining] =
+      for {n, k} <- [{1200, 37}, {1000, 53}], do: for(i <- 1..n, do: rem(i * k, 49_000))
+
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    request = &%{row: &1, prompt: &2, seed: 0, budget: &3}
+    step = &Generation.shrink(ctx, Generation.next(ctx, &1))
+
+    group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, long, 4)])
+    group = run_until(ctx, group, &(length(Enum.at(&1.ids, 0)) == 2))
+    group = Generation.admit(ctx, group, [request.(1, joining, 8)])
+    group = group |> step.() |> step.()
+    assert {Enum.at(group.done, 0), length(Enum.at(group.left, 1))} == {true, 1000 - 128}
+    assert group.state.capacity == 1280
+
+    group = run_until(ctx, group, &Enum.all?(&1.done))
+    assert row_tokens(group, 0) == Enum.take(alone.(long), 4)
+    assert row_tokens(group, 1) == alone.(joining)
+  end
+
+  defp steps_until(ctx, group, done?, steps \\ 0) do
+    if done?.(group),
+      do: {group, steps},
+      else: steps_until(ctx, Generation.next(ctx, group), done?, steps + 1)
   end
 
   defp run_until(ctx, group, done?) do
@@ -1173,11 +1324,11 @@ defmodule Transmuter.GenerationBitsTest do
   alias Transmuter.{Generation, GraphBreaks}
   alias Transmuter.Onnx.{AttributeProto, GraphProto, NodeProto, ValueInfoProto}
 
-  # The lm_head of a decoder without num_logits_to_keep computes the logits of one position
-  # with the input that generation adds, through the softcap of Gemma. A Reshape after the
-  # lm_head, another reader of a value on the way to the logits, or an input that the graph
-  # already declares, leaves the graph as it is.
-  test "the context keeps the logits of the last positions before the lm_head" do
+  # The lm_head computes the logits of one position of each row, at the position that the
+  # input transmuter.logit_index gives, through the softcap of Gemma. An export that declares
+  # num_logits_to_keep gets the same gather. A Reshape after the lm_head, or another reader of
+  # a value on the way to the logits, leaves the graph as it is.
+  test "the context keeps the logits of one position of each row before the lm_head" do
     node = &%NodeProto{op_type: &1, name: &1, input: &2, output: &3}
     host = &Nx.tensor(&1, backend: Nx.BinaryBackend)
 
@@ -1209,11 +1360,12 @@ defmodule Transmuter.GenerationBitsTest do
     %{"logits" => all} = Transmuter.run(model, model.params, inputs)
 
     %{model: kept} = Generation.context(repo, model, [])
-    assert "num_logits_to_keep" in kept.inputs
+    assert "transmuter.logit_index" in kept.inputs
+    at = &Map.put(inputs, "transmuter.logit_index", host.([[[&1]]]))
 
-    for {keep, expected} <- [{1, all[[.., 2..2]]}, {2, all[[.., 1..2]]}, {0, all}] do
-      static = %{"num_logits_to_keep" => host.(keep)}
-      assert Transmuter.run(kept, kept.params, inputs, static)["logits"] == expected
+    for position <- [2, 1, 0] do
+      expected = all[[.., position..position]]
+      assert Transmuter.run(kept, kept.params, at.(position))["logits"] == expected
     end
 
     flat = %{
@@ -1265,18 +1417,19 @@ defmodule Transmuter.GenerationBitsTest do
     merged_model = merged.(cached)
     %{model: kept} = Generation.context(repo, merged_model, [])
 
-    for flag <- [0, 1], {keep, positions} <- [{1, 2..2}, {2, 1..2}, {0, 0..2}] do
+    for flag <- [0, 1], position <- [2, 1, 0] do
       static = %{"use_cache_branch" => Nx.tensor([flag], type: :u8, backend: Nx.BinaryBackend)}
       %{"logits" => all} = Transmuter.run(merged_model, model.params, inputs, static)
-      static = Map.put(static, "num_logits_to_keep", host.(keep))
-      assert Transmuter.run(kept, kept.params, inputs, static)["logits"] == all[[.., positions]]
+      expected = all[[.., position..position]]
+      assert Transmuter.run(kept, kept.params, at.(position), static)["logits"] == expected
 
-      # The static inputs select the branch and fold the slice, so the graph does not break.
+      # The static input selects the branch, and the gather keeps the shapes, so the graph
+      # does not break.
       compiler = Transmuter.TestBackend.compiler_opts()
-      {compiled, segments} = GraphBreaks.run_once(kept, inputs, static, compiler)
+      {compiled, segments} = GraphBreaks.run_once(kept, at.(position), static, compiler)
       assert [%{start: 0, stop: :end}] = segments
       compiled = Nx.backend_transfer(compiled["logits"], Nx.BinaryBackend)
-      assert Nx.to_number(Nx.all_close(compiled, all[[.., positions]])) == 1
+      assert Nx.to_number(Nx.all_close(compiled, expected)) == 1
     end
 
     flat_branch = merged.([node.("Reshape", ["hidden", "shape"], ["cached"])])
@@ -1295,7 +1448,9 @@ defmodule Transmuter.GenerationBitsTest do
       assert log =~ "stops at #{op}"
     end
 
-    assert Generation.context(repo, declared, []).model == declared
+    %{model: kept_declared} = Generation.context(repo, declared, [])
+    assert "num_logits_to_keep" in kept_declared.inputs
+    assert "transmuter.logit_index" in kept_declared.inputs
 
     # The vocabulary size is the last dimension of the logits, else the vocab_size of the
     # configuration.

@@ -42,7 +42,7 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
   In `:append`, all rows of a step write at one offset, so the offset passes the rows of all steps, also the rows of the requests that ended. When a step does not fit, the buffers compact: the valid rows of each running row move to the front, and the offset goes back to the longest running row. After a step, the buffers also compact when the longest running row and 16 rows fit in half of them, so the rows after a long request do not keep its capacity.
 
-  A request joins with the steps of its prompt parts (see `Transmuter.Generation`), and the running rows get their next token only in the last of these steps. So each join delays the tokens of the running rows: about 125 ms for a chat prompt of Qwen3-0.6B on CUDA, against 26 ms for a step without a join.
+  A request joins with the steps of its prompt parts (see "Logits" in `Transmuter.Generation`), and each running row gets its next token in each of these steps. A step with running rows takes at most 64 tokens of a prompt, so a join delays the tokens of the running rows by at most one such step: for Qwen3-0.6B on CUDA, the time between two tokens is at most about 53 ms during a join, against 26 ms for a step without a join.
 
   On EMLX, MLX keeps the freed buffers of each size in a cache, which has no limit by default. Set a limit, for example `EMLX.set_cache_limit(1_000_000_000)`, when the application starts.
 
@@ -371,11 +371,11 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
     group =
       if requests == [],
-        do: Generation.next(state.ctx, state.group),
+        do: state.group,
         else: Generation.admit(state.ctx, state.group, requests)
 
+    group = Generation.next(state.ctx, group)
     group = Generation.shrink(state.ctx, group)
-
     emit(%{state | rows: Map.merge(state.rows, Map.new(admitted))}, group)
   end
 
@@ -418,7 +418,8 @@ defmodule Transmuter.Text.ContinuousGeneration do
   end
 
   # Sends the new token of each row to its stream, and the tokens of each row that ends to
-  # its caller. A row that ends is free for the next step.
+  # its caller. A row with a part of its prompt left has no token yet. A row that ends is free
+  # for the next step.
   defp emit(state, group) do
     rows =
       Enum.reduce(state.rows, state.rows, fn {row, request}, rows ->
@@ -426,6 +427,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
         done? = Enum.at(group.done, row)
 
         cond do
+          token == nil and not done? ->
+            :ok
+
           request.stream? ->
             logprob = if token, do: List.first(hd(Enum.at(group.logprobs, row)))
             send(request.pid, {request.ref, {:token, token || -1, logprob, done?}})

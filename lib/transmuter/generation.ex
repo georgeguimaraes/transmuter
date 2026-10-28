@@ -79,7 +79,9 @@ defmodule Transmuter.Generation do
 
   ## Logits
 
-  Generation reads the logits of one position of each row, at its last token. The last part of the prompt is no longer than the shortest prompt of the batch, so the last token of each row is at the last position of each step. A merged decoder runs the whole prompt of a row in the step of its length, so the prompt ends at the last position of that step. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 1, so the lm_head computes the logits of one position. `context/4` adds this input to a decoder that does not declare it, with the nodes of the Gemma 3 exports: a Slice keeps the last positions of the input of the lm_head, the MatMul or MatMulNBits that gives `logits`. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own Slice before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, and the decoder computes the logits of all positions. `Transmuter.load!/2` does not change the graph.
+  Generation reads the logits of one position of each row, at its last token. `context/4` puts a GatherND before the lm_head, the MatMul or MatMulNBits that gives `logits`: it takes the hidden state of one position of each row, from the input `transmuter.logit_index`. So the rows of a step can end their tokens at different positions, and the lm_head computes one position for each row. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 0, all positions, and the same gather. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own gather before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, the decoder computes the logits of all positions, and the selection reads the position of each row. `Transmuter.load!/2` does not change the graph.
+
+  When requests can join a group with other rows (`:in_place` and `:append` without a merged decoder, with greedy selection or sampling), a prompt runs in the steps of the other rows. Each step takes a part of each prompt from its front, the power of two at or below the longest prompt that is left, and the new token of each other row, which takes the logits at its own position. So a prompt of 37 tokens runs in steps of 32, 4 and 1 tokens, and each other row gets a token in each of them. When another row takes a new token, a step takes at most 64 tokens of a prompt, so a long prompt joins in more steps, and the other rows wait at most one step of 64 tokens for a token. The other decoders run all prompts in parts that end all prompts in the same step, with no other rows (see "Merged decoders" and beam search).
 
   ## Device memory
 
@@ -97,6 +99,10 @@ defmodule Transmuter.Generation do
   # The names of the extra inputs of the selection and of its output. The prefix keeps them
   # apart from the names of the graph.
   @offset "transmuter.select.offset"
+  # The position of the last token of each row in a step, see keep_last_logits/1.
+  @logit_index "transmuter.logit_index"
+  # The most tokens of a prompt in a step where other rows take a new token, see plan/1.
+  @join_tokens 64
   @seen "transmuter.select.seen"
   @mask "transmuter.select.mask."
   @history "transmuter.select.history"
@@ -405,7 +411,7 @@ defmodule Transmuter.Generation do
   defp remove(logits, mask), do: Nx.select(mask, Nx.Constants.min_finite(:f32), logits)
 
   @inputs ~w(input_ids inputs_embeds attention_mask position_ids num_logits_to_keep use_cache_branch) ++
-            [@position_offset, @key_mask]
+            [@position_offset, @key_mask, @logit_index]
 
   defp mode(model, given, embed) do
     if "inputs_embeds" in model.inputs and embed == nil do
@@ -451,22 +457,21 @@ defmodule Transmuter.Generation do
   # alone, with one input that is not static, such as a cast or the softcap of Gemma.
   @per_position ~w(Cast Identity Tanh Add Sub Mul Div)
 
-  # Adds num_logits_to_keep to a decoder that does not declare it, with the nodes of the
-  # Gemma 3 exports before the lm_head: the hidden states keep their last num_logits_to_keep
-  # positions on axis 1, or all positions for 0. Generation reads the rank-3 logits, and the
-  # operators after the lm_head keep the shape, so axis 1 of its input is the sequence. The
-  # values from the lm_head to the logits have no other use, so no other value changes. An If
-  # gives each branch the shape of its output, so each branch that gives the logits gets its
-  # own cut, as in the merged decoders of optimum.
+  # Gives the lm_head the hidden state of one position of each row: a GatherND before it takes
+  # the position of each row from @logit_index, {batch, 1, 1}. So each row of a step can end
+  # its tokens at another position, and the lm_head still computes one position for each row.
+  # Generation reads the rank-3 logits, and the operators after the lm_head keep the shape, so
+  # axis 1 of its input is the sequence. The values from the lm_head to the logits have no
+  # other use, so no other value changes. An If gives each branch the shape of its output, so
+  # each branch that gives the logits gets its own cut, as in the merged decoders of optimum.
+  # An export that declares num_logits_to_keep, such as Gemma 3, keeps it and gets 0, all
+  # positions, so the gather sees each position.
   defp keep_last_logits(model) do
     static = MapSet.new(Map.keys(model.params) ++ Map.keys(model.static))
 
-    with false <- "num_logits_to_keep" in model.inputs,
-         {:ok, lm_heads} <- follow(scope(model.nodes, model.outputs, static), "logits", nil) do
-      slice_hidden(model, MapSet.new(lm_heads))
-    else
-      true ->
-        model
+    case follow(scope(model.nodes, model.outputs, static), "logits", nil) do
+      {:ok, lm_heads} ->
+        gather_hidden(model, MapSet.new(lm_heads))
 
       {:bail, node} ->
         Logger.debug(
@@ -544,52 +549,33 @@ defmodule Transmuter.Generation do
       else: {:bail, scope.producers[name] || node}
   end
 
-  defp slice_hidden(model, lm_heads) do
-    name = &("transmuter.num_logits_to_keep." <> &1)
-    constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
-
-    starts = [
-      %NodeProto{
-        op_type: "Neg",
-        name: name.("neg"),
-        input: ["num_logits_to_keep"],
-        output: [name.("neg")]
-      },
-      %NodeProto{
-        op_type: "Reshape",
-        name: name.("starts"),
-        input: [name.("neg"), name.("shape")],
-        output: [name.("starts")]
-      }
-    ]
-
-    constants = %{
-      name.("shape") => constant.([1]),
-      name.("ends") => constant.([2_147_483_647]),
-      name.("axes") => constant.([1])
-    }
-
+  defp gather_hidden(model, lm_heads) do
     %{
       model
-      | nodes: starts ++ cut(model.nodes, lm_heads, name),
-        static: Map.merge(model.static, constants),
-        inputs: model.inputs ++ ["num_logits_to_keep"],
-        input_types: Map.put(model.input_types, "num_logits_to_keep", {:s64, []})
+      | nodes: cut(model.nodes, lm_heads, &(@logit_index <> "." <> &1)),
+        inputs: model.inputs ++ [@logit_index],
+        input_types: Map.put(model.input_types, @logit_index, {:s64, ["batch_size", 1, 1]})
     }
   end
 
-  # Puts a Slice of the hidden states before each lm_head, also in the branches of If nodes.
-  # A branch reads the starts and the constants of the slice from the outer graph. The nodes
-  # are found by value, because a branch can give its value the name of the If output.
+  # Puts a GatherND of the hidden states before each lm_head, also in the branches of If
+  # nodes, which read @logit_index from the outer graph. The nodes are found by value,
+  # because a branch can give its value the name of the If output.
   defp cut(nodes, lm_heads, name) do
     Enum.flat_map(nodes, fn node ->
       if MapSet.member?(lm_heads, node) do
         [hidden | rest] = node.input
         kept = name.(hidden)
-        slice = [hidden, name.("starts"), name.("ends"), name.("axes")]
+        batch = %AttributeProto{name: "batch_dims", type: :INT, i: 1}
 
         [
-          %NodeProto{op_type: "Slice", name: kept, input: slice, output: [kept]},
+          %NodeProto{
+            op_type: "GatherND",
+            name: kept,
+            input: [hidden, @logit_index],
+            output: [kept],
+            attribute: [batch]
+          },
           %{node | input: [kept | rest]}
         ]
       else
@@ -1102,6 +1088,7 @@ defmodule Transmuter.Generation do
         end),
       keys: zeros.(:u32, {rows, 2}),
       prompts: List.duplicate([], rows),
+      left: List.duplicate([], rows),
       ids: List.duplicate([], rows),
       logprobs: List.duplicate([], rows),
       new: List.duplicate(nil, rows),
@@ -1112,14 +1099,42 @@ defmodule Transmuter.Generation do
   end
 
   @doc false
-  # Gives each request of `requests` its row, runs the prompts and reads the first token of
-  # each new row (see prefill/5). A request is a map with the row, the prompt, the seed and
-  # the budget of new tokens, and can have the positions of the prompt and the cursor of its
-  # image features. The other rows that have not ended take their next token in
-  # the same steps. `inputs` and `features` are the inputs and the image features of the
-  # prompts, which only the first requests of a group can have.
+  # Gives each request of `requests` its row. A request is a map with the row, the prompt, the
+  # seed and the budget of new tokens, and can have the positions of the prompt and the cursor
+  # of its image features. `inputs` and `features` are the inputs and the image features of
+  # the prompts, which only the first requests of a group can have.
+  #
+  # When requests can join a group with other rows (joins?/1), the prompts run in the steps
+  # of next/2, next to the new tokens of the other rows (see plan/1). Otherwise the prompts
+  # run here, in parts that end all prompts in the same step, and the first token of each new
+  # row is read (see prefill/5): a merged decoder runs a prompt on its branch without cache,
+  # which no row with a cache can share, the rows of :grow and of a scalar offset need one
+  # length of the cache, and the beams of all prompts start their search in the same step.
   def admit(ctx, group, requests, inputs \\ %{}, features \\ nil) do
-    ctx |> prefill(group, requests, inputs, features) |> then(&select(ctx, &1))
+    pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
+
+    if not joins?(ctx) and Enum.any?(pending) do
+      raise ArgumentError,
+            "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder and without beams"
+    end
+
+    if joins?(ctx) do
+      longest = requests |> Enum.map(&length(&1.prompt)) |> Enum.max()
+
+      group =
+        ctx |> fit(reset_rows(group, requests), longest) |> then(&admit_rows(ctx, &1, requests))
+
+      left = Enum.reduce(requests, group.left, &List.replace_at(&2, &1.row, &1.prompt))
+      inputs = Map.merge(group.state.inputs, inputs)
+
+      %{
+        group
+        | left: left,
+          state: %{group.state | inputs: inputs, features: features || group.state.features}
+      }
+    else
+      ctx |> prefill(group, requests, inputs, features) |> then(&select(ctx, &1))
+    end
   end
 
   @doc false
@@ -1146,7 +1161,8 @@ defmodule Transmuter.Generation do
   @doc false
   # The rows of cache that `group` needs to admit `requests` and to run each row to the end of
   # its budget: the rows of the longest row, then the prompt parts, where each row that has not
-  # ended takes its next token, and then the new tokens that are left. In :append, the longest
+  # ended takes its next token, and then the new tokens that are left. A row that runs counts
+  # the tokens of its prompt that are left, which the next steps write. In :append, the longest
   # row is the longest row that runs, because fit/3 compacts the buffers to it.
   def rows_needed(ctx, group, requests) do
     active =
@@ -1156,7 +1172,7 @@ defmodule Transmuter.Generation do
     rows =
       if ctx.mode == :append,
         do: running_rows(group),
-        else: Enum.max(group.state.lengths)
+        else: max(Enum.max(group.state.lengths), running_rows(group))
 
     lengths = Enum.map(requests, &length(&1.prompt)) ++ List.duplicate(1, length(active))
     left = Enum.map(requests, & &1.budget) ++ active
@@ -1179,43 +1195,11 @@ defmodule Transmuter.Generation do
   defp prefill(ctx, group, requests, inputs, features) do
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
-    if not joins?(ctx) and Enum.any?(pending) do
-      raise ArgumentError,
-            "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder and without beams"
-    end
-
     # A row with a new token has one token in these steps.
     joining = Map.new(requests, &{&1.row, &1})
     lengths = Enum.map(requests, &length(&1.prompt)) ++ for(token <- pending, token, do: 1)
     sizes = part_sizes(ctx, lengths)
-
-    group =
-      Enum.reduce(requests, group, fn request, group ->
-        %{
-          group
-          | prompts: List.replace_at(group.prompts, request.row, request.prompt),
-            ids: List.replace_at(group.ids, request.row, []),
-            logprobs: List.replace_at(group.logprobs, request.row, []),
-            new: List.replace_at(group.new, request.row, nil),
-            done: List.replace_at(group.done, request.row, false),
-            budgets: List.replace_at(group.budgets, request.row, request.budget),
-            state: %{
-              group.state
-              | lengths: List.replace_at(group.state.lengths, request.row, 0),
-                valid: List.replace_at(group.state.valid, request.row, []),
-                positions:
-                  List.replace_at(
-                    group.state.positions,
-                    request.row,
-                    Map.get(request, :position, {[], 0})
-                  ),
-                cursors:
-                  List.replace_at(group.state.cursors, request.row, Map.get(request, :cursor, 0))
-            }
-        }
-      end)
-
-    group = fit(ctx, group, Enum.sum(sizes))
+    group = fit(ctx, reset_rows(group, requests), Enum.sum(sizes))
     group = admit_rows(ctx, group, requests)
 
     # The parts of each row: the parts of its prompt, its new token in the last part, or no
@@ -1263,6 +1247,35 @@ defmodule Transmuter.Generation do
 
     release(Map.values(own), [])
     %{group | state: %{state | features: nil, selected: selected(state.selected, picked)}}
+  end
+
+  # The rows of `requests` start again: their prompt, budget, positions and image cursor, no
+  # tokens, and no rows of cache.
+  defp reset_rows(group, requests) do
+    Enum.reduce(requests, group, fn request, group ->
+      %{
+        group
+        | prompts: List.replace_at(group.prompts, request.row, request.prompt),
+          ids: List.replace_at(group.ids, request.row, []),
+          logprobs: List.replace_at(group.logprobs, request.row, []),
+          new: List.replace_at(group.new, request.row, nil),
+          done: List.replace_at(group.done, request.row, false),
+          budgets: List.replace_at(group.budgets, request.row, request.budget),
+          state: %{
+            group.state
+            | lengths: List.replace_at(group.state.lengths, request.row, 0),
+              valid: List.replace_at(group.state.valid, request.row, []),
+              positions:
+                List.replace_at(
+                  group.state.positions,
+                  request.row,
+                  Map.get(request, :position, {[], 0})
+                ),
+              cursors:
+                List.replace_at(group.state.cursors, request.row, Map.get(request, :cursor, 0))
+          }
+      }
+    end)
   end
 
   # The parts of a prompt: the parts of power-of-two lengths that fill from the last one, or for
@@ -1341,12 +1354,14 @@ defmodule Transmuter.Generation do
     group
   end
 
+  # A row with a part of its prompt left gets no token, and has not ended.
   defp select(ctx, group) do
     {new, logprobs} =
-      group.state.selected
-      |> Nx.to_list()
-      |> Enum.zip_with(group.done, fn [token | logprob], done? ->
-        if done? or token in ctx.eos, do: {nil, nil}, else: {token, from_bits(logprob)}
+      [Nx.to_list(group.state.selected), group.done, group.left]
+      |> Enum.zip_with(fn [[token | logprob], done?, left] ->
+        if done? or left != [] or token in ctx.eos,
+          do: {nil, nil},
+          else: {token, from_bits(logprob)}
       end)
       |> Enum.unzip()
 
@@ -1354,8 +1369,8 @@ defmodule Transmuter.Generation do
     ids = push(group.ids, new, new)
 
     done =
-      Enum.zip_with([new, ids, group.budgets], fn [token, ids, budget] ->
-        token == nil or length(ids) == budget
+      Enum.zip_with([new, ids, group.budgets, group.left], fn [token, ids, budget, left] ->
+        left == [] and (token == nil or length(ids) == budget)
       end)
 
     %{
@@ -1646,9 +1661,38 @@ defmodule Transmuter.Generation do
 
   # The step of the new tokens gives the selection for the remaining tokens.
   defp advance(ctx, group) do
-    group = fit(ctx, group, 1)
-    selection = selection(ctx, group)
-    %{group | state: step(ctx, group.state, Enum.map(group.new, &List.wrap/1), selection)}
+    {parts, left} = plan(group)
+    group = fit(ctx, %{group | left: left}, parts |> Enum.map(&length/1) |> Enum.max())
+    state = step(ctx, group.state, parts, selection(ctx, group))
+
+    # The image features stay until the last part of a prompt has run.
+    state = if Enum.all?(left, &(&1 == [])), do: %{state | features: nil}, else: state
+    %{group | state: state}
+  end
+
+  # The tokens of each row in the next step, and the tokens of the prompts that are left after
+  # it. A row with a new token takes it. A row with a prompt takes a part of it from the front:
+  # the step has the power of two at or below the longest prompt that is left, at most
+  # @join_tokens when another row takes a new token, so a long prompt delays the other rows by
+  # steps of that size. Each row reads the logits at its own last token (see
+  # keep_last_logits/1), so the rows can end their tokens at different positions, and a prompt
+  # of 37 tokens runs in steps of 32, 4 and 1 tokens with a new token of each other row in each.
+  defp plan(group) do
+    longest = group.left |> Enum.map(&length/1) |> Enum.max()
+
+    running? =
+      Enum.any?(Enum.zip(group.new, group.done), &match?({token, false} when token != nil, &1))
+
+    size = if longest == 0, do: 0, else: 2 ** (length(Integer.digits(longest, 2)) - 1)
+    size = if running?, do: min(size, @join_tokens), else: size
+
+    [group.left, group.new, group.done]
+    |> Enum.zip_with(fn
+      [[], token, false] when token != nil -> {[token], []}
+      [[], _token, _done?] -> {[], []}
+      [left, _token, _done?] -> Enum.split(left, size)
+    end)
+    |> Enum.unzip()
   end
 
   # The masks of tokens are on the host, because a mark there is faster than a call to the
@@ -1745,8 +1789,14 @@ defmodule Transmuter.Generation do
     {inputs, state} = embed(ctx, state, inputs, tokens)
 
     # The selection takes the logits at the last real token of each row, which is this many
-    # positions before the last position of the step.
-    offsets = Nx.tensor(Enum.map(counts, &(n - &1)), type: :s32, backend: Nx.BinaryBackend)
+    # positions before the last position of the logits. With @logit_index, the logits have
+    # that position alone.
+    offsets =
+      if @logit_index in ctx.model.inputs,
+        do: List.duplicate(0, length(counts)),
+        else: Enum.map(counts, &(n - &1))
+
+    offsets = Nx.tensor(offsets, type: :s32, backend: Nx.BinaryBackend)
 
     # The selection of the last step is read, or is that of an earlier part of the prompt,
     # so nothing reads it now.
@@ -1928,8 +1978,9 @@ defmodule Transmuter.Generation do
   end
 
   @doc false
-  # Compacts the buffers of :append when the longest row that runs and @capacity_margin rows fit
-  # in half of them, as after a long row ends in a server. The buffers of the other modes stay.
+  # Compacts the buffers of :append when the longest row that runs, with the prompt that it has
+  # left, and @capacity_margin rows fit in half of them, as after a long row ends in a server.
+  # The buffers of the other modes stay.
   def shrink(ctx, group = %{state: state}) do
     if ctx.mode == :append and
          capacity(ctx, running_rows(group) + @capacity_margin) <= div(state.capacity, 2),
@@ -1937,11 +1988,11 @@ defmodule Transmuter.Generation do
        else: group
   end
 
-  # The rows of the longest row that has not ended, or 0.
+  # The rows of the longest row that has not ended, with the tokens of its prompt that are left
+  # (see plan/1), or 0.
   defp running_rows(group) do
-    group.state.lengths
-    |> Enum.zip(group.done)
-    |> Enum.map(fn {length, done?} -> if done?, do: 0, else: length end)
+    [group.state.lengths, group.left, group.done]
+    |> Enum.zip_with(fn [rows, left, done?] -> if done?, do: 0, else: rows + length(left) end)
     |> Enum.max(fn -> 0 end)
   end
 
@@ -2093,7 +2144,8 @@ defmodule Transmuter.Generation do
       "attention_mask" => masks,
       "position_ids" => positions(ctx, state, n),
       @position_offset => position_offset(ctx, state),
-      @key_mask => masks
+      @key_mask => masks,
+      @logit_index => for(count <- counts, do: [[max(count - 1, 0)]])
     }
 
     inputs =
@@ -2104,12 +2156,14 @@ defmodule Transmuter.Generation do
         {name, Nx.tensor(value, type: type, backend: Nx.BinaryBackend)}
       end
 
-    # The last token of each row is at the last position of the last part of the prompt (see
-    # start/6), and nothing reads the logits of the other parts, so a step keeps one position.
+    # An export that declares num_logits_to_keep keeps all positions (0). With @logit_index,
+    # the gather then takes the last token of each row before the lm_head. Without it, the
+    # logits have all positions, and the selection reads each row at its offset, because the
+    # rows of a step can end their tokens at different positions.
     flag = if cached?, do: 1, else: 0
 
     static =
-      for {name, value} <- [{"use_cache_branch", [flag]}, {"num_logits_to_keep", 1}],
+      for {name, value} <- [{"use_cache_branch", [flag]}, {"num_logits_to_keep", 0}],
           name in ctx.model.inputs,
           into: %{} do
         {type, _dims} = ctx.model.input_types[name]
