@@ -4,7 +4,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. A decoder without an `If` gets the rewrite on its graph when a node other than GroupQueryAttention reads the past, as the rotary positions of Apertus. GroupQueryAttention writes its new rows into the buffer and hides its free rows, so it needs no key mask, and no other node may read its present. The rewrite adds two inputs:
 
-    * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when every read is a `Gather` of a position table whose index has a leading axis of size 1 (as the positions of GPT-2), no later `Reshape` or `Expand` has a static first dimension of 1, and no prefix (below) takes the rows of the buffer as positions. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
+    * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when every read is a `Gather` of a position table whose index has a leading axis of size 1 (as the positions of GPT-2), or a read whose positions meet the tokens of each row, which have the batch first (the table reads of Marian, Whisper, TrOCR and Florence-2, whose output adds to the token embeddings, and the `Mul` of M2M100 and NLLB by the padding mask), no later `Reshape` or `Expand` has a static first dimension of 1, and no prefix (below) takes the rows of the buffer as positions. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
 
     * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The key mask is an input only when a node reads it. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
@@ -65,13 +65,14 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp per_row?(model, graph, reads, prefixes) do
     scope = static_scope(model, graph)
     producers = for node <- graph.node, output <- node.output, into: %{}, do: {output, node}
+    batch? = &(batch_index?(&1, producers, scope) or meets_tokens?(&1, graph))
 
     reason =
       cond do
         prefixes != [] ->
           {"a prefix of the rows of the buffer", hd(prefixes)}
 
-        read = Enum.find(reads, &(not batch_index?(&1, producers, scope))) ->
+        read = Enum.find(reads, &(not batch?.(&1))) ->
           {"a read that needs one offset for all rows", read_node(read)}
 
         node = batch_reshape(graph, reads, scope) ->
@@ -121,6 +122,53 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   defp batch_index?(_read, _producers, _scope), do: false
+
+  # A read whose positions meet the tokens of each row, which have the batch first: a table
+  # read whose output only goes into Add, Sub or Mul with a value of the tokens, through Cast,
+  # Identity or DequantizeLinear, as the positions of Marian, Whisper and TrOCR that add to the
+  # token embeddings, or a Mul whose
+  # other input is a value of the tokens, as the padding mask of M2M100. Its index or its
+  # shift input then takes the offset of each row, {batch, 1}: an index of the token positions
+  # gets the batch first, and an index with a first axis of the batch or 1 keeps its shape,
+  # as the sum with the tokens is valid in the graph.
+  defp meets_tokens?({node, input}, graph),
+    do: Enum.any?(List.delete_at(node.input, input), &MapSet.member?(token_values(graph), &1))
+
+  defp meets_tokens?(node = %NodeProto{op_type: op}, graph) when op in ["Gather", "Slice"],
+    do: adds_to_tokens?(hd(node.output), graph, token_values(graph))
+
+  defp meets_tokens?(_read, _graph), do: false
+
+  @same_shape ~w(Cast Identity DequantizeLinear)
+
+  defp adds_to_tokens?(value, graph, tokens) do
+    uses = Enum.filter(graph.node, &(value in &1.input))
+
+    uses != [] and
+      Enum.all?(uses, fn use ->
+        cond do
+          use.op_type in @same_shape and hd(use.input) == value ->
+            adds_to_tokens?(hd(use.output), graph, tokens)
+
+          use.op_type in ["Add", "Sub", "Mul"] ->
+            Enum.any?(List.delete(use.input, value), &MapSet.member?(tokens, &1))
+
+          true ->
+            false
+        end
+      end)
+  end
+
+  # The values that follow the tokens of each row, input_ids or inputs_embeds, without the
+  # shapes and the sizes, which have no batch axis.
+  defp token_values(graph) do
+    Enum.reduce(graph.node, MapSet.new(["input_ids", "inputs_embeds"]), fn node, tokens ->
+      if node.op_type not in ["Shape", "Size"] and
+           Enum.any?(node.input, &MapSet.member?(tokens, &1)),
+         do: MapSet.union(tokens, MapSet.new(node.output)),
+         else: tokens
+    end)
+  end
 
   defp leading_one?(shape, producers, list) do
     case {list.(shape), producers[shape]} do

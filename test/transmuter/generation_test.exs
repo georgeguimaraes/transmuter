@@ -880,6 +880,55 @@ defmodule Transmuter.GenerationTest do
     assert generate.(exact) == {:grow, [tokens]}
   end
 
+  # Marian reads its positions from a table at Range(L, L + n), and the positions add to the
+  # token embeddings, which have the batch first. So the rewrite gives it a position offset for
+  # each row, and decoder prompts of 1 and 3 tokens run in one group: the shorter row has gap
+  # rows and another valid length at each step. Each row gives the tokens that it gives alone,
+  # with log-probabilities within 1e-4. The tokens alone do not show a shift of the positions of
+  # a row by a few rows, so the log-probabilities are part of the check.
+  @tag ci_partition: 10
+  test "a merged decoder whose positions meet the tokens takes an offset for each row" do
+    {repo, encoder, decoder} =
+      Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/opus-mt-en-de"}, @opts)
+
+    tokenizer = Transmuter.Serving.tokenizer(repo, [])
+    {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, @lighthouse)
+    ids = Transmuter.Tokenizer.ids(tokenizer, encoding)
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    mask = host.([List.duplicate(1, length(ids))])
+    inputs = %{"input_ids" => host.([ids]), "attention_mask" => mask}
+    %{"last_hidden_state" => states} = Transmuter.run(encoder, encoder.params, inputs)
+    given = %{"encoder_hidden_states" => states, "encoder_attention_mask" => mask}
+    repo = %{repo | generation_config: Map.put(repo.generation_config, "num_beams", 1)}
+    opts = [max_new_tokens: 20, token_logprobs: true]
+    ctx = Generation.context(repo, decoder, opts, Map.keys(given))
+    assert {:s64, ["batch_size", 1]} = ctx.model.input_types["transmuter.position_offset"]
+
+    generate = fn prompts ->
+      rows = length(prompts)
+
+      inputs =
+        Map.new(given, fn {name, tensor} ->
+          {name, Nx.concatenate(List.duplicate(tensor, rows))}
+        end)
+
+      compiled = Generation.compile(ctx, rows, @opts[:defn_options])
+      Generation.generate(compiled, prompts, List.duplicate(0, rows), inputs)
+    end
+
+    start = repo.config["decoder_start_token_id"]
+    [answer] = generate.([[start]])
+    long = [start | answer |> Enum.take(2) |> Enum.map(&hd/1)]
+
+    rows = generate.([[start], long])
+
+    for {row, alone} <- Enum.zip(rows, [answer, hd(generate.([long]))]) do
+      assert Enum.map(row, &hd/1) == Enum.map(alone, &hd/1)
+      diff = Enum.zip_with(row, alone, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+      assert diff < 1.0e-4, "#{diff}"
+    end
+  end
+
   # The capacities of the buffers in the steps that `fun` compiles, and the result of `fun`. The
   # cross-attention cache of an encoder-decoder model is not a buffer.
   defp compiled_capacities(fun) do
