@@ -243,7 +243,7 @@ Supervisor.start_link(children, strategy: :one_for_one)
 Transmuter.Text.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
 ```
 
-`run/3` returns the same result as `Nx.Serving.batched_run/2`, and `stream/3` returns the same chunks as a serving with `stream: true`. A request gives the same text as alone. The server takes decoders that write the cache in place. It raises at the start for a merged decoder, a decoder that grows its cache, a decoder in `:append` and beam search. The module documentation gives the reasons.
+`run/3` returns the same result as `Nx.Serving.batched_run/2`, and `stream/3` returns the same chunks as a serving with `stream: true`. A request gives the same text as alone. The server takes decoders that write the cache in place. It raises at the start for a merged decoder, a decoder that grows its cache and beam search. A decoder in `:append` compacts its buffers when the rows of its steps pass them. The module documentation gives the reasons.
 
 Requests that arrive over time, at 0.8 and 1.2 times what 8 rows can give, get their first token much sooner from the server, with about the same tokens per second:
 

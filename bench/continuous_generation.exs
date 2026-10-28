@@ -14,7 +14,7 @@
 #     that already ran. For the serving, the time between two compiled calls of one batch;
 #   - tokens per call: all new tokens, divided by the compiled calls.
 #
-# Usage: mix run bench/continuous_generation.exs smollm2|qwen3 server|serving <rate> [requests]
+# Usage: mix run bench/continuous_generation.exs smollm2|smollm2-onnx|qwen3 server|serving <rate> [requests]
 Logger.configure(level: :warning)
 
 # The MLX cache of freed buffers has no limit by default, see the moduledoc of
@@ -53,6 +53,7 @@ questions = [
 repo =
   case name do
     "smollm2" -> "HuggingFaceTB/SmolLM2-135M-Instruct"
+    "smollm2-onnx" -> "onnx-community/SmolLM2-135M-Instruct-ONNX"
     "qwen3" -> "onnx-community/Qwen3-0.6B-ONNX"
   end
 

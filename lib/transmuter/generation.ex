@@ -1145,15 +1145,19 @@ defmodule Transmuter.Generation do
 
   @doc false
   # The rows of cache that `group` needs to admit `requests` and to run each row to the end of
-  # its budget. As in fit/3, these are the rows of all steps in :append, else the rows of the
-  # longest row, then the prompt parts, where each row that has not ended takes its next
-  # token, and then the new tokens that are left.
+  # its budget: the rows of the longest row, then the prompt parts, where each row that has not
+  # ended takes its next token, and then the new tokens that are left. In :append, the longest
+  # row is the longest row that runs, because fit/3 compacts the buffers to it.
   def rows_needed(ctx, group, requests) do
     active =
       for {false, budget, ids} <- Enum.zip([group.done, group.budgets, group.ids]),
           do: budget - length(ids)
 
-    rows = if ctx.mode == :append, do: group.state.used, else: Enum.max(group.state.lengths)
+    rows =
+      if ctx.mode == :append,
+        do: running_rows(group),
+        else: Enum.max(group.state.lengths)
+
     lengths = Enum.map(requests, &length(&1.prompt)) ++ List.duplicate(1, length(active))
     left = Enum.map(requests, & &1.budget) ++ active
     rows + Enum.sum(part_sizes(ctx, lengths)) + Enum.max(left) - 1
@@ -1921,6 +1925,24 @@ defmodule Transmuter.Generation do
     }
 
     %{group | state: state}
+  end
+
+  @doc false
+  # Compacts the buffers of :append when the longest row that runs and @capacity_margin rows fit
+  # in half of them, as after a long row ends in a server. The buffers of the other modes stay.
+  def shrink(ctx, group = %{state: state}) do
+    if ctx.mode == :append and
+         capacity(ctx, running_rows(group) + @capacity_margin) <= div(state.capacity, 2),
+       do: compact(ctx, group, 0),
+       else: group
+  end
+
+  # The rows of the longest row that has not ended, or 0.
+  defp running_rows(group) do
+    group.state.lengths
+    |> Enum.zip(group.done)
+    |> Enum.map(fn {length, done?} -> if done?, do: 0, else: length end)
+    |> Enum.max(fn -> 0 end)
   end
 
   # The capacity for `rows` rows and a slack of free rows, up to the largest capacity of the

@@ -35,11 +35,12 @@ defmodule Transmuter.Text.ContinuousGeneration do
     * A merged decoder, such as `Xenova/gpt2`, runs each prompt on its branch without cache, but the rows that already run need the branch with cache in the same step.
     * A decoder that grows its cache, or that takes one position offset for all rows, such as Apertus, needs one length of the cache for all rows of a step.
     * With `num_beams` above 1, the rows of a prompt move together as beams, so a request cannot join between them.
-    * A decoder in `:append` writes the rows of all steps at one offset, so a group that never ends would need a cache that grows without a limit. The server needs a compaction of these rows first.
 
   ## The KV cache
 
-  The server runs decoders in `:in_place`, see `Transmuter.Generation`. Each row writes its cache after its own rows, and a new request starts again at the first row. The buffers have one capacity for all rows, and they grow by 64 rows when the longest row does not fit them. They do not shrink while rows run, so a group runs at the capacity of its longest row. In a batch of `Transmuter.Text.generation/2`, all rows start together, so the buffers grow only near the end of the batch. In the server, the rows start at different steps, so after the first row passes a capacity, most steps run at the larger one. Each step reads the whole buffers, so these steps are a little slower: for Qwen3-0.6B with 8 rows on CUDA, 26.2 ms at 320 rows against 24.9 ms at 256. A shrink when the longest row ends would copy the buffers again each time the next row passes the capacity.
+  The server runs decoders in `:in_place` and in `:append`, see `Transmuter.Generation`. In `:in_place`, each row writes its cache after its own rows, and a new request starts again at the first row. The buffers have one capacity for all rows, and they grow by 64 rows when the longest row does not fit them. They do not shrink while rows run, so a group runs at the capacity of its longest row. In a batch of `Transmuter.Text.generation/2`, all rows start together, so the buffers grow only near the end of the batch. In the server, the rows start at different steps, so after the first row passes a capacity, most steps run at the larger one. Each step reads the whole buffers, so these steps are a little slower: for Qwen3-0.6B with 8 rows on CUDA, 26.2 ms at 320 rows against 24.9 ms at 256. A shrink when the longest row ends would copy the buffers again each time the next row passes the capacity.
+
+  In `:append`, all rows of a step write at one offset, so the offset passes the rows of all steps, also the rows of the requests that ended. When a step does not fit, the buffers compact: the valid rows of each running row move to the front, and the offset goes back to the longest running row. After a step, the buffers also compact when the longest running row and 16 rows fit in half of them, so the rows after a long request do not keep its capacity.
 
   A request joins with the steps of its prompt parts (see `Transmuter.Generation`), and the running rows get their next token only in the last of these steps. So each join delays the tokens of the running rows: about 125 ms for a chat prompt of Qwen3-0.6B on CUDA, against 26 ms for a step without a join.
 
@@ -84,17 +85,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
     {ctx, tokenizer, task} = TextGeneration.task(opts[:source], opts)
 
-    cond do
-      not Generation.joins?(ctx) ->
-        raise ArgumentError,
-              "requests cannot join a running batch of this model: it is a merged decoder, it needs one length of the cache for all rows, or it has num_beams above 1"
-
-      ctx.mode == :append ->
-        raise ArgumentError,
-              "a decoder in :append needs a compaction of its cache for continuous batching, which the server does not have yet"
-
-      true ->
-        :ok
+    unless Generation.joins?(ctx) do
+      raise ArgumentError,
+            "requests cannot join a running batch of this model: it is a merged decoder, it needs one length of the cache for all rows, or it has num_beams above 1"
     end
 
     ctx = %{ctx | max_capacity: min(ctx.max_capacity || opts[:capacity], opts[:capacity])}
@@ -380,6 +373,8 @@ defmodule Transmuter.Text.ContinuousGeneration do
       if requests == [],
         do: Generation.next(state.ctx, state.group),
         else: Generation.admit(state.ctx, state.group, requests)
+
+    group = Generation.shrink(state.ctx, group)
 
     emit(%{state | rows: Map.merge(state.rows, Map.new(admitted))}, group)
   end

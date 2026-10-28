@@ -154,19 +154,104 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
   end
 
   # Requests cannot join a running batch of a merged decoder, which runs each prompt on its
-  # branch without cache, or of beam search, whose rows of a prompt move together. A decoder
-  # in :append needs a compaction of its cache first.
+  # branch without cache, or of beam search, whose rows of a prompt move together.
   test "a model whose rows cannot join a running batch raises at the start" do
     for {source, opts, message} <- [
           {{:hf, "Xenova/gpt2"}, [], ~r/requests cannot join a running batch/},
           {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, [num_beams: 2],
-           ~r/requests cannot join a running batch/},
-          {{:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}, [], ~r/needs a compaction/}
+           ~r/requests cannot join a running batch/}
         ] do
       assert_raise ArgumentError, message, fn ->
         ContinuousGeneration.start_link([source: source] ++ opts ++ @opts)
       end
     end
+  end
+
+  # SmolLM2-ONNX runs in :append, where the rows of all steps write at one offset. A server of
+  # 2 rows with a cache of at most 256 rows gets a first request, and after its first chunk 11
+  # more, about 40 rows each and about 500 rows in all. The rows then end at different steps,
+  # so each request joins a running row. The compactions keep the buffers at 256 rows, and each
+  # request gives the text that it gives alone.
+  test "a server in :append compacts its buffers and gives each request its text alone" do
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    opts = [strategy: :greedy, max_new_tokens: 30] ++ @opts
+    texts = [@fox, "Once upon a time", "Explain how a rainbow forms.", "Why is the sky blue?"]
+    inputs = for i <- 0..11, do: Enum.at(texts, rem(i, 4))
+    single = Text.generation(source, opts)
+    alone = Map.new(texts, &{&1, Nx.Serving.run(single, &1)})
+
+    spec =
+      {ContinuousGeneration, [source: source, slots: 2, max_queue: 12, capacity: 256] ++ opts}
+
+    server = start_supervised!(spec)
+
+    [first | rest] = inputs
+
+    {results, steps} =
+      step_events(server, fn ->
+        parent = self()
+        ref = make_ref()
+
+        streamer =
+          Task.async(fn ->
+            server
+            |> ContinuousGeneration.stream(first)
+            |> Enum.map_join(fn chunk ->
+              send(parent, {ref, :chunk})
+              chunk
+            end)
+          end)
+
+        assert_receive {^ref, :chunk}, 60_000
+        others = ContinuousGeneration.run(server, rest)
+        {Task.await(streamer, :infinity), others}
+      end)
+
+    %{results: [%{text: text}]} = alone[first]
+    assert results == {text, Enum.map(rest, &alone[&1])}
+    assert steps |> Enum.map(& &1.capacity) |> Enum.max() == 256
+    assert Enum.count(steps, &(&1.admitted == 1 and &1.running == 1)) == 11
+  end
+
+  # A long request in :append, the fox 16 times, makes the buffers grow past 512 rows. Two
+  # short requests arrive after its first chunk and run in the other row. When the long
+  # request ends, the longest running row and 16 rows fit in half of the buffers, so the step
+  # compacts them into 256 rows, and the steps of the short requests after it run at 256 rows.
+  # Each request gives the text that it gives alone.
+  test "a server in :append shrinks its buffers after a long request ends" do
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    opts = [strategy: :greedy, max_new_tokens: 30] ++ @opts
+    long = String.duplicate(@fox <> " ", 16)
+    shorts = ["Once upon a time", "Explain how a rainbow forms."]
+    single = Text.generation(source, opts)
+    alone = for input <- [long | shorts], do: Nx.Serving.run(single, input)
+    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+
+    {{long_text, others}, steps} =
+      step_events(server, fn ->
+        parent = self()
+        ref = make_ref()
+
+        streamer =
+          Task.async(fn ->
+            server
+            |> ContinuousGeneration.stream(long)
+            |> Enum.map_join(fn chunk ->
+              send(parent, {ref, :chunk})
+              chunk
+            end)
+          end)
+
+        assert_receive {^ref, :chunk}, 60_000
+        others = ContinuousGeneration.run(server, shorts)
+        {Task.await(streamer, :infinity), others}
+      end)
+
+    [%{results: [%{text: text}]} | rest] = alone
+    assert {long_text, others} == {text, rest}
+    capacities = Enum.map(steps, & &1.capacity)
+    assert Enum.max(capacities) > 512
+    assert List.last(capacities) == 256
   end
 
   # The result of `fun` and the metadata of the steps that `server` started while it ran.
