@@ -49,11 +49,10 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
             Task.async(fn ->
               server
               |> ContinuousGeneration.stream(fox)
-              |> Enum.map(fn chunk ->
+              |> Enum.map_join(fn chunk ->
                 send(parent, {ref, :chunk})
                 chunk
               end)
-              |> Enum.join()
             end)
 
           assert_receive {^ref, :chunk}, 60_000
