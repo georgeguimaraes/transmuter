@@ -30,6 +30,11 @@ defmodule Transmuter.Serving do
   # binary heap of 256 MB (in 8-byte words) from the start removes these collections.
   @generation_bin_vheap_size 33_554_432
 
+  @doc false
+  # The heap sizes of a process that runs generation steps.
+  def generation_flags,
+    do: [min_heap_size: @generation_heap_size, min_bin_vheap_size: @generation_bin_vheap_size]
+
   @doc """
   The options that all text tasks take. See `Transmuter.Text`.
   """
@@ -559,8 +564,7 @@ defmodule Transmuter.Serving do
         ctx = Generation.compile(ctx, batch_size, defn_options)
 
         fn batch ->
-          Process.flag(:min_heap_size, @generation_heap_size)
-          Process.flag(:min_bin_vheap_size, @generation_bin_vheap_size)
+          Enum.each(generation_flags(), fn {flag, value} -> Process.flag(flag, value) end)
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
           {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
 
@@ -679,8 +683,9 @@ defmodule Transmuter.Serving do
     end
   end
 
+  @doc false
   # The flat integers of a row of :init, with each f32 value as its bits.
-  defp integers(row), do: row |> List.flatten() |> Enum.map(&integer/1)
+  def integers(row), do: row |> List.flatten() |> Enum.map(&integer/1)
 
   defp integer(value) when is_integer(value), do: value
   defp integer(value), do: Generation.to_bits(value)
@@ -715,12 +720,13 @@ defmodule Transmuter.Serving do
     |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
   end
 
+  @doc false
   # The rule of Bumblebee and of TextStreamer in Python transformers. The text of the
   # pending tokens comes out up to its last space, because a byte-level token can hold a
   # part of a character, and a tokenizer can add or remove the space before a word from
   # the tokens around it. A newline or a CJK character ends a chunk at once, and the
   # pending tokens start again after a newline.
-  defp stream_text(stream, tokenizer, summary, {done?, logprobs?}) do
+  def stream_text(stream, tokenizer, summary, {done?, logprobs?}) do
     state = %{ids: [], logprobs: [], count: 0, sent: 0, finished?: false}
     logprob = if logprobs?, do: &[Nx.to_number(&1.logprob[0])], else: fn _event -> [] end
 
@@ -860,7 +866,9 @@ defmodule Transmuter.Serving do
     end
   end
 
-  defp validate!(inputs, validate) when is_list(inputs) do
+  @doc false
+  # The inputs of a call, and whether the call gave a list of inputs.
+  def validate!(inputs, validate) when is_list(inputs) do
     inputs =
       for input <- inputs do
         case validate.(input) do
@@ -872,7 +880,7 @@ defmodule Transmuter.Serving do
     {inputs, true}
   end
 
-  defp validate!(input, validate) do
+  def validate!(input, validate) do
     case validate.(input) do
       {:ok, input} -> {[input], false}
       {:error, message} -> raise ArgumentError, "invalid input, #{message}"

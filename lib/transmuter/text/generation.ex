@@ -7,44 +7,52 @@ defmodule Transmuter.Text.Generation do
 
   alias Transmuter.{ChatTemplate, Generation, Hub, Serving, Tokenizer}
 
+  @options [
+             :variant,
+             :model,
+             :tokenizer,
+             :backend,
+             :compute_type,
+             :max_new_tokens,
+             :strategy,
+             :temperature,
+             :top_k,
+             :top_p,
+             :repetition_penalty,
+             :num_beams,
+             :length_penalty,
+             :early_stopping,
+             :no_repeat_ngram_size,
+             :min_length,
+             :min_new_tokens,
+             :forced_bos_token_id,
+             :forced_eos_token_id,
+             :seed,
+             :template_options,
+             token_logprobs: false,
+             defn_options: []
+           ] ++ Hub.options()
+
+  @doc false
+  # The options of the task without the options of the serving.
+  def options, do: @options
+
   @doc false
   def generation(source, opts) do
     opts =
-      Keyword.validate!(
-        opts,
-        [
-          :variant,
-          :model,
-          :tokenizer,
-          :backend,
-          :compute_type,
-          :max_new_tokens,
-          :strategy,
-          :temperature,
-          :top_k,
-          :top_p,
-          :repetition_penalty,
-          :num_beams,
-          :length_penalty,
-          :early_stopping,
-          :no_repeat_ngram_size,
-          :min_length,
-          :min_new_tokens,
-          :forced_bos_token_id,
-          :forced_eos_token_id,
-          :seed,
-          :template_options,
-          token_logprobs: false,
-          stream: false,
-          stream_done: false,
-          compile: [],
-          defn_options: []
-        ] ++ Hub.options()
-      )
+      opts
+      |> Keyword.validate!(@options ++ [stream: false, stream_done: false, compile: []])
       |> Serving.generation_options!()
 
     Keyword.validate!(opts[:compile], [:batch_size])
+    {ctx, tokenizer, task} = task(source, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
+  end
 
+  @doc false
+  # The context, the tokenizer and the task of `Serving.generation/4`, for generation/2 and
+  # `Transmuter.Text.ContinuousGeneration`.
+  def task(source, opts) do
     load_opts = [outputs: &Generation.outputs/1] ++ opts
     components = ["model", "decoder_model_merged"]
     {repo, model, tokenizer} = Serving.load!(source, load_opts, :q4, components)
@@ -69,7 +77,7 @@ defmodule Transmuter.Text.Generation do
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
 
-    Serving.generation(ctx, tokenizer, task, opts)
+    {ctx, tokenizer, task}
   end
 
   # A chat goes through the chat template, which adds the special tokens itself.

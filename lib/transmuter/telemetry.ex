@@ -69,6 +69,16 @@ defmodule Transmuter.Telemetry do
 
   Inside `Nx.Defn.jit/2`, `Transmuter.run/4` traces the graph. Then the duration is the time of the trace.
 
+  ### Continuous generation events
+
+    * `[:transmuter, :continuous_generation, :step, :start]` - a server of `Transmuter.Text.ContinuousGeneration` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
+      * Metadata: `%{running: integer, admitted: integer, waiting: integer, slots: integer, capacity: integer}`
+
+    * `[:transmuter, :continuous_generation, :step, :stop]` - the step ends, and the server has sent its tokens.
+      * Metadata: the same as the start
+
+  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:waiting` the number of requests in the queue after it, and `:capacity` the rows of the buffers before it. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.Text.ContinuousGeneration`).
+
   ### Graph break events
 
   A compiled function keeps a cache of compiled segments. The cache key is the position where the segment starts, the shapes and types of the segment arguments, and the values of the static values that the segment reads, such as static inputs. Each position keeps the `:cache_size` most recently used segments.

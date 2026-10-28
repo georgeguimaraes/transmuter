@@ -773,7 +773,8 @@ defmodule Transmuter.GenerationTest do
   # The Qwen3-MoE and Gemma 3 exports of onnxruntime-genai count the valid rows of
   # GroupQueryAttention from the length of the attention mask. Generation gives them the sum of
   # the mask, so they run in :in_place. The same decoder with one more node that reads the
-  # length of the cache, which no position uses, stays in :grow. The first layer gets a window
+  # length of the cache, which no position uses, stays in :grow, where requests cannot join a
+  # running group. The first layer gets a window
   # of 8 rows, which the prompts of 5, 12 and 20 tokens and their 16 new tokens pass. In a
   # batch, each row gives its tokens alone, and the tokens of :grow with log-probabilities
   # within 1e-4.
@@ -824,9 +825,11 @@ defmodule Transmuter.GenerationTest do
       end
 
       assert context.(model).mode == :in_place
+      assert Generation.joins?(context.(model))
 
       assert ExUnit.CaptureLog.capture_log([level: :debug], fn ->
                assert context.(grow).mode == :grow
+               refute Generation.joins?(context.(grow))
              end) =~ "because Shape reads reads the cache or its length"
 
       prompts = for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: i * 37 * row)

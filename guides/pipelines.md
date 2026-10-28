@@ -228,6 +228,33 @@ A decoder that grows its cache needs one length for all rows. For such a decoder
 
 Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 
+#### Continuous batching
+
+A serving of `Transmuter.Text.generation/2` runs each batch until its longest row ends. A request that arrives during a batch waits for the whole batch, and the rows that end early stay empty. `Transmuter.Text.ContinuousGeneration` is a server that gives a free row to a waiting request at the next step:
+
+```elixir
+children = [
+  {Transmuter.Text.ContinuousGeneration,
+   name: MyGen, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, slots: 8}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+
+Transmuter.Text.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
+```
+
+`run/3` returns the same result as `Nx.Serving.batched_run/2`, and `stream/3` returns the same chunks as a serving with `stream: true`. A request gives the same text as alone. The server takes decoders that write the cache in place. It raises at the start for a merged decoder, a decoder that grows its cache, a decoder in `:append` and beam search. The module documentation gives the reasons.
+
+Requests that arrive over time, at 0.8 and 1.2 times what 8 rows can give, get their first token much sooner from the server, with about the same tokens per second:
+
+| Model, on CUDA | Requests/s | Serving: tokens/s, first token p50 | Server: tokens/s, first token p50 |
+|---|---|---|---|
+| `HuggingFaceTB/SmolLM2-135M-Instruct` (q4) | 1.61 | 300.6 tokens/s, 1391 ms | 313.7 tokens/s, 65 ms |
+| `onnx-community/Qwen3-0.6B-ONNX` (q4) | 0.68 | 160.0 tokens/s, 3144 ms | 172.4 tokens/s, 176 ms |
+| `onnx-community/Qwen3-0.6B-ONNX` (q4) | 1.03 | 242.4 tokens/s, 5188 ms | 238.5 tokens/s, 2300 ms |
+
+The table shows 48 requests with greedy selection and up to 256 new tokens, with 8 rows on an RTX 3060 with EXLA, from `bench/continuous_generation.exs`. A warm round of the same requests at the same times comes first, so the values do not include the first compiles.
+
 #### Beam search
 
 Set `:num_beams` to keep the best `n` sequences at each step and return the best one at the end:

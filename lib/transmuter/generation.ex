@@ -1125,6 +1125,43 @@ defmodule Transmuter.Generation do
   # Runs the step of the new token of each row that has not ended, and reads its next token.
   def next(ctx, group), do: select(ctx, advance(ctx, group))
 
+  @doc false
+  # Whether requests can join a group with other rows: the rows of a step can have different
+  # lengths of the cache, the decoder runs its prompts on the same branch as its new tokens,
+  # and the rows of a prompt do not move together as beams.
+  def joins?(ctx), do: ctx.num_beams == 1 and not one_length?(ctx) and not merged?(ctx)
+
+  @doc false
+  # Ends `row` before its last token: the next steps give it no token, and admit/5 can give
+  # its row to a new request.
+  def cancel(group, row) do
+    %{
+      group
+      | done: List.replace_at(group.done, row, true),
+        new: List.replace_at(group.new, row, nil)
+    }
+  end
+
+  @doc false
+  # The rows of cache that `group` needs to admit `requests` and to run each row to the end of
+  # its budget. As in fit/3, these are the rows of all steps in :append, else the rows of the
+  # longest row, then the prompt parts, where each row that has not ended takes its next
+  # token, and then the new tokens that are left.
+  def rows_needed(ctx, group, requests) do
+    active =
+      for {false, budget, ids} <- Enum.zip([group.done, group.budgets, group.ids]),
+          do: budget - length(ids)
+
+    rows = if ctx.mode == :append, do: group.state.used, else: Enum.max(group.state.lengths)
+    lengths = Enum.map(requests, &length(&1.prompt)) ++ List.duplicate(1, length(active))
+    left = Enum.map(requests, & &1.budget) ++ active
+    rows + Enum.sum(part_sizes(ctx, lengths)) + Enum.max(left) - 1
+  end
+
+  @doc false
+  # The tokens of `row`, as generate/5 gives them.
+  def row_tokens(group, row), do: tokens(Enum.at(group.ids, row), Enum.at(group.logprobs, row))
+
   # Runs the prompts of `requests` in parts of power-of-two lengths. Each prompt fills the
   # parts from the last one, so the last token of each prompt is in the last part. A row that
   # has a new token from an earlier step takes it in the last part, and has no tokens in the
@@ -1137,9 +1174,9 @@ defmodule Transmuter.Generation do
   defp prefill(ctx, group, requests, inputs, features) do
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
-    if (one_length?(ctx) or merged?(ctx)) and Enum.any?(pending) do
+    if not joins?(ctx) and Enum.any?(pending) do
       raise ArgumentError,
-            "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder"
+            "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder and without beams"
     end
 
     # A row with a new token has one token in these steps.
@@ -1289,9 +1326,10 @@ defmodule Transmuter.Generation do
     if Enum.all?(group.done), do: finish(group), else: decode(ctx, next(ctx, group), notify)
   end
 
+  @doc false
   # Frees the device tensors that the group owns when it ends: its cache, its last selection
   # and selection state, its masks and its keys.
-  defp finish(group = %{state: state}) do
+  def finish(group = %{state: state}) do
     own = [state.selected, state.seen, state.history, state.count, state.prompt_count]
     own = [group.keys | own] ++ Map.values(state.cache)
     release(own ++ Map.values(group.masks), [])
