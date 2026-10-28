@@ -36,6 +36,8 @@ defmodule Transmuter.ContinuousGeneration do
 
     * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. The default is `4096`.
 
+    * `:compile_steps` - when `true`, the server compiles the shape of each step that its rows can take before it starts (see "Compiles"). The default is `false`.
+
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
   ## Scope
@@ -63,6 +65,12 @@ defmodule Transmuter.ContinuousGeneration do
   The encoder and the steps run on the same device, and a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image when the encoder takes them on its batch axis, and each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms, and at most 86 ms while the encoder runs in calls of one tile, against 863 ms with one call for the 13 tiles of an image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
 
   The group keeps the features of the image tokens that its rows have not run, and the features of a request join them. Then the prompt of the request runs in parts of at most 64 tokens, next to the new tokens of the running rows (see "The KV cache").
+
+  ## Compiles
+
+  A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of three widths, 1, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most three shapes for each capacity, 47 for a capacity of 4096 rows. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
+
+  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the vision encoder compile too. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
 
   ## Telemetry
 
@@ -97,6 +105,7 @@ defmodule Transmuter.ContinuousGeneration do
   def start_link(opts) do
     module = Keyword.get(opts, :task, Transmuter.Text.Generation)
     server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: 4096]
+    server_opts = server_opts ++ [compile_steps: false]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
@@ -116,7 +125,8 @@ defmodule Transmuter.ContinuousGeneration do
       task: task,
       slots: opts[:slots],
       max_queue: opts[:max_queue] || 4 * opts[:slots],
-      defn_options: opts[:defn_options]
+      defn_options: opts[:defn_options],
+      compile_steps: opts[:compile_steps]
     }
 
     GenServer.start_link(__MODULE__, state,
@@ -275,7 +285,8 @@ defmodule Transmuter.ContinuousGeneration do
   def init(state) do
     Process.flag(:trap_exit, true)
     server = self()
-    %{preprocess: preprocess, prepare: prepare} = state.task
+    %{preprocess: preprocess, prepare: prepare, example: example} = state.task
+    compile_steps? = state.compile_steps
     defn_options = state.defn_options
 
     # The worker loads the models of :prepare, such as the vision encoder, while the server
@@ -283,16 +294,31 @@ defmodule Transmuter.ContinuousGeneration do
     # the start.
     worker =
       spawn_link(fn ->
-        prepare = prepare.(defn_options)
-        send(server, {self(), :ready})
-        prepare_requests({preprocess, prepare}, Nx.Defn.to_backend(defn_options), server)
+        task = {preprocess, prepare.(defn_options)}
+        backend = Nx.Defn.to_backend(defn_options)
+
+        # The features of the example show the shape of the features of a request.
+        features =
+          if compile_steps? do
+            {:ok, %{features: features}, _run} = prepare_request(task, backend, %{input: example})
+            features
+          end
+
+        send(server, {self(), :ready, features})
+        :erlang.garbage_collect()
+        prepare_requests(task, backend, server)
       end)
 
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
+    if state.compile_steps, do: Generation.compile_steps(ctx, state.slots)
 
     receive do
-      {^worker, :ready} -> {:ok, start(state, ctx, worker)}
-      {:EXIT, ^worker, reason} -> {:stop, reason}
+      {^worker, :ready, features} ->
+        if features, do: Generation.compile_features(ctx, state.slots, features)
+        {:ok, start(state, ctx, worker)}
+
+      {:EXIT, ^worker, reason} ->
+        {:stop, reason}
     end
   end
 
@@ -425,6 +451,7 @@ defmodule Transmuter.ContinuousGeneration do
       metadata = %{
         running: map_size(state.rows),
         admitted: length(admitted),
+        prompts: Enum.count(state.group.left, &(&1 != [])) + length(admitted),
         waiting: :queue.len(state.queue),
         slots: state.slots,
         capacity: state.group.state.capacity
@@ -568,7 +595,8 @@ defmodule Transmuter.ContinuousGeneration do
 
     inputs = prepare.(tensors, [run.prompt])
     [position] = Map.get(inputs, :position_ids, [[]])
-    fields = %{prompt: run.prompt, seed: run.seed, features: inputs[:image_features]}
+    [features] = Map.get(inputs, :image_features, [nil])
+    fields = %{prompt: run.prompt, seed: run.seed, features: features}
     {:ok, Map.put(fields, :position, position), Map.delete(run, :tensors)}
   rescue
     exception -> {:error, exception}

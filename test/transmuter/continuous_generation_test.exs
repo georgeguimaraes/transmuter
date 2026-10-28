@@ -447,6 +447,228 @@ defmodule Transmuter.ContinuousGenerationTest do
     assert inspect(reason) =~ "no encoder"
   end
 
+  # A server with compile_steps runs one step of each shape before it starts. Then a stream
+  # starts in an idle group, where its prompt runs in one part, two requests join it with parts
+  # of at most 64 tokens, and the answers of 300 tokens take the buffers from 256 to 384 rows.
+  # No step of the server compiles.
+  test "a server with compile_steps compiles no step for its requests" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 300, min_new_tokens: 300] ++ @opts
+    spec = [source: source, slots: 2, capacity: 512, compile_steps: true] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :segment, :compile, :stop],
+      fn _event, _measurements, metadata, _config ->
+        if self() == server, do: send(parent, {id, metadata.shapes})
+      end,
+      nil
+    )
+
+    {_results, steps} =
+      step_events(server, fn ->
+        streamer =
+          Task.async(fn ->
+            server
+            |> ContinuousGeneration.stream(@fox)
+            |> Enum.map_join(fn chunk ->
+              send(parent, {id, :chunk})
+              chunk
+            end)
+          end)
+
+        assert_receive {^id, :chunk}, 60_000
+        others = ContinuousGeneration.run(server, ["Once upon a time", "Why is the sky blue?"])
+        {Task.await(streamer, :infinity), others}
+      end)
+
+    :telemetry.detach(id)
+    refute_received {^id, [_ | _]}
+    assert steps |> Enum.map(& &1.capacity) |> Enum.max() == 384
+    assert Enum.any?(steps, &(&1.admitted > 0 and &1.running > 0))
+  end
+
+  # A server of tiny Gemma 3 with compile_steps runs chats with 1 and 3 images, whose
+  # features have 4 and 12 rows (4 and 16 with the rows of zeros), next to a chat without
+  # images and next to each other. The server process compiles nothing: no step, no write of
+  # features into a slot and no merge (EXLA reports each compile, EMLX compiles none of them).
+  test "chats with images of uneven sizes compile nothing after compile_steps" do
+    source = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
+    variant = %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32}
+    opts = Keyword.merge(@opts, variant: variant, strategy: :greedy, max_new_tokens: 24)
+    spec = [task: Vision.ImageTextToText, source: source, slots: 3, capacity: 512]
+    server = start_supervised!({ContinuousGeneration, spec ++ [compile_steps: true] ++ opts})
+    image = StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
+    images = &List.duplicate(%{type: "image", image: image}, &1)
+    text = %{type: "text", text: "What is here?"}
+    [one, three] = for count <- [1, 3], do: chat(images.(count) ++ [text])
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach_many(
+      id,
+      [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+      fn event, _measurements, _metadata, _config ->
+        if self() == server, do: send(parent, {id, event})
+      end,
+      nil
+    )
+
+    streamer =
+      Task.async(fn ->
+        server
+        |> ContinuousGeneration.stream(chat([text]))
+        |> Enum.map_join(fn chunk ->
+          send(parent, {id, :chunk})
+          chunk
+        end)
+      end)
+
+    assert_receive {^id, :chunk}, 60_000
+    ContinuousGeneration.run(server, [one, three, three, one])
+    Task.await(streamer, :infinity)
+    :telemetry.detach(id)
+    refute_received {^id, [_ | _]}
+  end
+
+  # A request of about 380 tokens joins a server whose buffers have 256 rows. Its admission
+  # makes room for the tokens of its prompt, so the buffers pass two or more capacities between
+  # two steps (256 to 384 rows, over 320), in :in_place with growths and in :append with a
+  # compaction and growths, each one between neighbour capacities. After compile_steps, the
+  # server process compiles nothing (with EXLA, a direct growth from 256 to 384 rows would
+  # compile), and each request gives the text that it gives alone.
+  test "a join that grows the buffers across capacities compiles nothing after compile_steps" do
+    long = String.duplicate(@fox <> " ", 12)
+
+    for source <- [
+          {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+          {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+        ] do
+      opts = [strategy: :greedy, max_new_tokens: 40, min_new_tokens: 40] ++ @opts
+      single = Text.generation(source, opts)
+      alone = for input <- [@fox, long], do: Nx.Serving.run(single, input)
+      spec = [source: source, slots: 2, capacity: 512, compile_steps: true] ++ opts
+      server = start_supervised!({ContinuousGeneration, spec})
+      parent = self()
+      id = make_ref()
+
+      :telemetry.attach_many(
+        id,
+        [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+        fn event, _measurements, _metadata, _config ->
+          if self() == server, do: send(parent, {id, event})
+        end,
+        nil
+      )
+
+      {results, steps} =
+        step_events(server, fn ->
+          streamer =
+            Task.async(fn ->
+              server
+              |> ContinuousGeneration.stream(@fox)
+              |> Enum.map_join(fn chunk ->
+                send(parent, {id, :chunk})
+                chunk
+              end)
+            end)
+
+          assert_receive {^id, :chunk}, 60_000
+          other = ContinuousGeneration.run(server, long)
+          {Task.await(streamer, :infinity), other}
+        end)
+
+      :telemetry.detach(id)
+      refute_received {^id, [_ | _]}
+      [%{results: [%{text: text}]}, other] = alone
+      assert results == {text, other}, inspect(source)
+      capacities = steps |> Enum.map(& &1.capacity) |> Enum.dedup()
+      # The capacities up to 512 rows, each one step of the rule of Transmuter.Generation.
+      ladder = [256, 320, 384, 448, 512]
+      steps = Enum.map(capacities, &Enum.find_index(ladder, fn capacity -> capacity == &1 end))
+      assert Enum.any?(Enum.chunk_every(steps, 2, 1, :discard), fn [a, b] -> b - a >= 2 end)
+      stop_supervised!(ContinuousGeneration)
+    end
+  end
+
+  # In a cache of at most 512 rows, a request of about 170 tokens joins a row of about 400
+  # rows that has a few tokens left. The rows of the cache that its steps write fit, so the
+  # server admits it. The admit then makes room only for the tokens of its prompt, and the
+  # steps of its parts make room for their width, so nothing raises, where room for the row
+  # of 400 and the whole prompt (about 570 rows) would not fit. Each request gives the text
+  # that it gives alone, in :in_place and in :append.
+  test "a long prompt that joins a long row near its end gives the text that it gives alone" do
+    long = String.duplicate(@fox <> " ", 12)
+    joining = String.duplicate(@fox <> " ", 5)
+
+    for source <- [
+          {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+          {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+        ] do
+      opts = [strategy: :greedy, max_new_tokens: 10, min_new_tokens: 10] ++ @opts
+      single = Text.generation(source, opts)
+      alone = for input <- [long, joining], do: Nx.Serving.run(single, input)
+      spec = [source: source, slots: 2, capacity: 512] ++ opts
+      server = start_supervised!({ContinuousGeneration, spec})
+      assert results_after_first_chunk(server, long, joining) == alone, inspect(source)
+      stop_supervised!(ContinuousGeneration)
+    end
+  end
+
+  # In :append with no_repeat_ngram_size, whose selection reads the tokens of each row, a
+  # request of about 1000 tokens joins a row of about 2100 rows that ends a few steps later.
+  # Then the buffers shrink from more than 2048 rows while the joining prompt has most of its
+  # parts left, and they keep at least the 1024 rows of all its tokens, so its selection still
+  # sees its whole prompt. It gives the text that it gives alone.
+  test "a shrink in the middle of a joining prompt keeps the tokens of the prompt" do
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    long = String.duplicate(@fox <> " ", 64)
+    joining = String.duplicate(@fox <> " ", 30)
+    opts = [strategy: :greedy, max_new_tokens: 8, min_new_tokens: 8, no_repeat_ngram_size: 2]
+    opts = opts ++ @opts
+    single = Text.generation(source, opts)
+    alone = for input <- [long, joining], do: Nx.Serving.run(single, input)
+    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+
+    {results, steps} =
+      step_events(server, fn -> results_after_first_chunk(server, long, joining) end)
+
+    assert results == alone
+    capacities = Enum.map(steps, & &1.capacity)
+    peak = Enum.max(capacities)
+    after_peak = capacities |> Enum.drop_while(&(&1 != peak)) |> Enum.min()
+    assert peak > 2048 and after_peak >= 1024 and after_peak < peak
+  end
+
+  # Streams `first`, and after its first chunk runs `second`. Returns the result of each, as
+  # a run of a serving gives it.
+  defp results_after_first_chunk(server, first, second) do
+    parent = self()
+    ref = make_ref()
+
+    streamer =
+      Task.async(fn ->
+        server
+        |> ContinuousGeneration.stream(first, stream_done: true)
+        |> Enum.reduce({"", nil}, fn
+          {:done, %{token_summary: summary}}, {text, _summary} ->
+            {text, summary}
+
+          chunk, {text, summary} ->
+            send(parent, {ref, :chunk})
+            {text <> chunk, summary}
+        end)
+      end)
+
+    assert_receive {^ref, :chunk}, 60_000
+    other = ContinuousGeneration.run(server, second)
+    {text, summary} = Task.await(streamer, :infinity)
+    [%{results: [%{text: text, token_summary: summary}]}, other]
+  end
+
   @doc false
   def chat(content), do: %{messages: [%{role: "user", content: content}]}
 

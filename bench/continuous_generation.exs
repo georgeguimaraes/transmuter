@@ -6,16 +6,21 @@
 # Transmuter.Vision.image_text_to_text/2: 3 of 4 have one of 3 images, and 1 of 4 has no
 # image. The requests arrive at `rate` requests per second, with exponential times between them from a
 # fixed seed, and stream their text with greedy selection and up to 256 new tokens. EMLX gets
-# a limit of 1 GB on its MLX cache. A warm round of the same requests at the same times comes
-# first, so that the measured requests find the shapes of their steps compiled.
+# a limit of 1 GB on its MLX cache. Warm rounds of the same requests at the same times come
+# first, so that the measured requests find the shapes of their steps compiled. The batches of
+# the serving depend on the times of its calls, so a round with compiles can make other
+# batches than a round without them. So the warm rounds repeat until one has no compile, at
+# most 3 times. The server
+# starts with compile_steps: true, so it compiles each step shape before the warm round.
 #
 # Prints, for the measured requests:
 #   - tokens/s: all new tokens, divided by the time from the first arrival to the last end;
 #   - first token: the time from the arrival to the first chunk of text (p50 and p95);
-#   - between tokens: the time of a step for each running row (p50, p95, p99 and the largest).
-#     The joins are few of all steps, so p99 and the largest show them. For the server,
-#     from the step events, where a step with prompt parts that join counts for the rows
-#     that already ran. For the serving, the time between two compiled calls of one batch;
+#   - gaps (in RESULT and GAPS): the time between two chunks of text of one stream, in the
+#     caller, for both modes, which is what a client sees;
+#   - step time (STEPTIME): for the server, each step for each row with a request, also a row
+#     in its prompt; for the serving, the time between two compiled calls of one batch. It is
+#     not what a client sees;
 #   - gaps: the time between two chunks of text of one stream, in the caller, for both modes
 #     (p50, p95, p99 and the largest). A chunk can hold more than one token, but this time
 #     shows each wait of a row that runs, also for the encoder or for the prompt of a join;
@@ -23,7 +28,7 @@
 #   - for the server, the time of :prepare in the worker for each request, such as the vision
 #     encoder, and the time that the request waited for the worker before it (p50, p95 and the
 #     largest);
-#   - for the server, the time between tokens in the steps without joins, with and without a
+#   - for the server, the time between tokens in the decode steps (no prompt part), with and without a
 #     run of :prepare in the worker at the same time (p50, p99 and the largest).
 #
 # Usage: mix run bench/continuous_generation.exs smollm2|smollm2-onnx|qwen3|smolvlm server|serving <rate> [requests]
@@ -116,7 +121,8 @@ stream =
     "server" ->
       {:ok, _pid} =
         Transmuter.ContinuousGeneration.start_link(
-          [name: Bench, task: task, source: {:hf, repo}, slots: 8, max_queue: count] ++ opts
+          [name: Bench, task: task, source: {:hf, repo}, slots: 8, max_queue: count] ++
+            [compile_steps: true] ++ opts
         )
 
       &Transmuter.ContinuousGeneration.stream(Bench, &1, stream_done: true)
@@ -170,7 +176,7 @@ run_round = fn schedule, start ->
   end
 end
 
-compiles = :counters.new(3, [])
+compiles = :counters.new(6, [])
 phase = :atomics.new(1, [])
 compiled = :ets.new(:compiled, [:public, :bag])
 
@@ -197,8 +203,48 @@ compiled = :ets.new(:compiled, [:public, :bag])
   nil
 )
 
+# Each compile of EXLA in the measured requests, also of the small jit functions of
+# generation and of the eager operations of EXLA.Backend, which give no segment events.
+:telemetry.attach(
+  :exla_compiles,
+  [:exla, :compilation],
+  fn _event, measurements, metadata, _config ->
+    if :atomics.get(phase, 1) == 0, do: :counters.add(compiles, 6, 1)
+
+    if :atomics.get(phase, 1) == 1 do
+      :counters.add(compiles, 4, 1)
+      :counters.add(compiles, 5, measurements.total_time)
+
+      # The frames of Transmuter that called the compile.
+      {:current_stacktrace, stack} = Process.info(self(), :current_stacktrace)
+
+      site =
+        for {module, function, arity, _location} <- stack,
+            String.starts_with?(inspect(module), "Transmuter"),
+            do: "#{inspect(module)}.#{function}/#{arity}"
+
+      key = inspect(metadata.key, limit: 12, printable_limit: 200)
+
+      :ets.insert(
+        compiled,
+        {:exla, self(),
+         String.slice(key, 0, 80) <> " from " <> Enum.join(Enum.take(site, 3), " < ")}
+      )
+    end
+  end,
+  nil
+)
+
 schedule = gaps |> Enum.scan(&(&1 + &2)) |> Enum.zip(inputs)
-schedule |> run_round.(System.monotonic_time(:millisecond)) |> Task.await_many(:infinity)
+
+warm = fn warm, round ->
+  before = {:counters.get(compiles, 1), :counters.get(compiles, 6)}
+  schedule |> run_round.(System.monotonic_time(:millisecond)) |> Task.await_many(:infinity)
+  after_round = {:counters.get(compiles, 1), :counters.get(compiles, 6)}
+  if after_round != before and round < 3, do: warm.(warm, round + 1), else: round
+end
+
+warm_rounds = warm.(warm, 1)
 
 # The step events of the server and the calls of each process, as {pid, time, duration}.
 events = :ets.new(:events, [:public, :bag])
@@ -268,44 +314,83 @@ splits =
 f = &:erlang.float_to_binary(&1 / 1, decimals: 1)
 
 IO.puts(
-  "RESULT #{name} #{mode} rate #{rate}: #{f.(tokens / (span / 1000))} tokens/s, first token p50 #{percentile.(first, 0.5)} ms p95 #{percentile.(first, 0.95)} ms, between tokens p50 #{f.(percentile.(between, 0.5))} ms p95 #{f.(percentile.(between, 0.95))} ms p99 #{f.(percentile.(between, 0.99))} ms max #{f.(Enum.max(between))} ms, #{f.(tokens / length(calls))} tokens per call, #{tokens} tokens"
+  "RESULT #{name} #{mode} rate #{rate}: #{f.(tokens / (span / 1000))} tokens/s, first token p50 #{percentile.(first, 0.5)} ms p95 #{percentile.(first, 0.95)} ms, gaps between chunks p50 #{f.(percentile.(gaps, 0.5))} ms p95 #{f.(percentile.(gaps, 0.95))} ms p99 #{f.(percentile.(gaps, 0.99))} ms max #{f.(Enum.max(gaps))} ms, #{f.(tokens / length(calls))} tokens per call, #{tokens} tokens"
+)
+
+# The step time for each running row (the server) or between two calls (the serving). It is
+# not what a client sees: a step of a row in its prompt counts too, and a call of the serving
+# can be an embedding. See GAPS for the client.
+IO.puts(
+  "STEPTIME #{name} #{mode} rate #{rate}: p50 #{f.(percentile.(between, 0.5))} ms p95 #{f.(percentile.(between, 0.95))} ms p99 #{f.(percentile.(between, 0.99))} ms max #{f.(Enum.max(between))} ms"
 )
 
 # The steps without and with requests that join, the compiled calls in each, and the mean
-# rows of the steps without joins, which give one token to each running row.
+# rows of the decode steps, which give one token to each running row and run no prompt part.
 step_calls = fn {_event, pid, time, duration, _metadata} ->
   Enum.count(calls, fn {_call, call_pid, at, _duration, _metadata} ->
     call_pid == pid and at > time - duration and at <= time
   end)
 end
 
-{admits, decodes} =
-  Enum.split_with(steps, fn {_e, _p, _t, _d, metadata} -> metadata.admitted > 0 end)
+{prompted, decodes} =
+  Enum.split_with(steps, fn {_e, _p, _t, _d, metadata} -> metadata.prompts > 0 end)
 
 if steps != [] do
   mean = fn values -> Enum.sum(values) / max(length(values), 1) end
 
   IO.puts(
-    "COUNTS #{name} #{mode} rate #{rate}: #{length(decodes)} decode steps with #{Enum.sum(Enum.map(decodes, step_calls))} calls and #{f.(mean.(Enum.map(decodes, &elem(&1, 4).running)))} mean rows, #{length(admits)} admit steps with #{Enum.sum(Enum.map(admits, step_calls))} calls, #{f.(mean.(Enum.map(admits, &elem(&1, 4).admitted)))} mean admitted and #{f.(mean.(Enum.map(admits, &elem(&1, 4).running)))} mean running rows, #{length(calls)} calls in all"
+    "COUNTS #{name} #{mode} rate #{rate}: #{length(decodes)} decode steps with #{Enum.sum(Enum.map(decodes, step_calls))} calls and #{f.(mean.(Enum.map(decodes, &elem(&1, 4).running)))} mean rows, #{length(prompted)} prompt steps with #{Enum.sum(Enum.map(prompted, step_calls))} calls, #{f.(mean.(Enum.map(prompted, &elem(&1, 4).prompts)))} mean prompt rows and #{f.(mean.(Enum.map(prompted, &elem(&1, 4).running)))} mean running rows, #{length(calls)} calls in all"
   )
 end
 
+server_pid = Process.whereis(Bench)
+
+exla_in = fn pid ->
+  keys = for {:exla, ^pid, key} <- :ets.tab2list(compiled), do: key
+  "#{length(keys)} #{inspect(keys)}"
+end
+
+# The slowest steps of the server: duration, and the rows, joins, prompt rows and capacity
+# before each.
+if steps != [] do
+  slowest =
+    steps
+    |> Enum.sort_by(&(-elem(&1, 3)))
+    |> Enum.take(3)
+    |> Enum.map(fn {_event, _pid, _time, duration, metadata} ->
+      {f.(ms.(duration)), Map.take(metadata, [:running, :admitted, :prompts, :capacity])}
+    end)
+
+  IO.puts("SLOWEST #{name} #{mode} rate #{rate}: #{inspect(slowest)}")
+end
+
+# The functions of the EXLA compiles in the measured requests, with their count, the most
+# frequent first.
+exla_keys =
+  for({:exla, _pid, key} <- :ets.tab2list(compiled), do: key)
+  |> Enum.frequencies()
+  |> Enum.sort_by(&(-elem(&1, 1)))
+  |> Enum.take(20)
+
+IO.puts("EXLA #{name} #{mode} rate #{rate}: #{inspect(exla_keys)}")
+
 IO.puts(
-  "COMPILES #{name} #{mode} rate #{rate}: #{:counters.get(compiles, 1)} in the warm round, #{:counters.get(compiles, 2)} in the measured requests: #{inspect(:ets.tab2list(compiled))}"
+  "COMPILES #{name} #{mode} rate #{rate}: #{:counters.get(compiles, 1)} segment and #{:counters.get(compiles, 6)} EXLA compiles in #{warm_rounds} warm rounds, #{:counters.get(compiles, 2)} in the measured requests: #{inspect(for entry = {position, _shapes} <- :ets.tab2list(compiled), position != :exla, do: entry)}, and #{:counters.get(compiles, 4)} EXLA compiles of #{f.(:counters.get(compiles, 5) / 1000)} ms in all in the measured requests, #{exla_in.(server_pid)} of them in the server process"
 )
 
-# The wall time of the measured requests, split into the steps without and with joins, the
+# The wall time of the measured requests, split into the decode steps and the steps with a
+# prompt part, the
 # compiles in them, and the time between steps. A compile runs inside a step.
 step_time = fn steps -> steps |> Enum.map(&ms.(elem(&1, 3))) |> Enum.sum() end
 compile_time = ms.(:counters.get(compiles, 3))
 
 if steps != [] do
   IO.puts(
-    "TIME #{name} #{mode} rate #{rate}: #{span} ms in all, #{f.(step_time.(decodes))} ms in decode steps, #{f.(step_time.(admits))} ms in admit steps, #{f.(compile_time)} ms of compiles, #{f.(span - step_time.(decodes) - step_time.(admits))} ms between steps"
+    "TIME #{name} #{mode} rate #{rate}: #{span} ms in all, #{f.(step_time.(decodes))} ms in decode steps, #{f.(step_time.(prompted))} ms in prompt steps, #{f.(compile_time)} ms of compiles, #{f.(span - step_time.(decodes) - step_time.(prompted))} ms between steps"
   )
 end
 
-# The time of the steps without joins, for each capacity of the buffers.
+# The time of the decode steps, for each capacity of the buffers.
 for {capacity, durations} <-
       Enum.group_by(decodes, &elem(&1, 4).capacity, &ms.(elem(&1, 3))) do
   IO.puts(
@@ -330,7 +415,7 @@ if prepares != [] do
     "PREPARE #{name} #{mode} rate #{rate}: #{length(prepares)} requests, prepare p50 #{f.(percentile.(durations, 0.5))} ms p95 #{f.(percentile.(durations, 0.95))} ms max #{f.(Enum.max(durations))} ms, wait for the worker p50 #{f.(percentile.(waits, 0.5))} ms p95 #{f.(percentile.(waits, 0.95))} ms max #{f.(Enum.max(waits))} ms"
   )
 
-  # The steps without joins, with and without a run of :prepare at the same time.
+  # The decode steps, with and without a run of :prepare at the same time.
   spans = for {_event, _pid, time, duration, _metadata} <- prepares, do: {time - duration, time}
 
   {shared, alone} =

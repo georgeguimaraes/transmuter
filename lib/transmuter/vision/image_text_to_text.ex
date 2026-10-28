@@ -102,8 +102,13 @@ defmodule Transmuter.Vision.ImageTextToText do
       backend = Nx.Defn.to_backend(defn_options)
 
       fn
-        tensors, _prompts when map_size(tensors) == 0 -> %{}
-        tensors, prompts -> module.encode(processor, encode, tensors, prompts, backend)
+        tensors, _prompts when map_size(tensors) == 0 ->
+          %{}
+
+        tensors, prompts ->
+          processor
+          |> module.encode(encode, tensors, prompts, backend)
+          |> Map.update!(:image_features, &prompt_features(&1, prompts, image_token, backend))
       end
     end
 
@@ -124,12 +129,21 @@ defmodule Transmuter.Vision.ImageTextToText do
       validate: &validate/1,
       preprocess: preprocess,
       prepare: prepare,
+      example: example(),
       init: Serving.prepare_init(prepare),
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: @buckets
     }
 
     {ctx, tokenizer, task}
+  end
+
+  # A chat with one image of gray pixels, which `Transmuter.ContinuousGeneration` prepares when
+  # it starts with compile_steps: true, so the processor and the encoder compile for it.
+  defp example do
+    image = Nx.broadcast(Nx.tensor(128, type: :u8, backend: Nx.BinaryBackend), {64, 64, 3})
+    content = [%{type: "image", image: image}, %{type: "text", text: "Describe this image."}]
+    %{messages: [%{role: "user", content: content}]}
   end
 
   # The id of the image token from config.json and its text from the tokenizer.
@@ -342,6 +356,43 @@ defmodule Transmuter.Vision.ImageTextToText do
       end
 
     Nx.concatenate(features)
+  end
+
+  # The features of the image tokens of each prompt, from the features of all prompts in order,
+  # or nil for a prompt without images. Rows of zeros pad the features of each prompt to a
+  # power of two, so the slots of Transmuter.Generation take few shapes of them. The rows of a
+  # prompt are one range of the bytes of the features, so the split and the padding work on
+  # the binary: Nx operations on Nx.BinaryBackend take about 290 ms for the 832 rows of a
+  # SmolVLM image, the binary about 1 ms.
+  defp prompt_features(features, prompts, image_token, backend) do
+    {_count, hidden} = Nx.shape(features)
+    {_kind, bits} = type = Nx.type(features)
+    row = div(hidden * bits, 8)
+    binary = Nx.to_binary(features)
+
+    prompts
+    |> Enum.map_reduce(0, fn prompt, start ->
+      case Enum.count(prompt, &(&1 == image_token)) do
+        0 ->
+          {nil, start}
+
+        count ->
+          size = 2 ** length(Integer.digits(count - 1, 2))
+
+          bytes =
+            binary_part(binary, start * row, count * row) <>
+              :binary.copy(<<0>>, (size - count) * row)
+
+          rows =
+            bytes
+            |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+            |> Nx.reshape({size, hidden})
+            |> Nx.backend_transfer(backend)
+
+          {rows, start + count}
+      end
+    end)
+    |> elem(0)
   end
 
   @doc false

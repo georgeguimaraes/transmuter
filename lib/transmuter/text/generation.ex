@@ -76,6 +76,7 @@ defmodule Transmuter.Text.Generation do
       validate: &validate/1,
       preprocess: preprocess,
       prepare: prepare,
+      example: %{text: "Hello"},
       init: Serving.prepare_init(prepare),
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
