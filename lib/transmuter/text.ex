@@ -234,7 +234,7 @@ defmodule Transmuter.Text do
 
   Each row samples with its own key from its seed, so the random numbers of a row do not depend on the batch. With greedy selection, and with sampling from a seed, an input gives the same text in a batch as alone. A batch can change the rounding of the logits, so in rare cases a token can be different.
 
-  `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A decoder that grows its cache, such as `Xenova/gpt2` or Gemma 3, runs the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length.
+  `Transmuter.Generation` tells how each mode of the KV cache keeps the rows apart. A decoder that grows its cache and a decoder with one position offset for all rows, such as Apertus, run the prompts of each length as a separate group, one group after the other. Each step of a group runs all rows of the batch. So a batch is faster for these models only when prompts have the same length. A merged decoder that reads its positions from a table, such as `Xenova/gpt2`, decodes the rows of all prompt lengths together (see "Merged decoders" in `Transmuter.Generation`).
 
   Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a batch with prompts of the same power-of-two width.
 
