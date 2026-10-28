@@ -51,7 +51,7 @@ defmodule Transmuter.Text.Generation do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for generation/2 and
-  # `Transmuter.Text.ContinuousGeneration`.
+  # `Transmuter.ContinuousGeneration`.
   def task(source, opts) do
     load_opts = [outputs: &Generation.outputs/1] ++ opts
     components = ["model", "decoder_model_merged"]
@@ -70,10 +70,13 @@ defmodule Transmuter.Text.Generation do
       [%{prompt: ids, seed: seed, tensors: %{}, summary: summary}]
     end
 
+    prepare = fn _defn_options -> fn _tensors, _prompts -> %{} end end
+
     task = %{
       validate: &validate/1,
       preprocess: preprocess,
-      init: fn _defn_options -> fn _tensors, prompts, generate -> generate.(%{}, prompts) end end,
+      prepare: prepare,
+      init: Serving.prepare_init(prepare),
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
 

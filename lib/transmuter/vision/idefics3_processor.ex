@@ -96,14 +96,18 @@ defmodule Transmuter.Vision.Idefics3Processor do
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the `"pixel_values"` of `tensors`, of shape `{batch, tiles, 3, tile, tile}`, and gives the inputs of `Transmuter.Generation.generate/5`.
 
-  The encoder removes the tiles of zeros, as `Idefics3Model.get_image_features` of Python transformers does. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{tiles * image_seq_len, hidden}`, with rows of zeros after the features for the removed tiles. The prompts take the default positions.
+  The tiles of zeros do not run, as `Idefics3Model.get_image_features` of Python transformers removes them. Each real tile runs as one row of the batch of the encoder, so `encode` can run the tiles in more than one call. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{tiles * image_seq_len, hidden}`, with rows of zeros after the features for the tiles of zeros. The prompts take the default positions.
   """
   def encode(_processor, encode, %{"pixel_values" => pixels}, _prompts, backend) do
-    {batch, tiles, _channels, height, width} = Nx.shape(pixels)
+    {batch, tiles, channels, height, width} = Nx.shape(pixels)
+    pixels = Nx.reshape(pixels, {batch * tiles, 1, channels, height, width})
+    real = pixels |> Nx.not_equal(0) |> Nx.any(axes: [1, 2, 3, 4]) |> Nx.to_flat_list()
+    index = for {1, tile} <- Enum.with_index(real), do: tile
+    pixels = Nx.take(pixels, Nx.tensor(index, backend: backend))
 
     # Each tile is a whole image, so the mask has no padding.
     one = Nx.tensor(1, type: :u8, backend: backend)
-    mask = Nx.broadcast(one, {batch, tiles, height, width})
+    mask = Nx.broadcast(one, {length(index), 1, height, width})
 
     %{"image_features" => features} =
       encode.(%{"pixel_values" => pixels, "pixel_attention_mask" => mask})

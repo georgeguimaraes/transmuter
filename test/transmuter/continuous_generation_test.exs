@@ -1,4 +1,45 @@
-defmodule Transmuter.Text.ContinuousGenerationTest do
+defmodule Transmuter.ContinuousGenerationTest.FailingTask do
+  @moduledoc false
+  # The text generation task, whose :prepare raises on the prompt "boom", as an out-of-memory
+  # error of the device in the vision encoder would.
+
+  alias Transmuter.Text.Generation
+  alias Transmuter.Tokenizer
+
+  def options, do: Generation.options()
+
+  def task(source, opts) do
+    {ctx, tokenizer, task} = Generation.task(source, opts)
+
+    prepare = fn defn_options ->
+      prepare = task.prepare.(defn_options)
+
+      fn tensors, [prompt] ->
+        if Tokenizer.decode(tokenizer, prompt) =~ "boom",
+          do: raise("out of memory"),
+          else: prepare.(tensors, [prompt])
+      end
+    end
+
+    {ctx, tokenizer, %{task | prepare: prepare}}
+  end
+end
+
+defmodule Transmuter.ContinuousGenerationTest.BrokenTask do
+  @moduledoc false
+  # The text generation task, whose :prepare raises when it loads its models.
+
+  alias Transmuter.Text.Generation
+
+  def options, do: Generation.options()
+
+  def task(source, opts) do
+    {ctx, tokenizer, task} = Generation.task(source, opts)
+    {ctx, tokenizer, %{task | prepare: fn _defn_options -> raise "no encoder" end}}
+  end
+end
+
+defmodule Transmuter.ContinuousGenerationTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
@@ -11,8 +52,8 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
     variant: :fp32
   ]
 
-  alias Transmuter.Text
-  alias Transmuter.Text.ContinuousGeneration
+  alias Transmuter.{ContinuousGeneration, Text, Vision}
+  alias Transmuter.ContinuousGenerationTest.{BrokenTask, FailingTask}
 
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
 
@@ -68,7 +109,8 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
   end
 
   # A server of 1 row with a queue of 1 request. A stream that must give 200 tokens runs, a
-  # second request waits, and a third raises QueueFullError. The caller of the stream exits
+  # second request waits, and a third raises QueueFullError, while the second is in the worker
+  # and when it is in the queue. The caller of the stream exits
   # after its first chunk, at step k. The server sees the exit at most 2 steps later, so the
   # waiting request runs in its row and gives its result alone, at most k + 2 + its own steps
   # in total. A row that stays with the stream until its 200 tokens gives more. When the
@@ -96,12 +138,35 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
           end)
 
         assert_receive :chunk, 60_000
-        waiting = Task.async(fn -> ContinuousGeneration.run(server, "Once upon a time") end)
-        wait_for_queue(server, 1)
+        %{worker: worker} = :sys.get_state(server)
+        id = make_ref()
 
-        assert_raise ContinuousGeneration.QueueFullError, ~r/holds 1 requests/, fn ->
-          ContinuousGeneration.run(server, "Explain how a rainbow forms.")
+        :telemetry.attach(
+          id,
+          [:transmuter, :continuous_generation, :prepare, :start],
+          fn _event, _measurements, _metadata, _config ->
+            if self() == worker do
+              send(parent, {id, :preparing})
+              receive do: ({^id, :go} -> :ok)
+            end
+          end,
+          nil
+        )
+
+        waiting = Task.async(fn -> ContinuousGeneration.run(server, "Once upon a time") end)
+        assert_receive {^id, :preparing}, 60_000
+
+        full = fn ->
+          assert_raise ContinuousGeneration.QueueFullError, ~r/holds 1 requests/, fn ->
+            ContinuousGeneration.run(server, "Explain how a rainbow forms.", 60_000)
+          end
         end
+
+        full.()
+        send(worker, {id, :go})
+        :telemetry.detach(id)
+        wait_for(fn -> :queue.len(:sys.get_state(server).queue) == 1 end)
+        full.()
 
         Process.exit(streamer, :kill)
         killed_at = calls.()
@@ -112,7 +177,7 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
     assert calls <= killed_at + 2 + own_calls
 
     {caller, monitor} = spawn_monitor(fn -> ContinuousGeneration.run(server, @fox) end)
-    wait_for_rows(server, 1)
+    wait_for(fn -> map_size(:sys.get_state(server).rows) == 1 end)
     Process.exit(server, :kill)
 
     assert_receive {:DOWN, ^monitor, :process, ^caller,
@@ -254,6 +319,225 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
     assert List.last(capacities) == 256
   end
 
+  # A server of 3 rows runs a chat without images. A chat with text before its image joins, and
+  # while the image tokens of that chat are left, a chat with another image joins (see
+  # join_while_reading/2). So the features of both chats are in the group, and each chat must
+  # read its own. Each chat gives
+  # the result of image_text_to_text/2 alone, with greedy selection and with sampling from a
+  # seed. The random model gives the same text for all chats, so its log-probabilities show
+  # which features a chat read. Before them, a chat without images whose text has the image
+  # token raises in its caller, as its prompt has image tokens and no features.
+  test "chats with images that join a running batch give the result that they give alone" do
+    source = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
+    variant = %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32}
+    image = StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
+    tall = Nx.transpose(StbImage.to_nx(image), axes: [1, 0, 2])
+
+    chats = [
+      chat([%{type: "text", text: "What is the capital of France?"}]),
+      chat([%{type: "text", text: @fox <> " " <> @fox}, %{type: "image", image: image}]),
+      chat([%{type: "image", image: tall}, %{type: "text", text: "What animals are here?"}])
+    ]
+
+    literal = chat([%{type: "text", text: "What is <image_soft_token> here?"}])
+
+    for strategy <- [:greedy, :sampling] do
+      opts = [variant: variant, strategy: strategy, max_new_tokens: 24, token_logprobs: true]
+      opts = Keyword.merge(@opts, opts)
+
+      single = Vision.image_text_to_text(source, opts)
+      alone = Enum.map(chats, &Nx.Serving.run(single, Map.put(&1, :seed, 7)))
+      spec = [task: Vision.ImageTextToText, source: source, slots: 3] ++ opts
+      server = start_supervised!({ContinuousGeneration, spec})
+
+      assert_raise ArgumentError, ~r/has 1 image tokens .*, and the images give 0/, fn ->
+        ContinuousGeneration.run(server, literal)
+      end
+
+      results = join_while_reading(server, Enum.map(chats, &Map.put(&1, :seed, 7)))
+
+      for {%{results: [result]}, %{results: [expected]}} <- Enum.zip(results, alone) do
+        assert result.text == expected.text
+        assert_all_close(result.token_logprobs, expected.token_logprobs)
+      end
+
+      stop_supervised!(ContinuousGeneration)
+    end
+  end
+
+  # The worker raises on the request "boom" while a stream runs, as an out-of-memory error of
+  # the vision encoder would. The caller of that request gets the exception, and the stream
+  # and a later request give the text that they give alone.
+  test "an exception of the worker goes to the caller of its request, and the server continues" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
+    single = Text.generation(source, opts)
+    alone = for text <- [@fox, "Once upon a time"], do: Nx.Serving.run(single, text)
+    spec = [task: FailingTask, source: source, slots: 2] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+    parent = self()
+
+    streamer =
+      Task.async(fn ->
+        server
+        |> ContinuousGeneration.stream(@fox)
+        |> Enum.map_join(fn chunk ->
+          send(parent, :chunk)
+          chunk
+        end)
+      end)
+
+    assert_receive :chunk, 60_000
+
+    assert_raise RuntimeError, "out of memory", fn ->
+      ContinuousGeneration.run(server, "boom")
+    end
+
+    assert ContinuousGeneration.run(server, "Once upon a time") == Enum.at(alone, 1)
+    [%{results: [%{text: text}]} | _rest] = alone
+    assert Task.await(streamer, :infinity) == text
+  end
+
+  # The worker holds the request of a caller, and the caller exits. The server forgets the
+  # request, so it never takes a row when the worker sends it back, and a later request gives
+  # its text alone in the only step that admits a request.
+  test "a request whose caller exits while it is in the worker never runs" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 8] ++ @opts
+    alone = Nx.Serving.run(Text.generation(source, opts), "Once upon a time")
+    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+    %{worker: worker} = :sys.get_state(server)
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :continuous_generation, :prepare, :start],
+      fn _event, _measurements, _metadata, _config ->
+        if self() == worker and Process.put(id, :held) == nil do
+          send(parent, {id, :preparing})
+          receive do: ({^id, :go} -> :ok)
+        end
+      end,
+      nil
+    )
+
+    {caller, monitor} = spawn_monitor(fn -> ContinuousGeneration.run(server, @fox) end)
+    assert_receive {^id, :preparing}, 60_000
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^caller, :killed}
+    wait_for(fn -> :sys.get_state(server).preparing == %{} end)
+
+    {result, steps} =
+      step_events(server, fn ->
+        send(worker, {id, :go})
+        ContinuousGeneration.run(server, "Once upon a time")
+      end)
+
+    :telemetry.detach(id)
+    assert result == alone
+    assert steps |> Enum.map(& &1.admitted) |> Enum.sum() == 1
+  end
+
+  # The worker loads the models of :prepare before the server starts, so its error fails the
+  # start.
+  test "a server whose worker cannot load its models does not start" do
+    spec = [task: BrokenTask, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}] ++ @opts
+    assert {:error, reason} = start_supervised({ContinuousGeneration, spec})
+    assert inspect(reason) =~ "no encoder"
+  end
+
+  @doc false
+  def chat(content), do: %{messages: [%{role: "user", content: content}]}
+
+  @doc false
+  # Runs `chats` in one call and returns their results. The worker prepares the chats in their
+  # order. The first chat has no images and runs first. Telemetry handlers hold the server
+  # until the second chat joins next to the first, and then until the worker has prepared the
+  # third chat, which the worker holds until then. So the third chat joins at the next step,
+  # while the prompt of the second chat runs in parts of 64 tokens next to the first chat.
+  def join_while_reading(server, chats) do
+    %{worker: worker} = :sys.get_state(server)
+    pid = GenServer.whereis(server)
+    parent = self()
+    id = make_ref()
+
+    events = [
+      [:transmuter, :continuous_generation, :prepare, :start],
+      [:transmuter, :continuous_generation, :prepare, :stop],
+      [:transmuter, :continuous_generation, :step, :start]
+    ]
+
+    :telemetry.attach_many(id, events, &__MODULE__.hold/4, {id, parent, worker, pid})
+    task = Task.async(fn -> ContinuousGeneration.run(server, chats) end)
+
+    # The server holds a step of the first chat when the second chat is not ready yet.
+    receive do
+      {^id, :running} ->
+        assert_receive {^id, :second_prepared}, 60_000
+        send(pid, {id, :go})
+        assert_receive {^id, :joins}, 60_000
+
+      {^id, :joins} ->
+        :ok
+    after
+      60_000 -> flunk("the second chat did not join")
+    end
+
+    assert_receive {^id, :third}, 60_000
+    send(worker, {id, :go})
+    assert_receive {^id, :third_prepared}, 60_000
+    send(pid, {id, :go})
+    results = Task.await(task, :infinity)
+    :telemetry.detach(id)
+    results
+  end
+
+  @doc false
+  def hold([_, _, :prepare, :start], _measurements, _metadata, {id, parent, worker, _pid})
+      when self() == worker do
+    Process.put(id, Process.get(id, 0) + 1)
+
+    if Process.get(id) == 3 do
+      send(parent, {id, :third})
+      receive do: ({^id, :go} -> :ok)
+    end
+  end
+
+  def hold([_, _, :prepare, :stop], _measurements, _metadata, {id, parent, worker, _pid})
+      when self() == worker do
+    case Process.get(id) do
+      2 -> send(parent, {id, :second_prepared})
+      3 -> send(parent, {id, :third_prepared})
+      _first -> :ok
+    end
+  end
+
+  def hold([_, _, :step, :start], _measurements, metadata, {id, parent, _worker, pid})
+      when self() == pid and metadata.running == 1 do
+    case {metadata.admitted, Process.get(id)} do
+      {0, nil} -> wait(id, parent, :running)
+      {1, held} when held != :joins -> wait(id, parent, :joins)
+      _other -> :ok
+    end
+  end
+
+  def hold(_event, _measurements, _metadata, _config), do: :ok
+
+  defp wait(id, parent, event) do
+    Process.put(id, event)
+    send(parent, {id, event})
+    receive do: ({^id, :go} -> :ok)
+  end
+
+  defp assert_all_close(got, expected) do
+    assert length(got) == length(expected)
+
+    for {g, e} <- Enum.zip(got, expected) do
+      assert_in_delta g, e, 1.0e-4, "expected #{inspect(expected)}, got #{inspect(got)}"
+    end
+  end
+
   # The result of `fun` and the metadata of the steps that `server` started while it ran.
   defp step_events(server, fun) do
     pid = GenServer.whereis(server)
@@ -303,17 +587,72 @@ defmodule Transmuter.Text.ContinuousGenerationTest do
     {result, :counters.get(counter, 1)}
   end
 
-  defp wait_for_queue(server, length) do
-    unless :queue.len(:sys.get_state(server).queue) == length do
+  defp wait_for(done?) do
+    unless done?.() do
       Process.sleep(10)
-      wait_for_queue(server, length)
+      wait_for(done?)
     end
   end
+end
 
-  defp wait_for_rows(server, count) do
-    unless map_size(:sys.get_state(server).rows) == count do
-      Process.sleep(10)
-      wait_for_rows(server, count)
-    end
+# --only ci_partition:N in CI would also include :large_model tests, because an included tag
+# wins over an excluded one. So these tests are in a module without a :ci_partition tag, and
+# CI leaves them out.
+defmodule Transmuter.ContinuousGenerationLargeModelTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :hub
+  @moduletag timeout: 900_000
+
+  @opts [
+    backend: Transmuter.TestBackend.backend(),
+    defn_options: Transmuter.TestBackend.compiler_opts()
+  ]
+
+  alias Transmuter.{ContinuousGeneration, ContinuousGenerationTest, Vision}
+
+  # SmolVLM gives 64 image tokens for each tile of an image. A chat with an image joins a
+  # running chat without images, and a chat with another image joins while the image tokens
+  # of the first are left. Each chat gives the text of image_text_to_text/2 alone.
+  @tag :large_model
+  test "chats of SmolVLM that join a running batch give the text that they give alone" do
+    {server, alone} = server_and_alone({:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"})
+    assert ContinuousGenerationTest.join_while_reading(server, chats()) == alone
+  end
+
+  # The same joins with Qwen2-VL, whose image tokens have the 3-D positions of M-RoPE.
+  @tag :large_model
+  test "chats of Qwen2-VL that join a running batch give the text that they give alone" do
+    {server, alone} = server_and_alone({:hf, "onnx-community/Qwen2-VL-2B-Instruct"})
+    assert ContinuousGenerationTest.join_while_reading(server, chats()) == alone
+  end
+
+  defp chats do
+    image = StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
+    tall = Nx.transpose(StbImage.to_nx(image), axes: [1, 0, 2])
+
+    Enum.map(
+      [
+        [%{type: "text", text: "What is the capital of France?"}],
+        [%{type: "image", image: image}, %{type: "text", text: "Can you describe this image?"}],
+        [%{type: "image", image: tall}, %{type: "text", text: "What animals are in the image?"}]
+      ],
+      &ContinuousGenerationTest.chat/1
+    )
+  end
+
+  # The results of a serving alone, and then a server of 3 rows. The serving is out of scope
+  # and collected before the server loads its models, so only one copy of the models stays.
+  defp server_and_alone(source) do
+    opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
+    alone = alone(source, opts)
+    :erlang.garbage_collect()
+    spec = [task: Vision.ImageTextToText, source: source, slots: 3] ++ opts
+    {start_supervised!({ContinuousGeneration, spec}), alone}
+  end
+
+  defp alone(source, opts) do
+    single = Vision.image_text_to_text(source, opts)
+    Enum.map(chats(), &Nx.Serving.run(single, &1))
   end
 end

@@ -9,7 +9,7 @@ defmodule Transmuter.Vision.ImageTextToText do
   The tokenizer adds its special tokens to the rendered prompt, unless the prompt starts with the bos token, as `apply_chat_template` of the processors of Python transformers.
   """
 
-  @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding]}
+  @compile {:no_warn_undefined, [Tokenizers.Tokenizer, Tokenizers.Encoding, Transmuter.EMLX]}
 
   alias Transmuter.{ChatTemplate, Featurizer, Generation, Hub, Repo, Serving, Tokenizer}
 
@@ -25,37 +25,54 @@ defmodule Transmuter.Vision.ImageTextToText do
   # images), rounded up to a power of two, or 0 for a chat without images.
   @buckets [0 | for(exponent <- 0..16, do: 2 ** exponent)]
 
+  @options [
+             :variant,
+             :tokenizer,
+             :backend,
+             :compute_type,
+             :max_new_tokens,
+             :strategy,
+             :temperature,
+             :top_k,
+             :top_p,
+             :repetition_penalty,
+             :num_beams,
+             :length_penalty,
+             :early_stopping,
+             :seed,
+             :template_options,
+             token_logprobs: false,
+             defn_options: []
+           ] ++ Hub.options()
+
+  # The rows of the batch axis of one call of the vision encoder, at most. A call keeps the
+  # device until it ends, also for the steps of a server of ContinuousGeneration on the same
+  # device, so smaller calls make the steps wait less. See in_chunks/3.
+  @encode_rows 1
+
+  @doc false
+  # The options of the task without the options of the serving.
+  def options, do: @options
+
   @doc false
   def image_text_to_text(source, opts) do
     opts =
-      Keyword.validate!(
-        opts,
-        [
-          :variant,
-          :tokenizer,
-          :backend,
-          :compute_type,
-          :max_new_tokens,
-          :strategy,
-          :temperature,
-          :top_k,
-          :top_p,
-          :repetition_penalty,
-          :num_beams,
-          :length_penalty,
-          :early_stopping,
-          :seed,
-          :template_options,
-          token_logprobs: false,
-          stream: false,
-          stream_done: false,
-          compile: [],
-          defn_options: []
-        ] ++ Hub.options()
-      )
+      opts
+      |> Keyword.validate!(@options ++ [stream: false, stream_done: false, compile: []])
       |> Serving.generation_options!()
 
     compile = Keyword.validate!(opts[:compile], batch_size: 1)
+    opts = Keyword.put(opts, :compile, compile)
+    {ctx, tokenizer, task} = task(source, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
+  end
+
+  @doc false
+  # The context, the tokenizer and the task of `Serving.generation/4`, for image_text_to_text/2
+  # and `Transmuter.ContinuousGeneration`. The vision encoder compiles for `:batch_size` of
+  # `:compile` rows, 1 without it.
+  def task(source, opts) do
+    batch_size = get_in(opts, [:compile, :batch_size]) || 1
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     tokenizer = Serving.tokenizer(repo, opts)
     {image_token, image_text} = image_token!(repo, tokenizer)
@@ -78,17 +95,15 @@ defmodule Transmuter.Vision.ImageTextToText do
 
     bos = Repo.special_token(repo, "bos")
 
-    init = fn defn_options ->
-      template = module.template(processor, compile[:batch_size])
+    prepare = fn defn_options ->
+      template = module.template(processor, batch_size)
       encode = Transmuter.compile(vision, template, [cache_size: 64] ++ defn_options)
+      encode = in_chunks(encode, vision, @encode_rows)
       backend = Nx.Defn.to_backend(defn_options)
 
       fn
-        tensors, prompts, generate when map_size(tensors) == 0 ->
-          generate.(%{}, prompts)
-
-        tensors, prompts, generate ->
-          generate.(module.encode(processor, encode, tensors, prompts, backend), prompts)
+        tensors, _prompts when map_size(tensors) == 0 -> %{}
+        tensors, prompts -> module.encode(processor, encode, tensors, prompts, backend)
       end
     end
 
@@ -108,12 +123,13 @@ defmodule Transmuter.Vision.ImageTextToText do
     task = %{
       validate: &validate/1,
       preprocess: preprocess,
-      init: init,
+      prepare: prepare,
+      init: Serving.prepare_init(prepare),
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: @buckets
     }
 
-    Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
+    {ctx, tokenizer, task}
   end
 
   # The id of the image token from config.json and its text from the tokenizer.
@@ -267,9 +283,8 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   # As get_placeholder_mask of Python transformers: the image tokens of the prompt must be
   # those of the texts of the images, one for each feature. The text of a chat can also have
-  # the image token, which would move the features of the images to other tokens.
-  defp check_image_tokens!(_ids, [], _image_token, _image_text), do: :ok
-
+  # the image token, which would move the features of the images to other tokens, also in a
+  # chat without images.
   defp check_image_tokens!(ids, texts, image_token, image_text) do
     count = Enum.count(ids, &(&1 == image_token))
     expected = Enum.sum_by(texts, &(length(String.split(&1, image_text)) - 1))
@@ -328,6 +343,43 @@ defmodule Transmuter.Vision.ImageTextToText do
 
     Nx.concatenate(features)
   end
+
+  @doc false
+  # Runs `encode` in calls of at most `rows` rows and concatenates the outputs of the calls,
+  # when the first axis of each input of the vision encoder is its batch axis ("batch_size"
+  # in the model), so the encoder runs each row alone. An encoder whose first axis holds the
+  # patches of an image, such as that of Qwen2-VL, runs in one call. Each call evaluates its
+  # outputs: EMLX keeps them as expressions until a read, and then the device runs all calls
+  # of a request as one piece of work, which the steps of another process wait for.
+  def in_chunks(encode, vision, rows) do
+    call = &(&1 |> encode.() |> Map.new(fn {name, t} -> {name, evaluate(t)} end))
+
+    if Enum.all?(vision.inputs, &match?({_type, ["batch_size" | _]}, vision.input_types[&1])),
+      do: &encode_in_chunks(call, &1, rows),
+      else: call
+  end
+
+  defp encode_in_chunks(encode, inputs, rows) do
+    size = inputs |> Map.values() |> hd() |> Nx.axis_size(0)
+
+    outputs =
+      for start <- 0..(size - 1)//rows do
+        length = min(rows, size - start)
+
+        inputs
+        |> Map.new(fn {name, t} -> {name, Nx.slice_along_axis(t, start, length)} end)
+        |> encode.()
+      end
+
+    for name <- Map.keys(hd(outputs)), into: %{} do
+      {name, outputs |> Enum.map(& &1[name]) |> Nx.concatenate()}
+    end
+  end
+
+  defp evaluate(tensor = %Nx.Tensor{data: %{__struct__: EMLX.Backend}}),
+    do: Transmuter.EMLX.evaluate(tensor)
+
+  defp evaluate(tensor), do: tensor
 
   @doc false
   # The images of each row of a batch, before the rows of zeros, as {size, pixels}: a row

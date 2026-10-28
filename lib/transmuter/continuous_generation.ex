@@ -1,32 +1,42 @@
-defmodule Transmuter.Text.ContinuousGeneration do
+defmodule Transmuter.ContinuousGeneration do
   @moduledoc """
-  A server of text generation with continuous batching: a request joins the running batch at the next step, and a row that ends gives its place to the next request.
+  A server of generation with continuous batching: a request joins the running batch at the next step, and a row that ends gives its place to the next request.
 
-  `Transmuter.Text.generation/2` runs each batch until its longest row ends, so a request that arrives during a batch waits for all of it, and the rows that end early stay empty. This server keeps `:slots` rows, and between two steps it gives each free row to a waiting request. The text of a request does not depend on the other rows: with greedy selection, and with sampling from a seed, a request gives the same text as alone.
+  A serving of `Transmuter.Text.generation/2` or `Transmuter.Vision.image_text_to_text/2` runs each batch until its longest row ends, so a request that arrives during a batch waits for all of it, and the rows that end early stay empty. This server keeps `:slots` rows, and between two steps it gives each free row to a waiting request. The text of a request does not depend on the other rows: with greedy selection, and with sampling from a seed, a request gives the same text as alone.
 
       children = [
-        {Transmuter.Text.ContinuousGeneration,
+        {Transmuter.ContinuousGeneration,
          name: MyGen, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, slots: 8}
       ]
 
       Supervisor.start_link(children, strategy: :one_for_one)
 
       %{results: [%{text: text}]} =
-        Transmuter.Text.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
+        Transmuter.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
+
+  A server of a vision language model takes the chats of `Transmuter.Vision.image_text_to_text/2`:
+
+      {Transmuter.ContinuousGeneration,
+       name: MyChat,
+       task: Transmuter.Vision.ImageTextToText,
+       source: {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"},
+       slots: 8}
 
   ## Options
 
     * `:name` - the name of the server.
 
-    * `:source` - the model, as in `Transmuter.Text.generation/2`.
+    * `:task` - `Transmuter.Text.Generation`, the task of `Transmuter.Text.generation/2`, or `Transmuter.Vision.ImageTextToText`, the task of `Transmuter.Vision.image_text_to_text/2`. The default is `Transmuter.Text.Generation`.
+
+    * `:source` - the model, as in the function of the task.
 
     * `:slots` - the number of rows that generate together. The default is `8`.
 
-    * `:max_queue` - the number of requests that can wait for a row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.Text.ContinuousGeneration.QueueFullError`, so the caller can rescue this case and reject the request.
+    * `:max_queue` - the number of requests that can wait for a row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousGeneration.QueueFullError`, so the caller can rescue this case and reject the request.
 
     * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. The default is `4096`.
 
-  The other options are those of `Transmuter.Text.generation/2`, without `:compile`, `:stream` and `:stream_done`. The server loads the model and compiles the steps when it starts.
+  The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
   ## Scope
 
@@ -46,23 +56,32 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
   On EMLX, MLX keeps the freed buffers of each size in a cache, which has no limit by default. Set a limit, for example `EMLX.set_cache_limit(1_000_000_000)`, when the application starts.
 
+  ## Images
+
+  A request with images needs the features of its images before it joins, and for Qwen2-VL, Qwen2.5-VL and Qwen3-VL the 3-D positions of its prompt. A worker process of the server prepares one request at a time, in the order of the requests, and then puts the request in the queue. It runs the processor on the images and the tokenizer on the chat, and then the vision encoder on the images. So the steps of the running rows do not wait for the encoder, the caller does no work on the device, and the device memory of this work is that of one request. The processor and the encoder compile one time, in the worker. A request waits in the worker for the requests before it, also a request without images. The queue limit counts the requests in the worker. An error of the processor or of the encoder goes to the caller of the request (see "Failures").
+
+  The encoder and the steps run on the same device, and a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image when the encoder takes them on its batch axis, and each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms, and at most 86 ms while the encoder runs in calls of one tile, against 863 ms with one call for the 13 tiles of an image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
+
+  The group keeps the features of the image tokens that its rows have not run, and the features of a request join them. Then the prompt of the request runs in parts of at most 64 tokens, next to the new tokens of the running rows (see "The KV cache").
+
   ## Telemetry
 
-  Each step emits `[:transmuter, :continuous_generation, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests (see `Transmuter.Telemetry`). The duration of a step is the time between two tokens of a running row.
+  Each step emits `[:transmuter, :continuous_generation, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_generation, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
 
   ## Failures
 
   The callers of `run/3` and `stream/3` monitor the server. When the server stops, for example when a step raises an out-of-memory error of the device, each waiting caller exits with the reason of the server. When a caller exits, its row ends at the next step and goes to the next request.
+
+  When the worker raises on a request, for example with an out-of-memory error of the device in the vision encoder, the caller of that request gets the exception, and the server and the other requests continue. When the worker stops for another reason, the server stops with the same reason.
   """
 
   use GenServer
 
   alias Transmuter.{Generation, Serving}
-  alias Transmuter.Text.Generation, as: TextGeneration
 
   defmodule QueueFullError do
     @moduledoc """
-    The queue of a `Transmuter.Text.ContinuousGeneration` server is full.
+    The queue of a `Transmuter.ContinuousGeneration` server is full.
     """
     defexception [:message]
   end
@@ -76,14 +95,13 @@ defmodule Transmuter.Text.ContinuousGeneration do
   Loads the model, checks that requests can join a running batch, and starts the server. See the options in the module documentation.
   """
   def start_link(opts) do
-    opts =
-      opts
-      |> Keyword.validate!(
-        [:name, :source, slots: 8, max_queue: nil, capacity: 4096] ++ TextGeneration.options()
-      )
-      |> Serving.generation_options!()
+    module = Keyword.get(opts, :task, Transmuter.Text.Generation)
+    server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: 4096]
 
-    {ctx, tokenizer, task} = TextGeneration.task(opts[:source], opts)
+    opts =
+      opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
+
+    {ctx, tokenizer, task} = module.task(opts[:source], opts)
 
     unless Generation.joins?(ctx) do
       raise ArgumentError,
@@ -108,7 +126,7 @@ defmodule Transmuter.Text.ContinuousGeneration do
   end
 
   @doc """
-  Generates the text of `input`, a string, a map or a list of them, as `Nx.Serving.batched_run/2` with a serving of `Transmuter.Text.generation/2`, and returns the same result.
+  Generates the text of `input`, an input of the task or a list of them, as `Nx.Serving.batched_run/2` with a serving of the task, and returns the same result.
 
   Raises `QueueFullError` when the queue cannot take the inputs. After `timeout` milliseconds, the rows of the inputs end and the caller exits.
   """
@@ -117,14 +135,13 @@ defmodule Transmuter.Text.ContinuousGeneration do
     call = {__MODULE__, :run, [server, input, timeout]}
     info = info!(server, call)
     {inputs, multi?} = Serving.validate!(input, info.task.validate)
-    runs = Enum.map(inputs, info.task.preprocess)
-    refs = for [run] <- runs, do: {make_ref(), run}
+    refs = for input <- inputs, do: {make_ref(), input}
     monitor = enqueue!(info, refs, false, server, deadline, call)
 
     results =
-      for {ref, run} <- refs do
-        tokens = await(info, monitor, ref, deadline, refs, call)
-
+      for {ref, _input} <- refs do
+        run = await(info, monitor, {ref, :run}, deadline, refs, call)
+        tokens = await(info, monitor, {ref, :done}, deadline, refs, call)
         info.task.postprocess.([Serving.integers(tokens)], [run])
       end
 
@@ -133,9 +150,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
   end
 
   @doc """
-  Returns a stream of the text of `input`, as a serving of `Transmuter.Text.generation/2` with `stream: true`. Consume the stream in the process that called this function.
+  Returns a stream of the text of `input`, as a serving of the task with `stream: true`. Consume the stream in the process that called this function.
 
-  `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
+  The function returns when the worker has prepared the request (see "Images"), and it raises the exception of the worker on the request. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
   """
   def stream(server, input, opts \\ []) do
     opts = Keyword.validate!(opts, stream_done: false)
@@ -148,9 +165,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
         {_inputs, true} -> raise ArgumentError, "stream/3 takes one input, got a list"
       end
 
-    [run] = info.task.preprocess.(input)
     ref = make_ref()
-    monitor = enqueue!(info, [{ref, run}], true, server, :infinity, reason)
+    monitor = enqueue!(info, [{ref, input}], true, server, :infinity, reason)
+    run = await(info, monitor, {ref, :run}, :infinity, [{ref, input}], reason)
 
     events =
       Stream.resource(
@@ -170,9 +187,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
                 {[{:token, event}], done?}
 
-              {^ref, {:error, message}} ->
+              {^ref, {:error, exception}} ->
                 Process.demonitor(monitor, [:flush])
-                raise ArgumentError, message
+                raise exception
 
               {:DOWN, ^monitor, :process, _pid, down} ->
                 exit({down, reason})
@@ -203,9 +220,7 @@ defmodule Transmuter.Text.ContinuousGeneration do
   defp enqueue!(info, refs, stream?, server, deadline, call) do
     monitor = Process.monitor(info.pid)
 
-    requests =
-      for {ref, run} <- refs,
-          do: %{ref: ref, prompt: run.prompt, seed: run.seed, stream?: stream?}
+    requests = for {ref, input} <- refs, do: %{ref: ref, input: input, stream?: stream?}
 
     reply =
       try do
@@ -229,15 +244,17 @@ defmodule Transmuter.Text.ContinuousGeneration do
     end
   end
 
-  defp await(info, monitor, ref, deadline, refs, call) do
+  # The value of the message `tag` of the request `ref`: :run when the worker has run
+  # :preprocess on its input, and :done with its tokens when its row ends.
+  defp await(info, monitor, {ref, tag}, deadline, refs, call) do
     receive do
-      {^ref, {:done, tokens}} ->
-        tokens
+      {^ref, {^tag, value}} ->
+        value
 
-      {^ref, {:error, message}} ->
+      {^ref, {:error, exception}} ->
         GenServer.cast(info.pid, {:cancel, Enum.map(refs, &elem(&1, 0))})
         Process.demonitor(monitor, [:flush])
-        raise ArgumentError, message
+        raise exception
 
       {:DOWN, ^monitor, :process, _pid, reason} ->
         exit({reason, call})
@@ -256,12 +273,33 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
   @impl true
   def init(state) do
-    ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
     Process.flag(:trap_exit, true)
+    server = self()
+    %{preprocess: preprocess, prepare: prepare} = state.task
+    defn_options = state.defn_options
 
+    # The worker loads the models of :prepare, such as the vision encoder, while the server
+    # compiles the steps. The server starts when both are ready, so an error of either fails
+    # the start.
+    worker =
+      spawn_link(fn ->
+        prepare = prepare.(defn_options)
+        send(server, {self(), :ready})
+        prepare_requests({preprocess, prepare}, Nx.Defn.to_backend(defn_options), server)
+      end)
+
+    ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
+
+    receive do
+      {^worker, :ready} -> {:ok, start(state, ctx, worker)}
+      {:EXIT, ^worker, reason} -> {:stop, reason}
+    end
+  end
+
+  defp start(state, ctx, worker) do
     info = %{
       pid: self(),
-      task: state.task,
+      task: Map.take(state.task, [:validate, :postprocess]),
       tokenizer: state.tokenizer,
       logprobs?: ctx.token_logprobs?,
       max_queue: state.max_queue
@@ -269,26 +307,30 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
     :persistent_term.put({__MODULE__, self()}, info)
 
-    {:ok,
-     Map.merge(state, %{
-       ctx: ctx,
-       group: nil,
-       rows: %{},
-       queue: :queue.new(),
-       callers: %{},
-       stepping?: false
-     })}
+    Map.merge(state, %{
+      ctx: ctx,
+      worker: worker,
+      group: nil,
+      rows: %{},
+      preparing: %{},
+      queue: :queue.new(),
+      callers: %{},
+      stepping?: false
+    })
   end
 
+  # The requests go to the worker, which sends each one back with its inputs.
   @impl true
   def handle_call({:enqueue, requests}, {pid, _tag}, state) do
-    if :queue.len(state.queue) + length(requests) > state.max_queue do
+    if :queue.len(state.queue) + map_size(state.preparing) + length(requests) > state.max_queue do
       {:reply, {:error, :queue_full}, state}
     else
-      requests = Enum.map(requests, &Map.put(&1, :pid, pid))
-      queue = Enum.reduce(requests, state.queue, &:queue.in/2)
+      now = System.monotonic_time()
+      requests = Enum.map(requests, &Map.merge(&1, %{pid: pid, enqueued: now}))
+      Enum.each(requests, &send(state.worker, {:prepare, &1}))
+      preparing = Map.merge(state.preparing, Map.new(requests, &{&1.ref, &1}))
       callers = Map.put_new_lazy(state.callers, pid, fn -> Process.monitor(pid) end)
-      {:reply, :ok, kick(%{state | queue: queue, callers: callers})}
+      {:reply, :ok, %{state | preparing: preparing, callers: callers}}
     end
   end
 
@@ -306,12 +348,37 @@ defmodule Transmuter.Text.ContinuousGeneration do
       else: {:noreply, close(state)}
   end
 
+  # A request that the caller cancelled in the worker has no entry.
+  def handle_info({:prepared, ref, reply}, state) do
+    case {Map.pop(state.preparing, ref), reply} do
+      {{nil, _preparing}, _reply} ->
+        {:noreply, state}
+
+      {{request, preparing}, {:ok, fields, run}} ->
+        send(request.pid, {ref, {:run, run}})
+        request = request |> Map.delete(:input) |> Map.merge(fields)
+        {:noreply, kick(%{state | preparing: preparing, queue: :queue.in(request, state.queue)})}
+
+      {{request, preparing}, {:error, exception}} ->
+        send(request.pid, {ref, {:error, exception}})
+        {:noreply, forget_callers(%{state | preparing: preparing})}
+    end
+  end
+
   def handle_info({:DOWN, _monitor, :process, pid, _reason}, state) do
     {:noreply, drop(%{state | callers: Map.delete(state.callers, pid)}, &(&1.pid == pid))}
   end
 
+  def handle_info({:EXIT, worker, reason}, state = %{worker: worker}),
+    do: {:stop, reason, state}
+
   @impl true
-  def terminate(_reason, _state), do: :persistent_term.erase({__MODULE__, self()})
+  # The worker holds the compiled encoder. It does not trap exits, so a stop with :normal
+  # does not end it.
+  def terminate(_reason, state) do
+    Process.exit(state.worker, :kill)
+    :persistent_term.erase({__MODULE__, self()})
+  end
 
   defp kick(state = %{stepping?: true}), do: state
 
@@ -333,7 +400,10 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
   # Stops the monitors of the callers without rows or waiting requests.
   defp forget_callers(state) do
-    pids = MapSet.new(Map.values(state.rows) ++ :queue.to_list(state.queue), & &1.pid)
+    requests =
+      Map.values(state.rows) ++ Map.values(state.preparing) ++ :queue.to_list(state.queue)
+
+    pids = MapSet.new(requests, & &1.pid)
 
     {kept, gone} = Map.split_with(state.callers, fn {pid, _monitor} -> pid in pids end)
     Enum.each(gone, fn {_pid, monitor} -> Process.demonitor(monitor, [:flush]) end)
@@ -376,7 +446,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
 
     group = Generation.next(state.ctx, group)
     group = Generation.shrink(state.ctx, group)
-    emit(%{state | rows: Map.merge(state.rows, Map.new(admitted))}, group)
+    # The group keeps the features, so the rows do not keep them for their callers.
+    admitted = Map.new(admitted, fn {row, request} -> {row, Map.drop(request, [:features])} end)
+    emit(%{state | rows: Map.merge(state.rows, admitted)}, group)
   end
 
   defp admissions(state) do
@@ -400,7 +472,8 @@ defmodule Transmuter.Text.ContinuousGeneration do
             admissions(%{state | queue: queue}, free, candidates)
 
           admitted == [] and not active?(state) ->
-            send(waiting.pid, {waiting.ref, {:error, too_long(state, waiting)}})
+            exception = ArgumentError.exception(too_long(state, waiting))
+            send(waiting.pid, {waiting.ref, {:error, exception}})
             admissions(%{state | queue: queue}, [row | free], admitted)
 
           true ->
@@ -410,7 +483,9 @@ defmodule Transmuter.Text.ContinuousGeneration do
   end
 
   defp request(state, row, request) do
-    %{row: row, prompt: request.prompt, seed: request.seed, budget: state.ctx.max_new_tokens}
+    request
+    |> Map.take([:prompt, :seed, :features, :position])
+    |> Map.merge(%{row: row, budget: state.ctx.max_new_tokens})
   end
 
   defp too_long(state, request) do
@@ -450,6 +525,7 @@ defmodule Transmuter.Text.ContinuousGeneration do
   # Ends the rows and removes the waiting requests that `drop?` selects.
   defp drop(state, drop?) do
     queue = :queue.filter(&(not drop?.(&1)), state.queue)
+    preparing = Map.reject(state.preparing, fn {_ref, request} -> drop?.(request) end)
     {dropped, rows} = Enum.split_with(state.rows, fn {_row, request} -> drop?.(request) end)
 
     group =
@@ -457,6 +533,44 @@ defmodule Transmuter.Text.ContinuousGeneration do
         Generation.cancel(group, row)
       end)
 
-    %{state | queue: queue, rows: Map.new(rows), group: group}
+    %{state | queue: queue, preparing: preparing, rows: Map.new(rows), group: group}
+  end
+
+  # The worker runs :preprocess of the task on the input of each request alone, and :prepare
+  # on its tensors and its prompt. It sends the server the fields of the request for
+  # Generation and the run without its tensors, or the exception.
+  defp prepare_requests(task, backend, server) do
+    receive do
+      {:prepare, request} ->
+        metadata = %{wait: System.monotonic_time() - request.enqueued}
+
+        reply =
+          :telemetry.span([:transmuter, :continuous_generation, :prepare], metadata, fn ->
+            {prepare_request(task, backend, request), metadata}
+          end)
+
+        send(server, {:prepared, request.ref, reply})
+        # The device tensors of the request, such as its pixel values on the device, die here,
+        # and only a garbage collection frees them on EMLX. The worker makes little other
+        # garbage, so without it they stay for many requests.
+        :erlang.garbage_collect()
+        prepare_requests(task, backend, server)
+    end
+  end
+
+  defp prepare_request({preprocess, prepare}, backend, request) do
+    [run] = preprocess.(request.input)
+
+    tensors =
+      Map.new(run.tensors, fn {name, tensor} ->
+        {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
+      end)
+
+    inputs = prepare.(tensors, [run.prompt])
+    [position] = Map.get(inputs, :position_ids, [[]])
+    fields = %{prompt: run.prompt, seed: run.seed, features: inputs[:image_features]}
+    {:ok, Map.put(fields, :position, position), Map.delete(run, :tensors)}
+  rescue
+    exception -> {:error, exception}
   end
 end

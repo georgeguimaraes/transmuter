@@ -230,18 +230,20 @@ Prompts of up to 4096 tokens go into the same batch. A longer prompt goes into a
 
 #### Continuous batching
 
-A serving of `Transmuter.Text.generation/2` runs each batch until its longest row ends. A request that arrives during a batch waits for the whole batch, and the rows that end early stay empty. `Transmuter.Text.ContinuousGeneration` is a server that gives a free row to a waiting request at the next step:
+A serving of `Transmuter.Text.generation/2` runs each batch until its longest row ends. A request that arrives during a batch waits for the whole batch, and the rows that end early stay empty. `Transmuter.ContinuousGeneration` is a server that gives a free row to a waiting request at the next step:
 
 ```elixir
 children = [
-  {Transmuter.Text.ContinuousGeneration,
+  {Transmuter.ContinuousGeneration,
    name: MyGen, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, slots: 8}
 ]
 
 Supervisor.start_link(children, strategy: :one_for_one)
 
-Transmuter.Text.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
+Transmuter.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
 ```
+
+With `task: Transmuter.Vision.ImageTextToText`, the server takes the chats of `Transmuter.Vision.image_text_to_text/2`. A worker process of the server runs the processor and the vision encoder on the images of one request at a time, so the running rows do not wait for them.
 
 `run/3` returns the same result as `Nx.Serving.batched_run/2`, and `stream/3` returns the same chunks as a serving with `stream: true`. A request gives the same text as alone. The server takes decoders that write the cache in place. It raises at the start for a merged decoder, a decoder that grows its cache and beam search. A decoder in `:append` compacts its buffers when the rows of its steps pass them. The module documentation gives the reasons.
 

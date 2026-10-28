@@ -15,6 +15,7 @@ defmodule Transmuter.GenerationTest do
 
   alias Transmuter.{Audio, Generation, Text}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Vision.ImageTextToText
 
   # The best beam of "What is 2 + 2?" ends with eos at the eighth token while the other
   # beams still run. Greedy selection gives "2 + 2 is a classic arithmetic operation that
@@ -658,7 +659,7 @@ defmodule Transmuter.GenerationTest do
     assert capacities == [256, 320]
   end
 
-  # A request joins a running group with admit/5: its prompt runs in the same steps as the
+  # A request joins a running group with admit/4: its prompt runs in the same steps as the
   # next tokens of the other rows. The key of a row folds the number of new tokens of the
   # row, so a request that joins at a later step gives the tokens that it gives alone, with
   # greedy selection and with sampling. A row that ends early is free for the next request,
@@ -1090,6 +1091,64 @@ defmodule Transmuter.GenerationTest do
     group = run_until(ctx, group, &Enum.all?(&1.done))
     assert row_tokens(group, 0) == Enum.take(alone.(long), 4)
     assert row_tokens(group, 1) == alone.(joining)
+  end
+
+  # A group of 2 rows takes 6 chats with images. Each chat joins the row of the chat before
+  # the last, which ends there, also in the middle of its prompt, while the other row runs.
+  # After each join, the group keeps only the features of the image tokens that its rows have
+  # left, so the features do not grow with the joins. When no row has a part of its prompt
+  # left, the group has no features. A row that ends before its prompt has run takes no more steps.
+  @tag ci_partition: 10
+  test "a group keeps only the image features that its rows have not run" do
+    source = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
+    variant = %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32}
+    opts = [variant: variant, strategy: :greedy, max_new_tokens: 4] ++ @opts
+    {ctx, _tokenizer, task} = ImageTextToText.task(source, opts)
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    prepare = task.prepare.(@opts[:defn_options])
+    backend = Nx.Defn.to_backend(@opts[:defn_options])
+    image = StbImage.read_file!("test/fixtures/cats.png")
+    image_tokens = &(&1.left |> List.flatten() |> Enum.count(fn id -> id == ctx.image_token end))
+
+    requests =
+      for count <- 1..6 do
+        images = List.duplicate(%{type: "image", image: image}, count)
+        content = [%{type: "text", text: @fox} | images]
+        [run] = task.preprocess.(%{messages: [%{role: "user", content: content}]})
+
+        tensors =
+          Map.new(run.tensors, fn {name, tensor} ->
+            {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
+          end)
+
+        %{image_features: features} = prepare.(tensors, [run.prompt])
+        %{prompt: run.prompt, seed: 0, budget: 4, features: features}
+      end
+
+    group =
+      requests
+      |> Enum.with_index()
+      |> Enum.reduce(Generation.open(ctx, 2), fn {request, index}, group ->
+        row = rem(index, 2)
+
+        group =
+          Generation.admit(ctx, Generation.cancel(group, row), [Map.put(request, :row, row)])
+
+        assert Nx.axis_size(group.state.features, 0) == image_tokens.(group)
+        group |> then(&Generation.next(ctx, &1)) |> then(&Generation.next(ctx, &1))
+      end)
+
+    group = run_until(ctx, group, &Enum.all?(&1.left, fn left -> left == [] end))
+    assert group.state.features == nil
+
+    group = group |> Generation.cancel(0) |> Generation.cancel(1)
+
+    rows =
+      for {request, row} <- Enum.with_index(Enum.take(requests, 2)),
+          do: Map.put(request, :row, row)
+
+    group = Generation.next(ctx, Generation.cancel(Generation.admit(ctx, group, rows), 0))
+    assert Enum.at(group.state.lengths, 0) == 0
   end
 
   defp steps_until(ctx, group, done?, steps \\ 0) do

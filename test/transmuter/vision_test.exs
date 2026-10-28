@@ -933,15 +933,21 @@ defmodule Transmuter.VisionTest do
       assert_all_close(result.token_logprobs, logprobs)
     end
 
-    # A literal image token in the text gives one image token more than the images.
+    # A literal image token in the text gives one image token more than the images, also in a
+    # chat without images.
     text = %{type: "text", text: "What is <image_soft_token> here?"}
-    literal = %{messages: [%{role: "user", content: [%{type: "image", image: @image}, text]}]}
 
-    assert_raise ArgumentError,
-                 ~r/the prompt has 5 image tokens "<image_soft_token>", and the images give 4/,
-                 fn ->
-                   Nx.Serving.run(Vision.image_text_to_text(repo, opts), literal)
-                 end
+    for {content, message} <- [
+          {[%{type: "image", image: @image}, text],
+           ~r/has 5 image tokens .*, and the images give 4/},
+          {[text], ~r/has 1 image tokens .*, and the images give 0/}
+        ] do
+      assert_raise ArgumentError, message, fn ->
+        Nx.Serving.run(Vision.image_text_to_text(repo, opts), %{
+          messages: [%{role: "user", content: content}]
+        })
+      end
+    end
 
     batched = Vision.image_text_to_text(repo, [compile: [batch_size: 2]] ++ opts)
 

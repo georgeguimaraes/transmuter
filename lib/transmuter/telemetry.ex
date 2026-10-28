@@ -71,13 +71,21 @@ defmodule Transmuter.Telemetry do
 
   ### Continuous generation events
 
-    * `[:transmuter, :continuous_generation, :step, :start]` - a server of `Transmuter.Text.ContinuousGeneration` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
+    * `[:transmuter, :continuous_generation, :step, :start]` - a server of `Transmuter.ContinuousGeneration` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
       * Metadata: `%{running: integer, admitted: integer, waiting: integer, slots: integer, capacity: integer}`
 
     * `[:transmuter, :continuous_generation, :step, :stop]` - the step ends, and the server has sent its tokens.
       * Metadata: the same as the start
 
-  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:waiting` the number of requests in the queue after it, and `:capacity` the rows of the buffers before it. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.Text.ContinuousGeneration`).
+  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:waiting` the number of requests in the queue after it, and `:capacity` the rows of the buffers before it. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.ContinuousGeneration`).
+
+    * `[:transmuter, :continuous_generation, :prepare, :start]` - the worker of a server of `Transmuter.ContinuousGeneration` starts to prepare a request: it runs the processor and the tokenizer on its input, and the vision encoder on its images (see "Images" in `Transmuter.ContinuousGeneration`).
+      * Metadata: `%{wait: integer}`
+
+    * `[:transmuter, :continuous_generation, :prepare, :stop]` - the request is ready, and it goes to the queue of the server.
+      * Metadata: the same as the start
+
+  `:wait` is the time from the call of the request to the start, in `:native` time units, so the time that the request waited for the requests before it in the worker.
 
   ### Graph break events
 

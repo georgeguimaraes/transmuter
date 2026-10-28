@@ -634,6 +634,18 @@ defmodule Transmuter.Serving do
     )
   end
 
+  @doc false
+  # The :init of a task from its :prepare, which takes the defn options and returns a function
+  # from the tensors and the prompts of a batch to the other inputs of `generate`, such as the
+  # image features of the prompts. `Transmuter.ContinuousGeneration` calls the function of
+  # :prepare on the tensors and the prompt of each request alone.
+  def prepare_init(prepare) do
+    fn defn_options ->
+      prepare = prepare.(defn_options)
+      fn tensors, prompts, generate -> generate.(prepare.(tensors, prompts), prompts) end
+    end
+  end
+
   @doc """
   Validates the options of a generation task that `Keyword.validate!/2` does not check, before the task loads its models, and returns them. `:token_logprobs` is `true` or `false`. A stream gives the log-probabilities in its done event, so `token_logprobs: true` with `stream: true` needs `stream_done: true`.
   """

@@ -39,6 +39,8 @@ defmodule Transmuter.Generation do
 
   The task gives the features of the images to `generate/5` in `:image_features`. They are the features of the image tokens of all rows, in order, as `masked_scatter` in Python transformers uses them. A row starts at the features after those of the rows before it. In the steps of the prompt, the features replace the embeddings of the image tokens, and a cursor of each row counts the image tokens that the row used. Parts of the prompt without image tokens and the steps of new tokens only embed their tokens.
 
+  A request that joins a group with other rows (see "Batches") has its own features. The group then keeps the features of the image tokens that its running rows have left, and the features of the new requests after them. So the features of a group are at most those of the prompts that run, also after many joins.
+
   ## Positions
 
   Each token of a row has the position of its index in the row. The task can give other positions for the prompt of each row in `:position_ids` of `generate/5`, such as the 3-D positions of M-RoPE in Qwen2-VL. There, the image tokens of a prompt have the positions of their rows and columns in the image. A decoder whose `position_ids` has 3 axes takes 3 positions for each token. The tokens after the prompt continue from the largest position of the prompt: the token at index `i` has the position `i + delta` on all axes. `delta` is the largest position of the prompt, plus 1, minus the length of the prompt, as the rope delta of Python transformers.
@@ -977,11 +979,7 @@ defmodule Transmuter.Generation do
     {cursors, _count} =
       Enum.map_reduce(prompts, 0, &{&2, &2 + Enum.count(&1, fn id -> id == ctx.image_token end)})
 
-    extras = %{
-      features: features,
-      cursors: cursors,
-      positions: Enum.map(positions, &{&1, delta(&1)})
-    }
+    extras = %{features: features, cursors: cursors, positions: positions}
 
     ids =
       for prompts <- groups(ctx, prompts) do
@@ -991,7 +989,7 @@ defmodule Transmuter.Generation do
           group =
             ctx
             |> open(length(prompts), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
-            |> then(&admit(ctx, &1, requests(ctx, prompts, seeds, extras), inputs, features))
+            |> then(&admit(ctx, &1, requests(ctx, prompts, seeds, extras), inputs))
             |> then(
               &decode(ctx, &1, fn group -> notify(on_token, group, ctx.token_logprobs?) end)
             )
@@ -1005,10 +1003,12 @@ defmodule Transmuter.Generation do
     Enum.zip_with([Enum.map(prompts, fn _ -> [] end) | ids], &Enum.concat/1)
   end
 
-  # The positions after the prompt continue from its largest position. Without given
-  # positions, the delta is 0.
-  defp delta(axes),
-    do: Enum.max(List.flatten(axes), fn -> -1 end) + 1 - length(List.first(axes, []))
+  # The positions of the prompt of a request and the delta of the positions after it, which
+  # continue from its largest position. Without given positions, the delta is 0.
+  defp positions(request) do
+    axes = Map.get(request, :position, [])
+    {axes, Enum.max(List.flatten(axes), fn -> -1 end) + 1 - length(List.first(axes, []))}
+  end
 
   # The prompts of each group of rows that share a cache, with empty prompts for the other
   # rows. A group has the prompts of one length when the rows of a step need one length of the
@@ -1047,7 +1047,8 @@ defmodule Transmuter.Generation do
   end
 
   # The requests of the rows of `prompts` that have a prompt: the row, its prompt, its seed,
-  # its budget of new tokens, its positions and the cursor of its image features.
+  # its budget of new tokens, its positions, and the image features of all rows with the
+  # cursor of its features in them.
   defp requests(ctx, prompts, seeds, extras) do
     for {{prompt, seed}, row} <- Enum.with_index(Enum.zip(prompts, seeds)), prompt != [] do
       %{
@@ -1056,6 +1057,7 @@ defmodule Transmuter.Generation do
         seed: seed,
         budget: ctx.max_new_tokens,
         position: Enum.at(extras.positions, row),
+        features: extras.features,
         cursor: Enum.at(extras.cursors, row)
       }
     end
@@ -1063,7 +1065,7 @@ defmodule Transmuter.Generation do
 
   @doc false
   # A group of `rows` empty rows, with buffers for `length` rows of cache. An empty row has no
-  # request and is done. admit/5 gives requests to rows, and next/2 runs the steps.
+  # request and is done. admit/4 gives requests to rows, and next/2 runs the steps.
   def open(ctx, rows, length \\ @capacity_margin) do
     unless Map.has_key?(ctx, :backend) do
       raise ArgumentError, "a group needs a context from compile/3, got a context of context/4"
@@ -1100,17 +1102,18 @@ defmodule Transmuter.Generation do
 
   @doc false
   # Gives each request of `requests` its row. A request is a map with the row, the prompt, the
-  # seed and the budget of new tokens, and can have the positions of the prompt and the cursor
-  # of its image features. `inputs` and `features` are the inputs and the image features of
-  # the prompts, which only the first requests of a group can have.
+  # seed and the budget of new tokens. It can have the positions of the prompt (see "Positions"
+  # in the module documentation), and its image features with the cursor of its first image
+  # token in them. Requests can share one tensor of features, as the rows of a batch do.
+  # `inputs` are the inputs of the prompts, which only the first requests of a group can have.
   #
   # When requests can join a group with other rows (joins?/1), the prompts run in the steps
   # of next/2, next to the new tokens of the other rows (see plan/1). Otherwise the prompts
   # run here, in parts that end all prompts in the same step, and the first token of each new
-  # row is read (see prefill/5): a merged decoder runs a prompt on its branch without cache,
+  # row is read (see prefill/4): a merged decoder runs a prompt on its branch without cache,
   # which no row with a cache can share, the rows of :grow and of a scalar offset need one
   # length of the cache, and the beams of all prompts start their search in the same step.
-  def admit(ctx, group, requests, inputs \\ %{}, features \\ nil) do
+  def admit(ctx, group, requests, inputs \\ %{}) do
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
     if not joins?(ctx) and Enum.any?(pending) do
@@ -1120,6 +1123,7 @@ defmodule Transmuter.Generation do
 
     if joins?(ctx) do
       longest = requests |> Enum.map(&length(&1.prompt)) |> Enum.max()
+      {features, cursors} = join_features(ctx, group, requests)
 
       group =
         ctx |> fit(reset_rows(group, requests), longest) |> then(&admit_rows(ctx, &1, requests))
@@ -1130,10 +1134,10 @@ defmodule Transmuter.Generation do
       %{
         group
         | left: left,
-          state: %{group.state | inputs: inputs, features: features || group.state.features}
+          state: %{group.state | inputs: inputs, features: features, cursors: cursors}
       }
     else
-      ctx |> prefill(group, requests, inputs, features) |> then(&select(ctx, &1))
+      ctx |> prefill(group, requests, inputs) |> then(&select(ctx, &1))
     end
   end
 
@@ -1148,14 +1152,49 @@ defmodule Transmuter.Generation do
   def joins?(ctx), do: ctx.num_beams == 1 and not one_length?(ctx) and not merged?(ctx)
 
   @doc false
-  # Ends `row` before its last token: the next steps give it no token, and admit/5 can give
-  # its row to a new request.
+  # Ends `row` before its last token: the next steps give it no token and no part of its
+  # prompt, and admit/4 can give its row to a new request.
   def cancel(group, row) do
     %{
       group
       | done: List.replace_at(group.done, row, true),
-        new: List.replace_at(group.new, row, nil)
+        new: List.replace_at(group.new, row, nil),
+        left: List.replace_at(group.left, row, [])
     }
+  end
+
+  # The image features of a group after `requests` join it, and the cursor of each row in
+  # them. A row that has not ended keeps the features of the image tokens of its prompt that
+  # are left, and the features of the requests follow. So a group never keeps the features of
+  # a prompt that has run, also after many joins. A tensor that requests share goes in once,
+  # and their cursors stay in it.
+  defp join_features(ctx, group, requests) do
+    kept =
+      for {{left, cursor, done?}, row} <-
+            Enum.with_index(Enum.zip([group.left, group.state.cursors, group.done])),
+          count = Enum.count(left, &(&1 == ctx.image_token)),
+          not done? and count > 0,
+          do: {row, Nx.slice_along_axis(group.state.features, cursor, count, axis: 0)}
+
+    shared = for %{features: tensor} <- requests, tensor != nil, uniq: true, do: tensor
+    pieces = Enum.map(kept, &elem(&1, 1)) ++ shared
+    {starts, _size} = Enum.map_reduce(pieces, 0, &{&2, &2 + Nx.axis_size(&1, 0)})
+    {kept_starts, shared_starts} = Enum.split(starts, length(kept))
+    offsets = Map.new(Enum.zip(shared, shared_starts))
+
+    moved = Enum.zip_with(kept, kept_starts, fn {row, _slice}, start -> {row, start} end)
+
+    joined =
+      for request <- requests do
+        {request.row, Map.get(offsets, request[:features], 0) + Map.get(request, :cursor, 0)}
+      end
+
+    cursors =
+      Enum.reduce(moved ++ joined, group.state.cursors, fn {row, cursor}, cursors ->
+        List.replace_at(cursors, row, cursor)
+      end)
+
+    {if(pieces == [], do: nil, else: Nx.concatenate(pieces)), cursors}
   end
 
   @doc false
@@ -1192,8 +1231,9 @@ defmodule Transmuter.Generation do
   # for each prompt length. So when the rows of a step need one length of the cache, and with
   # a merged decoder, requests join only a group without other rows. Each row takes its first
   # token from the part where its prompt ends.
-  defp prefill(ctx, group, requests, inputs, features) do
+  defp prefill(ctx, group, requests, inputs) do
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
+    {features, cursors} = join_features(ctx, group, requests)
 
     # A row with a new token has one token in these steps.
     joining = Map.new(requests, &{&1.row, &1})
@@ -1221,7 +1261,8 @@ defmodule Transmuter.Generation do
     # The steps release the state of the step before, so they start without the state that the
     # selections read, which is released after the last part.
     own = Map.take(group.state, [:seen, :history, :count])
-    state = Map.merge(group.state, %{seen: nil, history: nil, count: nil, features: features})
+    state = %{group.state | seen: nil, history: nil, count: nil}
+    state = %{state | features: features, cursors: cursors}
     state = %{state | inputs: Map.merge(state.inputs, inputs)}
 
     # The part where the prompt of each row of the selection ends, counted from the last part,
@@ -1249,8 +1290,8 @@ defmodule Transmuter.Generation do
     %{group | state: %{state | features: nil, selected: selected(state.selected, picked)}}
   end
 
-  # The rows of `requests` start again: their prompt, budget, positions and image cursor, no
-  # tokens, and no rows of cache.
+  # The rows of `requests` start again: their prompt, budget and positions, no tokens, and no
+  # rows of cache.
   defp reset_rows(group, requests) do
     Enum.reduce(requests, group, fn request, group ->
       %{
@@ -1265,14 +1306,7 @@ defmodule Transmuter.Generation do
             group.state
             | lengths: List.replace_at(group.state.lengths, request.row, 0),
               valid: List.replace_at(group.state.valid, request.row, []),
-              positions:
-                List.replace_at(
-                  group.state.positions,
-                  request.row,
-                  Map.get(request, :position, {[], 0})
-                ),
-              cursors:
-                List.replace_at(group.state.cursors, request.row, Map.get(request, :cursor, 0))
+              positions: List.replace_at(group.state.positions, request.row, positions(request))
           }
       }
     end)
@@ -1403,9 +1437,7 @@ defmodule Transmuter.Generation do
       ctx
       |> open(length(rows), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
       |> Map.put(:scores, scores)
-      |> then(
-        &prefill(ctx, &1, requests(ctx, rows, repeat.(seeds), extras), inputs, extras.features)
-      )
+      |> then(&prefill(ctx, &1, requests(ctx, rows, repeat.(seeds), extras), inputs))
 
     items = Enum.map(prompts, &%{finished: [], open?: true, done?: &1 == []})
 
