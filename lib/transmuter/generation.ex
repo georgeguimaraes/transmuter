@@ -750,6 +750,7 @@ defmodule Transmuter.Generation do
 
     ctx
     |> Map.put(:grow, GraphBreaks.jit(&grow_rows/2, defn_options))
+    |> Map.put(:compact, GraphBreaks.jit(&compact_rows/2, defn_options))
     |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
     |> Map.put(:admit_rows, GraphBreaks.jit(&write_admitted/3, defn_options))
   end
@@ -1210,7 +1211,7 @@ defmodule Transmuter.Generation do
         }
       end)
 
-    group = %{group | state: fit(ctx, group.state, Enum.sum(sizes))}
+    group = fit(ctx, group, Enum.sum(sizes))
     group = admit_rows(ctx, group, requests)
 
     # The parts of each row: the parts of its prompt, its new token in the last part, or no
@@ -1447,7 +1448,7 @@ defmodule Transmuter.Generation do
           scores: Enum.map(beams, & &1.score)
       }
 
-      group = %{group | state: fit(ctx, group.state, 1)}
+      group = fit(ctx, group, 1)
       selection = selection(ctx, group)
       group = %{group | state: step(ctx, group.state, Enum.map(new, &List.wrap/1), selection)}
       search_steps(ctx, group, items, step + 1)
@@ -1641,7 +1642,7 @@ defmodule Transmuter.Generation do
 
   # The step of the new tokens gives the selection for the remaining tokens.
   defp advance(ctx, group) do
-    group = %{group | state: fit(ctx, group.state, 1)}
+    group = fit(ctx, group, 1)
     selection = selection(ctx, group)
     %{group | state: step(ctx, group.state, Enum.map(group.new, &List.wrap/1), selection)}
   end
@@ -1870,11 +1871,69 @@ defmodule Transmuter.Generation do
     :ok
   end
 
-  # Grows the state when the next step of n tokens does not fit, before the selection of the
-  # step reads the tokens of the rows from the state.
-  defp fit(ctx, state, n) when is_integer(n) do
-    rows = if ctx.mode == :append, do: state.used + n, else: Enum.max(state.lengths) + n
-    if rows > state.capacity, do: grow(ctx, state, rows), else: state
+  # Makes room for the next step of n tokens when it does not fit, before the selection of the
+  # step reads the tokens of the rows from the state: a compaction in :append, where the
+  # write offset passes the rows of all steps, else a growth.
+  defp fit(ctx, group = %{state: state}, n) when is_integer(n) do
+    cond do
+      ctx.mode == :append and state.used + n > state.capacity -> compact(ctx, group, n)
+      ctx.mode != :append and Enum.max(state.lengths) + n > state.capacity -> grow(ctx, group, n)
+      true -> group
+    end
+  end
+
+  # The rows of a step write at one offset in :append, so the rows of all steps count, also
+  # the gap rows of the shorter rows and the rows of the rows that ended. The compaction moves
+  # the valid rows of each row that has not ended to the front of its buffers, in their order,
+  # and the write offset goes back to the longest row. The buffers get the capacity of the
+  # longest row, the next n tokens and @capacity_margin rows, so a compaction frees rows for at
+  # least that many steps. The capacity can be smaller or larger than before. The keys and values keep the positions of their tokens,
+  # the masks come from the new ranges, and the position offset of a merged decoder reads the
+  # valid rows of each row or the write offset, which is the longest row.
+  defp compact(ctx, group = %{state: state}, n) do
+    valid = Enum.zip_with(state.valid, group.done, &if(&2, do: [], else: &1))
+    counts = Enum.map(valid, fn ranges -> ranges |> Enum.map(&elem(&1, 1)) |> Enum.sum() end)
+    longest = Enum.max(counts)
+    capacity = fitting(ctx, longest + n, @capacity_margin)
+
+    index =
+      for ranges <- valid do
+        rows =
+          for {start, count} <- Enum.reverse(ranges),
+              row <- start..(start + count - 1)//1,
+              do: row
+
+        rows ++ List.duplicate(0, capacity - length(rows))
+      end
+
+    old = state.cache |> Map.take(ctx.buffers) |> Map.put(@history, state.history)
+    moved = ctx.compact.(old, Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend))
+    {history, moved} = Map.pop!(moved, @history)
+    release(Map.values(old), [history | Map.values(moved)])
+
+    state = %{
+      state
+      | cache: Map.merge(state.cache, moved),
+        history: history,
+        capacity: capacity,
+        used: longest,
+        valid: Enum.map(counts, &if(&1 == 0, do: [], else: [{0, &1}]))
+    }
+
+    %{group | state: state}
+  end
+
+  # The capacity for `rows` rows and a slack of free rows, up to the largest capacity of the
+  # decoder, which must fit the rows.
+  defp fitting(ctx, rows, slack) do
+    capacity = capacity(ctx, rows + slack)
+
+    if rows > capacity do
+      raise ArgumentError,
+            "generation needs #{rows} rows of cache, more than the #{capacity} rows that the static tables of the decoder fit"
+    end
+
+    capacity
   end
 
   # Gives the buffers the capacity of capacity/2 that fits the rows of a step, up to the
@@ -1882,14 +1941,8 @@ defmodule Transmuter.Generation do
   # rows, which the masks hide, and each growth compiles the steps of one more capacity. The
   # tokens of the rows, which the processors read, have the same capacity and grow with the
   # buffers, also in :grow, where the cache has its exact length and only the tokens grow.
-  defp grow(ctx, state, rows) do
-    capacity = capacity(ctx, rows)
-
-    if rows > capacity do
-      raise ArgumentError,
-            "generation needs #{rows} rows of cache, more than the #{capacity} rows that the static tables of the decoder fit"
-    end
-
+  defp grow(ctx, group = %{state: state}, n) do
+    capacity = fitting(ctx, Enum.max(state.lengths) + n, 0)
     buffers = if ctx.mode == :grow, do: %{}, else: Map.take(state.cache, ctx.buffers)
     old = Map.put(buffers, @history, state.history)
 
@@ -1897,17 +1950,52 @@ defmodule Transmuter.Generation do
       Map.pop!(ctx.grow.(old, Nx.iota({capacity}, backend: Nx.BinaryBackend)), @history)
 
     release(Map.values(old), [history | Map.values(grown)])
-    %{state | cache: Map.merge(state.cache, grown), history: history, capacity: capacity}
+    state = %{state | cache: Map.merge(state.cache, grown), history: history, capacity: capacity}
+    %{group | state: state}
   end
 
   # The rows are axis 2 of a buffer, {batch, heads, rows, dim}, and axis 1 of the tokens,
   # {batch, rows}.
+  defp rows_axis(tensor), do: if(Nx.rank(tensor) == 2, do: 1, else: 2)
+
   defp grow_rows(tensors, capacity) do
-    Map.new(tensors, fn {name, tensor} ->
-      axis = if Nx.rank(tensor) == 2, do: 1, else: 2
-      free = Nx.axis_size(capacity, 0) - Nx.axis_size(tensor, axis)
+    Map.new(tensors, fn {name, tensor} -> {name, resize(tensor, Nx.axis_size(capacity, 0))} end)
+  end
+
+  # Pads the rows of a tensor with free rows, or keeps its first rows.
+  defp resize(tensor, capacity) do
+    axis = rows_axis(tensor)
+    free = capacity - Nx.axis_size(tensor, axis)
+
+    if free >= 0 do
       padding = List.replace_at(List.duplicate({0, 0, 0}, Nx.rank(tensor)), axis, {0, free, 0})
-      {name, Nx.pad(tensor, 0, padding)}
+      Nx.pad(tensor, 0, padding)
+    else
+      Nx.slice_along_axis(tensor, 0, capacity, axis: axis)
+    end
+  end
+
+  # Each row of a buffer takes the rows of `index`, {batch, capacity}, on its rows axis: a take
+  # on a view with the axes before the rows axis and the rows axis together. The tokens keep
+  # their places, and only their capacity follows the index.
+  defp compact_rows(tensors, index) do
+    {batch, capacity} = Nx.shape(index)
+
+    Map.new(tensors, fn
+      {@history, tokens} ->
+        {@history, resize(tokens, capacity)}
+
+      {name, tensor} ->
+        axis = rows_axis(tensor)
+        dims = Tuple.to_list(Nx.shape(tensor))
+        rows = Enum.at(dims, axis)
+        inner = dims |> Enum.slice(1, axis - 1) |> Enum.product()
+        outer = Nx.iota({batch, inner, 1}, axis: 0) |> Nx.multiply(inner)
+        start = Nx.add(outer, Nx.iota({batch, inner, 1}, axis: 1)) |> Nx.multiply(rows)
+        flat = start |> Nx.add(Nx.new_axis(index, 1)) |> Nx.flatten()
+        view = Nx.reshape(tensor, {:auto, dims |> Enum.drop(axis + 1) |> Enum.product()})
+        shape = dims |> List.replace_at(axis, capacity) |> List.to_tuple()
+        {name, view |> Nx.take(flat) |> Nx.reshape(shape)}
     end)
   end
 

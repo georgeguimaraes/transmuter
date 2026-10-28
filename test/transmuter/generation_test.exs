@@ -620,10 +620,10 @@ defmodule Transmuter.GenerationTest do
   end
 
   # In :append, all rows of a step write at one offset, so the parts of prompts of 229, 31 and
-  # 4 tokens leave gap rows in the shorter rows. The longest row ends early, at a token of its
-  # own answer that the middle row does not give. The offset then passes the length of each
-  # row, and the buffers grow from 256 to 320 rows for the 40 steps of the middle row. Each
-  # row gives the tokens that it gives alone, where it has no gap rows.
+  # 4 tokens leave gap rows in the shorter rows. The middle row ends early, at a token of its
+  # own answer that the longest row does not give. The longest row then runs its 40 steps and
+  # needs 269 rows, so the step that does not fit moves the valid rows to the front of buffers
+  # of 320 rows. Each row gives the tokens that it gives alone, where it has no gap rows.
   @essay "The printing press changed Europe in the fifteenth century. Before it, scribes copied each book by hand, and a single copy of a long text could take months. Johannes Gutenberg combined movable metal type, an oil-based ink and a screw press adapted from wine making. His workshop in Mainz printed a Bible around 1455, and within fifty years presses ran in more than two hundred cities. Books became cheaper, and more people learned to read. Scholars could compare identical copies of a text, so errors were easier to find and correct. Pamphlets spread news and arguments quickly, and the Reformation used them to reach ordinary readers. Printers also standardized spelling and grammar, because they wanted their books to sell in many regions. Over time, the press helped science, as researchers shared tables, maps and drawings that stayed the same in every copy. Newspapers appeared in the seventeenth century, and by the nineteenth century steam-powered presses printed thousands of pages each hour. Today historians still debate how fast these changes came, but most agree that the press made knowledge easier to keep. In the next part of this essay, we look at"
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
   @tag ci_partition: 10
@@ -642,8 +642,8 @@ defmodule Transmuter.GenerationTest do
 
     assert Enum.map(prompts, &length/1) == [229, 31, 4]
     [long, middle, _short] = prompts
-    {[answer], _capacities} = capacities(repo, model, [long])
-    {[other], _capacities} = capacities(repo, model, [middle])
+    {[answer], _capacities} = capacities(repo, model, [middle])
+    {[other], _capacities} = capacities(repo, model, [long])
     other = Enum.map(other, &hd/1)
     eos = answer |> Enum.map(&hd/1) |> Enum.drop(4) |> Enum.find(&(&1 not in other))
     repo = %{repo | generation_config: %{"eos_token_id" => eos}}
@@ -652,8 +652,8 @@ defmodule Transmuter.GenerationTest do
     alone = for prompt <- prompts, do: hd(elem(capacities(repo, model, [prompt]), 0))
 
     assert rows == alone
-    assert length(hd(rows)) < 40
-    assert length(Enum.at(rows, 1)) == 40
+    assert length(hd(rows)) == 40
+    assert length(Enum.at(rows, 1)) < 40
     assert capacities == [256, 320]
   end
 
@@ -708,6 +708,194 @@ defmodule Transmuter.GenerationTest do
       assert story_tokens == Enum.take(alone.(story, 11), 4)
       assert row_tokens(group, 1) == alone.(rainbow, 13)
     end
+  end
+
+  # In :append, all rows of a step write at one offset, so a group that lives on passes the
+  # rows of all its steps. The fox runs 100 steps. The essay of 229 tokens ends after 30 tokens
+  # at 259 rows, and its row stays ended. The third row takes a new prompt every 4 tokens, so
+  # the steps pass about 900 rows. While the essay runs, the buffers have 320 rows. When a step
+  # does not fit after it ends, the compaction moves the valid rows of each running row to the
+  # front and leaves the rows of the essay, so the buffers go back to 256 rows for the fox and
+  # its 131 rows. Each request gives the tokens that it gives alone.
+  @tag ci_partition: 10
+  test "a compaction keeps the buffers of :append at the rows of the longest running row" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    ctx = Generation.context(repo, model, max_new_tokens: 100)
+    assert ctx.mode == :append
+
+    [fox, essay, rainbow] =
+      for text <- [@fox, @essay, "Explain how a rainbow forms."] do
+        {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+        Transmuter.Tokenizer.ids(tokenizer, encoding)
+      end
+
+    short = Enum.take(fox, 9)
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
+    alone = Map.new([fox, essay, rainbow, short], &{&1, alone.(&1)})
+    request = &%{row: &1, prompt: &2, seed: 0, budget: &3}
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+
+    {{group, answers}, capacities} =
+      compiled_capacities(fn ->
+        group = Generation.open(ctx, 3)
+        group = Generation.admit(ctx, group, [request.(0, fox, 100), request.(1, essay, 30)])
+
+        Enum.reduce_while(Stream.cycle([rainbow, short]), {group, []}, fn prompt,
+                                                                          {group, answers} ->
+          if Enum.at(group.done, 0) do
+            {:halt, {group, answers}}
+          else
+            group = Generation.admit(ctx, group, [request.(2, prompt, 4)])
+            group = run_until(ctx, group, &Enum.at(&1.done, 2))
+            {:cont, {group, [{prompt, row_tokens(group, 2)} | answers]}}
+          end
+        end)
+      end)
+
+    assert row_tokens(group, 0) == alone[fox]
+    assert row_tokens(group, 1) == Enum.take(alone[essay], 30)
+    assert length(answers) > 20
+    for {prompt, tokens} <- answers, do: assert(tokens == Enum.take(alone[prompt], 4))
+    assert capacities == [256, 320]
+    assert group.state.capacity == 256
+  end
+
+  # A request that joins writes its prompt parts at the write offset, so a join can pass the
+  # capacity. The first row has a prompt of 200 tokens and runs 45 steps, so the offset is 245
+  # of 256 rows. The prompt of 20 tokens that joins then needs 20 rows in its parts, so the
+  # admit compacts the buffers into 320 rows before it writes them. Each row gives the tokens
+  # that it gives alone.
+  @tag ci_partition: 10
+  test "a request that joins past the capacity compacts the buffers before its prompt" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+    {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    ctx = Generation.context(repo, model, max_new_tokens: 60)
+
+    [long, joining] =
+      for {text, count} <- [{@essay, 200}, {@fox, 20}] do
+        {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+        tokenizer |> Transmuter.Tokenizer.ids(encoding) |> Enum.take(count)
+      end
+
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
+    request = &%{row: &1, prompt: &2, seed: 0, budget: &3}
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+
+    {group, capacities} =
+      compiled_capacities(fn ->
+        group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, long, 60)])
+        group = Enum.reduce(1..45, group, fn _step, group -> Generation.next(ctx, group) end)
+        assert {group.state.used, group.state.capacity} == {245, 256}
+        group = Generation.admit(ctx, group, [request.(1, joining, 10)])
+        run_until(ctx, group, &Enum.all?(&1.done))
+      end)
+
+    assert row_tokens(group, 0) == alone.(long)
+    assert row_tokens(group, 1) == Enum.take(alone.(joining), 10)
+    assert capacities == [256, 320]
+  end
+
+  # A merged decoder with one position offset for each row (gpt2) takes requests when its
+  # rows have ended. The group lives on for 13 rounds of two prompts of 30 and 25 tokens and
+  # 30 new tokens each, which pass about 1100 rows, more than the 1023 rows of the causal
+  # table of gpt2. The compactions keep the buffers at 128 rows or fewer, and each round gives
+  # the tokens of each prompt alone.
+  @tag ci_partition: 10
+  test "a compaction lets a group of gpt2 pass the rows of its causal table" do
+    {repo, model} = gpt2()
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    ctx = Generation.context(repo, model, max_new_tokens: 30)
+
+    prompts =
+      for {n, row} <- [{30, 1}, {25, 2}], do: for(i <- 1..n, do: rem(i * 37 * row, 50_000))
+
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = for prompt <- prompts, do: single |> Generation.generate([prompt], [0]) |> hd()
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+
+    requests =
+      for {prompt, row} <- Enum.with_index(prompts),
+          do: %{row: row, prompt: prompt, seed: 0, budget: 30}
+
+    {group, capacities} =
+      compiled_capacities(fn ->
+        Enum.reduce(1..13, Generation.open(ctx, 2), fn _round, group ->
+          group = run_until(ctx, Generation.admit(ctx, group, requests), &Enum.all?(&1.done))
+
+          for row <- [0, 1],
+              do: assert(row_tokens(group, row) == Enum.map(Enum.at(alone, row), &hd/1))
+
+          group
+        end)
+      end)
+
+    assert group.state.capacity <= 128
+    assert Enum.max(capacities) <= 128
+  end
+
+  # Beam search reorders the rows of the cache at each step. The merged decoder of Marian has
+  # one position offset for all rows and starts at 32 rows in :append, so an answer of more
+  # than 32 tokens compacts the buffers of the beams into 64 rows. Its tokens equal those of
+  # the same decoder with a cache of exact length, which a Shape node of the past outside the
+  # If keeps in :grow.
+  @lighthouse "The old lighthouse stood at the end of the pier, and every night its lamp turned slowly over the dark water, so the fishermen trusted it more than their maps, until one winter the keeper did not come back from the town."
+  @tag ci_partition: 10
+  test "beam search keeps its tokens across a compaction of the buffers" do
+    {repo, encoder, decoder} =
+      Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/opus-mt-en-de"}, @opts)
+
+    tokenizer = Transmuter.Serving.tokenizer(repo, [])
+    {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, @lighthouse)
+    ids = Transmuter.Tokenizer.ids(tokenizer, encoding)
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    mask = host.([List.duplicate(1, length(ids))])
+    inputs = %{"input_ids" => host.([ids]), "attention_mask" => mask}
+    %{"last_hidden_state" => states} = Transmuter.run(encoder, encoder.params, inputs)
+    given = %{"encoder_hidden_states" => states, "encoder_attention_mask" => mask}
+    start = repo.config["decoder_start_token_id"]
+
+    [past | _] = Enum.filter(decoder.inputs, &String.starts_with?(&1, "past_key_values."))
+    reads = %NodeProto{op_type: "Shape", name: "reads", input: [past], output: ["length"]}
+    exact = %{decoder | nodes: decoder.nodes ++ [reads]}
+
+    generate = fn decoder ->
+      ctx = Generation.context(repo, decoder, [num_beams: 2, max_new_tokens: 80], Map.keys(given))
+      compiled = Generation.compile(ctx, 1, @opts[:defn_options])
+      {ctx.mode, Generation.generate(compiled, [[start]], [0], given)}
+    end
+
+    {{mode, [tokens]}, capacities} = compiled_capacities(fn -> generate.(decoder) end)
+    assert mode == :append
+    assert length(tokens) > 32
+    assert capacities == [32, 64]
+    assert generate.(exact) == {:grow, [tokens]}
+  end
+
+  # The capacities of the buffers in the steps that `fun` compiles, and the result of `fun`. The
+  # cross-attention cache of an encoder-decoder model is not a buffer.
+  defp compiled_capacities(fun) do
+    id = make_ref()
+    pid = self()
+
+    handler = fn _event, _measurements, metadata, _config ->
+      for {"past_key_values." <> name, {{_batch, _heads, capacity, _dim}, _type}} <-
+            metadata.shapes,
+          not String.contains?(name, "encoder"),
+          self() == pid,
+          do: send(pid, {:capacity, capacity})
+    end
+
+    :telemetry.attach(id, [:transmuter, :segment, :compile, :stop], handler, nil)
+    result = fun.()
+    :telemetry.detach(id)
+    {result, received_capacities()}
   end
 
   defp run_until(ctx, group, done?) do
