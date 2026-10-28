@@ -6,6 +6,17 @@ Code.require_file("support/test_backend.exs", __DIR__)
 Application.put_env(:emlx, EMLX.CompileCache, max_items: 128)
 Application.put_env(:transmuter, :progress_bar_enabled, false)
 
+# On CUDA, the client of EXLA takes 90 percent of the GPU memory for its arena when it starts.
+# When the VITS test compiles its decoder, the autotuner of XLA takes about 8.6 GB of that arena
+# as scratch for the convolutions, and the async audio tests that run at the same time can run
+# out of memory. Without the arena, the client takes memory when it needs it, and audio_test
+# peaks at about 9 GB on a GPU of 12 GB.
+if Transmuter.TestBackend.compiler() == EXLA do
+  clients = Application.fetch_env!(:exla, :clients)
+  cuda = Keyword.put(clients[:cuda], :preallocate, false)
+  Application.put_env(:exla, :clients, Keyword.put(clients, :cuda, cuda))
+end
+
 # EMLX 0.5 creates its compile cache, a named ETS table, in the first process that
 # compiles, and ETS deletes a table when its owner exits. A compile here makes this
 # long-lived process the owner, so async tests that finish do not delete the cache.

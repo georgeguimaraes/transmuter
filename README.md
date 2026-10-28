@@ -407,6 +407,8 @@ If a case does not match, run `bench/coverage/trace_ort.py` and `bench/coverage/
 
 `mix test` also runs one small graph for each operator variant in `test/fixtures/ops`, with no download. `test/support/make_op_fixtures.py` makes these graphs and records their outputs from ONNX Runtime, or from the ONNX reference evaluator when ONNX Runtime does not have the operator. For random operators, the tests check the shape, the type and the distribution of the values.
 
+`TRANSMUTER_TEST_BACKEND=exla TRANSMUTER_TEST_DEVICE=gpu mix test` runs the tests with EXLA on CUDA. Set the environment variables of the EXLA section of `guides/backends_and_performance.md` (`NVIDIA_TF32_OVERRIDE` and `XLA_FLAGS`) before the BEAM starts. The test helper gives the CUDA client `preallocate: false`: with the default arena of 90 percent of the GPU memory, the autotuner of XLA fills most of the arena with scratch when the VITS test compiles its decoder, and the other async audio tests can run out of memory. `audio_test.exs` takes about 10 percent longer without the arena.
+
 On a Mac, `TRANSMUTER_TEST_DEVICE=cpu mix test` uses the EMLX CPU device. But EMLX 0.5 runs compiled functions on the GPU when Metal is available, also with `device: :cpu`. Thus only the Linux CI tests the CPU fully.
 
 ## License
