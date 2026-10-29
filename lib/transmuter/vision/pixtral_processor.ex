@@ -111,9 +111,9 @@ defmodule Transmuter.Vision.PixtralProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for an image of one block, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
+  The inputs of the vision encoder for an image of one block, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
   """
-  def template(processor, _batch_size) do
+  def template(processor) do
     zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
     %{"pixel_values" => Nx.broadcast(zero, {1, 3, processor.block, processor.block})}
   end
@@ -125,18 +125,21 @@ defmodule Transmuter.Vision.PixtralProcessor do
 
   The export of the vision encoder computes the rotary positions of the patches from the size of the image, so each image runs alone. Returns `%{image_features: features}`: the features of the images of all rows, in order. The prompts take the default positions.
   """
-  def encode(processor, encode, tensors, _prompts, _backend) do
+  def encode(processor, encode, tensors, _prompts, backend) do
     %{"pixel_values" => pixels, "image_sizes" => sizes} = tensors
 
     features =
       for row <- ImageTextToText.images(pixels, sizes, &count(processor, &1)),
           {[_height, width], blocks} <- row do
-        image = image(blocks, processor.block, div(width, processor.block))
-        features = encode.(%{"pixel_values" => image})["image_features"]
-        Nx.reshape(features, {:auto, Nx.axis_size(features, -1)})
+        image =
+          blocks
+          |> Nx.backend_transfer(backend)
+          |> image(processor.block, div(width, processor.block))
+
+        encode.(%{"pixel_values" => image})["image_features"]
       end
 
-    %{image_features: Nx.concatenate(features)}
+    %{image_features: ImageTextToText.join_rows(features)}
   end
 
   defp count(processor, [height, width]),

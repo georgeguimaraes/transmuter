@@ -45,11 +45,6 @@ defmodule Transmuter.Vision.ImageTextToText do
              defn_options: []
            ] ++ Hub.options()
 
-  # The rows of the batch axis of one call of the vision encoder, at most. A call keeps the
-  # device until it ends, also for the steps of a server of ContinuousGeneration on the same
-  # device, so smaller calls make the steps wait less. See in_chunks/3.
-  @encode_rows 1
-
   @doc false
   # The options of the task without the options of the serving.
   def options, do: @options
@@ -69,10 +64,8 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for image_text_to_text/2
-  # and `Transmuter.ContinuousGeneration`. The vision encoder compiles for `:batch_size` of
-  # `:compile` rows, 1 without it.
+  # and `Transmuter.ContinuousGeneration`.
   def task(source, opts) do
-    batch_size = get_in(opts, [:compile, :batch_size]) || 1
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     tokenizer = Serving.tokenizer(repo, opts)
     {image_token, image_text} = image_token!(repo, tokenizer)
@@ -96,9 +89,9 @@ defmodule Transmuter.Vision.ImageTextToText do
     bos = Repo.special_token(repo, "bos")
 
     prepare = fn defn_options ->
-      template = module.template(processor, batch_size)
+      template = module.template(processor)
       encode = Transmuter.compile(vision, template, [cache_size: 64] ++ defn_options)
-      encode = in_chunks(encode, vision, @encode_rows)
+      encode = &Map.new(encode.(&1), fn {name, t} -> {name, evaluate(t)} end)
       backend = Nx.Defn.to_backend(defn_options)
 
       fn
@@ -130,7 +123,6 @@ defmodule Transmuter.Vision.ImageTextToText do
       preprocess: preprocess,
       prepare: prepare,
       example: example(),
-      init: Serving.prepare_init(prepare),
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: @buckets
     }
@@ -345,17 +337,17 @@ defmodule Transmuter.Vision.ImageTextToText do
     features =
       for row <- images(pixels, sizes, fn _size -> 1 end), {_size, image} <- row do
         %{"image_features" => features} = encode.(%{"pixel_values" => image})
-        {1, tokens, hidden} = Nx.shape(features)
+        {1, tokens, _hidden} = Nx.shape(features)
 
         if tokens != count do
           raise ArgumentError,
                 "the vision encoder gives #{tokens} features for each image, and the processor gives #{count} image tokens"
         end
 
-        Nx.reshape(features, {tokens, hidden})
+        features
       end
 
-    Nx.concatenate(features)
+    join_rows(features)
   end
 
   # The features of the image tokens of each prompt, from the features of all prompts in order,
@@ -395,54 +387,61 @@ defmodule Transmuter.Vision.ImageTextToText do
     |> elem(0)
   end
 
-  @doc false
-  # Runs `encode` in calls of at most `rows` rows and concatenates the outputs of the calls,
-  # when the first axis of each input of the vision encoder is its batch axis ("batch_size"
-  # in the model), so the encoder runs each row alone. An encoder whose first axis holds the
-  # patches of an image, such as that of Qwen2-VL, runs in one call. Each call evaluates its
-  # outputs: EMLX keeps them as expressions until a read, and then the device runs all calls
-  # of a request as one piece of work, which the steps of another process wait for.
-  def in_chunks(encode, vision, rows) do
-    call = &(&1 |> encode.() |> Map.new(fn {name, t} -> {name, evaluate(t)} end))
-
-    if Enum.all?(vision.inputs, &match?({_type, ["batch_size" | _]}, vision.input_types[&1])),
-      do: &encode_in_chunks(call, &1, rows),
-      else: call
-  end
-
-  defp encode_in_chunks(encode, inputs, rows) do
-    size = inputs |> Map.values() |> hd() |> Nx.axis_size(0)
-
-    outputs =
-      for start <- 0..(size - 1)//rows do
-        length = min(rows, size - start)
-
-        inputs
-        |> Map.new(fn {name, t} -> {name, Nx.slice_along_axis(t, start, length)} end)
-        |> encode.()
-      end
-
-    for name <- Map.keys(hd(outputs)), into: %{} do
-      {name, outputs |> Enum.map(& &1[name]) |> Nx.concatenate()}
-    end
-  end
-
+  # The vision encoder runs one tile or one image in each call, from the tensors of the
+  # processor on the host, so its inputs need no operation that compiles for each count of
+  # rows. The processor makes all calls and then reads the outputs with join_rows/1, so on
+  # CUDA the calls wait in the queue of the device and only the last read waits for them.
+  # EMLX keeps the outputs as expressions until a read, and then the device runs all calls
+  # as one piece of work, which the steps of another process wait for. So on EMLX each call
+  # evaluates its outputs. A call keeps the device until it ends, also for the steps of a
+  # server of ContinuousGeneration on the same device, so small calls make the steps wait
+  # less.
   defp evaluate(tensor = %Nx.Tensor{data: %{__struct__: EMLX.Backend}}),
     do: Transmuter.EMLX.evaluate(tensor)
 
   defp evaluate(tensor), do: tensor
 
   @doc false
-  # The images of each row of a batch, before the rows of zeros, as {size, pixels}: a row
-  # of `sizes` (such as the grid of the image) and the `count.(size)` rows of `pixels` of the
-  # image. A size of zeros is padding.
+  # The rows `start` to `start + count - 1` of the first axis of a tensor on the host, from the
+  # bytes of its binary.
+  def host_rows(tensor, start, count) do
+    [rows | axes] = Tuple.to_list(Nx.shape(tensor))
+    size = div(Nx.byte_size(tensor), rows)
+
+    tensor
+    |> Nx.to_binary()
+    |> binary_part(start * size, count * size)
+    |> Nx.from_binary(Nx.type(tensor), backend: Nx.BinaryBackend)
+    |> Nx.reshape(List.to_tuple([count | axes]))
+  end
+
+  @doc false
+  # The features of the calls of the vision encoder, such as {1, tokens, hidden}, on the host
+  # as one tensor of shape {rows, hidden}, from their binaries. The reads wait for the calls,
+  # and no operation on the device compiles for each count of calls.
+  def join_rows(tensors = [first | _]) do
+    hidden = Nx.axis_size(first, -1)
+
+    tensors
+    |> Enum.map(&Nx.to_binary/1)
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(Nx.type(first), backend: Nx.BinaryBackend)
+    |> Nx.reshape({:auto, hidden})
+  end
+
+  @doc false
+  # The images of each row of a batch on the host, before the rows of zeros, as {size,
+  # pixels}: a row of `sizes` (such as the grid of the image) and the `count.(size)` rows of
+  # `pixels` of the image, from the binary of `pixels`. A size of zeros is padding.
   def images(pixels, sizes, count) do
+    [batch, rows | axes] = Tuple.to_list(Nx.shape(pixels))
+    pixels = Nx.reshape(pixels, List.to_tuple([batch * rows | axes]))
+
     for {sizes, row} <- sizes |> Nx.to_list() |> Enum.with_index() do
       sizes
       |> Enum.filter(fn [first | _] -> first > 0 end)
-      |> Enum.map_reduce(0, fn size, start ->
-        {{size, Nx.slice_along_axis(pixels[row], start, count.(size), axis: 0)},
-         start + count.(size)}
+      |> Enum.map_reduce(row * rows, fn size, start ->
+        {{size, host_rows(pixels, start, count.(size))}, start + count.(size)}
       end)
       |> elem(0)
     end

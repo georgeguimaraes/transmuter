@@ -103,9 +103,9 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for an image of 2x2 patches, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
+  The inputs of the vision encoder for an image of 2x2 patches, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
   """
-  def template(processor, _batch_size) do
+  def template(processor) do
     %{patch_size: patch, temporal_patch_size: temporal, merge_size: merge} = processor
     zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
 
@@ -137,10 +137,12 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
         encode.(inputs)["image_features"]
       end
 
+    # The padding rows of a batch have prompts and no tensors.
     grids = Enum.map(images, fn row -> Enum.map(row, &elem(&1, 0)) end)
+    grids = grids ++ List.duplicate([], length(prompts) - length(grids))
 
     %{
-      image_features: Nx.concatenate(features),
+      image_features: ImageTextToText.join_rows(features),
       position_ids: Enum.zip_with(prompts, grids, &positions(processor, &1, &2))
     }
   end

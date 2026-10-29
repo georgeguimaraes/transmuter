@@ -533,9 +533,11 @@ defmodule Transmuter.Serving do
 
     * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
-    * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The client makes the rows and the batches of a list of runs, so an error in them raises in the caller. A stream of runs, such as the windows of an audio stream, goes into batches when Nx.Serving reads them, once, in a process of its own. An error in such a stream ends the call with an exit, not an exception that the caller can rescue. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
+    * `:preprocess` takes a valid input and returns an enumerable of runs, such as the windows of long audio. The client makes the rows and the batches of a list of runs, so an error in them raises in the caller. A stream of runs, such as the windows of an audio stream, goes into batches when Nx.Serving reads them, once, in a process of its own. An error in such a stream ends the call with an exit, not an exception that the caller can rescue. A run is a map with the token ids of the prompt of the decoder in `:prompt`, the seed of sampling in `:seed`, a map of `Nx.BinaryBackend` tensors without a batch axis for `:init` or `:prepare` in `:tensors`, a batch key in `:key`, and `%{input: count, padding: count}` in `:summary` for the token summary of a stream. Runs with the same key have tensors of the same shapes. Each run is one row of a batch.
 
-    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. `generate` returns the tokens of each row, see `Transmuter.Generation.generate/5`. The function returns a list for each row, such as the result of `generate`. Its values are integers, f32 values such as log-probabilities, and lists of them. The serving sends the row as a flat list of integers, with each f32 value as its bits (see `Transmuter.Generation.from_bits/1`).
+    * `:init` takes the defn options and returns a function. The serving calls `:init` in its process, so it can compile models there. The function takes the tensors of a batch on the device, with padding rows up to the batch size, the prompts of its rows and a function `generate`. It calls `generate` with the other inputs of the decoder, such as the outputs of an encoder, and the prompts, one or more times. An empty prompt is a padding row. `generate` returns the tokens of each row, see `Transmuter.Generation.generate/5`. The function returns a list for each row, such as the result of `generate`. Its values are integers, f32 values such as log-probabilities, and lists of them. The serving sends the row as a flat list of integers, with each f32 value as its bits (see `Transmuter.Generation.from_bits/1`).
+
+    * `:prepare` can take the place of `:init`. It takes the defn options and returns a function from the tensors and the prompts of a batch to the other inputs of `generate`, such as the image features of the prompts. Its tensors stay on the host and have no padding rows, so the function moves to the device only what it uses, such as the images without the tiles of zeros. The serving calls `generate` with these inputs one time. `Transmuter.ContinuousGeneration` calls the function on the tensors and the prompt of each request alone.
 
     * `:postprocess` takes the list of the integers of each run of an input, and the runs from `:preprocess` for this input, and returns the result.
 
@@ -550,7 +552,8 @@ defmodule Transmuter.Serving do
 
     # The closures of the serving copy what they reference, so each one takes only its
     # function of the task.
-    %{validate: validate, preprocess: preprocess, init: init, postprocess: postprocess} = task
+    %{validate: validate, preprocess: preprocess, postprocess: postprocess} = task
+    init = run_init(task, batch_size)
 
     # One function runs the batches of all keys.
     Nx.Serving.new(
@@ -560,7 +563,6 @@ defmodule Transmuter.Serving do
           defn_options |> Keyword.delete(:batch_keys) |> Keyword.pop(:hooks, %{})
 
         run = init.(defn_options)
-        backend = Nx.Defn.to_backend(defn_options)
         ctx = Generation.compile(ctx, batch_size, defn_options)
 
         fn batch ->
@@ -568,9 +570,7 @@ defmodule Transmuter.Serving do
           inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
           {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
 
-          # Padding rows have no prompt. Nx.Batch.pad pads on the host, which is slow for
-          # large rows such as audio, so the tensors of the task get their padding rows on
-          # the device.
+          # Padding rows have no prompt.
           padding = batch_size - batch.size
 
           prompts =
@@ -578,10 +578,6 @@ defmodule Transmuter.Serving do
 
           prompts = prompts ++ List.duplicate([], padding)
           seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
-
-          tensors =
-            Map.new(tensors, fn {name, tensor} -> {name, pad_rows(tensor, padding, backend)} end)
-
           generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
           generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
           lengths = Enum.map(generated, &length/1)
@@ -634,15 +630,29 @@ defmodule Transmuter.Serving do
     )
   end
 
-  @doc false
-  # The :init of a task from its :prepare, which takes the defn options and returns a function
-  # from the tensors and the prompts of a batch to the other inputs of `generate`, such as the
-  # image features of the prompts. `Transmuter.ContinuousGeneration` calls the function of
-  # :prepare on the tensors and the prompt of each request alone.
-  def prepare_init(prepare) do
+  # The function of a batch from :init or :prepare of a task, which takes the tensors of the
+  # rows of the batch on the host. :init gets them on the device with padding rows, so the
+  # task runs a batch of the batch size. Nx.Batch.pad pads on the host, which is slow for
+  # large rows such as audio, so the padding rows are made on the device.
+  defp run_init(%{prepare: prepare}, _batch_size) do
     fn defn_options ->
       prepare = prepare.(defn_options)
       fn tensors, prompts, generate -> generate.(prepare.(tensors, prompts), prompts) end
+    end
+  end
+
+  defp run_init(%{init: init}, batch_size) do
+    fn defn_options ->
+      run = init.(defn_options)
+      backend = Nx.Defn.to_backend(defn_options)
+
+      fn tensors, prompts, generate ->
+        tensors
+        |> Map.new(fn {name, tensor} ->
+          {name, pad_rows(tensor, batch_size - Nx.axis_size(tensor, 0), backend)}
+        end)
+        |> run.(prompts, generate)
+      end
     end
   end
 

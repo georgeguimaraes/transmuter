@@ -683,7 +683,9 @@ defmodule Transmuter.VisionTest do
       %{"image_features" => blocks |> Nx.concatenate() |> Nx.new_axis(0)}
     end
 
-    %{image_features: features} = PixtralProcessor.encode(processor, encode, batch, [], nil)
+    %{image_features: features} =
+      PixtralProcessor.encode(processor, encode, batch, [], Nx.BinaryBackend)
+
     assert features == Nx.concatenate(Enum.map(tensors, & &1["pixel_values"]))
   end
 

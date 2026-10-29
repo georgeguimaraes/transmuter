@@ -16,6 +16,7 @@ defmodule Transmuter.Vision.Idefics3Processor do
   """
 
   alias Transmuter.{Featurizer, Hub}
+  alias Transmuter.Vision.ImageTextToText
 
   defstruct [:featurizer, :longest_edge, :tile, :split?, :image_seq_len]
 
@@ -80,42 +81,44 @@ defmodule Transmuter.Vision.Idefics3Processor do
   end
 
   @doc """
-  The inputs of the vision encoder for one tile in each row of a batch of `batch_size` rows, on `Nx.BinaryBackend`. The encoder compiles for them.
+  The inputs of the vision encoder for one tile, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one tile in each call.
   """
-  def template(processor, batch_size) do
-    shape = {batch_size, 1, processor.tile, processor.tile}
+  def template(processor) do
+    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
 
     %{
-      "pixel_values" =>
-        Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), Tuple.insert_at(shape, 2, 3)),
-      "pixel_attention_mask" =>
-        Nx.broadcast(Nx.tensor(1, type: :u8, backend: Nx.BinaryBackend), shape)
+      "pixel_values" => Nx.broadcast(zero, {1, 1, 3, processor.tile, processor.tile}),
+      "pixel_attention_mask" => mask(processor.tile, processor.tile)
     }
   end
 
   @doc """
-  Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the `"pixel_values"` of `tensors`, of shape `{batch, tiles, 3, tile, tile}`, and gives the inputs of `Transmuter.Generation.generate/5`.
+  Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the `"pixel_values"` of `tensors`, of shape `{batch, tiles, 3, tile, tile}` on the host, and gives the inputs of `Transmuter.Generation.generate/5`.
 
-  The tiles of zeros do not run, as `Idefics3Model.get_image_features` of Python transformers removes them. Each real tile runs as one row of the batch of the encoder, so `encode` can run the tiles in more than one call. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{tiles * image_seq_len, hidden}`, with rows of zeros after the features for the tiles of zeros. The prompts take the default positions.
+  The tiles of zeros do not run, as `Idefics3Model.get_image_features` of Python transformers removes them. Each real tile runs in a call of its own, from the bytes of the pixel values, so no operation compiles for each count of tiles, and the tiles of zeros do not go to the device. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{real_tiles * image_seq_len, hidden}` on the host. The prompts take the default positions.
   """
-  def encode(_processor, encode, %{"pixel_values" => pixels}, _prompts, backend) do
+  def encode(_processor, encode, %{"pixel_values" => pixels}, _prompts, _backend) do
     {batch, tiles, channels, height, width} = Nx.shape(pixels)
     pixels = Nx.reshape(pixels, {batch * tiles, 1, channels, height, width})
-    real = pixels |> Nx.not_equal(0) |> Nx.any(axes: [1, 2, 3, 4]) |> Nx.to_flat_list()
-    index = for {1, tile} <- Enum.with_index(real), do: tile
-    pixels = Nx.take(pixels, Nx.tensor(index, backend: backend))
+    zeros = :binary.copy(<<0>>, div(Nx.byte_size(pixels), batch * tiles))
+    mask = mask(height, width)
 
-    # Each tile is a whole image, so the mask has no padding.
-    one = Nx.tensor(1, type: :u8, backend: backend)
-    mask = Nx.broadcast(one, {length(index), 1, height, width})
+    features =
+      for tile <- 0..(batch * tiles - 1),
+          pixels = ImageTextToText.host_rows(pixels, tile, 1),
+          Nx.to_binary(pixels) != zeros do
+        encode.(%{"pixel_values" => pixels, "pixel_attention_mask" => mask})["image_features"]
+      end
 
-    %{"image_features" => features} =
-      encode.(%{"pixel_values" => pixels, "pixel_attention_mask" => mask})
+    %{image_features: ImageTextToText.join_rows(features)}
+  end
 
-    {count, tokens, hidden} = Nx.shape(features)
-    padding = (batch * tiles - count) * tokens
-    features = Nx.reshape(features, {count * tokens, hidden})
-    %{image_features: Nx.pad(features, 0.0, [{0, padding, 0}, {0, 0, 0}])}
+  # Each tile is a whole image, so the mask has no padding.
+  defp mask(height, width) do
+    <<1>>
+    |> :binary.copy(height * width)
+    |> Nx.from_binary(:u8, backend: Nx.BinaryBackend)
+    |> Nx.reshape({1, 1, height, width})
   end
 
   # As _resize_output_size_rescale_to_max_len of Python transformers: the long side gets

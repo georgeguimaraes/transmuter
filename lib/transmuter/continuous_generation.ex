@@ -70,7 +70,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   A request with images needs the features of its images before it joins, and for Qwen2-VL, Qwen2.5-VL and Qwen3-VL the 3-D positions of its prompt. A worker process of the server prepares one request at a time, in the order of the requests, and then puts the request in the queue. It runs the processor on the images and the tokenizer on the chat, and then the vision encoder on the images. So the steps of the running rows do not wait for the encoder, the caller does no work on the device, and the device memory of this work is that of one request. The processor and the encoder compile one time, in the worker. A request waits in the worker for the requests before it, also a request without images. The queue limit counts the requests in the worker. An error of the processor or of the encoder goes to the caller of the request (see "Failures").
 
-  The encoder and the steps run on the same device. On CUDA, EXLA runs the calls of the two processes side by side: for SmolVLM-256M on an RTX 3060, a decode step takes about 7 ms alone and at most about 16 ms while the worker encodes. On EMLX, both processes use the one GPU stream of EMLX, so a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image when the encoder takes them on its batch axis, and each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms alone and about 70 ms while the worker encodes in calls of one tile, against 863 ms with one call for the 13 tiles of an image, and the encoder takes about 1 s for each image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
+  The encoder and the steps run on the same device. On CUDA, EXLA runs the calls of the two processes side by side: for SmolVLM-256M on an RTX 3060, a decode step takes about 7 ms alone and at most about 16 ms while the worker encodes. On EMLX, both processes use the one GPU stream of EMLX, so a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image, and on EMLX each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms alone and about 70 ms while the worker encodes in calls of one tile, against 863 ms with one call for the 13 tiles of an image, and the encoder takes about 1 s for each image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
 
   The group keeps the features of the image tokens that its rows have not run, and the features of a request join them. Then the prompt of the request runs in parts of at most 64 tokens, next to the new tokens of the running rows (see "The KV cache").
 
@@ -303,18 +303,17 @@ defmodule Transmuter.ContinuousGeneration do
     worker =
       spawn_link(fn ->
         task = {preprocess, prepare.(defn_options)}
-        backend = Nx.Defn.to_backend(defn_options)
 
         # The features of the example show the shape of the features of a request.
         features =
           if compile_steps? do
-            {:ok, %{features: features}, _run} = prepare_request(task, backend, %{input: example})
+            {:ok, %{features: features}, _run} = prepare_request(task, %{input: example})
             features
           end
 
         send(server, {self(), :ready, features})
         :erlang.garbage_collect()
-        prepare_requests(task, backend, server)
+        prepare_requests(task, server)
       end)
 
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
@@ -572,34 +571,30 @@ defmodule Transmuter.ContinuousGeneration do
   end
 
   # The worker runs :preprocess of the task on the input of each request alone, and :prepare
-  # on its tensors and its prompt. It sends the server the fields of the request for
-  # Generation and the run without its tensors, or the exception.
-  defp prepare_requests(task, backend, server) do
+  # on its tensors on the host and its prompt. It sends the server the fields of the request
+  # for Generation and the run without its tensors, or the exception.
+  defp prepare_requests(task, server) do
     receive do
       {:prepare, request} ->
         metadata = %{wait: System.monotonic_time() - request.enqueued}
 
         reply =
           :telemetry.span([:transmuter, :continuous_generation, :prepare], metadata, fn ->
-            {prepare_request(task, backend, request), metadata}
+            {prepare_request(task, request), metadata}
           end)
 
         send(server, {:prepared, request.ref, reply})
-        # The device tensors of the request, such as its pixel values on the device, die here,
+        # The device tensors of the request, such as the tiles of its images, die here,
         # and only a garbage collection frees them on EMLX. The worker makes little other
         # garbage, so without it they stay for many requests.
         :erlang.garbage_collect()
-        prepare_requests(task, backend, server)
+        prepare_requests(task, server)
     end
   end
 
-  defp prepare_request({preprocess, prepare}, backend, request) do
+  defp prepare_request({preprocess, prepare}, request) do
     [run] = preprocess.(request.input)
-
-    tensors =
-      Map.new(run.tensors, fn {name, tensor} ->
-        {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
-      end)
+    tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
 
     inputs = prepare.(tensors, [run.prompt])
     [position] = Map.get(inputs, :position_ids, [[]])

@@ -69,9 +69,9 @@ defmodule Transmuter.Vision.LlavaProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call, so the template does not depend on `batch_size`.
+  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
   """
-  def template(processor, _batch_size), do: ImageTextToText.image_template(processor.size)
+  def template(processor), do: ImageTextToText.image_template(processor.size)
 
   @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on each image of a batch alone, and gives the inputs of `Transmuter.Generation.generate/5`.

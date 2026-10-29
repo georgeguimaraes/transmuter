@@ -770,9 +770,9 @@ defmodule Transmuter.GenerationTest do
   # A request that joins writes its prompt parts at the write offset, so a join can pass the
   # capacity. The first row has a prompt of 200 tokens, which runs in steps of 64, 64, 64 and 8
   # tokens, and then 44 steps of one token, so the offset is 244 of 256 rows. The prompt of 20
-  # tokens that joins then needs 20 rows in its parts, so the
-  # admit compacts the buffers into 320 rows before it writes them. Each row gives the tokens
-  # that it gives alone.
+  # tokens that joins then runs in a step of 64 rows at that offset, so the step compacts the
+  # buffers into 384 rows (244 and 64 rows, and 16 free rows) before it writes them. Each row
+  # gives the tokens that it gives alone.
   @tag ci_partition: 10
   test "a request that joins past the capacity compacts the buffers before its prompt" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -1183,10 +1183,7 @@ defmodule Transmuter.GenerationTest do
         content = [%{type: "text", text: @fox} | images]
         [run] = task.preprocess.(%{messages: [%{role: "user", content: content}]})
 
-        tensors =
-          Map.new(run.tensors, fn {name, tensor} ->
-            {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
-          end)
+        tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
 
         %{image_features: [features]} = prepare.(tensors, [run.prompt])
         %{prompt: run.prompt, seed: 0, budget: 4, features: features}
@@ -1234,7 +1231,6 @@ defmodule Transmuter.GenerationTest do
     opts = [variant: variant, strategy: :greedy, max_new_tokens: 4, token_logprobs: true]
     {ctx, _tokenizer, task} = ImageTextToText.task(source, opts ++ @opts)
     prepare = task.prepare.(@opts[:defn_options])
-    backend = Nx.Defn.to_backend(@opts[:defn_options])
     image = %{type: "image", image: StbImage.read_file!("test/fixtures/cats.png")}
 
     [short, long] =
@@ -1244,10 +1240,7 @@ defmodule Transmuter.GenerationTest do
           ] do
         [run] = task.preprocess.(%{messages: [%{role: "user", content: content}]})
 
-        tensors =
-          Map.new(run.tensors, fn {name, tensor} ->
-            {name, tensor |> Nx.new_axis(0) |> Nx.backend_transfer(backend)}
-          end)
+        tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
 
         %{image_features: [features]} = prepare.(tensors, [run.prompt])
         %{row: row, prompt: run.prompt, seed: 0, budget: 4, features: features}
