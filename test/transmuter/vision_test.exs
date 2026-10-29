@@ -383,6 +383,51 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The encoder of Idefics3 takes a tile of zeros as padding: a NonZero over the pixels finds
+  # the real tiles, and the segment after it has the count of real tiles in its key.
+  # Transmuter.compile/3 compiles only the segments before that break, so the start calls the
+  # encoder once with its template, its first input for the example image of the task, a real
+  # tile. Then a chat with an image after the start compiles no segment of the encoder.
+  @tag ci_partition: 15
+  test "the vision encoder compiles the path of a real image when the task starts" do
+    opts = [strategy: :greedy, max_new_tokens: 1] ++ @opts
+    {_ctx, _tokenizer, task} = Vision.ImageTextToText.task(@smolvlm, opts)
+    id = {__MODULE__, make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :segment, :compile, :stop],
+      fn _event, _measurements, %{source: source}, _config ->
+        if inspect(source) =~ "vision_encoder", do: send(parent, {id, :encoder})
+      end,
+      nil
+    )
+
+    # The compiles of the encoder since the last call.
+    compiles = fn ->
+      Stream.repeatedly(fn ->
+        receive do
+          {^id, :encoder} -> 1
+        after
+          0 -> nil
+        end
+      end)
+      |> Enum.take_while(& &1)
+      |> length()
+    end
+
+    prepare = task.prepare.(@opts[:defn_options])
+    assert compiles.() > 0
+
+    content = [%{type: "image", image: @image}, %{type: "text", text: "What is this?"}]
+    [run] = task.preprocess.(%{messages: [%{role: "user", content: content}]})
+    tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
+    %{image_features: [%Nx.Tensor{}]} = prepare.(tensors, [run.prompt])
+    :telemetry.detach(id)
+    assert compiles.() == 0
+  end
+
   @qwen2_vl {:hf, "onnx-community/Qwen2-VL-2B-Instruct"}
 
   @tag ci_partition: 15

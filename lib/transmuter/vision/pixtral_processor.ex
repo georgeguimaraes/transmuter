@@ -111,14 +111,6 @@ defmodule Transmuter.Vision.PixtralProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for an image of one block, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
-  """
-  def template(processor) do
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-    %{"pixel_values" => Nx.broadcast(zero, {1, 3, processor.block, processor.block})}
-  end
-
-  @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.
 
   `tensors` has the `"pixel_values"` of each row, of shape `{batch, blocks, 3 * block * block}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the blocks and the sizes of the images.

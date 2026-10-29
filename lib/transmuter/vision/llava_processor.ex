@@ -69,11 +69,6 @@ defmodule Transmuter.Vision.LlavaProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
-  """
-  def template(processor), do: ImageTextToText.image_template(processor.size)
-
-  @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on each image of a batch alone, and gives the inputs of `Transmuter.Generation.generate/5`.
 
   `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 3, height, width}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the images of a row, and they do not run. Returns `%{image_features: features}`: the features of the images of all rows, in order. The prompts take the default positions.

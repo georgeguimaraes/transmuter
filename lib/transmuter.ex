@@ -388,6 +388,11 @@ defmodule Transmuter do
   `Range`, `NonZero`, or `If`), `compile/3` creates graph breaks. Each segment
   between breaks is compiled separately. See [Compiling and Graph Breaks](guides/graph_breaks.md).
 
+  `compile/3` compiles only the segment before the first break, because the shapes after a
+  break come from the values of a call. The later segments compile at the first call, for
+  the shapes and values that it gives them. To pay these compiles before the first request,
+  call the function once with an input that takes the same path as the requests.
+
   ## Options
 
     * `:static_inputs` (`t:map/0`) - inputs whose values are known at compile

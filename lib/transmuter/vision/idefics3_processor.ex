@@ -81,18 +81,6 @@ defmodule Transmuter.Vision.Idefics3Processor do
   end
 
   @doc """
-  The inputs of the vision encoder for one tile, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one tile in each call.
-  """
-  def template(processor) do
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-
-    %{
-      "pixel_values" => Nx.broadcast(zero, {1, 1, 3, processor.tile, processor.tile}),
-      "pixel_attention_mask" => mask(processor.tile, processor.tile)
-    }
-  end
-
-  @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the `"pixel_values"` of `tensors`, of shape `{batch, tiles, 3, tile, tile}` on the host, and gives the inputs of `Transmuter.Generation.generate/5`.
 
   The tiles of zeros do not run, as `Idefics3Model.get_image_features` of Python transformers removes them. Each real tile runs in a call of its own, from the bytes of the pixel values, so no operation compiles for each count of tiles, and the tiles of zeros do not go to the device. So the features are those of the real tiles of all rows, in order. Returns `%{image_features: features}`, a tensor of shape `{real_tiles * image_seq_len, hidden}` on the host. The prompts take the default positions.

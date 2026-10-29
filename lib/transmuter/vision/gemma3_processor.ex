@@ -63,11 +63,6 @@ defmodule Transmuter.Vision.Gemma3Processor do
   end
 
   @doc """
-  The inputs of the vision encoder for one image, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
-  """
-  def template(processor), do: ImageTextToText.image_template(processor.size)
-
-  @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.
 
   `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, 3, height, width}`, and the `"image_sizes"` of each row, of shape `{batch, rows, 2}`. Rows of zeros follow the images of a row. Each image runs alone, so the encoder has one compiled shape and the memory of one image, and the rows of zeros do not run. Returns `%{image_features: features}`: the features of the images of all rows, in order, of shape `{images * image_seq_length, hidden}`. The prompts take the default positions.

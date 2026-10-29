@@ -103,20 +103,6 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   end
 
   @doc """
-  The inputs of the vision encoder for an image of 2x2 patches, on `Nx.BinaryBackend`. The encoder compiles for them. The encoder takes one image in each call.
-  """
-  def template(processor) do
-    %{patch_size: patch, temporal_patch_size: temporal, merge_size: merge} = processor
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-
-    %{
-      "pixel_values" => Nx.broadcast(zero, {merge * merge, 3 * temporal * patch * patch}),
-      processor.grid_input =>
-        Nx.tensor([[1, merge, merge]], type: :s64, backend: Nx.BinaryBackend)
-    }
-  end
-
-  @doc """
   Runs the vision encoder `encode`, a function from `Transmuter.compile/3`, on the images of a batch, and gives the inputs of `Transmuter.Generation.generate/5`.
 
   `tensors` has the `"pixel_values"` of each row, of shape `{batch, rows, values}`, and the `"image_grid_thw"` of each row, of shape `{batch, rows, 3}`. Rows of zeros follow the patches and the grids of the images. `prompts` are the token ids of each row.

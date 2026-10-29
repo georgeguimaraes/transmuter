@@ -89,10 +89,14 @@ defmodule Transmuter.Vision.ImageTextToText do
     bos = Repo.special_token(repo, "bos")
 
     prepare = fn defn_options ->
-      template = module.template(processor)
+      backend = Nx.Defn.to_backend(defn_options)
+      template = encoder_template({module, processor}, backend)
       encode = Transmuter.compile(vision, template, [cache_size: 64] ++ defn_options)
       encode = &Map.new(encode.(&1), fn {name, t} -> {name, evaluate(t)} end)
-      backend = Nx.Defn.to_backend(defn_options)
+      # Transmuter.compile/3 compiles only the segments before the first graph break of the
+      # encoder, such as the NonZero over the tiles of Idefics3, so one call compiles the
+      # others for the path of a real image before the first request.
+      encode.(template)
 
       fn
         tensors, _prompts when map_size(tensors) == 0 ->
@@ -130,12 +134,39 @@ defmodule Transmuter.Vision.ImageTextToText do
     {ctx, tokenizer, task}
   end
 
-  # A chat with one image of gray pixels, which `Transmuter.ContinuousGeneration` prepares when
-  # it starts with compile_steps: true, so the processor and the encoder compile for it.
+  # A chat with the example image, which `Transmuter.ContinuousGeneration` prepares when it
+  # starts with compile_steps: true, so the processor and the encoder compile for it.
   defp example do
-    image = Nx.broadcast(Nx.tensor(128, type: :u8, backend: Nx.BinaryBackend), {64, 64, 3})
+    image = example_image()
     content = [%{type: "image", image: image}, %{type: "text", text: "Describe this image."}]
     %{messages: [%{role: "user", content: content}]}
+  end
+
+  # An image of gray pixels. Its values are not 0 after the normalization of the processors,
+  # because the encoder of Idefics3 takes a tile of zeros as padding and runs another path
+  # for it.
+  defp example_image,
+    do: Nx.broadcast(Nx.tensor(128, type: :u8, backend: Nx.BinaryBackend), {64, 64, 3})
+
+  # The template of the vision encoder: the inputs of its first call for the example image,
+  # from the processor and the encode function of the processor, as for a request. So the
+  # call with the template takes the path of a real image, and the template cannot differ
+  # from the inputs of a request.
+  defp encoder_template({module, processor}, backend) do
+    text = module.placeholder(processor)
+    %{tensors: tensors} = expand!({module, processor}, text, [example_image()], backend)
+    tensors = Map.new(tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
+
+    # The encode function of the processor calls the encoder that it gets, so this one throws
+    # its first input and stops there.
+    {:template, inputs} =
+      try do
+        module.encode(processor, &throw({:template, &1}), tensors, [[]], backend)
+      catch
+        template = {:template, _inputs} -> template
+      end
+
+    inputs
   end
 
   # The id of the image token from config.json and its text from the tokenizer.
@@ -319,13 +350,6 @@ defmodule Transmuter.Vision.ImageTextToText do
     pixels = Featurizer.process(featurizer, [image], backend: backend)
     sizes = Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
     %{"pixel_values" => pixels, "image_sizes" => sizes}
-  end
-
-  @doc false
-  # The inputs of the vision encoder for one image of `size`, on Nx.BinaryBackend.
-  def image_template({height, width}) do
-    zero = Nx.tensor(0.0, backend: Nx.BinaryBackend)
-    %{"pixel_values" => Nx.broadcast(zero, {1, 3, height, width})}
   end
 
   @doc false
