@@ -25,6 +25,64 @@ defmodule Transmuter.TestBackend do
     end
   end
 
+  # The memory of the test device in GB: the GPU of the CUDA client, from nvidia-smi, because
+  # EXLA gives only the allocated and the peak bytes of a client. Else the RAM of the host,
+  # which EMLX shares with the GPU of a Mac. test_helper.exs reads it once.
+  def device_memory_gb do
+    bytes = if device_opts() == [client: :cuda], do: cuda_memory(), else: host_memory()
+    bytes / 1024 ** 3
+  end
+
+  # nvidia-smi does not read CUDA_VISIBLE_DEVICES, so it gets the index of the first visible
+  # GPU, which is the device of the client.
+  defp cuda_memory do
+    path =
+      System.find_executable("nvidia-smi") ||
+        raise "the tests on CUDA read the memory of the GPU with nvidia-smi, which is not in PATH"
+
+    index = "CUDA_VISIBLE_DEVICES" |> System.get_env("0") |> String.split(",") |> hd()
+    args = ["--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", index]
+    {mib, 0} = System.cmd(path, args)
+    String.to_integer(String.trim(mib)) * 1024 ** 2
+  end
+
+  defp host_memory do
+    case :os.type() do
+      {:unix, :darwin} ->
+        {bytes, 0} = System.cmd("sysctl", ["-n", "hw.memsize"])
+        String.to_integer(String.trim(bytes))
+
+      {:unix, _linux} ->
+        [kib] =
+          Regex.run(~r/MemTotal:\s+(\d+) kB/, File.read!("/proc/meminfo"),
+            capture: :all_but_first
+          )
+
+        String.to_integer(kib) * 1024
+    end
+  end
+
+  # Tags the next test with the device memory in GB that it needs, and skips it when the test
+  # device has less. A skip and not an exclude filter, because a test that --only selects by
+  # name runs whatever the exclude filters say.
+  defmacro device_memory(gigabytes) do
+    quote do
+      @tag device_memory: unquote(gigabytes)
+
+      if reason = Transmuter.TestBackend.memory_skip(unquote(gigabytes)) do
+        @tag skip: reason
+      end
+    end
+  end
+
+  # The reason to skip a test that needs `gigabytes` of device memory, or nil when it fits.
+  def memory_skip(gigabytes) do
+    available = Application.fetch_env!(:transmuter, :test_device_memory_gb)
+
+    if gigabytes > available,
+      do: "needs #{gigabytes} GB of device memory, the device has #{Float.round(available, 1)} GB"
+  end
+
   defp device do
     default = if match?({:unix, :darwin}, :os.type()), do: "gpu", else: "cpu"
 

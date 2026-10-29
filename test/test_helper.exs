@@ -35,6 +35,13 @@ exclude =
   if(Transmuter.TestBackend.compiler() == EXLA, do: [], else: [:exla]) ++
     if System.find_executable("ffmpeg"), do: [], else: [:ffmpeg]
 
+# Transmuter.TestBackend.device_memory/1 skips the tests that need more device memory.
+Application.put_env(
+  :transmuter,
+  :test_device_memory_gb,
+  Transmuter.TestBackend.device_memory_gb()
+)
+
 ExUnit.start(exclude: exclude)
 
 # The EMLX job of CI sets HANG_DIR. See Transmuter.HangWatchdog.
