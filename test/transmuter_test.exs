@@ -904,7 +904,9 @@ defmodule TransmuterTest.EXLACacheTest do
   # The cache of EXLA is global, so other tests must not compile at the same time.
   use ExUnit.Case, async: false
 
-  @moduletag :exla
+  import Transmuter.TestBackend, only: [module_needs: 1]
+
+  module_needs(:exla)
 
   test "EXLA keeps no compiled segment after the process that compiled it exits" do
     backend = Transmuter.TestBackend.backend()

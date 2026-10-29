@@ -1475,7 +1475,7 @@ end
 defmodule Transmuter.VisionLargeModelTest do
   use ExUnit.Case, async: true
 
-  import Transmuter.TestBackend, only: [device_memory: 1]
+  import Transmuter.TestBackend, only: [needs: 1]
 
   @moduletag :hub
   @moduletag timeout: 900_000
@@ -1718,7 +1718,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @tag :large_model
   # A bound, not a measurement: EXLA CUDA runs out of memory on 12 GB, and the EMLX
   # footprint is 6.8 GB.
-  device_memory(16)
+  needs(device_memory: 16)
 
   test "image-text-to-text with Qwen2-VL matches ONNX Runtime alone and in a batch" do
     tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
@@ -1819,7 +1819,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @tag :large_model
   # A bound, not a measurement: EXLA CUDA runs out of memory on 12 GB, and the EMLX
   # footprint is 6.7 GB.
-  device_memory(16)
+  needs(device_memory: 16)
 
   test "image-text-to-text with Qwen2.5-VL matches ONNX Runtime alone and in a batch" do
     tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
@@ -1885,7 +1885,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @tag :large_model
   # A bound, not a measurement: EXLA CUDA runs out of memory on 12 GB, and the EMLX
   # footprint is 5.8 GB.
-  device_memory(16)
+  needs(device_memory: 16)
 
   test "image-text-to-text with Ministral 3 matches ONNX Runtime" do
     chats =
@@ -1926,7 +1926,7 @@ defmodule Transmuter.VisionLargeModelTest do
   @tag :large_model
   # A bound, not a measurement: EXLA CUDA runs out of memory on 12 GB, and the EMLX
   # footprint is 7.7 GB.
-  device_memory(16)
+  needs(device_memory: 16)
 
   test "image-text-to-text with Gemma 3 matches ONNX Runtime alone and in a batch" do
     tall = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])

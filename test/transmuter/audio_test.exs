@@ -1,6 +1,8 @@
 defmodule Transmuter.AudioTest do
   use ExUnit.Case, async: true
 
+  import Transmuter.TestBackend, only: [needs: 1]
+
   # Reference values come from WhisperFeatureExtractor, the generate function and the
   # automatic-speech-recognition pipeline of Python transformers, see
   # test/support/pipeline_references.py. The audio is the first sample of
@@ -54,7 +56,8 @@ defmodule Transmuter.AudioTest do
 
   # test/fixtures/librispeech_0.flac has the samples of librispeech_0.f32 in 16 bits, so
   # ffmpeg decodes it to the same samples.
-  @tag :ffmpeg
+  needs(:ffmpeg)
+
   test "a file gives the result of its samples" do
     serving = Transmuter.Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, @opts)
     file = {:file, "test/fixtures/librispeech_0.flac"}
@@ -646,6 +649,8 @@ end
 defmodule Transmuter.Audio.FeaturizerTest do
   use ExUnit.Case, async: true
 
+  import Transmuter.TestBackend, only: [needs: 1]
+
   alias Transmuter.Audio.Featurizer
 
   test "an input that is not audio gives an error" do
@@ -675,14 +680,16 @@ defmodule Transmuter.Audio.FeaturizerTest do
     assert_raise ArgumentError, ~r/each chunk/, fn -> Enum.to_list(chunks) end
   end
 
-  @tag :ffmpeg
+  needs(:ffmpeg)
+
   test "ffmpeg decodes a file to its samples" do
     file = {:file, "test/fixtures/librispeech_0.flac"}
     assert {:ok, [audio]} = Featurizer.audio(file, 16_000)
     assert Nx.to_binary(audio) == File.read!("test/fixtures/librispeech_0.f32")
   end
 
-  @tag :ffmpeg
+  needs(:ffmpeg)
+
   test "a file that ffmpeg cannot decode gives the reason of ffmpeg" do
     assert {:error, error} = Featurizer.audio({:file, "test/fixtures/librispeech_0.f32"}, 16_000)
     assert error =~ ~r/exit status 183: .*Invalid data/s

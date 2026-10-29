@@ -1975,8 +1975,10 @@ defmodule Transmuter.GenerationMemoryTest do
   # select it on EMLX.
   use ExUnit.Case, async: false
 
+  import Transmuter.TestBackend, only: [module_needs: 1]
+
   @moduletag :hub
-  @moduletag :exla
+  module_needs(:exla)
   @moduletag timeout: 900_000
 
   @opts [

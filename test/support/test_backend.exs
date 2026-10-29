@@ -62,21 +62,42 @@ defmodule Transmuter.TestBackend do
     end
   end
 
-  # Tags the next test with the device memory in GB that it needs, and skips it when the test
-  # device has less. A skip and not an exclude filter, because a test that --only selects by
-  # name runs whatever the exclude filters say.
-  defmacro device_memory(gigabytes) do
+  # Tags the next test with a need of the test machine, and skips it when the machine does
+  # not have it (see unmet/1). The tag is the need: :exla, :ffmpeg or device_memory: gigabytes.
+  # A skip and not an exclude filter, because a test that --only selects by name runs
+  # whatever the exclude filters say.
+  defmacro needs(need) do
     quote do
-      @tag device_memory: unquote(gigabytes)
+      @tag unquote(need)
 
-      if reason = Transmuter.TestBackend.memory_skip(unquote(gigabytes)) do
+      if reason = Transmuter.TestBackend.unmet(unquote(need)) do
         @tag skip: reason
       end
     end
   end
 
-  # The reason to skip a test that needs `gigabytes` of device memory, or nil when it fits.
-  def memory_skip(gigabytes) do
+  # needs/1 for all tests of a module.
+  defmacro module_needs(need) do
+    quote do
+      @moduletag unquote(need)
+
+      if reason = Transmuter.TestBackend.unmet(unquote(need)) do
+        @moduletag skip: reason
+      end
+    end
+  end
+
+  # The reason to skip a test with a need that the test machine does not have, or nil.
+  def unmet(:exla) do
+    if compiler() != EXLA, do: "needs the EXLA compiler, the tests run on #{inspect(compiler())}"
+  end
+
+  # The tests that read audio files need ffmpeg, which CI does not install.
+  def unmet(:ffmpeg) do
+    if !System.find_executable("ffmpeg"), do: "needs ffmpeg, which is not in PATH"
+  end
+
+  def unmet(device_memory: gigabytes) do
     available = Application.fetch_env!(:transmuter, :test_device_memory_gb)
 
     if gigabytes > available,
