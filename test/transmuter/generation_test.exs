@@ -279,14 +279,14 @@ defmodule Transmuter.GenerationTest do
   end
 
   # The branch with cache of the merged Whisper decoder has no causal mask, so a step of several
-  # tokens there gives wrong logits, also in ONNX Runtime. So its prompts run on that branch
-  # with one token of each prompt in a step. The decoder prompts have 7, 10 and 12 tokens, so
-  # steps of up to 64 tokens would run all of them in one step. The references are ONNX Runtime
-  # with the prompt as one step without cache and each new token as one step with cache, greedy
-  # and without logits processors, see the speech-to-text section of
-  # test/support/pipeline_references.py. The log-probabilities show the wrong logits, also when
-  # the tokens do not change.
-  test "a merged decoder without a causal mask runs its prompt one token in each step" do
+  # tokens there gives wrong logits, also in ONNX Runtime. The prompts of a new group run as one
+  # step on the branch without cache, which has the causal mask. The decoder prompts have 7, 10
+  # and 12 tokens. The references are ONNX Runtime with the prompt as one step without cache and
+  # each new token as one step with cache, greedy and without logits processors, see the
+  # speech-to-text section of test/support/pipeline_references.py. The log-probabilities show
+  # wrong logits, also when the tokens do not change. The count of the compiled calls shows the
+  # one prompt step.
+  test "a merged decoder runs its prompt as one step on the branch without cache" do
     {repo, encoder, decoder} =
       Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/whisper-tiny.en"}, @opts)
 
@@ -341,14 +341,18 @@ defmodule Transmuter.GenerationTest do
     end
 
     for {prompt, ids, logprobs} <- cases do
-      [tokens, []] =
-        Generation.generate(ctx, [prompt, []], [0, 0], %{"encoder_hidden_states" => hidden})
+      {[tokens, []], calls} =
+        count_calls(fn ->
+          Generation.generate(ctx, [prompt, []], [0, 0], %{"encoder_hidden_states" => hidden})
+        end)
 
       check.(tokens, ids, logprobs)
+      # The cross function, one step of the prompt and 11 steps of new tokens.
+      assert calls == 1 + 1 + 11
     end
 
-    # Rows with prompts of 7 and 12 tokens run in one group, and each row gives its tokens
-    # alone.
+    # Rows with prompts of 7 and 12 tokens run in one group, with the shorter prompt padded in
+    # the first step, and each row gives its tokens alone.
     [{short, short_ids, short_logprobs}, _, {long, long_ids, long_logprobs}] = cases
 
     [first, second] =
@@ -1004,8 +1008,8 @@ defmodule Transmuter.GenerationTest do
   # A request of Marian joins a running group with the outputs of its own encoder. The cross
   # function writes its cross-attention cache into its row, and its encoder outputs and mask
   # pad to the encoder capacity of the group with rows of zeros, which the mask hides. The fox
-  # starts the group at 64 encoder rows, and the longer source moves it to 128 while the fox
-  # runs. Each row gives the tokens of a context without the cross function, which runs the
+  # (32 rows) starts the group at 32 encoder rows, and the longer source moves it to 128 while
+  # the fox runs. Each row gives the tokens of a context without the cross function, which runs the
   # prompt on the branch without cache with the exact encoder outputs, and log-probabilities
   # within 1e-4.
   @tag ci_partition: 10
@@ -1020,7 +1024,7 @@ defmodule Transmuter.GenerationTest do
     ctx = Generation.compile(ctx, 2, @opts[:defn_options])
     request = &%{row: &1, prompt: [start], seed: 0, budget: 20, inputs: &2}
     group = ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, fox)]))
-    assert group.state.encoder_capacity == 64
+    assert group.state.encoder_capacity == 32
     group = Enum.reduce(1..3, group, fn _step, group -> Generation.next(ctx, group) end)
     group = Generation.admit(ctx, group, [request.(1, long)])
     assert group.state.encoder_capacity == 128
@@ -1036,10 +1040,11 @@ defmodule Transmuter.GenerationTest do
 
   # The branch with cache of Whisper reads no encoder mask, so its rows keep their encoder
   # outputs without rows of zeros, and all rows of a group have the 1500 rows of the encoder.
-  # A request joins a running row at a later step, and each row gives the tokens of a context
-  # without the cross function, with log-probabilities within 1e-4. The encoder outputs are
-  # fixed values in place of audio, so the test needs no encoder. Such outputs can give eos as
-  # the first token, so min_new_tokens keeps 6 tokens in each row.
+  # A request with a prompt of 7 tokens joins a running row at a later step. That branch has no
+  # causal mask, so the prompt runs one token in each step next to the running row. Each row
+  # gives the tokens of a context without the cross function, with log-probabilities within
+  # 1e-4. The encoder outputs are fixed values in place of audio, so the test needs no encoder.
+  # Such outputs can give eos as the first token, so min_new_tokens keeps 6 tokens in each row.
   @tag ci_partition: 10
   test "a request of Whisper joins a running group with encoder outputs of the same length" do
     model =
@@ -1063,12 +1068,15 @@ defmodule Transmuter.GenerationTest do
         %{"encoder_hidden_states" => hidden}
       end
 
-    prompt = [50_257, 50_362]
+    prompts = [[50_257, 50_362], [50_257, 50_362, 1770, 13, 2264, 346, 353]]
     old = Generation.compile(%{ctx | cross: nil}, 1, @opts[:defn_options])
-    alone = for given <- [first, second], do: hd(Generation.generate(old, [prompt], [0], given))
+
+    alone =
+      for {given, prompt} <- Enum.zip([first, second], prompts),
+          do: hd(Generation.generate(old, [prompt], [0], given))
 
     ctx = Generation.compile(ctx, 2, @opts[:defn_options])
-    request = &%{row: &1, prompt: prompt, seed: 0, budget: 6, inputs: &2}
+    request = &%{row: &1, prompt: Enum.at(prompts, &1), seed: 0, budget: 6, inputs: &2}
     group = ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, first)]))
     group = Enum.reduce(1..3, group, fn _step, group -> Generation.next(ctx, group) end)
     group = Generation.admit(ctx, group, [request.(1, second)])

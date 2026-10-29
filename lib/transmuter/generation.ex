@@ -16,15 +16,17 @@ defmodule Transmuter.Generation do
 
   A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same).
 
-  When requests can join a group (see "Logits"), the prompt of a merged decoder runs on the branch with cache, next to the new tokens of the other rows. The buffers of a new row have no valid rows, and the key mask hides them. When each attention of the branch with cache that reads a buffer has a causal mask, as in GPT-2 and Florence-2, a step takes up to 64 tokens of a prompt, as for the other decoders. Otherwise, as in Whisper and Marian, a step takes one token of each prompt (see `Transmuter.Generation.MergedDecoder`).
+  A step whose rows with tokens have no cache yet runs on the branch without cache, because Nx has no tensors of length 0. This branch has the causal mask, so the step takes the parts of the prompts as for the other decoders: the first step of a new group, or of a group whose other rows ended. Each row reads the logits at its last token, and the padding after a shorter part is in gap rows of the buffers. The other steps run on the branch with cache.
 
-  Otherwise, as with beam search, the prompt of a merged decoder runs as one step on the branch without cache, because Nx has no tensors of length 0, and only the new tokens take the branch with cache. The prompts of a batch run as one step for each prompt length, from the longest to the shortest, and each row takes its first token from the step of its prompt.
+  When requests can join a group (see "Logits"), the prompt of a request that joins running rows runs on the branch with cache, next to their new tokens. When each attention of the branch with cache that reads a buffer has a causal mask, as in GPT-2 and Florence-2, a step takes up to 64 tokens of the prompt, as for the other decoders. Otherwise, as in Whisper and Marian, a step takes one token of each prompt (see `Transmuter.Generation.MergedDecoder`). So each branch has the widths of its steps.
+
+  Otherwise, as with beam search, the prompts of a batch run on the branch without cache as one step for each prompt length, from the longest to the shortest, and each row takes its first token from the step of its prompt.
 
   A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`. A decoder without an `If`, such as Apertus, whose rotary positions come from the length of its past, gets the same rewrite on its graph. Its GroupQueryAttention hides its own free rows, so it takes only the offset and runs in `:in_place`, and the rows of a group have prompts of one length. When the valid rows have one value for each row, as in GPT-2, the rows of prompts of different lengths run together, and the steps of the other prompt lengths leave gap rows in each row. A group takes the next prompt length while the sum of its prompt lengths and the new tokens fits the static tables of the decoder, else the length starts a new group. When they have one value for all rows, as in M2M100 and Whisper, the prompts of each length run as one group, as in `:grow` (see "Batches").
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its branch without cache computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. The branch with cache gives an empty present for this cache, so the cache keeps its value.
 
-  When requests can join, each row keeps its own outputs of the encoder and its own cross-attention cache. The cross function of `Transmuter.Generation.MergedDecoder.cross/1` computes the cache of each request alone when it joins, and its row gets both. A decoder whose cross-attention cache reads other values, such as the tokens, has no cross function, and its requests cannot join. The rows of a group have the same number of encoder rows, the encoder capacity. When the branch with cache reads the encoder mask, as in Marian, M2M100 and Florence-2, the outputs of a shorter encoder run get rows of zeros that the mask hides, and the encoder capacity is a power of two of at least 64 rows, up to the longest output of the encoder in the configuration. It grows to the largest one of the requests of the group and does not shrink, so the steps compile for a few shapes. Otherwise, as in Whisper and TrOCR, all rows of a group need the same number of encoder rows.
+  When requests can join, each row keeps its own outputs of the encoder and its own cross-attention cache. The cross function of `Transmuter.Generation.MergedDecoder.cross/1` computes the cache of each request alone when it joins, and its row gets both. This is the only write of that cache, also when the next step runs on the branch without cache. A decoder whose cross-attention cache reads other values, such as the tokens, has no cross function, and its requests cannot join. The rows of a group have the same number of encoder rows, the encoder capacity. When the branch with cache reads the encoder mask, as in Marian, M2M100 and Florence-2, the outputs of a shorter encoder run get rows of zeros that the mask hides, and the encoder capacity is a power of two of at least 32 rows, up to the longest output of the encoder in the configuration, so the source lengths of the servings (32, 128 and 512 tokens) need no pad. Outputs of another length get rows of zeros on the host. It grows to the largest one of the requests of the group and does not shrink, so the steps compile for a few shapes. Otherwise, as in Whisper and TrOCR, all rows of a group need the same number of encoder rows.
 
   The token selection applies the logits processors of Python transformers that `generation_config.json` sets, in the order of `_get_logits_processor`: `repetition_penalty`, `no_repeat_ngram_size`, the bad words of one token in `bad_words_ids`, `min_length` or `min_new_tokens`, `forced_bos_token_id`, `forced_eos_token_id`, `suppress_tokens`, `begin_suppress_tokens`, the processors of the task, `renormalize_logits`, `temperature`, `top_k` and `top_p`.
 
@@ -191,7 +193,7 @@ defmodule Transmuter.Generation do
       buffers: buffers(model),
       min_capacity: min_capacity(model),
       max_capacity: model[:max_capacity],
-      widths: widths(model),
+      widths: %{with_cache: widths(model), without_cache: @step_widths},
       given: given,
       one_length: model[:one_length],
       cross: MergedDecoder.cross(model),
@@ -213,8 +215,9 @@ defmodule Transmuter.Generation do
     |> Map.merge(beam_search(gen, opts, sampling?))
   end
 
-  # The widths of the steps of a group (see plan/3): one token for a merged decoder whose branch
-  # with cache has no causal mask (see "Merged decoders").
+  # The widths of the steps on the branch with cache (see plan/3): one token for a merged decoder
+  # whose branch with cache has no causal mask (see "Merged decoders"). The branch without cache
+  # always has the causal mask, so its steps take every width.
   defp widths(%{causal: false}), do: [1]
   defp widths(_model), do: @step_widths
 
@@ -1011,7 +1014,7 @@ defmodule Transmuter.Generation do
   end
 
   @doc """
-  Generates tokens after each prompt of `prompts` with a context from `compile/3`. A prompt is a list of token ids, and an empty prompt is a padding row. `seeds` has the seed of sampling of each row. `inputs` are the inputs of each step that `context/4` names in `given`, with one row for each prompt.
+  Generates tokens after each prompt of `prompts` with a context from `compile/3`. A prompt is a list of token ids, and an empty prompt is a padding row. `seeds` has the seed of sampling of each row. `inputs` are the inputs of each step that `context/4` names in `given`, with one row for each prompt. When the rows of a merged decoder keep their own encoder outputs (see "Merged decoders"), outputs whose number of rows is an encoder capacity avoid a copy to the host for the pad.
 
   `inputs` can also have the key `:image_features`, a list with an item for each prompt: `nil`, or a tensor of shape `{count, hidden}` with the features of the image tokens of the prompt in their order. `count` is a power of two, and rows of zeros follow the features. It is not an input of the decoder. See the module documentation.
 
@@ -1179,6 +1182,8 @@ defmodule Transmuter.Generation do
   # seed and the budget of new tokens. It can have the positions of the prompt (see "Positions"
   # in the module documentation) and the image features of its image tokens.
   # `inputs` are the inputs of the prompts, which only the first requests of a group can have.
+  # When the rows keep their own inputs, a request has them in `:inputs`, and inputs whose
+  # number of rows is an encoder capacity avoid a copy to the host (see pad_rows/2).
   #
   # When requests can join a group with other rows (joins?/1), the prompts run in the steps
   # of next/2, next to the new tokens of the other rows (see plan/1). Otherwise the prompts
@@ -1251,29 +1256,36 @@ defmodule Transmuter.Generation do
   @doc false
   # Runs one step of each shape that the steps of a group of `rows` rows can take, so each
   # shape compiles before a request needs it: each capacity of the buffers that capacity/2
-  # gives up to the largest, with each width of step_width/1 that fits it. It also compiles
-  # the writes of the rows of 1 to `rows` requests that join together at each capacity, and a
-  # growth, or in :append a compaction, from each capacity to the next. When the rows keep their
-  # own inputs, `inputs` are the inputs of one request, which give their types and shapes, and
-  # the steps also run at each encoder capacity of encoder_capacities/2, with the cross
-  # function, the writes of a row and each move between neighbour encoder capacities. Returns
-  # the number of step shapes.
+  # gives up to the largest, with each width of each branch (see branch_widths/3) that fits it.
+  # It also compiles the writes of the rows of 1 to `rows` requests that join together at each
+  # capacity, and a growth, or in :append a compaction, from each capacity to the next. When the
+  # rows keep their own inputs, `inputs` are the inputs of one request, which give their types
+  # and shapes, and the steps also run at each encoder capacity of encoder_capacities/2, with
+  # the cross function, the writes of a row and each move between neighbour encoder capacities.
+  # Returns the number of step shapes.
   def compile_steps(ctx, rows, inputs \\ %{}) do
     capacities = capacities(ctx, ctx.max_capacity)
     encoders = encoder_capacities(ctx, inputs)
 
+    # The first step of a new group, on the branch without cache of a merged decoder, and for a
+    # merged decoder a step on the branch with cache, where its row has one row of cache before
+    # its part. Such a step fits the part next to that row only below the capacity.
+    first = if merged?(ctx), do: ctx.widths.without_cache, else: ctx.widths.with_cache
+    later = if merged?(ctx), do: ctx.widths.with_cache, else: []
+
     shapes =
       for capacity <- capacities,
-          size <- ctx.widths,
-          size <= capacity,
+          {widths, past} <- [{first, 0}, {later, 1}],
+          size <- widths,
+          size + past <= capacity,
           encoder <- encoders,
-          do: {capacity, size, encoder}
+          do: {capacity, size, past, encoder}
 
-    for {capacity, size, encoder} <- shapes do
+    for {capacity, size, past, encoder} <- shapes do
       request = %{row: 0, prompt: List.duplicate(0, size), seed: 0, budget: 1}
       request = Map.put(request, :inputs, encoder_inputs(ctx, inputs, encoder))
       group = admit(ctx, open(ctx, rows, capacity), [request])
-      finish(next(ctx, group))
+      finish(next(ctx, cached_rows(group, past)))
     end
 
     for capacity <- capacities, count <- 2..rows//1 do
@@ -1311,6 +1323,21 @@ defmodule Transmuter.Generation do
     length(shapes)
   end
 
+  # The group with `past` rows of cache in its row 0, which compile_steps/3 gives a step on the
+  # branch with cache.
+  defp cached_rows(group, 0), do: group
+
+  defp cached_rows(group = %{state: state}, past) do
+    state = %{
+      state
+      | lengths: List.replace_at(state.lengths, 0, past),
+        valid: List.replace_at(state.valid, 0, [{0, past}]),
+        used: max(state.used, past)
+    }
+
+    %{group | state: state}
+  end
+
   @doc false
   # Compiles the image features of a group of `rows` rows for the type and the width of
   # `features`, the features of one prompt: the slots, a write of the features of each power
@@ -1327,7 +1354,7 @@ defmodule Transmuter.Generation do
       ctx.write_features.(slots, part, Nx.tensor(0, backend: Nx.BinaryBackend))
     end
 
-    for width <- ctx.widths do
+    for width <- Enum.uniq(ctx.widths.with_cache ++ ctx.widths.without_cache) do
       embeds = ctx.embed.(List.duplicate(List.duplicate(0, width), rows))
       index = Nx.broadcast(Nx.tensor(0, type: :s32, backend: Nx.BinaryBackend), {rows, width})
       mask = Nx.broadcast(Nx.tensor(0, type: :u8, backend: Nx.BinaryBackend), {rows, width})
@@ -1435,8 +1462,9 @@ defmodule Transmuter.Generation do
 
       Enum.max(ends ++ Enum.map(running_lengths(rows), &(&1 + 1)), fn -> 0 end)
     else
-      {parts, left} = plan(rows, room(ctx, rows), ctx.widths)
-      written = Enum.max(running_lengths(rows), fn -> 0 end) + step_width(parts, ctx.widths)
+      widths = branch_widths(ctx, rows, rows.lengths)
+      {parts, left} = plan(rows, room(ctx, rows), widths)
+      written = Enum.max(running_lengths(rows), fn -> 0 end) + step_width(parts, widths)
 
       [selects, remaining] =
         [parts, left, rows.done, rows.remaining]
@@ -1648,14 +1676,18 @@ defmodule Transmuter.Generation do
     end
   end
 
+  # The smallest encoder capacity: the smallest source length of the servings (see
+  # Serving.sequence_lengths/2), so their encoder outputs, of 32, 128 or 512 rows, need no pad.
+  @min_encoder_capacity 32
+
   # The encoder capacity for `rows` rows of the encoder. When the branch with cache reads the
   # encoder mask, the padding rows are hidden, so the capacity is a power of two of at least
-  # 64 rows, at most the longest output of the encoder (see encoder_length/1). Otherwise all
-  # rows of a group need the same rows of the encoder.
+  # @min_encoder_capacity rows, at most the longest output of the encoder (see
+  # encoder_length/1). Otherwise all rows of a group need the same rows of the encoder.
   defp encoder_capacity(%{pad_encoder?: false}, rows), do: rows
 
   defp encoder_capacity(ctx, rows) do
-    capacity = power_of_two(max(rows, 64))
+    capacity = power_of_two(max(rows, @min_encoder_capacity))
     max(rows, if(ctx.encoder_length, do: min(capacity, ctx.encoder_length), else: capacity))
   end
 
@@ -1719,7 +1751,7 @@ defmodule Transmuter.Generation do
 
   # The encoder capacities after `from` on the way to `to`.
   defp encoder_path(ctx, from, to) do
-    below = Stream.iterate(64, &(&1 * 2)) |> Enum.take_while(&(&1 < to))
+    below = Stream.iterate(@min_encoder_capacity, &(&1 * 2)) |> Enum.take_while(&(&1 < to))
     steps = if ctx.pad_encoder?, do: below ++ [to], else: [to]
     Enum.filter(steps, &(&1 > from))
   end
@@ -1744,13 +1776,7 @@ defmodule Transmuter.Generation do
             "the branch with cache of the decoder reads no encoder mask, so all rows of a group need the same rows of the encoder, got #{rows} and #{capacity}"
     end
 
-    padded =
-      Map.new(request.inputs, fn {name, t} ->
-        padding =
-          List.replace_at(List.duplicate({0, 0, 0}, Nx.rank(t)), 1, {0, capacity - rows, 0})
-
-        {name, Nx.pad(t, 0, padding)}
-      end)
+    padded = Map.new(request.inputs, fn {name, t} -> {name, pad_rows(t, capacity)} end)
 
     cross =
       for {"present." <> rest, t} <- if(ctx.cross, do: ctx.cross.(padded), else: %{}),
@@ -1760,9 +1786,27 @@ defmodule Transmuter.Generation do
     values = Map.merge(padded, cross)
     old = Map.take(state.cache, Map.keys(values))
     row = Nx.tensor(request.row, backend: Nx.BinaryBackend)
-    written = ctx.write_row.(old, row, values)
+    # The old tensors die here, so the write can reuse their buffers (EMLX copies them).
+    written = ctx.write_row.(Nx.donatable(old), row, values)
     release(Map.values(old) ++ Map.values(values), Map.values(request.inputs))
     %{group | state: %{state | cache: Map.merge(state.cache, written)}}
+  end
+
+  # Pads the encoder rows of an input of one request, {1, rows, ...}, to the bucket of the row,
+  # `capacity` rows, with zero bytes after its data. The pad runs on the host, because a device
+  # op on a tensor of `rows` rows compiles for each number of rows on EXLA, and the rows of a
+  # caller have no bound. An input with `capacity` rows gets no bytes and stays on the device.
+  defp pad_rows(tensor, capacity) do
+    case (capacity - Nx.axis_size(tensor, 1)) * div(Nx.size(tensor), Nx.axis_size(tensor, 1)) do
+      0 ->
+        tensor
+
+      count ->
+        {_kind, bits} = Nx.type(tensor)
+        data = Nx.to_binary(tensor) <> :binary.copy(<<0>>, div(count * bits, 8))
+        shape = put_elem(Nx.shape(tensor), 1, capacity)
+        data |> Nx.from_binary(Nx.type(tensor), backend: Nx.BinaryBackend) |> Nx.reshape(shape)
+    end
   end
 
   # The row `row` of each tensor gets the row of `values`.
@@ -2098,14 +2142,31 @@ defmodule Transmuter.Generation do
   defp advance(ctx, group) do
     group = if ctx.mode == :in_place, do: drop_ended(group), else: group
     rows = %{lengths: group.state.lengths, done: group.done}
-    {parts, left} = plan(group, room(ctx, rows), ctx.widths)
-    width = step_width(parts, ctx.widths)
+    widths = branch_widths(ctx, group, group.state.lengths)
+    {parts, left} = plan(group, room(ctx, rows), widths)
+    width = step_width(parts, widths)
     group = %{fit(ctx, group, width) | left: left}
     state = step(ctx, group.state, parts, selection(ctx, group), width)
 
     # The image features stay until the last part of a prompt has run.
     state = if Enum.all?(left, &(&1 == [])), do: %{state | features: nil}, else: state
     %{group | state: state}
+  end
+
+  # A step of a merged decoder whose rows with tokens, of `lengths` rows of cache, have no
+  # cache yet runs on the branch without cache, which reads no past. This is the first step of a
+  # new or idle group, and of each prompt with beam search (see "Merged decoders").
+  defp without_cache?(ctx, lengths), do: merged?(ctx) and Enum.all?(lengths, &(&1 == 0))
+
+  # The widths of the next step of `rows`: those of the branch that it runs on (see context/4).
+  # Its rows with tokens are the rows with a part of a prompt left or with a new token.
+  defp branch_widths(ctx, rows, lengths) do
+    taking =
+      for {length, left, token, done?} <- Enum.zip([lengths, rows.left, rows.new, rows.done]),
+          left != [] or (token != nil and not done?),
+          do: length
+
+    if without_cache?(ctx, taking), do: ctx.widths.without_cache, else: ctx.widths.with_cache
   end
 
   # The tokens of each row in the next step, and the tokens of the prompts that are left after
@@ -2300,6 +2361,15 @@ defmodule Transmuter.Generation do
           Map.has_key?(outputs, "present." <> rest),
           into: %{},
           do: {name, outputs["present." <> rest]}
+
+    # When the rows keep their own inputs, admit_inputs/3 alone writes the cross-attention cache
+    # of each row, so the step drops that cache from the presents of the branch without cache.
+    {present, dead} =
+      Map.split_with(present, fn {name, _} ->
+        name in ctx.buffers or not rows_keep_inputs?(ctx)
+      end)
+
+    release(Map.values(dead), [])
 
     # The present replaces the cache entries that the step wrote, and their old buffers are
     # dead. In :append, the tail wrote the new rows into the buffers (see tail/1). The
@@ -2631,13 +2701,11 @@ defmodule Transmuter.Generation do
   defp step_inputs(ctx, state, tokens, counts) do
     n = length(hd(tokens))
 
-    # When its requests cannot join, the prompt of a merged decoder takes the branch without
-    # cache, which reads no past: a step whose rows with tokens have no rows in the cache.
     cached? =
-      not (merged?(ctx) and not joins?(ctx) and
-             Enum.all?(Enum.zip(state.lengths, counts), fn {past, count} ->
-               past == 0 or count == 0
-             end))
+      not without_cache?(
+        ctx,
+        for({past, count} <- Enum.zip(state.lengths, counts), count > 0, do: past)
+      )
 
     masks =
       for {past, valid} <- Enum.zip(state.lengths, state.valid) do
