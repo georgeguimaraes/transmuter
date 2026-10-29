@@ -30,20 +30,28 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   @doc """
   Returns `model` with the position offset and the key mask in the branch with cache, its
-  largest capacity in `:max_capacity` and the shape of its offset in `:per_row_offset`, or
-  `model` itself when the rules do not hold.
+  largest capacity in `:max_capacity`, the shape of its offset in `:per_row_offset` and in
+  `:causal` whether a step of several tokens on the branch with cache gives the logits of each
+  token (see causal?/3), or `model` itself when the rules do not hold. When the rows of a step
+  need one length of the cache, `:one_length` names the node that needs it. `step_rows` is the
+  most tokens of a step, which the causal tables must fit with the largest capacity (see
+  extend_tables/4).
   """
-  def rewrite(model) do
+  def rewrite(model, step_rows) do
     with false <- "position_ids" in model.inputs,
          {branch, graph} <- cache_graph(model),
          {:ok, cores} <- buffer_cores(model, graph),
-         {:ok, [_ | _] = reads, limit, prefixes} <- past_uses(model, graph) do
-      per_row? = per_row?(model, graph, reads, prefixes)
+         {:ok, [_ | _] = reads, limit, prefixes, kinds} <- past_uses(model, graph) do
+      one_offset = one_offset(model, graph, reads, prefixes)
+      per_row? = one_offset == nil
 
       model
       |> offset_reads(branch, graph, Map.new(reads ++ cores, &read_entry/1), per_row?)
       |> Map.put(:max_capacity, limit && limit - 1)
       |> Map.put(:per_row_offset, per_row?)
+      |> Map.put(:one_length, one_offset)
+      |> Map.put(:causal, causal?(graph, cores, kinds))
+      |> extend_tables(graph, kinds, limit && limit - 1 + step_rows)
     else
       {:bail, node} ->
         exact_cache(model, node)
@@ -56,13 +64,65 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
+  # A step of n tokens at a capacity of C rows reads C + n keys, so each causal table that a
+  # Slice reads gets `rows` rows: the largest capacity and the most tokens of a step. The
+  # table is a tril (see causal?/1), and a larger tril gives the same values at every key of
+  # the smaller one. The largest capacity stays at the rows of the table of the export, which
+  # also bound the positions. A causal table of the export is large, so it is a param (see
+  # Transmuter.load!/2).
+  defp extend_tables(model, _graph, _kinds, nil), do: model
+
+  defp extend_tables(model, graph, kinds, rows) do
+    tables =
+      for node = %{op_type: "Slice"} <- graph.node,
+          match?({:causal, _, _}, kinds[hd(node.output)]),
+          table = model.params[hd(node.input)],
+          Nx.axis_size(table, -1) < rows,
+          uniq: true,
+          do: hd(node.input)
+
+    params =
+      Map.new(tables, fn name ->
+        table = model.params[name]
+
+        rank = Nx.rank(table)
+        shape = table |> Nx.shape() |> put_elem(rank - 2, rows) |> put_elem(rank - 1, rows)
+        tril = Nx.greater_equal(Nx.iota({rows, rows}, axis: 0), Nx.iota({rows, rows}, axis: 1))
+        value = tril |> Nx.as_type(Nx.type(table)) |> Nx.reshape(shape)
+        {name, if(model.backend, do: Nx.backend_transfer(value, model.backend), else: value)}
+      end)
+
+    %{model | params: Map.merge(model.params, params)}
+  end
+
+  # Whether each core whose keys read a buffer masks the keys after each query, so a step of
+  # several tokens on the branch with cache gives the logits of each token: its mask or its
+  # keys to keep (inputs 3 and 4) follow from a causal table or a comparison of L, as in GPT-2,
+  # Florence-2 and moonshine. The exports of Whisper and Marian trace this branch for one token
+  # and have no such mask.
+  defp causal?(graph, cores, kinds) do
+    seeds = for {name, kind} <- kinds, kind == :bool or match?({:causal, _, _}, kind), do: name
+
+    causal =
+      Enum.reduce(graph.node, MapSet.new(seeds), fn node, causal ->
+        if node.op_type not in ["Shape", "Size"] and
+             Enum.any?(node.input, &MapSet.member?(causal, &1)),
+           do: MapSet.union(causal, MapSet.new(node.output)),
+           else: causal
+      end)
+
+    Enum.all?(cores, fn core ->
+      Enum.any?(Enum.slice(core.input, 3, 2), &MapSet.member?(causal, &1))
+    end)
+  end
+
   # The offset is one value for each row, of shape {batch, 1}, when the rows of a step can have
   # different valid rows: every read is a Gather of a position table whose index has a leading
   # axis of size 1, so the offset gives the index the batch and keeps its rank, no later Reshape
   # or Expand has a static first dimension of 1, and no prefix takes the rows of the buffer as
   # positions. Otherwise it is one value for all rows, and Generation runs one group for each
-  # prompt length.
-  defp per_row?(model, graph, reads, prefixes) do
+  # prompt length. Returns nil for an offset for each row, else the reason for one offset.
+  defp one_offset(model, graph, reads, prefixes) do
     scope = static_scope(model, graph)
     producers = for node <- graph.node, output <- node.output, into: %{}, do: {output, node}
     batch? = &(batch_index?(&1, producers, scope) or meets_tokens?(&1, graph))
@@ -84,14 +144,17 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     case reason do
       nil ->
-        true
+        nil
 
       {what, node} ->
+        reason =
+          "its position offset is one value for all rows, because of #{what} at #{where(node)}"
+
         Logger.debug(
-          "generation runs one group for each prompt length of the merged decoder, because of #{what} at #{where(node)}"
+          "generation runs one group for each prompt length of the merged decoder: #{reason}"
         )
 
-        false
+        reason
     end
   end
 
@@ -210,11 +273,11 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp read_entry(node), do: {node, nil}
 
   defp exact_cache(model, node) do
-    Logger.debug(
-      "generation keeps a cache of exact length, because #{where(node)} reads the cache or its length"
-    )
+    reason =
+      "it keeps a cache of exact length, because #{where(node)} reads the cache or its length"
 
-    model
+    Logger.debug("generation: #{reason}")
+    Map.put(model, :one_length, reason)
   end
 
   # The comparisons give booleans, whose casts are masks.
@@ -286,7 +349,7 @@ defmodule Transmuter.Generation.MergedDecoder do
     |> case do
       {:bail, _node} = bail -> bail
       {:mixed, ranges, node} -> index_space(model, graph, index_ranges, ranges, node)
-      {reads, _kinds, _lengths, limit, prefixes} -> {:ok, reads, limit, prefixes}
+      {reads, kinds, _lengths, limit, prefixes} -> {:ok, reads, limit, prefixes, kinds}
     end
   end
 
@@ -1005,6 +1068,20 @@ defmodule Transmuter.Generation.MergedDecoder do
       end
     else
       _other -> nil
+    end
+  end
+
+  @doc """
+  Returns the inputs of `model` that a step on the branch with cache reads: the inputs of the nodes outside the `If` and of its branch with cache. Without an `If`, all inputs.
+  """
+  def cache_reads(model) do
+    case cache_if(model) do
+      nil ->
+        model.inputs
+
+      {node, graph} ->
+        nodes = List.delete(model.nodes, node) ++ graph.node
+        Enum.filter(reads(nodes, &Transmuter.dependencies/1, []), &(&1 in model.inputs))
     end
   end
 

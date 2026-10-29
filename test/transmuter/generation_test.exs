@@ -279,13 +279,14 @@ defmodule Transmuter.GenerationTest do
   end
 
   # The branch with cache of the merged Whisper decoder has no causal mask, so a step of several
-  # tokens there gives wrong logits, also in ONNX Runtime. The decoder prompts have 7, 10 and 12
-  # tokens, so parts of power-of-two lengths would run 2 or 4 of them on that branch. The
-  # references are ONNX Runtime with the prompt as one step without cache and each new token as
-  # one step with cache, greedy and without logits processors, see the speech-to-text section of
+  # tokens there gives wrong logits, also in ONNX Runtime. So its prompts run on that branch
+  # with one token of each prompt in a step. The decoder prompts have 7, 10 and 12 tokens, so
+  # steps of up to 64 tokens would run all of them in one step. The references are ONNX Runtime
+  # with the prompt as one step without cache and each new token as one step with cache, greedy
+  # and without logits processors, see the speech-to-text section of
   # test/support/pipeline_references.py. The log-probabilities show the wrong logits, also when
   # the tokens do not change.
-  test "a merged decoder runs its prompt as one step on the branch without cache" do
+  test "a merged decoder without a causal mask runs its prompt one token in each step" do
     {repo, encoder, decoder} =
       Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/whisper-tiny.en"}, @opts)
 
@@ -346,8 +347,8 @@ defmodule Transmuter.GenerationTest do
       check.(tokens, ids, logprobs)
     end
 
-    # Rows with prompts of 7 and 12 tokens run as two groups, because :grow groups the rows by
-    # the length of the cache, so each row gives its tokens alone.
+    # Rows with prompts of 7 and 12 tokens run in one group, and each row gives its tokens
+    # alone.
     [{short, short_ids, short_logprobs}, _, {long, long_ids, long_logprobs}] = cases
 
     [first, second] =
@@ -467,11 +468,12 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # A merged decoder whose position offset is one value for each row runs the prompt of each
-  # length as one step without cache, and then decodes all rows in one group. gpt2 reads its
-  # positions from a table, so 3 prompts of 30, 12 and 5 tokens give the greedy tokens of a
-  # cache of exact length, in 3 prompt steps and 39 decode steps. With one group for each
-  # length, the same run takes 3 groups of 40 steps.
+  # A merged decoder whose position offset is one value for each row runs its prompts on the
+  # branch with cache, and decodes all rows in one group. The branch with cache of gpt2 has a
+  # causal table, so a step takes up to 64 tokens of each prompt, and 3 prompts of 30, 12 and
+  # 5 tokens give the greedy tokens of a cache of exact length in 1 prompt step and 39 decode
+  # steps. With one token of each prompt in a step, the same run takes 30 prompt steps, and
+  # with one group for each length, 3 groups of 40 steps.
   @tag ci_partition: 5
   test "a merged decoder with an offset for each row decodes prompts of different lengths together" do
     {repo, model} = gpt2()
@@ -488,7 +490,7 @@ defmodule Transmuter.GenerationTest do
       assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 40)
     end
 
-    assert calls == 3 + 39
+    assert calls == 1 + 39
   end
 
   # The result of `fun` and the compiled calls that it made.
@@ -527,16 +529,18 @@ defmodule Transmuter.GenerationTest do
           {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, false},
           {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, false}
         ] do
-      rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite()
+      rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite(1)
       assert "transmuter.position_offset" in rewritten.inputs, inspect(source)
       assert rewritten[:per_row_offset] == per_row?, inspect(source)
     end
   end
 
-  # The GPT-2 export slices a causal table of 1024 rows at the length of its cache, so in
-  # :append the buffer and the new token must fit it: 900 + 32 tokens take a buffer of 1023
-  # rows, not 1024, and give the greedy tokens of the cache of exact length. 900 + 132 tokens
-  # raise at the step that does not fit.
+  # The GPT-2 export slices a causal table of 1024 rows at the length of its cache. Its rows
+  # bound the buffer and the positions: 900 + 32 tokens take a buffer of 1023 rows, not 1024,
+  # and give the greedy tokens of the cache of exact length, and 900 + 132 tokens raise at the
+  # step that does not fit. They do not bound the keys of a step: the prompt of 900 tokens runs
+  # on the branch with cache in a step of 512 tokens at 1023 rows, which reads 1535 keys of the
+  # causal table that the rewrite extends.
   test "a merged decoder keeps its buffer within its causal table" do
     {repo, model} = gpt2()
     prompt = for i <- 1..900, do: rem(i * 37, 50_000)
@@ -556,19 +560,38 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # In one group, the prompt step of each length writes its own rows of the buffer of GPT-2,
-  # so the rows of a group are the sum of its prompt lengths and the new tokens. Prompts of 600,
-  # 500 and 400 tokens with 16 new tokens need 1515 rows in one group, more than the 1023 rows
-  # of the causal table. So 600 runs alone, and 500 and 400 run as a group of 915 rows: 1 + 15
-  # and 2 + 15 steps, and each row gives the greedy tokens of the cache of exact length.
+  # With beam search, requests cannot join, so the prompts of a merged decoder run on the
+  # branch without cache, and the prompt step of each length writes its own rows of the buffer
+  # of GPT-2. So the rows of a group are the sum of its prompt lengths and the new tokens.
+  # Prompts of 600, 500 and 400 tokens with 16 new tokens need 1515 rows in one group, more than
+  # the 1023 rows of the causal table. So 600 runs alone, and 500 and 400 run as a group of 915
+  # rows: 1 + 15 and 2 + 15 steps, and each prompt gives the tokens that it gives alone.
   @tag ci_partition: 5
   test "a merged decoder starts a new group when the prompt lengths do not fit its causal table" do
     {repo, model} = gpt2()
+    prompts = gpt2_prompts([600, 500, 400])
+    ctx = Generation.context(repo, model, num_beams: 2, max_new_tokens: 16)
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+    {rows, calls} = count_calls(fn -> Generation.generate(ctx, prompts, [0, 0, 0]) end)
 
-    prompts =
-      for {length, row} <- [{600, 1}, {500, 2}, {400, 3}],
-          do: for(i <- 1..length, do: rem(i * 37 * row, 50_000))
+    for {tokens, prompt} <- Enum.zip(rows, prompts) do
+      assert tokens == hd(Generation.generate(single, [prompt], [0]))
+    end
 
+    assert calls == 1 + 15 + 2 + 15
+  end
+
+  # When requests can join, each row of GPT-2 runs its prompt on the branch with cache and
+  # counts only its own rows, so prompts of 600, 500 and 400 tokens share one group. The first
+  # step takes 512 tokens of each prompt and ends the prompts of 500 and 400 tokens. The other
+  # two rows then take a new token in each step, so the prompt of 600 tokens takes 64 and then
+  # 24 tokens. The write offset ends at 655 rows: 3 prompt steps and 15 steps of new tokens,
+  # and each row gives the greedy tokens of the cache of exact length.
+  @tag ci_partition: 5
+  test "the rows of a merged decoder share one group when each row fits its causal table" do
+    {repo, model} = gpt2()
+    prompts = gpt2_prompts([600, 500, 400])
     ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 16)
     ctx = Generation.compile(ctx, 3, @opts[:defn_options])
     {rows, calls} = count_calls(fn -> Generation.generate(ctx, prompts, [0, 0, 0]) end)
@@ -577,7 +600,12 @@ defmodule Transmuter.GenerationTest do
       assert Enum.map(tokens, &hd/1) == exact_greedy(model, prompt, 16)
     end
 
-    assert calls == 1 + 15 + 2 + 15
+    assert calls == 3 + 15
+  end
+
+  defp gpt2_prompts(lengths) do
+    for {length, row} <- Enum.with_index(lengths, 1),
+        do: for(i <- 1..length, do: rem(i * 37 * row, 50_000))
   end
 
   # A merged decoder that the rewrite moves to :append starts at 32 rows, and other decoders
@@ -971,6 +999,150 @@ defmodule Transmuter.GenerationTest do
       diff = Enum.zip_with(row, alone, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
       assert diff < 1.0e-4, "#{diff}"
     end
+  end
+
+  # A request of Marian joins a running group with the outputs of its own encoder. The cross
+  # function writes its cross-attention cache into its row, and its encoder outputs and mask
+  # pad to the encoder capacity of the group with rows of zeros, which the mask hides. The fox
+  # starts the group at 64 encoder rows, and the longer source moves it to 128 while the fox
+  # runs. Each row gives the tokens of a context without the cross function, which runs the
+  # prompt on the branch without cache with the exact encoder outputs, and log-probabilities
+  # within 1e-4.
+  @tag ci_partition: 10
+  test "a request of a merged decoder joins a running group with its own encoder outputs" do
+    {repo, ctx, encode} = marian(max_new_tokens: 20, token_logprobs: true)
+    [fox, long] = Enum.map([@fox, String.duplicate(@lighthouse <> " ", 2)], encode)
+    start = repo.config["decoder_start_token_id"]
+
+    old = Generation.compile(%{ctx | cross: nil}, 1, @opts[:defn_options])
+    alone = for given <- [fox, long], do: hd(Generation.generate(old, [[start]], [0], given))
+
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    request = &%{row: &1, prompt: [start], seed: 0, budget: 20, inputs: &2}
+    group = ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, fox)]))
+    assert group.state.encoder_capacity == 64
+    group = Enum.reduce(1..3, group, fn _step, group -> Generation.next(ctx, group) end)
+    group = Generation.admit(ctx, group, [request.(1, long)])
+    assert group.state.encoder_capacity == 128
+    group = run_until(ctx, group, &Enum.all?(&1.done))
+
+    for {expected, row} <- Enum.with_index(alone) do
+      tokens = Generation.row_tokens(group, row)
+      assert Enum.map(tokens, &hd/1) == Enum.map(expected, &hd/1)
+      diff = Enum.zip_with(tokens, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+      assert diff < 1.0e-4, "#{diff}"
+    end
+  end
+
+  # The branch with cache of Whisper reads no encoder mask, so its rows keep their encoder
+  # outputs without rows of zeros, and all rows of a group have the 1500 rows of the encoder.
+  # A request joins a running row at a later step, and each row gives the tokens of a context
+  # without the cross function, with log-probabilities within 1e-4. The encoder outputs are
+  # fixed values in place of audio, so the test needs no encoder. Such outputs can give eos as
+  # the first token, so min_new_tokens keeps 6 tokens in each row.
+  @tag ci_partition: 10
+  test "a request of Whisper joins a running group with encoder outputs of the same length" do
+    model =
+      Transmuter.load!({:hf, "Xenova/whisper-tiny.en", "onnx/decoder_model_merged.onnx"},
+        backend: @opts[:backend],
+        outputs: &Generation.outputs/1
+      )
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => 50_256}}
+    opts = [max_new_tokens: 6, min_new_tokens: 6, token_logprobs: true]
+    ctx = Generation.context(repo, model, opts, ["encoder_hidden_states"])
+
+    [first, second] =
+      for divisor <- [17, 23] do
+        hidden =
+          Nx.iota({1, 1500, 384}, type: :f32, backend: @opts[:backend])
+          |> Nx.remainder(divisor)
+          |> Nx.subtract(8)
+          |> Nx.divide(8)
+
+        %{"encoder_hidden_states" => hidden}
+      end
+
+    prompt = [50_257, 50_362]
+    old = Generation.compile(%{ctx | cross: nil}, 1, @opts[:defn_options])
+    alone = for given <- [first, second], do: hd(Generation.generate(old, [prompt], [0], given))
+
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    request = &%{row: &1, prompt: prompt, seed: 0, budget: 6, inputs: &2}
+    group = ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, first)]))
+    group = Enum.reduce(1..3, group, fn _step, group -> Generation.next(ctx, group) end)
+    group = Generation.admit(ctx, group, [request.(1, second)])
+    assert group.state.encoder_capacity == 1500
+    group = run_until(ctx, group, &Enum.all?(&1.done))
+
+    for {expected, row} <- Enum.with_index(alone) do
+      tokens = Generation.row_tokens(group, row)
+      assert Enum.map(tokens, &hd/1) == Enum.map(expected, &hd/1)
+      diff = Enum.zip_with(tokens, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+      assert diff < 1.0e-4, "#{diff}"
+    end
+  end
+
+  # After compile_steps with the inputs of one request, Marian requests whose sources have
+  # uneven lengths join a group and compile nothing: the encoder capacities are powers of two,
+  # so the steps, the cross function and the writes of a row have one shape for each.
+  @tag ci_partition: 10
+  test "requests with encoder outputs of uneven lengths compile nothing after compile_steps" do
+    {repo, ctx, encode} = marian(max_new_tokens: 6)
+    start = repo.config["decoder_start_token_id"]
+    texts = [@fox, @lighthouse, @fox <> " " <> @lighthouse, @essay]
+    [first | rest] = Enum.map(texts, encode)
+    ctx = Generation.compile(%{ctx | max_capacity: 128}, 2, @opts[:defn_options])
+    Generation.compile_steps(ctx, 2, first)
+    id = make_ref()
+    pid = self()
+
+    :telemetry.attach_many(
+      id,
+      [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+      fn event, _measurements, _metadata, _config -> if self() == pid, do: send(pid, event) end,
+      nil
+    )
+
+    request = &%{row: &1, prompt: [start], seed: 0, budget: 6, inputs: &2}
+    group = ctx |> Generation.open(2) |> then(&Generation.admit(ctx, &1, [request.(0, first)]))
+
+    group =
+      rest
+      |> Enum.with_index()
+      |> Enum.reduce(group, fn {given, i}, group ->
+        group = Generation.next(ctx, group)
+        group = run_until(ctx, group, &Enum.at(&1.done, rem(i + 1, 2)))
+        Generation.admit(ctx, group, [request.(rem(i + 1, 2), given)])
+      end)
+
+    Generation.finish(run_until(ctx, group, &Enum.all?(&1.done)))
+    :telemetry.detach(id)
+    refute_received [_ | _]
+    assert group.state.encoder_capacity == 256
+  end
+
+  # The context of the merged Marian decoder and a function that encodes a text into the
+  # inputs of the decoder for it.
+  defp marian(opts) do
+    {repo, encoder, decoder} =
+      Transmuter.Serving.load_encoder_decoder!({:hf, "Xenova/opus-mt-en-de"}, @opts)
+
+    tokenizer = Transmuter.Serving.tokenizer(repo, [])
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+
+    encode = fn text ->
+      {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+      ids = Transmuter.Tokenizer.ids(tokenizer, encoding)
+      mask = host.([List.duplicate(1, length(ids))])
+      inputs = %{"input_ids" => host.([ids]), "attention_mask" => mask}
+      %{"last_hidden_state" => states} = Transmuter.run(encoder, encoder.params, inputs)
+      %{"encoder_hidden_states" => states, "encoder_attention_mask" => mask}
+    end
+
+    repo = %{repo | generation_config: Map.put(repo.generation_config, "num_beams", 1)}
+    given = ["encoder_hidden_states", "encoder_attention_mask"]
+    {repo, Generation.context(repo, decoder, opts, given), encode}
   end
 
   # The capacities of the buffers in the steps that `fun` compiles, and the result of `fun`. The

@@ -44,9 +44,11 @@ defmodule Transmuter.ContinuousGeneration do
 
   The server takes a decoder whose rows can join a running batch, and it raises an `ArgumentError` at the start for the others:
 
-    * A merged decoder, such as `Xenova/gpt2`, runs each prompt on its branch without cache, but the rows that already run need the branch with cache in the same step.
-    * A decoder that grows its cache, or that takes one position offset for all rows, such as Apertus, needs one length of the cache for all rows of a step.
+    * A decoder that grows its cache, or that takes one position offset for all rows, such as Apertus and the merged decoders of llama2.c, T5 and moonshine, needs one length of the cache for all rows of a step.
     * With `num_beams` above 1, the rows of a prompt move together as beams, so a request cannot join between them.
+    * A merged decoder whose cross-attention cache reads other values than the outputs of the encoder cannot compute that cache for one request (see `Transmuter.Generation.MergedDecoder.cross/1`).
+
+  A merged decoder with an offset for each row, such as `Xenova/gpt2`, runs the prompt of a request on its branch with cache, next to the new tokens of the other rows (see "Merged decoders" in `Transmuter.Generation`).
 
   ## The server and the serving
 
@@ -120,9 +122,8 @@ defmodule Transmuter.ContinuousGeneration do
 
     {ctx, tokenizer, task} = module.task(opts[:source], opts)
 
-    unless Generation.joins?(ctx) do
-      raise ArgumentError,
-            "requests cannot join a running batch of this model: it is a merged decoder, it needs one length of the cache for all rows, or it has num_beams above 1"
+    if reason = Generation.cannot_join(ctx) do
+      raise ArgumentError, "requests cannot join a running batch of this model: #{reason}"
     end
 
     ctx = %{ctx | max_capacity: min(ctx.max_capacity || opts[:capacity], opts[:capacity])}

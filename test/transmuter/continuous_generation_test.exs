@@ -218,13 +218,23 @@ defmodule Transmuter.ContinuousGenerationTest do
     :telemetry.detach(id)
   end
 
-  # Requests cannot join a running batch of a merged decoder, which runs each prompt on its
-  # branch without cache, or of beam search, whose rows of a prompt move together.
+  # Requests cannot join a running batch of a merged decoder that grows its cache, such as
+  # the merged llama2.c, whose rows need one length of the cache, or of beam search, whose rows
+  # of a prompt move together. The error names the reason, with the node that reads the cache.
   test "a model whose rows cannot join a running batch raises at the start" do
+    source = {:hf, "Xenova/llama2.c-stories15M"}
+
+    merged =
+      Transmuter.load!({:hf, "Xenova/llama2.c-stories15M", "onnx/decoder_model_merged.onnx"},
+        backend: @opts[:backend],
+        outputs: &Transmuter.Generation.outputs/1
+      )
+
     for {source, opts, message} <- [
-          {{:hf, "Xenova/gpt2"}, [], ~r/requests cannot join a running batch/},
+          {source, [model: merged],
+           ~r/cannot join a running batch .* one length of the cache: .*, because \w+ \S+ reads/},
           {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, [num_beams: 2],
-           ~r/requests cannot join a running batch/}
+           ~r/cannot join a running batch of this model: it has num_beams 2/}
         ] do
       assert_raise ArgumentError, message, fn ->
         ContinuousGeneration.start_link([source: source] ++ opts ++ @opts)
