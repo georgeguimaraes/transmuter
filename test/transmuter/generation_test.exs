@@ -426,6 +426,47 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # The cross function gives the cross-attention cache of the branch without cache from the
+  # outputs of the encoder alone. The tokens give only the batch size, so a template token
+  # in place of the prompt keeps the cache.
+  test "the cross function of a merged decoder gives its cross-attention cache" do
+    for {repo, length} <- [{"Xenova/opus-mt-en-de", 7}, {"Xenova/whisper-tiny.en", 1500}] do
+      model =
+        Transmuter.load!({:hf, repo, "onnx/decoder_model_merged.onnx"},
+          backend: @opts[:backend],
+          outputs: &Generation.outputs/1
+        )
+
+      cross = Transmuter.Generation.MergedDecoder.cross(model)
+      {_type, [_batch, _length, hidden]} = model.input_types["encoder_hidden_states"]
+      host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+
+      encoder = %{
+        "encoder_hidden_states" =>
+          Nx.iota({1, length, hidden}, type: :f32, backend: @opts[:backend])
+          |> Nx.remainder(17)
+          |> Nx.subtract(8)
+          |> Nx.divide(8),
+        "encoder_attention_mask" => host.([List.duplicate(1, length)])
+      }
+
+      {inputs, static} = Generation.prompt_inputs(model, 1, 3)
+      inputs = Map.merge(inputs, Map.put(encoder, "input_ids", host.([[5, 9, 14]])))
+      full = Transmuter.run(model, model.params, Map.take(inputs, model.inputs), static)
+
+      given = Map.put(encoder, "input_ids", host.([[0]]))
+      outputs = Transmuter.run(cross, cross.params, Map.take(given, cross.inputs))
+
+      assert Enum.sort(cross.outputs) ==
+               full |> Map.keys() |> Enum.filter(&(&1 =~ ".encoder.")) |> Enum.sort()
+
+      for name <- cross.outputs do
+        diff = Nx.subtract(outputs[name], full[name]) |> Nx.abs() |> Nx.reduce_max()
+        assert Nx.to_number(diff) < 1.0e-6
+      end
+    end
+  end
+
   # A merged decoder whose position offset is one value for each row runs the prompt of each
   # length as one step without cache, and then decodes all rows in one group. gpt2 reads its
   # positions from a table, so 3 prompts of 30, 12 and 5 tokens give the greedy tokens of a

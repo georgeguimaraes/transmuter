@@ -955,6 +955,85 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
+  # The inputs whose values a cross function can read.
+  @cross_inputs ~w(encoder_hidden_states encoder_attention_mask)
+
+  @doc """
+  Returns the cross function of a merged decoder: a model of the nodes of its branch without cache that give the present of each cache entry outside `buffers/1`, the cross-attention cache, and its outputs are the names of these presents. The values of this cache may read only `encoder_hidden_states` and `encoder_attention_mask`. Other inputs, such as the tokens, may give only shapes, such as the batch size in the cross-attention of Marian, so the caller gives them as templates of one row and one token. Returns `nil` for a decoder without such a cache, and for one whose cache reads the values of another input.
+  """
+  def cross(model) do
+    with {node, _graph} <- cache_if(model),
+         cross = Enum.map(cross_cache(model), &("present." <> &1)),
+         [_ | _] <- cross do
+      without = Enum.find_value(node.attribute, &(&1.name == "else_branch" && &1.g))
+
+      outputs =
+        for {name, index} <- Enum.with_index(node.output),
+            name in cross,
+            do: {name, Enum.at(without.output, index).name}
+
+      nodes = Enum.take_while(model.nodes, &(&1 != node)) ++ without.node
+      names = MapSet.new(outputs, &elem(&1, 1))
+
+      local =
+        Map.new(without.initializer, fn t ->
+          {t.name, t |> Transmuter.Ops.tensor() |> Transmuter.upcast(model.compute_type)}
+        end)
+
+      known = ["" | Map.keys(model.params) ++ Map.keys(model.static) ++ Map.keys(local)]
+      value = &Transmuter.value_dependencies/1
+      values = reads(slice(nodes, names, value), value, known)
+      nodes = slice(nodes, names, &Transmuter.dependencies/1)
+      inputs = reads(nodes, &Transmuter.dependencies/1, known)
+
+      # The branch names its outputs, which can differ from the outputs of the If.
+      renames =
+        for {outer, inner} <- outputs,
+            inner != outer,
+            do: %NodeProto{op_type: "Identity", name: outer, input: [inner], output: [outer]}
+
+      if values -- @cross_inputs == [] and inputs -- model.inputs == [] do
+        %{
+          model
+          | nodes: nodes ++ renames,
+            static: Map.merge(model.static, local),
+            inputs: inputs,
+            input_types: Map.take(model.input_types, inputs),
+            outputs: cross,
+            output_types: Map.take(model.output_types, cross)
+        }
+      end
+    else
+      _other -> nil
+    end
+  end
+
+  # The cache entries outside the buffers, without the "past_key_values." prefix.
+  defp cross_cache(model) do
+    buffers = buffers(model)
+    for "past_key_values." <> name = full <- model.inputs, full not in buffers, do: name
+  end
+
+  # The nodes of `nodes`, in order, that the values of `names` need through `dependencies`.
+  defp slice(nodes, names, dependencies) do
+    {kept, _names} =
+      nodes
+      |> Enum.reverse()
+      |> Enum.reduce({[], names}, fn node, {kept, names} ->
+        if Enum.any?(node.output, &MapSet.member?(names, &1)),
+          do: {[node | kept], MapSet.union(names, MapSet.new(dependencies.(node)))},
+          else: {kept, names}
+      end)
+
+    kept
+  end
+
+  # The names that `nodes` read through `dependencies` and do not make, other than `known`.
+  defp reads(nodes, dependencies, known) do
+    made = Enum.flat_map(nodes, & &1.output)
+    Enum.uniq(Enum.flat_map(nodes, dependencies)) -- (made ++ known)
+  end
+
   defp where(nil), do: "a graph input"
   defp where(node), do: "#{node.op_type} #{node.name}"
 
