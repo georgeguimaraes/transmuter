@@ -103,7 +103,7 @@ defmodule Transmuter.Generation.MergedDecoder do
          scope
        ) do
     axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
-    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+    list = &static_list(scope, &1, producers[index])
 
     axis == 0 and
       case producers[index] do
@@ -184,13 +184,16 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     graph.node
     |> Enum.reduce_while(after_reads, fn node, after_reads ->
-      shape = Enum.at(node.input, 1, "")
-      first = scope.values[shape] && scope.values[shape] |> Nx.to_flat_list() |> List.first()
-
       cond do
-        not Enum.any?(node.input, &MapSet.member?(after_reads, &1)) -> {:cont, after_reads}
-        node.op_type in ["Reshape", "Expand"] and first == 1 -> {:halt, node}
-        true -> {:cont, MapSet.union(after_reads, MapSet.new(node.output))}
+        not Enum.any?(node.input, &MapSet.member?(after_reads, &1)) ->
+          {:cont, after_reads}
+
+        node.op_type in ["Reshape", "Expand"] and
+            match?([1 | _], static_list(scope, Enum.at(node.input, 1), node)) ->
+          {:halt, node}
+
+        true ->
+          {:cont, MapSet.union(after_reads, MapSet.new(node.output))}
       end
     end)
     |> case do
@@ -367,6 +370,27 @@ defmodule Transmuter.Generation.MergedDecoder do
     %{values: values, static: MapSet.new(Map.keys(values))}
   end
 
+  # The values of a static input of a node as a list, or nil when the input is not static. Only
+  # a small value, such as a shape, an axis, a start or a step, becomes a list: a walk that
+  # reads a weight, as a list of millions of terms, raises.
+  defp static_list(scope, name, node) do
+    value = scope.values[name]
+
+    cond do
+      value == nil ->
+        nil
+
+      Nx.rank(value) <= 1 and Nx.size(value) <= 16 ->
+        Nx.to_flat_list(value)
+
+      true ->
+        raise ArgumentError,
+              "the rewrite reads the static input #{name} of #{node.op_type} node " <>
+                "#{inspect(node.name)} as a list, but its shape #{inspect(Nx.shape(value))} " <>
+                "is not a shape, an axis or an index"
+    end
+  end
+
   defp past_use(walk, node = %{op_type: op, input: [source | _]}, _kinds)
        when op in ["Shape", "Size"] do
     sliced? = Enum.any?(node.attribute, &(&1.name in ["start", "end"]))
@@ -446,9 +470,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   # A Slice from 0 to a shift of L with step 1, a prefix. With a buffer it keeps C + n rows in
   # place of v + n, which hold every row that a step reads, and it shifts nothing. Its output
   # keeps the kind of its data.
-  defp prefix?(scope, %{op_type: "Slice", input: [_data, starts, ends | rest]}, kinds) do
+  defp prefix?(scope, node = %{op_type: "Slice", input: [_data, starts, ends | rest]}, kinds) do
     steps = Enum.at(rest, 1, "")
-    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+    list = &static_list(scope, &1, node)
     all? = fn name, value -> list.(name) != nil and Enum.all?(list.(name), &(&1 == value)) end
     all?.(starts, 0) and kinds[ends] == :shift and (steps == "" or all?.(steps, 1))
   end
@@ -458,7 +482,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   # A dimension of a shape: the length is a shift of L, another dimension does not depend on it.
   defp dims(scope, node = %{op_type: op, input: [shape | rest]}, kinds) do
     {:dims, axis, rank} = kinds[shape]
-    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+    list = &static_list(scope, &1, node)
     from_end = &if(&1 >= 0 and &1 < rank, do: &1 - rank, else: &1)
 
     picked =
@@ -526,9 +550,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   # unless an earlier walk found that a use compares or mixes it with L (see value_use/2), as
   # the causal mask of moonshine compares the key index with the positions of L.
   defp key_positions?(walk, node = %{op_type: "Range", input: [start, _limit | _]}, deps) do
-    value = walk.scope.values[start]
-
-    deps == [{1, :shift}] and value != nil and Nx.to_flat_list(value) == [0] and
+    deps == [{1, :shift}] and static_list(walk.scope, start, node) == [0] and
       not MapSet.member?(walk.index, hd(node.output))
   end
 
@@ -597,7 +619,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   # A Slice of a causal table, or of a slice of it, on its last two axes, from and to shifts of L.
   defp causal_slice(scope, node = %{input: [_, starts, ends, axes | _]}, kinds, {rank, size}) do
-    axes = scope.values[axes] && Nx.to_flat_list(scope.values[axes])
+    axes = static_list(scope, axes, node)
     last = [rank - 2, rank - 1, -2, -1]
 
     if kinds[starts] in [nil, :shift] and kinds[ends] in [nil, :shift] and axes != nil and
@@ -634,9 +656,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     axis == 0 and kinds[index] == :shift
   end
 
-  defp position_index?(scope, %{op_type: "Slice", input: [_, starts, ends | rest]}, kinds) do
+  defp position_index?(scope, node = %{op_type: "Slice", input: [_, starts, ends | rest]}, kinds) do
     [axes, steps] = Enum.take(rest ++ ["", ""], 2)
-    list = &(scope.values[&1] && Nx.to_flat_list(scope.values[&1]))
+    list = &static_list(scope, &1, node)
 
     kinds[starts] == :shift and kinds[ends] == :shift and list.(axes) == [0] and
       (steps == "" or list.(steps) == [1])
