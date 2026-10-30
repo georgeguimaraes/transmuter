@@ -23,8 +23,7 @@ defmodule Transmuter.Vision.DepthEstimation do
 
       pixels =
         featurizer
-        |> Featurizer.process([image], backend: backend)
-        |> Nx.backend_transfer(Nx.BinaryBackend)
+        |> Featurizer.process_on_host([image], backend: backend)
 
       %{
         "pixel_values" => pixels[0],

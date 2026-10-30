@@ -35,8 +35,7 @@ defmodule Transmuter.Vision.MaskGeneration do
 
       pixels =
         featurizer
-        |> Featurizer.process([image], backend: backend)
-        |> Nx.backend_transfer(Nx.BinaryBackend)
+        |> Featurizer.process_on_host([image], backend: backend)
 
       prompts
       |> prompt_tensors({resized_width / width, resized_height / height})

@@ -97,10 +97,12 @@ defmodule Mix.Tasks.Transmuter.Graph do
 
   defp default_backend, do: if(Code.ensure_loaded?(EXLA), do: "exla", else: "binary")
 
-  defp backend("exla"), do: {{EXLA.Backend, client: :host}, compiler: EXLA, client: :host}
-  defp backend("emlx"), do: {{EMLX.Backend, device: :cpu}, compiler: EMLX, device: :cpu}
-  defp backend("binary"), do: {Nx.BinaryBackend, compiler: Nx.Defn.Evaluator}
+  defp backend("exla"), do: with_compiler({EXLA.Backend, client: :host})
+  defp backend("emlx"), do: with_compiler({EMLX.Backend, device: :cpu})
+  defp backend("binary"), do: with_compiler(Nx.BinaryBackend)
   defp backend(other), do: Mix.raise("--backend is exla, emlx or binary, not #{other}")
+
+  defp with_compiler(backend), do: {backend, Transmuter.compiler_options(backend)}
 
   @doc false
   # Parses each --dim NAME=SIZE.

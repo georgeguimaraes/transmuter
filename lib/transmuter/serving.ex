@@ -162,8 +162,7 @@ defmodule Transmuter.Serving do
         for group <- if(size, do: [images], else: Enum.map(images, &[&1])) do
           pixels =
             featurizer
-            |> Featurizer.process(group, backend: backend)
-            |> Nx.backend_transfer(Nx.BinaryBackend)
+            |> Featurizer.process_on_host(group, backend: backend)
 
           {image_inputs(model, pixels), key}
         end

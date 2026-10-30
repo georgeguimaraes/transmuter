@@ -226,8 +226,7 @@ defmodule Transmuter.Vision.ImageToText do
 
   defp pixels(featurizer, image, backend) do
     featurizer
-    |> Featurizer.process([image], backend: backend)
-    |> Nx.backend_transfer(Nx.BinaryBackend)
+    |> Featurizer.process_on_host([image], backend: backend)
     |> then(& &1[0])
   end
 

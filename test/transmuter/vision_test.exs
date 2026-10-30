@@ -132,6 +132,52 @@ defmodule Transmuter.VisionTest do
     end
   end
 
+  # The steps of an image compile for the buckets of its size: 200 to 220 rows give 256 and
+  # 260 to 300 columns give 384, and the taps of the resize to 224 have up to 4 pixels. So
+  # three images of these sizes compile one function. The test counts the compiles of EXLA
+  # on the host, which CI also has.
+  @tag ci_partition: 17
+  test "images of sizes in one bucket compile the steps of the featurizer once" do
+    featurizer =
+      Featurizer.new(%{
+        "image_processor_type" => "ViTImageProcessor",
+        "size" => %{"height" => 224, "width" => 224},
+        "image_mean" => [0.5, 0.5, 0.5],
+        "image_std" => [0.5, 0.5, 0.5]
+      })
+
+    pixels = StbImage.to_nx(@image)
+    id = {__MODULE__, make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      id,
+      [:exla, :compilation],
+      fn _event, _measurements, _metadata, _config ->
+        if self() == parent, do: send(parent, {id, :compiled})
+      end,
+      nil
+    )
+
+    values =
+      for {height, width} <- [{200, 260}, {210, 280}, {220, 300}] do
+        image = Nx.slice(pixels, [0, 0, 0], [height, width, 3])
+        Featurizer.process(featurizer, [image], backend: {EXLA.Backend, client: :host})
+      end
+
+    :telemetry.detach(id)
+    assert Enum.map(values, &Nx.shape/1) == List.duplicate({1, 3, 224, 224}, 3)
+    assert length(for {^id, :compiled} <- flush_messages(), do: :compiled) == 1
+  end
+
+  defp flush_messages do
+    receive do
+      message -> [message | flush_messages()]
+    after
+      0 -> []
+    end
+  end
+
   @tag :smoke
   @tag ci_partition: 17
   test "image classification matches the pipeline" do

@@ -29,8 +29,7 @@ defmodule Transmuter.Vision.ImageToImage do
 
       pixels =
         featurizer
-        |> Featurizer.process([image], backend: backend)
-        |> Nx.backend_transfer(Nx.BinaryBackend)
+        |> Featurizer.process_on_host([image], backend: backend)
 
       %{
         "pixel_values" => pixels[0],
@@ -44,7 +43,7 @@ defmodule Transmuter.Vision.ImageToImage do
       # 144x112. So the serving starts with the pixel values of the smallest image, and
       # compiles the size of each image on its first call.
       pixel = Nx.broadcast(Nx.tensor(0, type: :u8, backend: Nx.BinaryBackend), {1, 1, 3})
-      template = %{"pixel_values" => Featurizer.process(featurizer, [pixel])}
+      template = %{"pixel_values" => Featurizer.process_on_host(featurizer, [pixel])}
       run = Transmuter.compile(model, template, [cache_size: @image_sizes] ++ defn_options)
 
       fn %{"pixel_values" => pixels, "size" => size} ->

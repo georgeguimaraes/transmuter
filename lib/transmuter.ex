@@ -1045,6 +1045,20 @@ defmodule Transmuter do
   end
 
   @doc false
+  # The options of Nx.Defn.jit/2 and Nx.Defn.compile/3 that run on `backend`, the inverse of
+  # Nx.Defn.to_backend/1 for the backends of Transmuter. A backend without a compiler runs on
+  # Nx.Defn.Evaluator.
+  def compiler_options(module) when is_atom(module), do: compiler_options({module, []})
+
+  def compiler_options({EXLA.Backend, opts}),
+    do: [compiler: EXLA] ++ Keyword.take(opts, [:client])
+
+  def compiler_options({EMLX.Backend, opts}),
+    do: [compiler: EMLX] ++ Keyword.take(opts, [:device])
+
+  def compiler_options({_module, _opts}), do: [compiler: Nx.Defn.Evaluator]
+
+  @doc false
   # Moves the params of model to backend and returns the model with that backend. An EMLX
   # backend without a :device gets the device of the EMLX compiler (see Transmuter.EMLX.backend/1).
   #

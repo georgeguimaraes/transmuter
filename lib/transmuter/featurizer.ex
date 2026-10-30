@@ -247,74 +247,359 @@ defmodule Transmuter.Featurizer do
   @doc """
   Turns a list of images into one tensor of shape `{batch, channels, height, width}` and type `:f32`. The images must give the same size.
 
+  The steps of an image run in one compiled function. The host computes the sizes of the steps and the taps of each resize and crop from the size of the image, and the function gets the image and the taps padded to buckets of size. So images of many sizes compile few functions (see "Buckets" below).
+
   ## Options
 
-    * `:backend` - the backend that does the steps, such as `EMLX.Backend`. The default is the backend of each image. The resize is slow on `Nx.BinaryBackend`.
+    * `:backend` - the backend that runs the steps, such as `EMLX.Backend` or `{EXLA.Backend, client: :cuda}`. The default is the backend of each image. The steps are slow on `Nx.BinaryBackend`.
+
+  ## Buckets
+
+  Each side of the image and of the result of each step rounds up to the next size of the form 2^k or 3 * 2^(k - 1) (..., 256, 384, 512, 768, 1024, ...), so the function sees at most 1.5 times each side. The taps of each output pixel of a resize round up to a power of two, with the weight 0 for the added taps. The taps read only the pixels of the real image, so the padding of a bucket does not change the result: an added tap adds an exact 0. The host cuts the real result from the bucket at the end.
   """
   def process(featurizer, images, opts \\ []) do
-    images
-    |> Enum.map(&process_image(featurizer, &1, opts[:backend]))
-    |> Nx.stack()
+    {:ok, first} = images |> hd() |> tensor()
+    backend = opts[:backend] || first.data.__struct__
+    featurizer |> process_on_host(images, opts) |> Nx.backend_transfer(backend)
+  end
+
+  @doc false
+  # process/3 with the result on Nx.BinaryBackend, where the host cuts it from its bucket, for
+  # the callers that keep the result on the host.
+  def process_on_host(featurizer, images, opts \\ []) do
+    images |> Enum.map(&process_image(featurizer, &1, opts[:backend])) |> stack()
   end
 
   defp process_image(featurizer, image, backend) do
     image =
       case tensor(image) do
-        {:ok, image} when backend == nil -> image
-        {:ok, image} -> Nx.backend_transfer(image, backend)
+        {:ok, image} -> image
         {:error, message} -> raise ArgumentError, message
       end
 
-    image = if featurizer.rgb, do: rgb(image), else: image
+    compiler = Transmuter.compiler_options(backend || image.data.__struct__)
+    image = Nx.backend_copy(image, Nx.BinaryBackend)
 
-    image =
+    {height, width, channels} = Nx.shape(image)
+    {steps, args, {out_height, out_width}} = plan(featurizer, {height, width}, Nx.type(image))
+    image = pad_bucket(image, {bucket(height), bucket(width), channels})
+    run = Nx.Defn.jit(&run_steps(steps, &1, &2), compiler)
+    image |> run.(List.to_tuple(args)) |> cut({out_height, out_width})
+  end
+
+  # The steps of an image in the order of the image processor, as {steps, args, size}: each
+  # step is static (its kind and the static values that decide the compiled function), the
+  # args are the tensors of the steps, such as the taps, and size is the real size of the
+  # result. The steps run in run_steps/3. The OWLv2 image processor rescales and pads before
+  # it resizes.
+  defp plan(featurizer, size, type) do
+    order =
+      if featurizer.resample == :gaussian_linear,
+        do: [:rgb, :rescale, :pad, :resize, :normalize],
+        else: [:rgb, :resize, :crop, :rescale, :normalize, :pad]
+
+    {steps, {size, _type}} =
+      Enum.flat_map_reduce(order, {size, type}, &plan_step(featurizer, &1, &2))
+
+    {steps, args} =
+      Enum.map_reduce(steps, [], fn {step, step_args}, args ->
+        {{step, length(args)}, args ++ step_args}
+      end)
+
+    {steps, args, size}
+  end
+
+  defp plan_step(%{rgb: true}, :rgb, state), do: {[{:rgb, []}], state}
+
+  defp plan_step(%{resize: resize} = featurizer, :resize, {size, type}) when resize != nil do
+    {height, width} = output_size(resize, size)
+
+    type =
+      if type == {:u, 8} and featurizer.resample != :gaussian_linear, do: type, else: {:f, 32}
+
+    width_step = resize_taps(featurizer, elem(size, 1), width, 1, type)
+    height_step = resize_taps(featurizer, elem(size, 0), height, 0, type)
+    steps = width_step ++ height_step
+
+    # The resize of the OWLv2 image processor clips to the minimum and the maximum of its
+    # input, which the mask of the real pixels takes without the bucket.
+    steps =
       if featurizer.resample == :gaussian_linear do
-        image
-        |> rescale(featurizer)
-        |> pad(featurizer.pad)
-        |> resize_step(featurizer)
-        |> normalize(featurizer.normalize)
+        real = Nx.tensor(Tuple.to_list(size), type: :s32, backend: Nx.BinaryBackend)
+        [{:bounds, [real]}] ++ steps ++ [{:clip, []}]
       else
-        image
-        |> resize_step(featurizer)
-        |> center_crop(featurizer.crop)
-        |> rescale(featurizer)
-        |> normalize(featurizer.normalize)
-        |> pad(featurizer.pad)
+        steps
       end
+
+    {steps, {{height, width}, type}}
+  end
+
+  defp plan_step(%{crop: {height, width}}, :crop, {size, type}) do
+    steps = crop_taps(elem(size, 0), height, 0) ++ crop_taps(elem(size, 1), width, 1)
+    {steps, {{height, width}, type}}
+  end
+
+  defp plan_step(featurizer, :rescale, {size, _type}),
+    do: {[{{:rescale, featurizer.rescale}, []}], {size, {:f, 32}}}
+
+  defp plan_step(%{normalize: {mean, std}}, :normalize, state) do
+    mean = Nx.tensor(mean, type: :f32, backend: Nx.BinaryBackend)
+    std = Nx.tensor(std, type: :f32, backend: Nx.BinaryBackend)
+    {[{:normalize, [mean, std]}], state}
+  end
+
+  defp plan_step(%{pad: {target, value}}, :pad, {{height, width}, type}) do
+    {to_height, to_width} = pad_size(target, {height, width})
+    steps = pad_taps(height, to_height, 0, value) ++ pad_taps(width, to_width, 1, value)
+    {steps, {{to_height, to_width}, type}}
+  end
+
+  defp plan_step(_featurizer, _step, state), do: {[], state}
+
+  # The resize of one axis as a gather: the input pixels and the weights of each output pixel,
+  # as resize/4 computes them. A u8 image gets the weights as integers with fraction bits.
+  defp resize_taps(_featurizer, size, size, _axis, _type), do: []
+
+  defp resize_taps(featurizer, in_size, size, axis, type) do
+    taps = taps(in_size, size, featurizer.resample)
+    weights = Enum.map(taps, fn row -> Enum.map(row, &elem(&1, 1)) end)
+
+    case type do
+      {:u, 8} ->
+        bits = precision_bits(weights, featurizer.resample, featurizer.weights)
+        one = 2 ** bits
+
+        fixed =
+          Enum.map(taps, fn row ->
+            Enum.map(row, fn {j, w} -> {j, trunc(w * one + if(w < 0, do: -0.5, else: 0.5))} end)
+          end)
+
+        [gather_step(fixed, size, axis, {:s, 32}, {:u8, bits})]
+
+      _f32 ->
+        [gather_step(taps, size, axis, {:f, 32}, :f32)]
+    end
+  end
+
+  # A crop keeps the center of an axis, and a crop larger than the axis pads it with zeros on
+  # both sides, as center_crop of Python transformers.
+  defp crop_taps(size, size, _axis), do: []
+
+  defp crop_taps(in_size, size, axis) do
+    indices =
+      if in_size > size do
+        offset = div(in_size - size, 2)
+        Enum.map(0..(size - 1), &[{offset + &1, 1}])
+      else
+        low = div(size - in_size + 1, 2)
+
+        Enum.map(
+          0..(size - 1),
+          &if(&1 >= low and &1 < low + in_size, do: [{&1 - low, 1}], else: [])
+        )
+      end
+
+    [take_step(indices, size, axis)]
+  end
+
+  # A pad on the bottom and the right: the symmetric padding of numpy reflects the image with
+  # its edge pixel (a b c | c b a), and a value pads with that value.
+  defp pad_taps(size, size, _axis, _value), do: []
+
+  defp pad_taps(in_size, size, axis, :symmetric) do
+    indices =
+      for i <- 0..(size - 1) do
+        i = rem(i, 2 * in_size)
+        [{if(i < in_size, do: i, else: 2 * in_size - 1 - i), 1}]
+      end
+
+    [take_step(indices, size, axis)]
+  end
+
+  defp pad_taps(in_size, size, axis, value) do
+    taps = for i <- 0..(size - 1), do: if(i < in_size, do: [{i, 1.0}], else: [])
+    bias = for i <- 0..(size - 1), do: if(i < in_size, do: 0.0, else: value / 1)
+    bias = bias ++ List.duplicate(0.0, bucket(size) - size)
+    {{:gather, ^axis, :f32}, args} = gather_step(taps, size, axis, {:f, 32}, :f32)
+    [{{:gather, axis, :bias}, args ++ [Nx.tensor(bias, type: :f32, backend: Nx.BinaryBackend)]}]
+  end
+
+  # A gather with weights on one axis: the indices and the weights of each output pixel, padded
+  # to the bucket of the size and to a power of two of taps with the index 0 and the weight 0.
+  defp gather_step(taps, size, axis, type, path) do
+    width = taps |> Enum.map(&length/1) |> Enum.max() |> max(1) |> power_of_two()
+    rows = bucket(size)
+    empty = List.duplicate({0, 0}, width)
+    taps = Enum.map(taps, &(&1 ++ Enum.drop(empty, length(&1))))
+    taps = taps ++ List.duplicate(empty, rows - size)
+    indices = for row <- taps, {j, _w} <- row, do: j
+    weights = for row <- taps, {_j, w} <- row, do: w
+
+    indices =
+      indices |> Nx.tensor(type: :s32, backend: Nx.BinaryBackend) |> Nx.reshape({rows, width})
+
+    weights =
+      weights |> Nx.tensor(type: type, backend: Nx.BinaryBackend) |> Nx.reshape({rows, width})
+
+    {{:gather, axis, path}, [indices, weights]}
+  end
+
+  # A gather without weights on one axis: the input pixel of each output pixel, or no pixel,
+  # which gives 0.
+  defp take_step(taps, size, axis) do
+    taps = taps ++ List.duplicate([], bucket(size) - size)
+    index = Enum.map(taps, fn tap -> if tap == [], do: 0, else: elem(hd(tap), 0) end)
+    mask = Enum.map(taps, &if(&1 == [], do: 0, else: 1))
+
+    {{:take, axis},
+     [
+       Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend),
+       Nx.tensor(mask, type: :u8, backend: Nx.BinaryBackend)
+     ]}
+  end
+
+  # The compiled function of the steps. The steps are static, so the function compiles once
+  # for each set of steps and of bucket shapes. The bounds of a :bounds step stay for the
+  # :clip step after the resize.
+  defp run_steps(steps, image, args) do
+    {image, _bounds} =
+      Enum.reduce(steps, {image, nil}, fn {step, at}, {image, bounds} ->
+        run_step(step, {image, bounds}, args, at)
+      end)
 
     Nx.transpose(image, axes: [2, 0, 1])
   end
 
-  defp resize_step(image, %{resize: nil}), do: image
+  defp run_step(:rgb, {image, bounds}, _args, _at) do
+    {height, width, channels} = Nx.shape(image)
 
-  defp resize_step(image, featurizer) do
-    {height, width, _channels} = Nx.shape(image)
-    size = output_size(featurizer.resize, {height, width})
-    resize(image, size, featurizer.resample, featurizer.weights)
+    image =
+      if channels < 3,
+        do: image |> Nx.slice_along_axis(0, 1, axis: 2) |> Nx.broadcast({height, width, 3}),
+        else: Nx.slice_along_axis(image, 0, 3, axis: 2)
+
+    {image, bounds}
   end
 
-  defp rescale(image, featurizer) do
+  defp run_step({:rescale, factor}, {image, bounds}, _args, _at) do
     image = Nx.as_type(image, :f32)
-    if featurizer.rescale, do: Nx.multiply(image, featurizer.rescale), else: image
+    {if(factor, do: Nx.multiply(image, factor), else: image), bounds}
   end
 
-  # Pads the bottom and the right of the image to a square of its long side
-  # (Owlv2ImageProcessor), to a size (pad_size of SamImageProcessor) or to the next multiple
-  # of a size (Swin2SRImageProcessor). The padding is a value, or :symmetric, the mode of
-  # numpy.pad that reflects the image with its edge pixel: a b c | c b a.
-  defp pad(image, nil), do: image
+  defp run_step(:normalize, {image, bounds}, args, at),
+    do: {image |> Nx.subtract(elem(args, at)) |> Nx.divide(elem(args, at + 1)), bounds}
 
-  defp pad(image, {target, value}) do
-    {height, width, _channels} = Nx.shape(image)
-    {to_height, to_width} = pad_size(target, {height, width})
+  defp run_step(:bounds, {image, nil}, args, at) do
+    {height, width, _channels} = shape = Nx.shape(image)
+    real = elem(args, at)
+    rows = Nx.less(Nx.iota({height, 1, 1}), real[0])
+    columns = Nx.less(Nx.iota({1, width, 1}), real[1])
+    mask = Nx.broadcast(Nx.logical_and(rows, columns), shape)
+    low = Nx.reduce_min(Nx.select(mask, image, Nx.Constants.max_finite(:f32)))
+    high = Nx.reduce_max(Nx.select(mask, image, Nx.Constants.min_finite(:f32)))
+    {image, {low, high}}
+  end
 
-    if value == :symmetric do
-      image |> symmetric(0, to_height) |> symmetric(1, to_width)
-    else
-      padding = [{0, to_height - height, 0}, {0, to_width - width, 0}, {0, 0, 0}]
-      Nx.pad(image, Nx.tensor(value, type: Nx.type(image)), padding)
-    end
+  defp run_step(:clip, {image, {low, high}}, _args, _at), do: {Nx.clip(image, low, high), nil}
+
+  defp run_step({:take, axis}, {image, bounds}, args, at) do
+    mask = elem(args, at + 1) |> Nx.as_type(Nx.type(image)) |> along(axis)
+    {image |> Nx.take(elem(args, at), axis: axis) |> Nx.multiply(mask), bounds}
+  end
+
+  defp run_step({:gather, axis, path}, {image, bounds}, args, at) do
+    {indices, weights} = {elem(args, at), elem(args, at + 1)}
+    {rows, width} = Nx.shape(indices)
+    shape = image |> Nx.shape() |> put_elem(axis, rows) |> Tuple.insert_at(axis + 1, width)
+    weight_shape = for(a <- 0..3, do: if(a in [axis, axis + 1], do: elem(shape, a), else: 1))
+    weights = Nx.reshape(weights, List.to_tuple(weight_shape))
+    gathered = image |> Nx.take(Nx.flatten(indices), axis: axis) |> Nx.reshape(shape)
+
+    image =
+      case path do
+        {:u8, bits} ->
+          gathered
+          |> Nx.as_type(:s32)
+          |> Nx.multiply(weights)
+          |> Nx.sum(axes: [axis + 1])
+          |> Nx.add(div(2 ** bits, 2))
+          |> Nx.right_shift(bits)
+          |> Nx.clip(0, 255)
+          |> Nx.as_type(:u8)
+
+        :f32 ->
+          gathered |> Nx.as_type(:f32) |> Nx.multiply(weights) |> Nx.sum(axes: [axis + 1])
+
+        :bias ->
+          gathered
+          |> Nx.multiply(weights)
+          |> Nx.sum(axes: [axis + 1])
+          |> Nx.add(along(elem(args, at + 2), axis))
+      end
+
+    {image, bounds}
+  end
+
+  # A vector of one value for each pixel of an axis, shaped to broadcast along that axis of an
+  # image {height, width, channels}.
+  defp along(vector, 0), do: Nx.reshape(vector, {Nx.size(vector), 1, 1})
+  defp along(vector, 1), do: Nx.reshape(vector, {1, Nx.size(vector), 1})
+
+  # The bucket of a size: the next size of the form 2^k or 3 * 2^(k - 1).
+  @doc false
+  def bucket(size) when size <= 2, do: size
+
+  def bucket(size) do
+    power = power_of_two(size)
+    if div(power * 3, 4) >= size, do: div(power * 3, 4), else: power
+  end
+
+  defp power_of_two(size), do: 2 ** length(Integer.digits(size - 1, 2))
+
+  # The image {height, width, channels} on the host, with zeros after it to the bucket shape.
+  defp pad_bucket(image, {height, width, channels}) do
+    {rows, columns, ^channels} = Nx.shape(image)
+    {_kind, bits} = type = Nx.type(image)
+    row = div(columns * channels * bits, 8)
+    binary = Nx.to_binary(image)
+    zeros = :binary.copy(<<0>>, div((width - columns) * channels * bits, 8))
+
+    padded = [
+      for(r <- 0..(rows - 1), do: [binary_part(binary, r * row, row), zeros]),
+      :binary.copy(<<0>>, div((height - rows) * width * channels * bits, 8))
+    ]
+
+    padded
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+    |> Nx.reshape({height, width, channels})
+  end
+
+  # The real result {channels, height, width} of a result in its bucket, on the host.
+  defp cut(image, {height, width}) do
+    {channels, rows, columns} = Nx.shape(image)
+    binary = Nx.to_binary(image)
+    {_kind, bits} = type = Nx.type(image)
+    row = div(columns * bits, 8)
+    size = div(width * bits, 8)
+
+    for(
+      c <- 0..(channels - 1),
+      r <- 0..(height - 1),
+      do: binary_part(binary, (c * rows + r) * row, size)
+    )
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+    |> Nx.reshape({channels, height, width})
+  end
+
+  # The images {channels, height, width} on the host as one tensor with a batch axis.
+  defp stack(images = [first | _]) do
+    images
+    |> Enum.map(&Nx.to_binary/1)
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(Nx.type(first), backend: Nx.BinaryBackend)
+    |> Nx.reshape(Tuple.insert_at(Nx.shape(first), 0, length(images)))
   end
 
   defp pad_size(:square, {height, width}), do: {max(height, width), max(height, width)}
@@ -324,18 +609,6 @@ defmodule Transmuter.Featurizer do
     do: {(div(height, multiple) + 1) * multiple, (div(width, multiple) + 1) * multiple}
 
   defp pad_size({to_height, to_width}, _size), do: {to_height, to_width}
-
-  defp symmetric(image, axis, to_size) do
-    size = Nx.axis_size(image, axis)
-
-    indices =
-      for i <- 0..(to_size - 1) do
-        i = rem(i, 2 * size)
-        if i < size, do: i, else: 2 * size - 1 - i
-      end
-
-    Nx.take(image, Nx.tensor(indices, backend: Nx.BinaryBackend), axis: axis)
-  end
 
   @doc """
   Returns `{:ok, tensor}` for an image, a `StbImage` struct or a tensor of shape `{height, width, channels}`. Returns `{:error, message}` for other values.
@@ -419,39 +692,6 @@ defmodule Transmuter.Featurizer do
       rem(low, 2) == 0 -> low
       true -> low + 1
     end
-  end
-
-  # As center_crop of Python transformers: an image smaller than the crop is padded with zeros.
-  defp center_crop(image, nil), do: image
-
-  defp center_crop(image, {height, width}) do
-    image |> crop_axis(0, height) |> crop_axis(1, width)
-  end
-
-  defp crop_axis(image, axis, size) do
-    case Nx.axis_size(image, axis) do
-      ^size ->
-        image
-
-      in_size when in_size > size ->
-        Nx.slice_along_axis(image, div(in_size - size, 2), size, axis: axis)
-
-      in_size ->
-        low = div(size - in_size + 1, 2)
-
-        padding =
-          for a <- 0..2, do: if(a == axis, do: {low, size - in_size - low, 0}, else: {0, 0, 0})
-
-        Nx.pad(image, Nx.tensor(0, type: Nx.type(image)), padding)
-    end
-  end
-
-  defp normalize(image, nil), do: image
-
-  defp normalize(image, {mean, std}) do
-    mean = Nx.tensor(mean, type: :f32, backend: Nx.BinaryBackend)
-    std = Nx.tensor(std, type: :f32, backend: Nx.BinaryBackend)
-    image |> Nx.subtract(mean) |> Nx.divide(std)
   end
 
   @doc """
