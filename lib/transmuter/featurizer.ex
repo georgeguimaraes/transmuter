@@ -258,8 +258,7 @@ defmodule Transmuter.Featurizer do
   Each side of the image and of the result of each step rounds up to the next size of the form 2^k or 3 * 2^(k - 1) (..., 256, 384, 512, 768, 1024, ...), so the function sees at most 1.5 times each side. The taps of each output pixel of a resize round up to a power of two, with the weight 0 for the added taps. The taps read only the pixels of the real image, so the padding of a bucket does not change the result: an added tap adds an exact 0. The host cuts the real result from the bucket at the end.
   """
   def process(featurizer, images, opts \\ []) do
-    {:ok, first} = images |> hd() |> tensor()
-    backend = opts[:backend] || first.data.__struct__
+    backend = opts[:backend] || image!(hd(images)).data.__struct__
     featurizer |> process_on_host(images, opts) |> Nx.backend_transfer(backend)
   end
 
@@ -270,13 +269,16 @@ defmodule Transmuter.Featurizer do
     images |> Enum.map(&process_image(featurizer, &1, opts[:backend])) |> stack()
   end
 
-  defp process_image(featurizer, image, backend) do
-    image =
-      case tensor(image) do
-        {:ok, image} -> image
-        {:error, message} -> raise ArgumentError, message
-      end
+  # The tensor of an image, or an ArgumentError with the message of tensor/1.
+  defp image!(image) do
+    case tensor(image) do
+      {:ok, image} -> image
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
 
+  defp process_image(featurizer, image, backend) do
+    image = image!(image)
     compiler = Transmuter.compiler_options(backend || image.data.__struct__)
     image = Nx.backend_copy(image, Nx.BinaryBackend)
 
