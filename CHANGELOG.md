@@ -1,5 +1,90 @@
 # Changelog
 
+## [2.1.0](https://github.com/georgeguimaraes/transmuter/compare/v2.0.0...v2.1.0) (2026-10-30)
+
+
+### Features
+
+* Add a continuous batching server for :in_place decoders ([450aa53](https://github.com/georgeguimaraes/transmuter/commit/450aa53d971ca9eb03a4b30513dad37b137ef8a5))
+* Decode the prompts of different lengths of a merged decoder together ([6999a2d](https://github.com/georgeguimaraes/transmuter/commit/6999a2d747cfe1b25735ed8e5bf2319066e993cb))
+* Run the continuous batching server for decoders in :append ([2ba52c2](https://github.com/georgeguimaraes/transmuter/commit/2ba52c2d2da91bcec33c5a579abf975630a9bfc5))
+* Run the continuous batching server for vision language models ([bb80ca2](https://github.com/georgeguimaraes/transmuter/commit/bb80ca25b364543f1151a34751609925bf14ccaf))
+
+
+### Bug Fixes
+
+* Collect the garbage of generation after 256 MB of released buffers ([f26b816](https://github.com/georgeguimaraes/transmuter/commit/f26b81667756862cef2887cb17f9ad3994dd642b))
+* Compile the vision encoder for a real image when the task starts ([76bbb21](https://github.com/georgeguimaraes/transmuter/commit/76bbb210f09632b509e58bb8e2f981ef76166169))
+* Evaluate the params that the device computes at the load ([4001def](https://github.com/georgeguimaraes/transmuter/commit/4001defbbfab400b9d0b3dda6f8b77dd728ccea1))
+* Free the state of a generation when its group ends ([21f2d2c](https://github.com/georgeguimaraes/transmuter/commit/21f2d2cfb8fbb9382a597fd8c3572c0a0a693673))
+* Give image features only to the image tokens of a prompt ([7dc4a44](https://github.com/georgeguimaraes/transmuter/commit/7dc4a44fc3634632f04d5fb0a8d1950d3b96a0fc))
+* Keep the mask of the MLX attention kernel finite on the GPU ([782812d](https://github.com/georgeguimaraes/transmuter/commit/782812d30d0e8d91cd6b5f753ae8bc7900cf00f2))
+* Raise ArgumentError for an input that is not an image in Featurizer.process/3 ([09c82d8](https://github.com/georgeguimaraes/transmuter/commit/09c82d8b03495a64f7ab4a0123be465a3b76b764))
+* Read only small static values as lists in MergedDecoder ([cfd9ef2](https://github.com/georgeguimaraes/transmuter/commit/cfd9ef2219612dbc92662542dd6d278861d9a333))
+* Run the prompt of a merged decoder as one step without cache ([f595133](https://github.com/georgeguimaraes/transmuter/commit/f5951331c7f6562eff38d5deb3ce0635062825a9))
+* Run the tail of a compiled graph when a break node ends the graph ([d37d905](https://github.com/georgeguimaraes/transmuter/commit/d37d905ce74fa44ba08cfd78123d406571292ff4))
+* Squeeze with a reshape, so that a chain of Squeeze nodes compiles ([b11e2d3](https://github.com/georgeguimaraes/transmuter/commit/b11e2d3ac6dee9eed6f8889f16a2026fc55895bc))
+
+
+### Miscellaneous
+
+* Delete the model downloads of the reference scripts at exit ([e18e9ee](https://github.com/georgeguimaraes/transmuter/commit/e18e9ee081d8b521420aa2020a0f7f8188322867))
+* Use Enum.map_join in the continuous generation test ([a36f466](https://github.com/georgeguimaraes/transmuter/commit/a36f466636522d3e67fa426ed44dc84d8105cdbc))
+
+
+### Documentation
+
+* Compare the server with the serving, and give the cost of the encoder on EMLX ([a61d97f](https://github.com/georgeguimaraes/transmuter/commit/a61d97fdf72ff82d9d3e61ab3b6b143ccf53f829))
+* Measure the batch throughput again, and give the rule of the groups by length ([10c6686](https://github.com/georgeguimaraes/transmuter/commit/10c6686df93c334a0826c127b5b2e189978d55ca))
+* Say which decoders run a group for each prompt length ([aca9c7f](https://github.com/georgeguimaraes/transmuter/commit/aca9c7fe5c9ec23b95481e12d2fb1525f00f9306))
+* Set the correctly rounded f32 division of XLA on CUDA ([02d8f4f](https://github.com/georgeguimaraes/transmuter/commit/02d8f4f65a9a53048f4f8104834ad0ebdc7a72d1))
+* Use version 2.0 of Transmuter in the installation examples ([9b9729b](https://github.com/georgeguimaraes/transmuter/commit/9b9729b1c47d508c26c7ffa22468743ebea7200b))
+
+
+### Code Refactoring
+
+* Give each row of generation its own step and budget ([cc3da36](https://github.com/georgeguimaraes/transmuter/commit/cc3da36e1134eda5f431572dea9eb39f7431037d))
+* Let requests join a running group of generation ([6aaa285](https://github.com/georgeguimaraes/transmuter/commit/6aaa28572e641d9d3d45d00b252c9766cc4ffb37))
+
+
+### Tests
+
+* Give the CUDA test client no preallocated arena ([badc623](https://github.com/georgeguimaraes/transmuter/commit/badc62349e6c44876ed7a24d777c795aaad10404))
+* in both cache modes, with greedy selection and with sampling from a seed, a request that joins a running group at a later step, and a request in the row of a request that ended, give the tokens that they give alone. The test fails when the key of a row folds the number of new tokens of the oldest row, the step of the group before cc3da36. ([6aaa285](https://github.com/georgeguimaraes/transmuter/commit/6aaa28572e641d9d3d45d00b252c9766cc4ffb37))
+* largest/2 gives the values and indices of Nx.top_k on the test backend, with ties in one chunk and across chunks, a last chunk with fewer values than k, rows of min_finite and of -inf, and k above the square-root chunk. The test fails when the padding has the largest value of the tensor. ([4532eb3](https://github.com/georgeguimaraes/transmuter/commit/4532eb346ae2961a239239a5c11dfcd84e603c8c))
+* prompts of 229, 31 and 4 tokens, where the longest row ends early and the buffers grow from 256 to 512 rows, give the tokens of each row alone. The test fails when the valid rows include the gap rows, when the write offset is the longest length, and when the growth uses the longest length. ([9e4e6d0](https://github.com/georgeguimaraes/transmuter/commit/9e4e6d0142701ec184b0ce45c450f0b92bba5432))
+* Skip the tests that need more device memory than the test device has ([44fc4c3](https://github.com/georgeguimaraes/transmuter/commit/44fc4c381df6a874871f3e71403cbb32968b3da7))
+* Skip the tests whose needs the test machine does not have ([231028d](https://github.com/georgeguimaraes/transmuter/commit/231028d9ff6f53bd58fa15d9f24d632258369805))
+
+
+### Performance Improvements
+
+* Compact the :append buffers when a step does not fit ([d4a5770](https://github.com/georgeguimaraes/transmuter/commit/d4a57702252cace7512eff312609a562003b0437))
+* Compute the logits of one position in each generation step ([257d241](https://github.com/georgeguimaraes/transmuter/commit/257d24187855988ba7972167413a1fd9a403bf64))
+* Compute the logits of one position in the branches of merged decoders ([39a7ad1](https://github.com/georgeguimaraes/transmuter/commit/39a7ad15915f8c289c3bd0be2a8110d4382db437))
+* Donate the buffers of the KV cache to each generation step ([d666a25](https://github.com/georgeguimaraes/transmuter/commit/d666a257724bb2dc859d0fe2136ca14feb9d065a))
+* Evaluate the state outputs of a step with its selection on EMLX ([19ba3df](https://github.com/georgeguimaraes/transmuter/commit/19ba3dfdc24bed8aa7302baebe86e0e7cf275e0d))
+* Fuse the attention cores of the Florence-2, moonshine, T5 and llama2.c exports ([b838031](https://github.com/georgeguimaraes/transmuter/commit/b83803138bfd4d8c34083ab5b545ca87e7936ede))
+* Give Apertus its rotary positions from the position offset in :in_place ([efe448a](https://github.com/georgeguimaraes/transmuter/commit/efe448af3ab134cbf833fa646dcec2f05588fca2))
+* Give merged decoders whose positions meet the tokens an offset for each row ([8bce974](https://github.com/georgeguimaraes/transmuter/commit/8bce974969497f1dfac90830d08976d32e7f1ba5))
+* Give the params to a compiled segment as one tuple ([0d94907](https://github.com/georgeguimaraes/transmuter/commit/0d949077bb13d63bab312ff5a3f626ae63203bc8))
+* Give the running rows a token in each step of a join ([d09a89b](https://github.com/georgeguimaraes/transmuter/commit/d09a89bcd956ca8f62fcd7c477b1ed4321931a7d))
+* Give the steps three widths and compile them before the server starts ([2a8134f](https://github.com/georgeguimaraes/transmuter/commit/2a8134f62a9ebe762543d9082ba9b6309011c3cc))
+* Grow the KV buffers of generation in power-of-two capacities ([5397a24](https://github.com/georgeguimaraes/transmuter/commit/5397a240cc9af1295a6a19317f07adf4a147c595))
+* Grow the KV cache buffers by a quarter of their power of two ([af827ef](https://github.com/georgeguimaraes/transmuter/commit/af827efaa33a2cd5f4cafe801dd384a1f96dbb93))
+* Keep the token state of the logits processors on the device ([92029aa](https://github.com/georgeguimaraes/transmuter/commit/92029aac27a050931737d77a9ad395a6412bd0ad))
+* Move the merged M2M100 and NLLB decoders to :append ([3baec5c](https://github.com/georgeguimaraes/transmuter/commit/3baec5cc03771dfba8b20e8af2314fb0f7eed859))
+* Move the merged moonshine decoder to :append ([72a9717](https://github.com/georgeguimaraes/transmuter/commit/72a9717bac451fd91a95b45528679c0edc26b0fe))
+* Move the merged T5 decoder to :append ([70f1ae2](https://github.com/georgeguimaraes/transmuter/commit/70f1ae22d1c81166cae52193514747b40131eb34))
+* Run merged decoders without position_ids with a KV buffer ([8533f12](https://github.com/georgeguimaraes/transmuter/commit/8533f12e1596b6dc176887d98fbd238d28ee6574))
+* Run the decoders of Gemma 3 and Qwen-VL with GroupQueryAttention in :in_place ([242b2a2](https://github.com/georgeguimaraes/transmuter/commit/242b2a2e1556c94aa9bfa77f57497e18a08508bb))
+* Run the featurizer steps of an image in one compiled function for each bucket ([568499e](https://github.com/georgeguimaraes/transmuter/commit/568499e4056f0f5e565376731390fb86da49d7b1))
+* Run the token selection in the compiled program of each step ([a1eea43](https://github.com/georgeguimaraes/transmuter/commit/a1eea43cb9be9a662391c103e3094d2fb30d590d))
+* Run the vision encoder on each tile from the tensors on the host ([c5c5b24](https://github.com/georgeguimaraes/transmuter/commit/c5c5b24c69c9fa8ae534d1455449b2a4e6a7bb6b))
+* Take the top_k of generation in two stages ([4532eb3](https://github.com/georgeguimaraes/transmuter/commit/4532eb346ae2961a239239a5c11dfcd84e603c8c))
+* Write the new cache rows of :append in the program of the step ([0e8b2f3](https://github.com/georgeguimaraes/transmuter/commit/0e8b2f3d4b28fc3b4017513f9bca2fccc8456d35))
+* Write the new rows of :append for all batch rows at one offset ([9e4e6d0](https://github.com/georgeguimaraes/transmuter/commit/9e4e6d0142701ec184b0ce45c450f0b92bba5432))
+
 ## [2.0.0](https://github.com/georgeguimaraes/transmuter/compare/v1.0.1...v2.0.0) (2026-10-25)
 
 
