@@ -56,13 +56,17 @@ defmodule Transmuter.Vision.Idefics3Processor do
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{tiles, 3, tile, tile}` and type `:f32`, on `backend`.
   """
   def process(processor, image, backend),
-    do: processor |> process_on_host(image, backend) |> ImageTextToText.on_backend(backend)
+    do: process_with(processor, image, backend, &Featurizer.process_image/3)
 
   @doc false
-  # process/3 with the tensors on the host. The resizes and the steps of the featurizer run in
-  # one compiled function for each bucket of image size (see
-  # Transmuter.Featurizer.process_image_on_host/3), and the host cuts the tiles.
-  def process_on_host(processor, image, backend) do
+  # process/3 with the tensors on the host.
+  def process_on_host(processor, image, backend),
+    do: process_with(processor, image, backend, &Featurizer.process_image_on_host/3)
+
+  # The resizes, the steps of the featurizer and the tiles with the global tile run in one
+  # compiled function for each bucket of image size, see
+  # Transmuter.Featurizer.process_image_on_host/3.
+  defp process_with(processor, image, backend, process) do
     {:ok, tensor} = Featurizer.tensor(image)
     {height, width, _channels} = Nx.shape(tensor)
     tile = processor.tile
@@ -80,25 +84,19 @@ defmodule Transmuter.Vision.Idefics3Processor do
         else: resizes ++ [{tile, tile}]
 
     {height, width} = List.last(resizes)
+    {rows, columns} = {div(height, tile), div(width, tile)}
 
-    full =
-      &Featurizer.process_image_on_host(processor.featurizer, image,
-        backend: backend,
-        before: Enum.map(&1, fn size -> {:resize, size} end)
-      )
+    # An image of one tile does not split, and it has no global tile.
+    {layout, rows, columns} =
+      if rows * columns > 1, do: {{:tiles, tile}, rows, columns}, else: {:image, 0, 0}
 
-    pixels = full.(resizes)
+    before = Enum.map(resizes, &{:resize, &1})
 
-    {tiles, rows, columns} =
-      if height > tile or width > tile do
-        {rows, columns} = {div(height, tile), div(width, tile)}
-        global = full.(resizes ++ [{tile, tile}])
-        {tiles(pixels, tile, global), rows, columns}
-      else
-        {Nx.new_axis(pixels, 0), 0, 0}
-      end
+    pixels =
+      process.(processor.featurizer, image, backend: backend, before: before, layout: layout)
 
-    {%{"pixel_values" => tiles}, text(processor, rows, columns)}
+    pixels = if layout == :image, do: Nx.new_axis(pixels, 0), else: pixels
+    {%{"pixel_values" => pixels}, text(processor, rows, columns)}
   end
 
   @doc """
@@ -157,30 +155,6 @@ defmodule Transmuter.Vision.Idefics3Processor do
       height = ceil(height / tile) * tile
       {height, ceil(trunc(height * aspect) / tile) * tile}
     end
-  end
-
-  # The tiles of an image {channels, height, width} on the host, row by row, and the global
-  # tile after them, as one tensor {tiles, channels, tile, tile}. The sides are multiples of a
-  # tile, so all tiles have the same size. Each row of a tile is one range of the bytes of a
-  # channel of the image, so the tiles are one copy of these ranges.
-  defp tiles(image, tile, global) do
-    {channels, height, width} = Nx.shape(image)
-    {_kind, bits} = type = Nx.type(image)
-    {line, part} = {div(width * bits, 8), div(tile * bits, 8)}
-    {rows, columns} = {div(height, tile), div(width, tile)}
-    binary = Nx.to_binary(image)
-
-    parts =
-      for row <- 0..(rows - 1),
-          column <- 0..(columns - 1),
-          channel <- 0..(channels - 1),
-          y <- (row * tile)..(row * tile + tile - 1),
-          do: binary_part(binary, (channel * height + y) * line + column * part, part)
-
-    [parts, Nx.to_binary(global)]
-    |> IO.iodata_to_binary()
-    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
-    |> Nx.reshape({rows * columns + 1, channels, tile, tile})
   end
 
   defp text(processor, rows, columns) do
