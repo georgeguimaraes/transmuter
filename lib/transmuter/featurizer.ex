@@ -266,7 +266,7 @@ defmodule Transmuter.Featurizer do
   # process/3 with the result on Nx.BinaryBackend, where the host cuts it from its bucket, for
   # the callers that keep the result on the host.
   def process_on_host(featurizer, images, opts \\ []) do
-    images |> Enum.map(&process_image(featurizer, &1, opts[:backend])) |> stack()
+    images |> Enum.map(&process_image_on_host(featurizer, &1, opts)) |> stack()
   end
 
   # The tensor of an image, or an ArgumentError with the message of tensor/1.
@@ -277,31 +277,58 @@ defmodule Transmuter.Featurizer do
     end
   end
 
-  defp process_image(featurizer, image, backend) do
+  @doc false
+  # The result of one image on the host, for the processors of image-text-to-text, with the
+  # steps of the featurizer and these options:
+  #
+  #   * :before - the steps before those of the featurizer, after the convert: {:resize, size}
+  #     with the resample of the featurizer, or {:crop, size}, which keeps the top left.
+  #   * :convert - :rgb (the default) or :on_white, which puts an image with alpha on white.
+  #   * :layout - :image (the default, {channels, height, width}), {:blocks, block} (one row of
+  #     {channels, block, block} values for each block) or {:patches, patch, temporal, merge}
+  #     (the patches of Qwen2VLImageProcessor). The buckets of a layout are multiples of its
+  #     block or of its patch times its merge.
+  #   * :backend - as in process/3.
+  def process_image_on_host(featurizer, image, opts \\ []) do
     image = image!(image)
-    compiler = Transmuter.compiler_options(backend || image.data.__struct__)
+    compiler = Transmuter.compiler_options(opts[:backend] || image.data.__struct__)
     image = Nx.backend_copy(image, Nx.BinaryBackend)
+    layout = opts[:layout] || :image
+    align = alignment(layout)
 
     {height, width, channels} = Nx.shape(image)
-    {steps, args, {out_height, out_width}} = plan(featurizer, {height, width}, Nx.type(image))
-    image = pad_bucket(image, {bucket(height), bucket(width), channels})
-    run = Nx.Defn.jit(&run_steps(steps, &1, &2), compiler)
-    image |> run.(List.to_tuple(args)) |> cut({out_height, out_width})
+    before = opts[:before] || []
+    convert = opts[:convert] || :rgb
+
+    {steps, args, size} =
+      plan(featurizer, {{height, width}, Nx.type(image), align}, before, convert)
+
+    image = pad_bucket(image, {bucket(height, align), bucket(width, align), channels})
+    run = Nx.Defn.jit(&run_steps(steps, layout, &1, &2), compiler)
+    image |> run.(List.to_tuple(args)) |> cut(layout, size, align)
   end
+
+  defp alignment({:blocks, block}), do: block
+  defp alignment({:patches, patch, _temporal, merge}), do: patch * merge
+  defp alignment(:image), do: 1
 
   # The steps of an image in the order of the image processor, as {steps, args, size}: each
   # step is static (its kind and the static values that decide the compiled function), the
   # args are the tensors of the steps, such as the taps, and size is the real size of the
-  # result. The steps run in run_steps/3. The OWLv2 image processor rescales and pads before
-  # it resizes.
-  defp plan(featurizer, size, type) do
+  # result. The steps run in run_steps/4. The OWLv2 image processor rescales and pads before
+  # it resizes. The state of each step is {size, type, align}: the real size and the type of
+  # the image, and the alignment of its buckets.
+  defp plan(featurizer, state, before, convert) do
     order =
       if featurizer.resample == :gaussian_linear,
-        do: [:rgb, :rescale, :pad, :resize, :normalize],
-        else: [:rgb, :resize, :crop, :rescale, :normalize, :pad]
+        do: [:rescale, :pad, :resize, :normalize],
+        else: [:resize, :crop, :rescale, :normalize, :pad]
 
-    {steps, {size, _type}} =
-      Enum.flat_map_reduce(order, {size, type}, &plan_step(featurizer, &1, &2))
+    convert = if convert == :rgb and !featurizer.rgb, do: [], else: [convert]
+    order = convert ++ before ++ order
+
+    {steps, {size, _type, _align}} =
+      Enum.flat_map_reduce(order, state, &plan_step(featurizer, &1, &2))
 
     {steps, args} =
       Enum.map_reduce(steps, [], fn {step, step_args}, args ->
@@ -311,16 +338,36 @@ defmodule Transmuter.Featurizer do
     {steps, args, size}
   end
 
-  defp plan_step(%{rgb: true}, :rgb, state), do: {[{:rgb, []}], state}
+  defp plan_step(_featurizer, convert, state) when convert in [:rgb, :on_white],
+    do: {[{convert, []}], state}
 
-  defp plan_step(%{resize: resize} = featurizer, :resize, {size, type}) when resize != nil do
+  defp plan_step(featurizer, {:resize, to}, {size, type, align}) do
+    type = if type == {:u, 8}, do: type, else: {:f, 32}
+    width_step = resize_taps(featurizer, elem(size, 1), elem(to, 1), 1, type, align)
+    height_step = resize_taps(featurizer, elem(size, 0), elem(to, 0), 0, type, align)
+    {width_step ++ height_step, {to, type, align}}
+  end
+
+  defp plan_step(_featurizer, {:crop, {height, width}}, {size, type, align}) do
+    rows = Enum.map(0..(height - 1), &[{&1, 1}])
+    columns = Enum.map(0..(width - 1), &[{&1, 1}])
+
+    steps =
+      if(elem(size, 0) == height, do: [], else: [take_step(rows, height, 0, align)]) ++
+        if elem(size, 1) == width, do: [], else: [take_step(columns, width, 1, align)]
+
+    {steps, {{height, width}, type, align}}
+  end
+
+  defp plan_step(%{resize: resize} = featurizer, :resize, {size, type, align})
+       when resize != nil do
     {height, width} = output_size(resize, size)
 
     type =
       if type == {:u, 8} and featurizer.resample != :gaussian_linear, do: type, else: {:f, 32}
 
-    width_step = resize_taps(featurizer, elem(size, 1), width, 1, type)
-    height_step = resize_taps(featurizer, elem(size, 0), height, 0, type)
+    width_step = resize_taps(featurizer, elem(size, 1), width, 1, type, align)
+    height_step = resize_taps(featurizer, elem(size, 0), height, 0, type, align)
     steps = width_step ++ height_step
 
     # The resize of the OWLv2 image processor clips to the minimum and the maximum of its
@@ -333,16 +380,18 @@ defmodule Transmuter.Featurizer do
         steps
       end
 
-    {steps, {{height, width}, type}}
+    {steps, {{height, width}, type, align}}
   end
 
-  defp plan_step(%{crop: {height, width}}, :crop, {size, type}) do
-    steps = crop_taps(elem(size, 0), height, 0) ++ crop_taps(elem(size, 1), width, 1)
-    {steps, {{height, width}, type}}
+  defp plan_step(%{crop: {height, width}}, :crop, {size, type, align}) do
+    steps =
+      crop_taps(elem(size, 0), height, 0, align) ++ crop_taps(elem(size, 1), width, 1, align)
+
+    {steps, {{height, width}, type, align}}
   end
 
-  defp plan_step(featurizer, :rescale, {size, _type}),
-    do: {[{{:rescale, featurizer.rescale}, []}], {size, {:f, 32}}}
+  defp plan_step(featurizer, :rescale, {size, _type, align}),
+    do: {[{{:rescale, featurizer.rescale}, []}], {size, {:f, 32}, align}}
 
   defp plan_step(%{normalize: {mean, std}}, :normalize, state) do
     mean = Nx.tensor(mean, type: :f32, backend: Nx.BinaryBackend)
@@ -350,19 +399,22 @@ defmodule Transmuter.Featurizer do
     {[{:normalize, [mean, std]}], state}
   end
 
-  defp plan_step(%{pad: {target, value}}, :pad, {{height, width}, type}) do
+  defp plan_step(%{pad: {target, value}}, :pad, {{height, width}, type, align}) do
     {to_height, to_width} = pad_size(target, {height, width})
-    steps = pad_taps(height, to_height, 0, value) ++ pad_taps(width, to_width, 1, value)
-    {steps, {{to_height, to_width}, type}}
+
+    steps =
+      pad_taps(height, to_height, 0, value, align) ++ pad_taps(width, to_width, 1, value, align)
+
+    {steps, {{to_height, to_width}, type, align}}
   end
 
   defp plan_step(_featurizer, _step, state), do: {[], state}
 
   # The resize of one axis as a gather: the input pixels and the weights of each output pixel,
   # as resize/4 computes them. A u8 image gets the weights as integers with fraction bits.
-  defp resize_taps(_featurizer, size, size, _axis, _type), do: []
+  defp resize_taps(_featurizer, size, size, _axis, _type, _align), do: []
 
-  defp resize_taps(featurizer, in_size, size, axis, type) do
+  defp resize_taps(featurizer, in_size, size, axis, type, align) do
     taps = taps(in_size, size, featurizer.resample)
     weights = Enum.map(taps, fn row -> Enum.map(row, &elem(&1, 1)) end)
 
@@ -376,18 +428,18 @@ defmodule Transmuter.Featurizer do
             Enum.map(row, fn {j, w} -> {j, trunc(w * one + if(w < 0, do: -0.5, else: 0.5))} end)
           end)
 
-        [gather_step(fixed, size, axis, {:s, 32}, {:u8, bits})]
+        [gather_step(fixed, size, axis, {:s, 32}, {:u8, bits}, align)]
 
       _f32 ->
-        [gather_step(taps, size, axis, {:f, 32}, :f32)]
+        [gather_step(taps, size, axis, {:f, 32}, :f32, align)]
     end
   end
 
   # A crop keeps the center of an axis, and a crop larger than the axis pads it with zeros on
   # both sides, as center_crop of Python transformers.
-  defp crop_taps(size, size, _axis), do: []
+  defp crop_taps(size, size, _axis, _align), do: []
 
-  defp crop_taps(in_size, size, axis) do
+  defp crop_taps(in_size, size, axis, align) do
     indices =
       if in_size > size do
         offset = div(in_size - size, 2)
@@ -401,36 +453,36 @@ defmodule Transmuter.Featurizer do
         )
       end
 
-    [take_step(indices, size, axis)]
+    [take_step(indices, size, axis, align)]
   end
 
   # A pad on the bottom and the right: the symmetric padding of numpy reflects the image with
   # its edge pixel (a b c | c b a), and a value pads with that value.
-  defp pad_taps(size, size, _axis, _value), do: []
+  defp pad_taps(size, size, _axis, _value, _align), do: []
 
-  defp pad_taps(in_size, size, axis, :symmetric) do
+  defp pad_taps(in_size, size, axis, :symmetric, align) do
     indices =
       for i <- 0..(size - 1) do
         i = rem(i, 2 * in_size)
         [{if(i < in_size, do: i, else: 2 * in_size - 1 - i), 1}]
       end
 
-    [take_step(indices, size, axis)]
+    [take_step(indices, size, axis, align)]
   end
 
-  defp pad_taps(in_size, size, axis, value) do
+  defp pad_taps(in_size, size, axis, value, align) do
     taps = for i <- 0..(size - 1), do: if(i < in_size, do: [{i, 1.0}], else: [])
     bias = for i <- 0..(size - 1), do: if(i < in_size, do: 0.0, else: value / 1)
-    bias = bias ++ List.duplicate(0.0, bucket(size) - size)
-    {{:gather, ^axis, :f32}, args} = gather_step(taps, size, axis, {:f, 32}, :f32)
+    bias = bias ++ List.duplicate(0.0, bucket(size, align) - size)
+    {{:gather, ^axis, :f32}, args} = gather_step(taps, size, axis, {:f, 32}, :f32, align)
     [{{:gather, axis, :bias}, args ++ [Nx.tensor(bias, type: :f32, backend: Nx.BinaryBackend)]}]
   end
 
   # A gather with weights on one axis: the indices and the weights of each output pixel, padded
   # to the bucket of the size and to a power of two of taps with the index 0 and the weight 0.
-  defp gather_step(taps, size, axis, type, path) do
+  defp gather_step(taps, size, axis, type, path, align) do
     width = taps |> Enum.map(&length/1) |> Enum.max() |> max(1) |> power_of_two()
-    rows = bucket(size)
+    rows = bucket(size, align)
     empty = List.duplicate({0, 0}, width)
     taps = Enum.map(taps, &(&1 ++ Enum.drop(empty, length(&1))))
     taps = taps ++ List.duplicate(empty, rows - size)
@@ -448,8 +500,8 @@ defmodule Transmuter.Featurizer do
 
   # A gather without weights on one axis: the input pixel of each output pixel, or no pixel,
   # which gives 0.
-  defp take_step(taps, size, axis) do
-    taps = taps ++ List.duplicate([], bucket(size) - size)
+  defp take_step(taps, size, axis, align) do
+    taps = taps ++ List.duplicate([], bucket(size, align) - size)
     index = Enum.map(taps, fn tap -> if tap == [], do: 0, else: elem(hd(tap), 0) end)
     mask = Enum.map(taps, &if(&1 == [], do: 0, else: 1))
 
@@ -463,13 +515,41 @@ defmodule Transmuter.Featurizer do
   # The compiled function of the steps. The steps are static, so the function compiles once
   # for each set of steps and of bucket shapes. The bounds of a :bounds step stay for the
   # :clip step after the resize.
-  defp run_steps(steps, image, args) do
+  defp run_steps(steps, layout, image, args) do
     {image, _bounds} =
       Enum.reduce(steps, {image, nil}, fn {step, at}, {image, bounds} ->
         run_step(step, {image, bounds}, args, at)
       end)
 
-    Nx.transpose(image, axes: [2, 0, 1])
+    image |> Nx.transpose(axes: [2, 0, 1]) |> lay_out(layout)
+  end
+
+  defp lay_out(image, :image), do: image
+
+  defp lay_out(image, {:blocks, block}) do
+    {channels, height, width} = Nx.shape(image)
+    {rows, columns} = {div(height, block), div(width, block)}
+
+    image
+    |> Nx.reshape({channels, rows, block, columns, block})
+    |> Nx.transpose(axes: [1, 3, 0, 2, 4])
+    |> Nx.reshape({rows * columns, channels * block * block})
+  end
+
+  # As _preprocess of Qwen2VLImageProcessor: the image repeats for each of the temporal
+  # frames, and the grid of patches has the merge x merge patches of each merged feature in
+  # consecutive rows.
+  defp lay_out(image, {:patches, patch, temporal, merge}) do
+    {channels, height, width} = Nx.shape(image)
+    {rows, columns} = {div(height, patch), div(width, patch)}
+
+    image
+    |> Nx.broadcast({temporal, channels, height, width}, axes: [1, 2, 3])
+    |> Nx.reshape(
+      {temporal, channels, div(rows, merge), merge, patch, div(columns, merge), merge, patch}
+    )
+    |> Nx.transpose(axes: [2, 5, 3, 6, 1, 0, 4, 7])
+    |> Nx.reshape({rows * columns, channels * temporal * patch * patch})
   end
 
   defp run_step(:rgb, {image, bounds}, _args, _at) do
@@ -481,6 +561,29 @@ defmodule Transmuter.Featurizer do
         else: Nx.slice_along_axis(image, 0, 3, axis: 2)
 
     {image, bounds}
+  end
+
+  # As convert_to_rgb of PixtralImageProcessor: an image with alpha goes on white, as
+  # Image.paste of Pillow with the image as the mask. Each channel is
+  # in * alpha / 255 + 255 * (255 - alpha) / 255, with the rounding of Pillow.
+  defp run_step(:on_white, {image, bounds}, args, at) do
+    {_height, _width, channels} = Nx.shape(image)
+
+    if channels in [2, 4] do
+      image = Nx.as_type(image, :s32)
+      alpha = Nx.slice_along_axis(image, channels - 1, 1, axis: 2)
+      color = image |> Nx.slice_along_axis(0, channels - 1, axis: 2) |> rgb()
+
+      image =
+        color
+        |> mul_div_255(alpha)
+        |> Nx.add(mul_div_255(255, Nx.subtract(255, alpha)))
+        |> Nx.as_type(:u8)
+
+      {image, bounds}
+    else
+      run_step(:rgb, {image, bounds}, args, at)
+    end
   end
 
   defp run_step({:rescale, factor}, {image, bounds}, _args, _at) do
@@ -542,19 +645,28 @@ defmodule Transmuter.Featurizer do
     {image, bounds}
   end
 
+  defp mul_div_255(a, b) do
+    product = Nx.add(Nx.multiply(a, b), 128)
+    product |> Nx.right_shift(8) |> Nx.add(product) |> Nx.right_shift(8)
+  end
+
   # A vector of one value for each pixel of an axis, shaped to broadcast along that axis of an
   # image {height, width, channels}.
   defp along(vector, 0), do: Nx.reshape(vector, {Nx.size(vector), 1, 1})
   defp along(vector, 1), do: Nx.reshape(vector, {1, Nx.size(vector), 1})
 
-  # The bucket of a size: the next size of the form 2^k or 3 * 2^(k - 1).
+  # The bucket of a size: the next size of the form 2^k or 3 * 2^(k - 1), then the next
+  # multiple of `align`.
   @doc false
-  def bucket(size) when size <= 2, do: size
+  def bucket(size, align \\ 1)
+  def bucket(size, align) when size <= 2, do: align_up(size, align)
 
-  def bucket(size) do
+  def bucket(size, align) do
     power = power_of_two(size)
-    if div(power * 3, 4) >= size, do: div(power * 3, 4), else: power
+    align_up(if(div(power * 3, 4) >= size, do: div(power * 3, 4), else: power), align)
   end
+
+  defp align_up(size, align), do: div(size + align - 1, align) * align
 
   defp power_of_two(size), do: 2 ** length(Integer.digits(size - 1, 2))
 
@@ -577,8 +689,26 @@ defmodule Transmuter.Featurizer do
     |> Nx.reshape({height, width, channels})
   end
 
-  # The real result {channels, height, width} of a result in its bucket, on the host.
-  defp cut(image, {height, width}) do
+  # The real result of a result in its bucket, on the host: the image {channels, height,
+  # width}, or the rows of the real blocks or patches. The blocks or the merged patches of one
+  # row of the image are consecutive rows, and the real ones come first in each row.
+  defp cut(rows, {:blocks, block}, {height, width}, align),
+    do: cut_rows(rows, div(height, block), div(width, block), div(bucket(width, align), block))
+
+  defp cut(rows, {:patches, patch, _temporal, merge}, {height, width}, align) do
+    {group, side} = {merge * merge, patch * merge}
+    columns = div(width, side) * group
+    cut_rows(rows, div(height, side), columns, div(bucket(width, align), side) * group)
+  end
+
+  defp cut(image, :image, {height, width}, _align) do
+    case Nx.shape(image) do
+      {_channels, ^height, ^width} -> Nx.backend_transfer(image, Nx.BinaryBackend)
+      _bucket -> cut_image(image, {height, width})
+    end
+  end
+
+  defp cut_image(image, {height, width}) do
     {channels, rows, columns} = Nx.shape(image)
     binary = Nx.to_binary(image)
     {_kind, bits} = type = Nx.type(image)
@@ -593,6 +723,19 @@ defmodule Transmuter.Featurizer do
     |> IO.iodata_to_binary()
     |> Nx.from_binary(type, backend: Nx.BinaryBackend)
     |> Nx.reshape({channels, height, width})
+  end
+
+  # The first `count` rows of each of the first `groups` groups of `stride` rows.
+  defp cut_rows(rows, groups, count, stride) do
+    {_total, columns} = Nx.shape(rows)
+    {_kind, bits} = type = Nx.type(rows)
+    row = div(columns * bits, 8)
+    binary = Nx.to_binary(rows)
+
+    for(g <- 0..(groups - 1), do: binary_part(binary, g * stride * row, count * row))
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+    |> Nx.reshape({groups * count, columns})
   end
 
   # The images {channels, height, width} on the host as one tensor with a batch axis.

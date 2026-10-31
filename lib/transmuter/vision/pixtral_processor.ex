@@ -77,12 +77,18 @@ defmodule Transmuter.Vision.PixtralProcessor do
 
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{blocks, 3 * block * block}` and type `:f32` on `backend`, and `"image_sizes"` of shape `{1, 2}` and type `:s64`, the height and the width of the image after the resize.
   """
-  def process(processor, image, backend) do
-    {:ok, image} = Featurizer.tensor(image)
-    image = Nx.backend_transfer(image, backend)
-    image = if processor.white?, do: on_white(image), else: Featurizer.rgb(image)
+  def process(processor, image, backend),
+    do: processor |> process_on_host(image, backend) |> ImageTextToText.on_backend(backend)
+
+  @doc false
+  # process/3 with the tensors on the host. The convert, the resize or the crop, the steps of
+  # the featurizer and the blocks run in one compiled function for each bucket of image size,
+  # see Transmuter.Featurizer.process_image_on_host/3.
+  def process_on_host(processor, image, backend) do
+    {:ok, tensor} = Featurizer.tensor(image)
     %{featurizer: featurizer, block: block} = processor
-    {height, width, _channels} = shape = Nx.shape(image)
+    {height, width, _channels} = Nx.shape(tensor)
+    shape = {height, width, 3}
 
     {height, width} =
       if processor.max_size,
@@ -94,16 +100,20 @@ defmodule Transmuter.Vision.PixtralProcessor do
             "the image of shape #{inspect(shape)} gives no block of #{block}x#{block} pixels on a side"
     end
 
-    image =
-      if processor.max_size,
-        do: Featurizer.resize(image, {height, width}, featurizer.resample, featurizer.weights),
-        else: Nx.slice(image, [0, 0, 0], [height, width, 3])
+    pixels =
+      Featurizer.process_image_on_host(featurizer, image,
+        backend: backend,
+        convert: if(processor.white?, do: :on_white, else: :rgb),
+        before: [
+          if(processor.max_size, do: {:resize, {height, width}}, else: {:crop, {height, width}})
+        ],
+        layout: {:blocks, block}
+      )
 
-    pixels = Featurizer.process(featurizer, [image], backend: backend)
     {rows, columns} = {div(height, block), div(width, block)}
 
     tensors = %{
-      "pixel_values" => blocks(pixels, block),
+      "pixel_values" => pixels,
       "image_sizes" => Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
     }
 
@@ -149,43 +159,8 @@ defmodule Transmuter.Vision.PixtralProcessor do
      (Integer.floor_div(width - 1, block) + 1) * block}
   end
 
-  # As convert_to_rgb of PixtralImageProcessor: an image with alpha goes on white, as
-  # Image.paste of Pillow with the image as the mask. Each channel is
-  # in * alpha / 255 + 255 * (255 - alpha) / 255, with the rounding of Pillow.
-  defp on_white(image) do
-    {_height, _width, channels} = Nx.shape(image)
-
-    if channels in [2, 4] do
-      image = Nx.as_type(image, :s32)
-      alpha = Nx.slice_along_axis(image, channels - 1, 1, axis: 2)
-      color = image |> Nx.slice_along_axis(0, channels - 1, axis: 2) |> Featurizer.rgb()
-
-      color
-      |> mul_div_255(alpha)
-      |> Nx.add(mul_div_255(255, Nx.subtract(255, alpha)))
-      |> Nx.as_type(:u8)
-    else
-      Featurizer.rgb(image)
-    end
-  end
-
-  defp mul_div_255(a, b) do
-    product = Nx.add(Nx.multiply(a, b), 128)
-    product |> Nx.right_shift(8) |> Nx.add(product) |> Nx.right_shift(8)
-  end
-
-  # {1, channels, height, width} to one row of {channels, block, block} values for each block.
-  defp blocks(pixels, block) do
-    {1, channels, height, width} = Nx.shape(pixels)
-    {rows, columns} = {div(height, block), div(width, block)}
-
-    pixels
-    |> Nx.reshape({channels, rows, block, columns, block})
-    |> Nx.transpose(axes: [1, 3, 0, 2, 4])
-    |> Nx.reshape({rows * columns, channels * block * block})
-  end
-
-  # The inverse of blocks/2, for an image of `columns` blocks in each row.
+  # The image of its blocks, the rows of {channels, block, block} values that
+  # process_on_host/3 gives, for an image of `columns` blocks in each row.
   defp image(blocks, block, columns) do
     rows = div(Nx.axis_size(blocks, 0), columns)
 

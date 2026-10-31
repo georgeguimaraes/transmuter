@@ -77,22 +77,33 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
 
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{patches, 3 * 2 * patch_size * patch_size}` (1176 for Qwen2-VL) and type `:f32` on `backend`, and `"image_grid_thw"` of shape `{1, 3}` and type `:s64`.
   """
-  def process(processor, image, backend) do
-    {:ok, image} = Featurizer.tensor(image)
-    image = image |> Nx.backend_transfer(backend) |> Featurizer.rgb()
-    {height, width, _channels} = Nx.shape(image)
-    factor = processor.patch_size * processor.merge_size
+  def process(processor, image, backend),
+    do: processor |> process_on_host(image, backend) |> ImageTextToText.on_backend(backend)
+
+  @doc false
+  # process/3 with the tensors on the host. The resize, the steps of the featurizer and the
+  # patches run in one compiled function for each bucket of image size, see
+  # Transmuter.Featurizer.process_image_on_host/3.
+  def process_on_host(processor, image, backend) do
+    {:ok, tensor} = Featurizer.tensor(image)
+    {height, width, _channels} = Nx.shape(tensor)
+    %{patch_size: patch, temporal_patch_size: temporal, merge_size: merge} = processor
+    factor = patch * merge
 
     {height, width} =
       if processor.resize?,
         do: smart_resize(height, width, factor, processor.min_pixels, processor.max_pixels),
         else: {height, width}
 
-    %{resample: resample, weights: weights} = processor.featurizer
-    image = Featurizer.resize(image, {height, width}, resample, weights)
-    frames = Featurizer.process(processor.featurizer, [image], backend: backend)
-    {patches, grid} = patches(processor, frames)
-    count = div(Enum.product(grid), processor.merge_size ** 2)
+    patches =
+      Featurizer.process_image_on_host(processor.featurizer, image,
+        backend: backend,
+        before: [{:resize, {height, width}}],
+        layout: {:patches, patch, temporal, merge}
+      )
+
+    grid = [1, div(height, patch), div(width, patch)]
+    count = div(Enum.product(grid), merge ** 2)
 
     tensors = %{
       "pixel_values" => patches,
@@ -160,25 +171,6 @@ defmodule Transmuter.Vision.Qwen2VLProcessor do
   end
 
   defp text_positions(start, count), do: for(i <- start..(start + count - 1)//1, do: {i, i, i})
-
-  # As _preprocess of Qwen2VLImageProcessor: the frames {temporal, 3, height, width} split
-  # into a grid of patches, with the 2x2 patches of each merged feature in consecutive rows.
-  defp patches(processor, frame) do
-    %{patch_size: patch, temporal_patch_size: temporal, merge_size: merge} = processor
-    {1, channels, height, width} = Nx.shape(frame)
-    {rows, columns} = {div(height, patch), div(width, patch)}
-    frames = Nx.concatenate(List.duplicate(frame, temporal))
-
-    patches =
-      frames
-      |> Nx.reshape(
-        {1, temporal, channels, div(rows, merge), merge, patch, div(columns, merge), merge, patch}
-      )
-      |> Nx.transpose(axes: [0, 3, 6, 4, 7, 2, 1, 5, 8])
-      |> Nx.reshape({rows * columns, channels * temporal * patch * patch})
-
-    {patches, [1, rows, columns]}
-  end
 
   # As smart_resize of Python transformers. round/1 of Python rounds half to even.
   defp smart_resize(height, width, factor, min_pixels, max_pixels) do

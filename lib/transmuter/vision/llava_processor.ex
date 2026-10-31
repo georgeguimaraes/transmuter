@@ -63,7 +63,12 @@ defmodule Transmuter.Vision.LlavaProcessor do
 
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{1, 3, height, width}` and type `:f32` on `backend`, and `"image_sizes"` of shape `{1, 2}` and type `:s64`, the height and the width of the image.
   """
-  def process(processor, image, backend) do
+  def process(processor, image, backend),
+    do: processor |> process_on_host(image, backend) |> ImageTextToText.on_backend(backend)
+
+  @doc false
+  # process/3 with the tensors on the host.
+  def process_on_host(processor, image, backend) do
     tensors = ImageTextToText.image_tensors(processor.featurizer, processor.size, image, backend)
     {tensors, String.duplicate(processor.image, processor.image_seq_len)}
   end

@@ -297,7 +297,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     end
 
     {tensors, texts} =
-      images |> Enum.map(&module.process(processor, &1, backend)) |> Enum.unzip()
+      images |> Enum.map(&module.process_on_host(processor, &1, backend)) |> Enum.unzip()
 
     prompt = Enum.join([first | Enum.zip_with(texts, rest, &(&1 <> &2))])
     count = Enum.sum_by(tensors, &Nx.axis_size(&1["pixel_values"], 0))
@@ -308,12 +308,9 @@ defmodule Transmuter.Vision.ImageTextToText do
               "the images of the chat give #{count} rows of pixel values, and a chat takes up to #{List.last(@buckets)}"
 
     tensors =
-      for name <- tensors |> Enum.flat_map(&Map.keys/1) |> Enum.uniq(), into: %{} do
-        tensor = tensors |> Enum.map(& &1[name]) |> Nx.concatenate()
-        [_rows | axes] = List.duplicate({0, 0, 0}, Nx.rank(tensor))
-        tensor = Nx.pad(tensor, 0, [{0, key - Nx.axis_size(tensor, 0), 0} | axes])
-        {name, Nx.backend_transfer(tensor, Nx.BinaryBackend)}
-      end
+      for name <- tensors |> Enum.flat_map(&Map.keys/1) |> Enum.uniq(),
+          into: %{},
+          do: {name, tensors |> Enum.map(& &1[name]) |> join_padded(key)}
 
     %{prompt: prompt, tensors: tensors, key: key, texts: texts}
   end
@@ -343,11 +340,31 @@ defmodule Transmuter.Vision.ImageTextToText do
     Tokenizer.ids(tokenizer, encoding)
   end
 
+  # The tensors of the processor on the host joined along their first axis, with rows of zeros
+  # to `rows` rows, from their binaries.
+  defp join_padded(tensors = [first | _], rows) do
+    [_rows | axes] = Tuple.to_list(Nx.shape(first))
+    {_kind, bits} = type = Nx.type(first)
+    count = Enum.sum_by(tensors, &Nx.axis_size(&1, 0))
+    zeros = :binary.copy(<<0>>, div((rows - count) * Enum.product(axes) * bits, 8))
+
+    [Enum.map(tensors, &Nx.to_binary/1), zeros]
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+    |> Nx.reshape(List.to_tuple([rows | axes]))
+  end
+
+  @doc false
+  # The tensors of process/3 of a processor from its process_on_host/3: the pixel values move
+  # to `backend`, and the small tensors, such as the sizes of the images, stay on the host.
+  def on_backend({tensors, text}, backend),
+    do: {Map.update!(tensors, "pixel_values", &Nx.backend_transfer(&1, backend)), text}
+
   @doc false
   # The tensors of an image for a processor that gives all images one `size`, such as Gemma 3
   # and LLaVA: "pixel_values" {1, 3, height, width} from `featurizer` and "image_sizes" {1, 2}.
   def image_tensors(featurizer, {height, width}, image, backend) do
-    pixels = Featurizer.process(featurizer, [image], backend: backend)
+    pixels = Featurizer.process_on_host(featurizer, [image], backend: backend)
     sizes = Nx.tensor([[height, width]], type: :s64, backend: Nx.BinaryBackend)
     %{"pixel_values" => pixels, "image_sizes" => sizes}
   end

@@ -56,7 +56,12 @@ defmodule Transmuter.Vision.Gemma3Processor do
 
   Returns `{tensors, text}`. `tensors` has `"pixel_values"` of shape `{1, 3, height, width}` and type `:f32` on `backend`, and `"image_sizes"` of shape `{1, 2}` and type `:s64`, the height and the width of the image. Each pixel value row of a batch has 3 * height * width values (9.6 MB for 896x896), also a row of zeros that fills a chat to its batch key.
   """
-  def process(processor, image, backend) do
+  def process(processor, image, backend),
+    do: processor |> process_on_host(image, backend) |> ImageTextToText.on_backend(backend)
+
+  @doc false
+  # process/3 with the tensors on the host.
+  def process_on_host(processor, image, backend) do
     tensors = ImageTextToText.image_tensors(processor.featurizer, processor.size, image, backend)
     tokens = String.duplicate(processor.image, processor.image_seq_len)
     {tensors, "\n\n" <> processor.boi <> tokens <> processor.eoi <> "\n\n"}
