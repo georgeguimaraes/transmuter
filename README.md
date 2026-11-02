@@ -122,6 +122,18 @@ end
 
 Use EXLA instead of EMLX for CUDA. The `Transmuter.Text` servings need `tokenizers`. To read image files for the `Transmuter.Vision` servings, add `{:stb_image, "~> 1.0"}`. Chat templates need `{:otera, "~> 0.1"}`, which renders Jinja templates in pure Elixir.
 
+### Set the MLX cache limit
+
+With EMLX, set a cache limit when your application starts:
+
+```elixir
+EMLX.set_cache_limit(1_000_000_000)  # 1 GB
+```
+
+MLX keeps freed buffers in a cache for reuse. When the shapes change from call to call, such as image sizes, audio lengths or batch sizes, the cache can grow until it uses almost all of the memory. Without a limit, a Kokoro TTS service grew to 11.7 GB on a 16 GB Mac and slowed from 0.87 s to 22.5 s per call.
+
+Transmuter does not set this limit for you. The limit applies to all MLX code in the BEAM, so your application must choose it. The [Backends and Performance guide](guides/backends_and_performance.md) explains EMLX memory management.
+
 ## Compilation and graph breaks
 
 Some graphs use a tensor value to set a shape or to select a branch. `Transmuter.compile/3` breaks the graph at these operators, runs the break eagerly on the real values, and compiles the next segment for the shapes the values decide. Compiled segments are cached by input shapes.
