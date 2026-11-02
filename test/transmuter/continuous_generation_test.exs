@@ -501,6 +501,65 @@ defmodule Transmuter.ContinuousGenerationTest do
     assert Enum.any?(steps, &(&1.admitted > 0 and &1.running > 0))
   end
 
+  # A merged decoder runs the first step of a group on its branch without cache, and
+  # compile_steps compiles that step only at the capacities where a new group starts. So a
+  # request that waits while the last running row ends must start a new group. In a server of 1
+  # row, the answer of 30 tokens to a prompt of 4 tokens needs 33 rows, so its last step takes
+  # the buffers of gpt2 from 32 to 64 rows. The waiting prompt has 17 to 32 tokens, so its step
+  # starts at 32 rows (the capacity of a step event is the one before the step). The server
+  # opens a new group when no row runs, which resets every group, also the buffers of :in_place
+  # and the encoder capacity of the rows. In :append, Generation.shrink/2 also takes the buffers
+  # of a group whose rows all ended back to 32 rows, so for gpt2 a group keeps 64 rows only
+  # without both. Such a group would run the step at 64 rows, a shape that compile_steps does
+  # not compile. No step of the server compiles.
+  test "a request that waits for the last running row of a merged decoder compiles nothing" do
+    source = {:hf, "Xenova/gpt2"}
+    waiting = "The old lighthouse stood at the end of the pier, and every night its lamp turned"
+    tokenizer = Transmuter.Serving.tokenizer(Transmuter.Repo.load!(source), [])
+    {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, waiting)
+    assert length(Transmuter.Tokenizer.ids(tokenizer, encoding)) in 17..32
+
+    opts = [strategy: :greedy, max_new_tokens: 30, min_new_tokens: 30] ++ @opts
+    spec = [source: source, slots: 1, capacity: 256, compile_steps: true] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach_many(
+      id,
+      [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+      fn event, _measurements, _metadata, _config ->
+        if self() == server, do: send(parent, {id, event})
+      end,
+      nil
+    )
+
+    {_results, steps} =
+      step_events(server, fn ->
+        ContinuousGeneration.run(server, ["Once upon a time", waiting])
+      end)
+
+    :telemetry.detach(id)
+    refute_received {^id, [_ | _]}
+    assert [%{capacity: 32}, %{capacity: 32}] = Enum.filter(steps, &(&1.admitted > 0))
+  end
+
+  # Generation.shrink/2 does not move the buffers of :in_place, so only the new group that the
+  # server opens when no row runs takes them back to their start capacity. In a server of 1 row
+  # of SmolLM2, the answer of 300 tokens takes the buffers from 256 rows past 256, and the
+  # second request, which waits for it, starts in a new group at 256 rows.
+  test "a request that waits for the last running row of :in_place starts at the start capacity" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 300, min_new_tokens: 300] ++ @opts
+    server = start_supervised!({ContinuousGeneration, [source: source, slots: 1] ++ opts})
+
+    {_results, steps} =
+      step_events(server, fn -> ContinuousGeneration.run(server, [@fox, "Once upon a time"]) end)
+
+    assert steps |> Enum.map(& &1.capacity) |> Enum.max() > 256
+    assert [%{capacity: 256}, %{capacity: 256}] = Enum.filter(steps, &(&1.admitted > 0))
+  end
+
   # A server of tiny Gemma 3 with compile_steps runs chats with 1 and 3 images, whose
   # features have 4 and 12 rows (4 and 16 with the rows of zeros), next to a chat without
   # images and next to each other. The server process compiles nothing: no step, no write of

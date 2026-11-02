@@ -347,8 +347,9 @@ defmodule Transmuter.GenerationTest do
         end)
 
       check.(tokens, ids, logprobs)
-      # The cross function, one step of the prompt and 11 steps of new tokens.
-      assert calls == 1 + 1 + 11
+      # One step of the prompt and 11 steps of new tokens. The prompt step gives the
+      # cross-attention cache, so the request needs no call of the cross function.
+      assert calls == 1 + 11
     end
 
     # Rows with prompts of 7 and 12 tokens run in one group, with the shorter prompt padded in
@@ -843,9 +844,9 @@ defmodule Transmuter.GenerationTest do
   # A request that joins writes its prompt parts at the write offset, so a join can pass the
   # capacity. The first row has a prompt of 200 tokens, which runs in steps of 64, 64, 64 and 8
   # tokens, and then 44 steps of one token, so the offset is 244 of 256 rows. The prompt of 20
-  # tokens that joins then runs in a step of 64 rows at that offset, so the step compacts the
-  # buffers into 384 rows (244 and 64 rows, and 16 free rows) before it writes them. Each row
-  # gives the tokens that it gives alone.
+  # tokens that joins then runs in a step of 64 rows at that offset, so its admission compacts
+  # the buffers into 384 rows (244 and 64 rows, and 16 free rows), and the step does not move
+  # them again. Each row gives the tokens that it gives alone.
   @tag ci_partition: 10
   test "a request that joins past the capacity compacts the buffers before its prompt" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -872,6 +873,9 @@ defmodule Transmuter.GenerationTest do
         assert {group.state.used, group.state.capacity} == {244, 256}
         assert group.state.used + length(joining) > group.state.capacity
         group = Generation.admit(ctx, group, [request.(1, joining, 10)])
+        assert group.state.capacity == 384
+        group = Generation.next(ctx, group)
+        assert group.state.capacity == 384
         run_until(ctx, group, &Enum.all?(&1.done))
       end)
 
@@ -1128,6 +1132,37 @@ defmodule Transmuter.GenerationTest do
     :telemetry.detach(id)
     refute_received [_ | _]
     assert group.state.encoder_capacity == 256
+  end
+
+  # compile_steps compiles the first step of a new group at the capacity that the admission of
+  # its prompt and the step of its first part give it. Prompts at the lengths where the width of
+  # the first step or the capacity changes each start a new group and compile nothing.
+  @tag ci_partition: 10
+  test "the first steps of new groups at the boundary lengths compile nothing after compile_steps" do
+    {repo, ctx, encode} = marian(max_new_tokens: 2)
+    start = repo.config["decoder_start_token_id"]
+    inputs = encode.(@fox)
+    ctx = Generation.compile(%{ctx | max_capacity: 128}, 2, @opts[:defn_options])
+    Generation.compile_steps(ctx, 2, inputs)
+    id = make_ref()
+    pid = self()
+
+    :telemetry.attach_many(
+      id,
+      [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+      fn event, _measurements, _metadata, _config -> if self() == pid, do: send(pid, event) end,
+      nil
+    )
+
+    for length <- [1, 16, 17, 32, 33, 48, 49, 64, 65] do
+      prompt = [start | List.duplicate(100, length - 1)]
+      request = %{row: 0, prompt: prompt, seed: 0, budget: 2, inputs: inputs}
+      group = Generation.admit(ctx, Generation.open(ctx, 2), [request])
+      Generation.finish(Generation.next(ctx, group))
+    end
+
+    :telemetry.detach(id)
+    refute_received [_ | _]
   end
 
   # The context of the merged Marian decoder and a function that encodes a text into the

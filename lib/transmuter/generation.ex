@@ -16,7 +16,7 @@ defmodule Transmuter.Generation do
 
   A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same).
 
-  A step whose rows with tokens have no cache yet runs on the branch without cache, because Nx has no tensors of length 0. This branch has the causal mask, so the step takes the parts of the prompts as for the other decoders: the first step of a new group, or of a group whose other rows ended. Each row reads the logits at its last token, and the padding after a shorter part is in gap rows of the buffers. The other steps run on the branch with cache.
+  A step whose rows with tokens have no cache yet runs on the branch without cache, because Nx has no tensors of length 0. This branch has the causal mask, so the step takes the parts of the prompts as for the other decoders, at the smallest power of two up to 512 that holds the longest part: the first step of a new group, or of a group whose other rows ended. So a short prompt, such as the 4 tokens of Whisper, runs at about its own length. Each row reads the logits at its last token, and the padding after a shorter part is in gap rows of the buffers. The other steps run on the branch with cache.
 
   When requests can join a group (see "Logits"), the prompt of a request that joins running rows runs on the branch with cache, next to their new tokens. When each attention of the branch with cache that reads a buffer has a causal mask, as in GPT-2 and Florence-2, a step takes up to 64 tokens of the prompt, as for the other decoders. Otherwise, as in Whisper and Marian, a step takes one token of each prompt (see `Transmuter.Generation.MergedDecoder`). So each branch has the widths of its steps.
 
@@ -26,7 +26,7 @@ defmodule Transmuter.Generation do
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its branch without cache computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. The branch with cache gives an empty present for this cache, so the cache keeps its value.
 
-  When requests can join, each row keeps its own outputs of the encoder and its own cross-attention cache. The cross function of `Transmuter.Generation.MergedDecoder.cross/1` computes the cache of each request alone when it joins, and its row gets both. This is the only write of that cache, also when the next step runs on the branch without cache. A decoder whose cross-attention cache reads other values, such as the tokens, has no cross function, and its requests cannot join. The rows of a group have the same number of encoder rows, the encoder capacity. When the branch with cache reads the encoder mask, as in Marian, M2M100 and Florence-2, the outputs of a shorter encoder run get rows of zeros that the mask hides, and the encoder capacity is a power of two of at least 32 rows, up to the longest output of the encoder in the configuration, so the source lengths of the servings (32, 128 and 512 tokens) need no pad. Outputs of another length get rows of zeros on the host. It grows to the largest one of the requests of the group and does not shrink, so the steps compile for a few shapes. Otherwise, as in Whisper and TrOCR, all rows of a group need the same number of encoder rows.
+  When requests can join, each row keeps its own outputs of the encoder and its own cross-attention cache. The cache of a row comes from its first step. When the row joins rows that run, that step is on the branch with cache, so the cross function of `Transmuter.Generation.MergedDecoder.cross/1` computes the cache of the request alone when it joins. Otherwise the first step is on the branch without cache, whose presents give the cache of each row from its outputs of the encoder, with no other call. A decoder whose cross-attention cache reads other values, such as the tokens, has no cross function, and its requests cannot join. The rows of a group have the same number of encoder rows, the encoder capacity. The capacity starts at the encoder rows of the first rows of the group, a later row with more rows grows it to the encoder capacity of its rows, and a row with fewer rows pads to the capacity of the group. So `generate/5` runs at the exact encoder rows of its batch, with no pad. The rows of zeros of a pad need the encoder mask to hide them, so the rows of a group need the same number of encoder rows when the branch with cache does not read the mask, as in Whisper and TrOCR. When it does, as in Marian, M2M100 and Florence-2, the encoder capacity of a row is a power of two of at least 32 rows, up to the longest output of the encoder in the configuration. The source lengths of the servings, 32, 128 and 512 tokens, are such capacities. The pad of the outputs of another length runs on the host, because a device op compiles for each length on EXLA. The capacity does not shrink, so the steps compile for a few shapes.
 
   The token selection applies the logits processors of Python transformers that `generation_config.json` sets, in the order of `_get_logits_processor`: `repetition_penalty`, `no_repeat_ngram_size`, the bad words of one token in `bad_words_ids`, `min_length` or `min_new_tokens`, `forced_bos_token_id`, `forced_eos_token_id`, `suppress_tokens`, `begin_suppress_tokens`, the processors of the task, `renormalize_logits`, `temperature`, `top_k` and `top_p`.
 
@@ -117,6 +117,11 @@ defmodule Transmuter.Generation do
   # The widths of the steps of a group: new tokens, and the parts of the prompts next to rows
   # that decode and in an idle group. See step_width/1.
   @step_widths [1, @join_tokens, 512]
+
+  # The widths of the steps on the branch without cache of a merged decoder: the powers of two up
+  # to the widest step. That branch always has the causal mask, and the step pads its longest
+  # part to the next power of two, so a short prompt runs at about its own length.
+  @first_widths for exponent <- 0..9, do: 2 ** exponent
   @seen "transmuter.select.seen"
   @mask "transmuter.select.mask."
   @history "transmuter.select.history"
@@ -193,7 +198,7 @@ defmodule Transmuter.Generation do
       buffers: buffers(model),
       min_capacity: min_capacity(model),
       max_capacity: model[:max_capacity],
-      widths: %{with_cache: widths(model), without_cache: @step_widths},
+      widths: %{with_cache: widths(model), without_cache: @first_widths},
       given: given,
       one_length: model[:one_length],
       cross: MergedDecoder.cross(model),
@@ -216,8 +221,7 @@ defmodule Transmuter.Generation do
   end
 
   # The widths of the steps on the branch with cache (see plan/3): one token for a merged decoder
-  # whose branch with cache has no causal mask (see "Merged decoders"). The branch without cache
-  # always has the causal mask, so its steps take every width.
+  # whose branch with cache has no causal mask (see "Merged decoders").
   defp widths(%{causal: false}), do: [1]
   defp widths(_model), do: @step_widths
 
@@ -1031,7 +1035,7 @@ defmodule Transmuter.Generation do
     {positions, inputs} =
       Map.pop_lazy(inputs, :position_ids, fn -> Enum.map(prompts, fn _ -> [] end) end)
 
-    extras = %{features: features, positions: positions, inputs: inputs}
+    extras = %{features: features, positions: positions}
 
     ids =
       for prompts <- groups(ctx, prompts) do
@@ -1115,23 +1119,16 @@ defmodule Transmuter.Generation do
   end
 
   # The requests of the rows of `prompts` that have a prompt: the row, its prompt, its seed,
-  # its budget of new tokens, its positions and its image features. When the rows keep their
-  # own inputs, a request also has the row of each input of the prompts.
+  # its budget of new tokens, its positions and its image features.
   defp requests(ctx, prompts, seeds, extras) do
     for {{prompt, seed}, row} <- Enum.with_index(Enum.zip(prompts, seeds)), prompt != [] do
-      inputs =
-        if rows_keep_inputs?(ctx),
-          do: Map.new(extras.inputs, fn {name, t} -> {name, Nx.slice_along_axis(t, row, 1)} end),
-          else: %{}
-
       %{
         row: row,
         prompt: prompt,
         seed: seed,
         budget: ctx.max_new_tokens,
         position: Enum.at(extras.positions, row),
-        features: Enum.at(extras.features, row),
-        inputs: inputs
+        features: Enum.at(extras.features, row)
       }
     end
   end
@@ -1204,18 +1201,21 @@ defmodule Transmuter.Generation do
       left = Enum.reduce(requests, group.left, &List.replace_at(&2, &1.row, &1.prompt))
 
       # The tokens of each prompt go into the rows of its tokens now, and its keys and values
-      # in the steps of its parts, which fit their width (see fit/3).
+      # in the steps of its parts. The buffers make room for both before the writes (see
+      # fit_next/2).
       group =
         ctx
-        |> fit(%{reset_rows(group, requests) | left: left}, 0)
+        |> fit_next(%{reset_rows(group, requests) | left: left})
         |> then(&admit_rows(ctx, &1, requests))
 
-      # The rows of a merged decoder keep their own inputs, and the inputs of the prompts are
-      # in the requests (see requests/4).
+      # The rows of a merged decoder keep their own inputs: the inputs of the prompts, one row
+      # for each row of the group, or else the inputs of each request (see admit_inputs/3).
       {group, inputs} =
-        if rows_keep_inputs?(ctx),
-          do: {admit_inputs(ctx, group, requests), group.state.inputs},
-          else: {group, Map.merge(group.state.inputs, inputs)}
+        cond do
+          not rows_keep_inputs?(ctx) -> {group, Map.merge(group.state.inputs, inputs)}
+          inputs == %{} -> {admit_inputs(ctx, group, requests), group.state.inputs}
+          true -> {put_in(group.state.encoder_capacity, encoder_rows(%{inputs: inputs})), inputs}
+        end
 
       %{group | state: %{group.state | inputs: inputs, features: features, cursors: cursors}}
     else
@@ -1256,28 +1256,33 @@ defmodule Transmuter.Generation do
   @doc false
   # Runs one step of each shape that the steps of a group of `rows` rows can take, so each
   # shape compiles before a request needs it: each capacity of the buffers that capacity/2
-  # gives up to the largest, with each width of each branch (see branch_widths/3) that fits it.
+  # gives up to the largest, with each width that fits it, and for a merged decoder each first
+  # step of a new group (see first_steps/1).
   # It also compiles the writes of the rows of 1 to `rows` requests that join together at each
   # capacity, and a growth, or in :append a compaction, from each capacity to the next. When the
   # rows keep their own inputs, `inputs` are the inputs of one request, which give their types
   # and shapes, and the steps also run at each encoder capacity of encoder_capacities/2, with
   # the cross function, the writes of a row and each move between neighbour encoder capacities.
-  # Returns the number of step shapes.
+  # A shape that it misses compiles on its first step, so that step is slower and gives the
+  # same result. Returns the number of step shapes.
   def compile_steps(ctx, rows, inputs \\ %{}) do
     capacities = capacities(ctx, ctx.max_capacity)
     encoders = encoder_capacities(ctx, inputs)
 
-    # The first step of a new group, on the branch without cache of a merged decoder, and for a
-    # merged decoder a step on the branch with cache, where its row has one row of cache before
-    # its part. Such a step fits the part next to that row only below the capacity.
-    first = if merged?(ctx), do: ctx.widths.without_cache, else: ctx.widths.with_cache
-    later = if merged?(ctx), do: ctx.widths.with_cache, else: []
+    # Each step of a decoder that is not merged, and for a merged decoder the first steps of a
+    # new group (first_steps/1) and the steps on the branch with cache, where the row has one row
+    # of cache before its part. Such a step fits the part next to that row only below the
+    # capacity.
+    steps =
+      if merged?(ctx) do
+        later = for c <- capacities, size <- ctx.widths.with_cache, size < c, do: {c, size, 1}
+        for({c, size} <- first_steps(ctx), do: {c, size, 0}) ++ later
+      else
+        for c <- capacities, size <- ctx.widths.with_cache, size <= c, do: {c, size, 0}
+      end
 
     shapes =
-      for capacity <- capacities,
-          {widths, past} <- [{first, 0}, {later, 1}],
-          size <- widths,
-          size + past <= capacity,
+      for {capacity, size, past} <- steps,
           encoder <- encoders,
           do: {capacity, size, past, encoder}
 
@@ -1286,6 +1291,22 @@ defmodule Transmuter.Generation do
       request = Map.put(request, :inputs, encoder_inputs(ctx, inputs, encoder))
       group = admit(ctx, open(ctx, rows, capacity), [request])
       finish(next(ctx, cached_rows(group, past)))
+    end
+
+    # A later request with more rows of the encoder, which grows the encoder capacity to the
+    # next one, and a request that joins a row that runs, which runs the cross function and
+    # writes its row, at each encoder capacity (see admit_inputs/3).
+    request =
+      &%{row: &1, prompt: [0], seed: 0, budget: 1, inputs: encoder_inputs(ctx, inputs, &2)}
+
+    for [from, to] <- Enum.chunk_every(encoders, 2, 1, :discard) do
+      group = admit(ctx, open(ctx, rows, hd(capacities)), [request.(0, from)])
+      finish(admit(ctx, cancel(group, 0), [request.(0, to)]))
+    end
+
+    for encoder <- encoders, encoder != nil, rows > 1 do
+      group = admit(ctx, open(ctx, rows, hd(capacities)), [request.(0, encoder)])
+      finish(admit(ctx, cached_rows(group, 1), [request.(1, encoder)]))
     end
 
     for capacity <- capacities, count <- 2..rows//1 do
@@ -1323,6 +1344,27 @@ defmodule Transmuter.Generation do
     length(shapes)
   end
 
+  # The capacity and the width of each first step of a new group of a merged decoder, on its
+  # branch without cache: for each prompt length up to the largest capacity, the width of the
+  # first part of plan/3 (part_size/4) and the capacity of fit_capacity/4 in a group that open/3
+  # just made, whose rows have no rows of cache: the room that fit_next/2 makes at the admission,
+  # which the first step does not move.
+  # The server opens a new group when no row runs (see Transmuter.ContinuousGeneration), so its
+  # steps on that branch are such first steps. One row stands for the rows of a group, because
+  # the longest prompt decides the width and the capacity.
+  defp first_steps(ctx) do
+    start = capacity(ctx, @capacity_margin)
+
+    widths = ctx.widths.without_cache
+    room = room(ctx, %{lengths: [0], done: [false]})
+
+    for length <- 1..ctx.max_capacity, uniq: true do
+      width = width_for(min(length, part_size(false, length, room, widths)), widths)
+      rows = %{written: 0, kept: 0, running: length}
+      {fit_capacity(ctx, start, rows, width), width}
+    end
+  end
+
   # The group with `past` rows of cache in its row 0, which compile_steps/3 gives a step on the
   # branch with cache.
   defp cached_rows(group, 0), do: group
@@ -1354,7 +1396,9 @@ defmodule Transmuter.Generation do
       ctx.write_features.(slots, part, Nx.tensor(0, backend: Nx.BinaryBackend))
     end
 
-    for width <- Enum.uniq(ctx.widths.with_cache ++ ctx.widths.without_cache) do
+    widths = ctx.widths.with_cache ++ if(merged?(ctx), do: ctx.widths.without_cache, else: [])
+
+    for width <- Enum.uniq(widths) do
       embeds = ctx.embed.(List.duplicate(List.duplicate(0, width), rows))
       index = Nx.broadcast(Nx.tensor(0, type: :s32, backend: Nx.BinaryBackend), {rows, width})
       mask = Nx.broadcast(Nx.tensor(0, type: :u8, backend: Nx.BinaryBackend), {rows, width})
@@ -1645,23 +1689,38 @@ defmodule Transmuter.Generation do
   end
 
   # The rows of a merged decoder whose requests join keep their own inputs, such as the outputs
-  # of the encoder, in the cache of the group, next to the cross-attention cache that the cross
-  # function gives from them (see MergedDecoder.cross/1).
+  # of the encoder, in the cache of the group, next to their cross-attention cache.
   defp rows_keep_inputs?(ctx), do: ctx.given != [] and merged?(ctx) and joins?(ctx)
 
-  # Writes the inputs of each request and its cross-attention cache into its row. The inputs
-  # have the rows of the encoder on axis 1, and the cache on axis 2. All rows of a group have
-  # the encoder capacity of encoder_capacity/2, which grows to the largest one of its requests
-  # and does not shrink, so the steps compile for few shapes. The rows after the encoder rows
-  # of a request are zeros, which its encoder mask hides.
-  defp admit_inputs(ctx, group, requests) do
-    capacity =
-      Enum.reduce(requests, group.state.encoder_capacity, fn request, capacity ->
-        max(capacity, encoder_capacity(ctx, encoder_rows(request)))
-      end)
+  # Writes the inputs of each request into its row. The inputs have the rows of the encoder on
+  # axis 1, and the cache on axis 2. All rows of a group have one encoder capacity: it starts at
+  # the rows of the encoder of the first rows, a later row with more rows grows it to the
+  # encoder_capacity/2 of its rows, and a row with fewer rows pads to it with rows of zeros,
+  # which its encoder mask hides. The capacity does not shrink, so the steps compile for few
+  # shapes.
+  #
+  # The cross-attention cache of a row comes from its first step. When the group has rows that
+  # run, that step is on the branch with cache, which reads the cache, so the cross function
+  # writes it here. Otherwise the first step is on the branch without cache, whose presents
+  # give the cache of all rows from their inputs (see step/5).
+  defp admit_inputs(ctx, group = %{state: state}, requests) do
+    if Enum.any?(ctx.given, &Map.has_key?(state.inputs, &1)) do
+      raise ArgumentError,
+            "a request with its own encoder outputs cannot join a group whose rows took the encoder outputs of the prompts"
+    end
 
+    longest = requests |> Enum.map(&encoder_rows/1) |> Enum.max()
+
+    capacity =
+      cond do
+        state.encoder_capacity == 0 -> longest
+        longest <= state.encoder_capacity -> state.encoder_capacity
+        true -> encoder_capacity(ctx, longest)
+      end
+
+    cross? = Enum.any?(running_lengths(%{lengths: state.lengths, done: group.done}), &(&1 > 0))
     group = widen(ctx, group, hd(requests), capacity)
-    Enum.reduce(requests, group, &write_request(ctx, &2, &1))
+    Enum.reduce(requests, group, &write_request(ctx, &2, &1, cross?))
   end
 
   # The rows of the encoder in the inputs of a request.
@@ -1699,21 +1758,32 @@ defmodule Transmuter.Generation do
 
   # Gives the inputs and the cross-attention cache of the rows the encoder capacity
   # `capacity`, one capacity of encoder_capacity/2 at a time, so each move compiles only between
-  # neighbour capacities. The first request of a group makes the inputs, from the types and
-  # the shapes of its own inputs.
-  defp widen(ctx, group = %{state: state}, request, capacity) do
-    rows = length(group.done)
+  # neighbour capacities. The first rows of a group make these tensors at their capacity, as
+  # zeros on the device, from the types and the shapes of the inputs of a request and of the
+  # placeholders of the cache.
+  defp widen(ctx, group = %{state: state, done: done}, request, capacity)
+       when state.encoder_capacity == 0 do
+    shapes =
+      Enum.map(request.inputs, fn {name, t} ->
+        {name, Nx.type(t), put_elem(Nx.shape(t), 0, length(done))}
+      end) ++
+        for name <- ctx.cache -- ctx.buffers,
+            t = state.cache[name],
+            do: {name, Nx.type(t), Nx.shape(t)}
 
     made =
-      for {name, t} <- request.inputs, not Map.has_key?(state.cache, name), into: %{} do
-        shape = t |> Nx.shape() |> put_elem(0, rows) |> put_elem(1, state.encoder_capacity)
-        {name, Nx.broadcast(Nx.tensor(0, type: Nx.type(t), backend: ctx.backend), shape)}
-      end
+      Map.new(shapes, fn {name, type, shape} ->
+        axis = if String.starts_with?(name, "past_key_values."), do: 2, else: 1
+        shape = put_elem(shape, axis, capacity)
+        {name, Nx.broadcast(Nx.tensor(0, type: type, backend: ctx.backend), shape)}
+      end)
 
-    tensors =
-      state.cache
-      |> Map.take((ctx.cache -- ctx.buffers) ++ Map.keys(request.inputs))
-      |> Map.merge(made)
+    release(Map.values(Map.take(state.cache, Map.keys(made))), [])
+    %{group | state: %{state | cache: Map.merge(state.cache, made), encoder_capacity: capacity}}
+  end
+
+  defp widen(ctx, group = %{state: state}, request, capacity) do
+    tensors = Map.take(state.cache, (ctx.cache -- ctx.buffers) ++ Map.keys(request.inputs))
 
     widened =
       ctx
@@ -1729,14 +1799,14 @@ defmodule Transmuter.Generation do
   end
 
   # The encoder capacities that the rows of a group can have, from the rows of the encoder in
-  # `inputs`, the inputs of one request: each one up to the longest output of the encoder when
-  # padding rows are hidden, else the rows of `inputs`. Without inputs, [nil].
+  # `inputs`, the inputs of its first request: those rows, and when padding rows are hidden each
+  # larger one up to the longest output of the encoder. Without inputs, [nil].
   defp encoder_capacities(_ctx, inputs) when inputs == %{}, do: [nil]
 
   defp encoder_capacities(ctx, inputs) do
     rows = encoder_rows(%{inputs: inputs})
     top = encoder_capacity(ctx, max(rows, ctx.encoder_length || rows))
-    encoder_path(ctx, 0, top)
+    [rows | encoder_path(ctx, rows, top)]
   end
 
   # Inputs of the types of `inputs` with `rows` rows of the encoder, all zeros.
@@ -1766,8 +1836,8 @@ defmodule Transmuter.Generation do
   end
 
   # Pads the inputs of `request` to the encoder capacity of the group, runs its cross function
-  # and writes both into its row.
-  defp write_request(ctx, group = %{state: state}, request) do
+  # when `cross?` (see admit_inputs/3), and writes both into its row.
+  defp write_request(ctx, group = %{state: state}, request, cross?) do
     capacity = state.encoder_capacity
     rows = encoder_rows(request)
 
@@ -1779,7 +1849,7 @@ defmodule Transmuter.Generation do
     padded = Map.new(request.inputs, fn {name, t} -> {name, pad_rows(t, capacity)} end)
 
     cross =
-      for {"present." <> rest, t} <- if(ctx.cross, do: ctx.cross.(padded), else: %{}),
+      for {"present." <> rest, t} <- if(cross? and ctx.cross, do: ctx.cross.(padded), else: %{}),
           into: %{},
           do: {"past_key_values." <> rest, t}
 
@@ -2140,12 +2210,9 @@ defmodule Transmuter.Generation do
   # row that ended loses its valid rows, so it writes the padding of the step from its first
   # row and needs no rows of the buffers. In :append, a compaction drops it.
   defp advance(ctx, group) do
-    group = if ctx.mode == :in_place, do: drop_ended(group), else: group
-    rows = %{lengths: group.state.lengths, done: group.done}
-    widths = branch_widths(ctx, group, group.state.lengths)
-    {parts, left} = plan(group, room(ctx, rows), widths)
-    width = step_width(parts, widths)
-    group = %{fit(ctx, group, width) | left: left}
+    group = fit_next(ctx, group)
+    {parts, left, width} = next_parts(ctx, group)
+    group = %{group | left: left}
     state = step(ctx, group.state, parts, selection(ctx, group), width)
 
     # The image features stay until the last part of a prompt has run.
@@ -2169,6 +2236,26 @@ defmodule Transmuter.Generation do
     if without_cache?(ctx, taking), do: ctx.widths.without_cache, else: ctx.widths.with_cache
   end
 
+  # Makes room in the buffers for the next step of a group (see fit/3), after the rows that
+  # ended in :in_place lose their valid rows (see drop_ended/1). admit/4 calls it after the rows
+  # of its requests take their prompts, so the room covers each token that admit/4 writes, the
+  # tokens of each prompt, and each row that the first step writes. Then the first step after an
+  # admission does not move the buffers. advance/2 calls it before each later step.
+  defp fit_next(ctx, group) do
+    group = if ctx.mode == :in_place, do: drop_ended(group), else: group
+    {_parts, _left, width} = next_parts(ctx, group)
+    fit(ctx, group, width)
+  end
+
+  # The parts of the next step of a group (see plan/3), the prompts that are left after it, and
+  # its width, on the branch that the step runs on (see branch_widths/3).
+  defp next_parts(ctx, group) do
+    widths = branch_widths(ctx, group, group.state.lengths)
+    rows = %{lengths: group.state.lengths, done: group.done}
+    {parts, left} = plan(group, room(ctx, rows), widths)
+    {parts, left, step_width(parts, widths)}
+  end
+
   # The tokens of each row in the next step, and the tokens of the prompts that are left after
   # it. A row with a new token takes it. A row with a prompt takes a part of it from the front:
   # at most @join_tokens tokens when another row takes a new token, so a long prompt delays the
@@ -2183,9 +2270,7 @@ defmodule Transmuter.Generation do
       Enum.any?(Enum.zip(group.new, group.done), &match?({token, false} when token != nil, &1))
 
     longest = group.left |> Enum.map(&length/1) |> Enum.max()
-    join = min(@join_tokens, List.last(widths))
-    fills = for width <- widths, width <= longest, width <= room, do: width
-    size = if running?, do: join, else: Enum.max([join | fills])
+    size = part_size(running?, longest, room, widths)
 
     [group.left, group.new, group.done]
     |> Enum.zip_with(fn
@@ -2194,6 +2279,14 @@ defmodule Transmuter.Generation do
       [left, _token, _done?] -> Enum.split(left, size)
     end)
     |> Enum.unzip()
+  end
+
+  # The most tokens of a prompt in the next step, when the longest prompt has `longest` tokens
+  # left, see plan/3.
+  defp part_size(running?, longest, room, widths) do
+    join = min(@join_tokens, List.last(widths))
+    fills = for width <- widths, width <= longest, width <= room, do: width
+    if running?, do: join, else: Enum.max([join | fills])
   end
 
   # The lengths of the rows that have not ended.
@@ -2218,10 +2311,10 @@ defmodule Transmuter.Generation do
   # part. The shorter parts pad to it, as the parts of the rows of a step pad to the longest
   # one. So the steps of a group have at most three shapes for each capacity (see
   # compile_steps/3), whatever the timing of the requests.
-  defp step_width(parts, widths) do
-    longest = parts |> Enum.map(&length/1) |> Enum.max()
-    Enum.find(widths, &(&1 >= longest))
-  end
+  defp step_width(parts, widths),
+    do: width_for(parts |> Enum.map(&length/1) |> Enum.max(), widths)
+
+  defp width_for(tokens, widths), do: Enum.find(widths, &(&1 >= tokens))
 
   # The masks of tokens are on the host, because a mark there is faster than a call to the
   # device. They are made from binaries, because Nx.broadcast on Nx.BinaryBackend goes
@@ -2298,7 +2391,7 @@ defmodule Transmuter.Generation do
       used: 0,
       valid: List.duplicate([], batch_size),
       capacity: capacity,
-      encoder_capacity: 1,
+      encoder_capacity: 0,
       selected: nil,
       seen: nil,
       history: nil,
@@ -2361,15 +2454,6 @@ defmodule Transmuter.Generation do
           Map.has_key?(outputs, "present." <> rest),
           into: %{},
           do: {name, outputs["present." <> rest]}
-
-    # When the rows keep their own inputs, admit_inputs/3 alone writes the cross-attention cache
-    # of each row, so the step drops that cache from the presents of the branch without cache.
-    {present, dead} =
-      Map.split_with(present, fn {name, _} ->
-        name in ctx.buffers or not rows_keep_inputs?(ctx)
-      end)
-
-    release(Map.values(dead), [])
 
     # The present replaces the cache entries that the step wrote, and their old buffers are
     # dead. In :append, the tail wrote the new rows into the buffers (see tail/1). The
@@ -2473,35 +2557,73 @@ defmodule Transmuter.Generation do
   # of each row that runs with the prompt that it has left (running_rows/1), because the
   # tokens of a prompt go into the state when it joins.
   defp fit(ctx, group = %{state: state}, n) when is_integer(n) do
-    written = if ctx.mode == :append, do: state.used, else: Enum.max(state.lengths)
+    rows = buffer_rows(ctx, group)
 
     cond do
-      rows_for(group, written, n) <= state.capacity -> group
-      ctx.mode == :append -> compact(ctx, group, n)
-      true -> grow(ctx, group, n)
+      rows_for(rows, rows.written, n) <= state.capacity -> group
+      ctx.mode == :append -> compact(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
+      true -> grow(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
     end
   end
+
+  # The rows of a group that size its buffers: `written`, the rows that the buffers hold (the
+  # write offset in :append, else the longest row), `kept`, the rows of the longest row that a
+  # compaction or a growth keeps (its valid rows in :append, else its length), and `running`,
+  # the rows of the longest row that has not ended with the prompt that it has left.
+  defp buffer_rows(ctx, group = %{state: state}) do
+    longest = Enum.max(state.lengths)
+
+    if ctx.mode == :append do
+      kept = group |> valid_rows() |> row_counts() |> Enum.max()
+      %{written: state.used, kept: kept, running: running_rows(group)}
+    else
+      %{written: longest, kept: longest, running: running_rows(group)}
+    end
+  end
+
+  # The capacity of the buffers after fit/3 for a step of n tokens, from the capacity now and
+  # the rows of buffer_rows/2: the capacity now when the step fits, else the capacity of a
+  # compaction in :append (see compact/3) or of a growth (see grow/3). compile_steps/3 reads it
+  # to find the capacities of the first steps of a group.
+  defp fit_capacity(ctx, capacity, rows, n) do
+    if rows_for(rows, rows.written, n) <= capacity,
+      do: capacity,
+      else: moved_capacity(ctx, rows, n)
+  end
+
+  # The capacity of a compaction in :append, with @capacity_margin free rows, or of a growth,
+  # for a step of n tokens after the rows that it keeps.
+  defp moved_capacity(ctx, rows, n) do
+    slack = if ctx.mode == :append, do: @capacity_margin, else: 0
+    fitting(ctx, rows_for(rows, rows.kept, n), slack)
+  end
+
+  # The valid rows of each row that has not ended.
+  defp valid_rows(group = %{state: state}),
+    do: Enum.zip_with(state.valid, group.done, &if(&2, do: [], else: &1))
+
+  defp row_counts(valid),
+    do: Enum.map(valid, fn ranges -> ranges |> Enum.map(&elem(&1, 1)) |> Enum.sum() end)
 
   # The rows that the buffers need for a step of n tokens after `written` rows, and for the
   # tokens of each row that runs with the prompt that it has left. fit/3, grow/3, compact/3
   # and shrink/2 all size the buffers with it.
-  defp rows_for(group, written, n), do: max(written + n, running_rows(group))
+  defp rows_for(rows, written, n), do: max(written + n, rows.running)
 
   # The rows of a step write at one offset in :append, so the rows of all steps count, also
   # the gap rows of the shorter rows and the rows of the rows that ended. The compaction moves
   # the valid rows of each row that has not ended to the front of its buffers, in their order,
-  # and the write offset goes back to the longest row. The buffers get the capacity of the
-  # longest row and the next n tokens, or of the tokens of the longest row with the prompt that
-  # it has left, and @capacity_margin rows, so a compaction frees rows for at least that many
+  # and the write offset goes back to the longest row. The buffers get `capacity`, which
+  # moved_capacity/3 gives for the longest row and the next n tokens, or for the tokens of the
+  # longest row with the prompt that it has left, and @capacity_margin rows, so a compaction frees rows for at least that many
   # steps and never cuts the tokens of a prompt. The capacity can be smaller or larger than
   # before. The keys and values keep the positions of their tokens, the masks come from the
   # new ranges, and the position offset of a merged decoder reads the valid rows of each row
   # or the write offset, which is the longest row.
-  defp compact(ctx, group = %{state: state}, n) do
-    valid = Enum.zip_with(state.valid, group.done, &if(&2, do: [], else: &1))
-    counts = Enum.map(valid, fn ranges -> ranges |> Enum.map(&elem(&1, 1)) |> Enum.sum() end)
+  defp compact(ctx, group = %{state: state}, capacity) do
+    valid = valid_rows(group)
+    counts = row_counts(valid)
     longest = Enum.max(counts)
-    capacity = fitting(ctx, rows_for(group, longest, n), @capacity_margin)
 
     index =
       for ranges <- valid do
@@ -2536,8 +2658,8 @@ defmodule Transmuter.Generation do
   # The buffers of the other modes stay.
   def shrink(ctx, group = %{state: state}) do
     if ctx.mode == :append and
-         capacity(ctx, rows_for(group, 0, 0) + @capacity_margin) <= div(state.capacity, 2),
-       do: compact(ctx, group, 0),
+         capacity(ctx, running_rows(group) + @capacity_margin) <= div(state.capacity, 2),
+       do: compact(ctx, group, moved_capacity(ctx, buffer_rows(ctx, group), 0)),
        else: group
   end
 
@@ -2567,8 +2689,7 @@ defmodule Transmuter.Generation do
   # rows, which the masks hide, and each growth compiles the steps of one more capacity. The
   # tokens of the rows, which the processors read, have the same capacity and grow with the
   # buffers, also in :grow, where the cache has its exact length and only the tokens grow.
-  defp grow(ctx, group = %{state: state}, n) do
-    capacity = fitting(ctx, rows_for(group, Enum.max(state.lengths), n), 0)
+  defp grow(ctx, group = %{state: state}, capacity) do
     old = buffer_tensors(ctx, group)
     {history, grown} = Map.pop!(resize_buffers(ctx, old, state.capacity, capacity), @history)
     state = %{state | cache: Map.merge(state.cache, grown), history: history, capacity: capacity}
