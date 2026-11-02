@@ -4,7 +4,7 @@ defmodule Transmuter.Ops.Transformer do
 
   On EMLX (see `Transmuter.Ops.emlx?/1`), the normalizations and the attention core run as fused kernels of `EMLX.Fast`. The kernels take f16 and bf16 values as they are and accumulate in f32. Attention with a softcap keeps the Nx operations, because the kernel has no softcap. The Nx operations compute f16 and bf16 values in f32 (see `Transmuter.Ops.widen/2`).
 
-  All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel.
+  All attention ops share one attention core with the scale, the softcap, the masks and the grouping of key and value heads. When the causal mask is the only mask, it runs as the causal kernel, which builds no mask. Other masks become one additive mask for the kernel. The attention core is the `Nx.block/4` of `Transmuter.Ops.Attention` on every backend, so a compiler can run it as one kernel, such as the cuDNN flash attention on EXLA CUDA.
 
   Without the kernel, the attention core builds the scores of the query rows, in f32 or in the wider float type of q and k. When the scores of all rows take more than 256 MiB, the core runs on chunks of query rows, one chunk at a time. The rows split into the fewest chunks whose scores fit in 256 MiB, with the same number of rows in each chunk. A chunk has at least one row, so when the scores of one row take more than 256 MiB, the scores of a chunk take more too. Each row has its own softmax over all keys, so the chunks give the values of all rows at once. For example, a 1540x1540 image in the vision encoder of Ministral 3 has 12100 query rows and scores of 9.4 GB, which become 35 chunks of 346 rows and 268 MB.
 
@@ -12,6 +12,7 @@ defmodule Transmuter.Ops.Transformer do
   """
 
   alias Nx.Defn.Expr
+  alias Transmuter.Ops.Attention
 
   import Transmuter.Ops,
     only: [
@@ -648,15 +649,43 @@ defmodule Transmuter.Ops.Transformer do
   #   * :causal - whether query i sees only the keys up to T - S + i. ONNX Runtime aligns the
   #     causal mask to the last query, so past keys stay visible.
   #
-  # The masks broadcast to {B, N, S, T}. On EMLX without softcap, one kernel computes it: the
-  # causal kernel when the causal mask is the only mask, or else the kernel with one additive
-  # mask in the type of q.
+  # The masks broadcast to {B, N, S, T}. The core is the Nx.block of Transmuter.Ops.Attention
+  # on every backend, so a compiler can run it as one kernel. Its default function is
+  # attention/2. It is public for its test.
   @doc false
-  # The attention of q, k and v. On EMLX, the fused kernel of MLX runs when it takes the
-  # shapes, or when the head size padded with zeros takes it (see Transmuter.Ops.mlx_attention/4).
-  # Otherwise the Nx core runs in chunks of query rows, because the fallback of MLX builds
-  # the scores of all rows at once. It is public for its test.
   def attend(q, k, v, opts) do
+    # Leading axes of 1 keep the values of a mask that broadcasts to {B, N, S, T}.
+    bias = opts.bias && Nx.reshape(opts.bias, rank4(opts.bias))
+    masks = for {name, mask} <- [bias: bias, hidden: opts.hidden], mask, do: {name, mask}
+
+    attention =
+      struct!(
+        Attention,
+        opts |> Map.take([:scale, :softcap, :causal]) |> Map.put(:masks, Keyword.keys(masks))
+      )
+
+    args = [q, k, v | Keyword.values(masks)]
+    out = Nx.template(put_elem(Nx.shape(q), 3, Nx.axis_size(v, 3)), Nx.type(q))
+    Nx.block(attention, args, out, attention_fun(length(args)))
+  end
+
+  defp attention_fun(3), do: &attention(&1, [&2, &3, &4])
+  defp attention_fun(4), do: &attention(&1, [&2, &3, &4, &5])
+  defp attention_fun(5), do: &attention(&1, [&2, &3, &4, &5, &6])
+
+  # The default function of the attention block. On EMLX without softcap, one kernel of MLX
+  # computes it when it takes the shapes, or when the head size padded with zeros takes it
+  # (see Transmuter.Ops.mlx_attention/4): the causal kernel when the causal mask is the only
+  # mask, or else the kernel with one additive mask in the type of q. Otherwise the Nx core
+  # runs in chunks of query rows, because the fallback of MLX builds the scores of all rows
+  # at once.
+  defp attention(attention, [q, k, v | masks]) do
+    opts =
+      attention
+      |> Map.take([:scale, :softcap, :causal])
+      |> Map.merge(%{bias: nil, hidden: nil})
+      |> Map.merge(Map.new(Enum.zip(attention.masks, masks)))
+
     type = Nx.type(q)
 
     case emlx?(q) and opts.softcap == 0 and
@@ -679,6 +708,9 @@ defmodule Transmuter.Ops.Transformer do
         |> hd()
     end
   end
+
+  defp rank4(mask),
+    do: List.to_tuple(List.duplicate(1, 4 - Nx.rank(mask)) ++ Tuple.to_list(Nx.shape(mask)))
 
   # The mask that fused_attention/4 gives the kernel: the masks of opts become one array.
   defp mask_kind(%{bias: nil, hidden: nil, causal: true}), do: :causal

@@ -132,6 +132,7 @@ defmodule Transmuter.MixProject do
           Transmuter.Shared,
           Transmuter.Random,
           Transmuter.Ops,
+          Transmuter.Ops.Attention,
           Transmuter.Ops.Elementwise,
           Transmuter.Ops.LinAlg,
           Transmuter.Ops.MoE,
