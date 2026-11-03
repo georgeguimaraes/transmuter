@@ -16,7 +16,7 @@ defmodule Transmuter.Generation do
 
   A merged decoder of optimum has a branch without cache and a branch with cache (`use_cache_branch`). The exports trace the branch with cache for one new token, and some of them, such as Whisper and Marian, have no causal mask in it, so a step of several tokens there gives wrong logits (ONNX Runtime gives the same).
 
-  A step whose rows with tokens have no cache yet runs on the branch without cache, because Nx has no tensors of length 0. This branch has the causal mask, so the step takes the parts of the prompts as for the other decoders, at the smallest power of two up to 512 that holds the longest part: the first step of a new group, or of a group whose other rows ended. So a short prompt, such as the 4 tokens of Whisper, runs at about its own length. Each row reads the logits at its last token, and the padding after a shorter part is in gap rows of the buffers. The other steps run on the branch with cache.
+  A step whose rows with tokens have no cache yet runs on the branch without cache, because Nx has no tensors of length 0. This is the first step of a new group, or of a group whose other rows ended. This branch has the causal mask, so the step takes the parts of the prompts as for the other decoders. A prompt of up to 64 tokens runs in one step at the smallest power of two that holds it, so a short prompt, such as the 4 tokens of Whisper, runs at about its own length. A longer prompt takes parts of 64 or 512 tokens, as the other steps. Each row reads the logits at its last token, and the padding after a shorter part is in gap rows of the buffers. The other steps run on the branch with cache.
 
   When requests can join a group (see "Logits"), the prompt of a request that joins running rows runs on the branch with cache, next to their new tokens. When each attention of the branch with cache that reads a buffer has a causal mask, as in GPT-2 and Florence-2, a step takes up to 64 tokens of the prompt, as for the other decoders. Otherwise, as in Whisper and Marian, a step takes one token of each prompt (see `Transmuter.Generation.MergedDecoder`). So each branch has the widths of its steps.
 
@@ -119,9 +119,13 @@ defmodule Transmuter.Generation do
   @step_widths [1, @join_tokens, 512]
 
   # The widths of the steps on the branch without cache of a merged decoder: the powers of two up
-  # to the widest step. That branch always has the causal mask, and the step pads its longest
-  # part to the next power of two, so a short prompt runs at about its own length.
-  @first_widths for exponent <- 0..9, do: 2 ** exponent
+  # to @join_tokens, then the wider steps of @step_widths. That branch always has the causal
+  # mask, so a prompt of up to @join_tokens tokens runs in one step at about its own length, and
+  # a longer prompt runs in the parts of the other steps. A step of more tokens costs more to
+  # compile (about 1.7 s for 64 tokens and 2.5 s for 256 on CUDA for Marian), so the widths
+  # between @join_tokens and 512 are not steps.
+  @first_widths for(exponent <- 0..trunc(:math.log2(@join_tokens)), do: 2 ** exponent) ++
+                  Enum.filter(@step_widths, &(&1 > @join_tokens))
   @seen "transmuter.select.seen"
   @mask "transmuter.select.mask."
   @history "transmuter.select.history"
