@@ -100,6 +100,7 @@ defmodule Transmuter.Generation do
   A backend that frees a released buffer only when the BEAM collects its tensor, such as EMLX 0.5 (see elixir-nx/emlx#159), still keeps the dead caches of the steps until a collection. A loop with little host garbage collects rarely, so these caches pile up. So the generation process collects its garbage after it releases 256 MB of device buffers. A small cache then rarely costs a collection, and a large one gets one before its dead copies take much memory.
   """
 
+  alias Nx.Defn.Composite
   alias Transmuter.Generation.MergedDecoder
   alias Transmuter.{GraphBreaks, Serving}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
@@ -774,12 +775,34 @@ defmodule Transmuter.Generation do
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
 
     ctx
-    |> Map.put(:grow, GraphBreaks.jit(&grow_rows/2, defn_options))
-    |> Map.put(:compact, GraphBreaks.jit(&compact_rows/2, defn_options))
-    |> Map.put(:reorder, GraphBreaks.jit(&reorder_rows/2, defn_options))
-    |> Map.put(:admit_rows, GraphBreaks.jit(&write_admitted/3, defn_options))
-    |> Map.put(:write_row, GraphBreaks.jit(&write_row/3, defn_options))
-    |> Map.put(:widen, GraphBreaks.jit(&widen_rows/2, defn_options))
+    |> Map.put(:grow, state_jit(&grow_rows/2, defn_options))
+    |> Map.put(:compact, state_jit(&compact_rows/2, defn_options))
+    |> Map.put(:reorder, state_jit(&reorder_rows/2, defn_options))
+    |> Map.put(:admit_rows, state_jit(&write_admitted/3, defn_options))
+    |> Map.put(:write_row, state_jit(&write_row/3, defn_options))
+    |> Map.put(:widen, state_jit(&widen_rows/2, defn_options))
+  end
+
+  # The jit function of `fun`, whose outputs become the state of a group, such as a row that a
+  # request writes. Each compiled function whose outputs become group state evaluates them:
+  # the step evaluates its state with its selection (see anchor/2), and this function evaluates
+  # the outputs when the call returns. On EMLX 0.5, an output otherwise stays an MLX expression
+  # that each later call that reads it computes again, and a later step that read the outputs
+  # of write_row/3 this way gave wrong values in some runs, in the joins of Marian.
+  defp state_jit(fun, defn_options) do
+    jit = GraphBreaks.jit(fun, defn_options)
+
+    case Function.info(fun, :arity) do
+      {:arity, 2} -> fn a, b -> evaluated(jit.(a, b)) end
+      {:arity, 3} -> fn a, b, c -> evaluated(jit.(a, b, c)) end
+    end
+  end
+
+  defp evaluated(outputs) do
+    Composite.traverse(outputs, fn
+      tensor = %Nx.Tensor{data: %{__struct__: EMLX.Backend}} -> Transmuter.EMLX.evaluate(tensor)
+      tensor -> tensor
+    end)
   end
 
   # The settings of the selection, and the processes of the processors with the masks in their
@@ -975,7 +998,7 @@ defmodule Transmuter.Generation do
 
     %{ctx | embed: embed}
     |> Map.put(:merge, GraphBreaks.jit(&merge_features/4, defn_options))
-    |> Map.put(:write_features, GraphBreaks.jit(&write_features/3, defn_options))
+    |> Map.put(:write_features, state_jit(&write_features/3, defn_options))
   end
 
   defp compile_cross(ctx = %{cross: nil}, _defn_options), do: ctx
@@ -1193,6 +1216,9 @@ defmodule Transmuter.Generation do
   # which no row with a cache can share, the rows of :grow and of a scalar offset need one
   # length of the cache, and the beams of all prompts start their search in the same step.
   def admit(ctx, group, requests, inputs \\ %{}) do
+    # The group keeps the inputs of the prompts across steps, so they are evaluated as the
+    # outputs of state_jit/2.
+    inputs = evaluated(inputs)
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
     if not joins?(ctx) and Enum.any?(pending) do
