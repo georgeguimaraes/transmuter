@@ -540,6 +540,26 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # A merged decoder that reads the position of each new token from a static table keeps its
+  # buffer within the table, as with the causal table of GPT-2 below. A step at a buffer of C
+  # rows reads its first new token at C + k, the index of the read, so the buffer has at most
+  # rows - k - 1 rows. Marian reads Gather(table, Range(L, L + T)) of 512 rows, so k is 0, and
+  # Florence-2 adds the offset 2 of BART to that range on a table of 1026 rows, so k is 2. A
+  # position past the table would read a clamped row on EXLA.
+  test "a merged decoder keeps its buffer within its position table" do
+    for {repo, max_capacity} <- [
+          {"Xenova/opus-mt-en-de", 511},
+          {"onnx-community/Florence-2-base-ft", 1023}
+        ] do
+      rewritten =
+        {:hf, repo, "onnx/decoder_model_merged.onnx"}
+        |> Transmuter.load!(backend: Nx.BinaryBackend)
+        |> Generation.MergedDecoder.rewrite(1)
+
+      assert rewritten[:max_capacity] == max_capacity, repo
+    end
+  end
+
   # The GPT-2 export slices a causal table of 1024 rows at the length of its cache. Its rows
   # bound the buffer and the positions: 900 + 32 tokens take a buffer of 1023 rows, not 1024,
   # and give the greedy tokens of the cache of exact length, and 900 + 132 tokens raise at the

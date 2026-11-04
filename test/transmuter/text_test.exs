@@ -625,6 +625,8 @@ defmodule Transmuter.TextLargeModelTest do
   @moduletag :hub
   @moduletag timeout: 900_000
 
+  alias Transmuter.Generation.MergedDecoder
+
   @opts [
     backend: Transmuter.TestBackend.backend(),
     defn_options: Transmuter.TestBackend.compiler_opts()
@@ -632,7 +634,9 @@ defmodule Transmuter.TextLargeModelTest do
 
   # The reference is the greedy translation pipeline of transformers with src_lang and
   # tgt_lang, see test/support/pipeline_references.py. The configuration of m2m100_418M has
-  # num_beams: 5, so the test gives num_beams: 1.
+  # num_beams: 5, so the test gives num_beams: 1. Both decoders read their positions from a
+  # table of 1026 rows at (cumsum(mask) + L) * mask + 1, so the new token of a buffer of C rows
+  # reads row C + 2, and the buffer has at most 1023 rows.
   @tag :large_model
   test "NLLB and M2M100 translate as the translation pipeline of transformers" do
     sentence =
@@ -655,21 +659,31 @@ defmodule Transmuter.TextLargeModelTest do
              {"__fr__", "__de__", french,
               "Das Leben ist schön und die Sonne schlägt auf die Stadt."}
            ]}
-        ],
-        {source, target, text, expected} <- cases do
-      serving =
-        Transmuter.Text.text_to_text(
-          {:hf, repo},
-          [
-            variant: variant,
-            strategy: :greedy,
-            num_beams: 1,
-            source_language_token: source,
-            target_language_token: target
-          ] ++ @opts
-        )
+        ] do
+      max_capacity =
+        {:hf, repo, "onnx/decoder_model_merged.onnx"}
+        |> Transmuter.load!(backend: Nx.BinaryBackend)
+        |> MergedDecoder.rewrite(1)
+        |> Map.get(:max_capacity)
 
-      assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, text)
+      assert max_capacity == 1023, repo
+      :erlang.garbage_collect()
+
+      for {source, target, text, expected} <- cases do
+        serving =
+          Transmuter.Text.text_to_text(
+            {:hf, repo},
+            [
+              variant: variant,
+              strategy: :greedy,
+              num_beams: 1,
+              source_language_token: source,
+              target_language_token: target
+            ] ++ @opts
+          )
+
+        assert %{results: [%{text: ^expected}]} = Nx.Serving.run(serving, text)
+      end
     end
   end
 

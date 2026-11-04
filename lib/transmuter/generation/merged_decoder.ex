@@ -65,24 +65,27 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   # A step of n tokens at a capacity of C rows reads C + n keys, so each causal table that a
-  # Slice reads gets `rows` rows: the largest capacity and the most tokens of a step. The
-  # table is a tril (see causal?/1), and a larger tril gives the same values at every key of
-  # the smaller one. The largest capacity stays at the rows of the table of the export, which
-  # also bound the positions. A causal table of the export is large, so it is a param (see
-  # Transmuter.load!/2).
+  # Slice reads gets `rows` rows, the largest capacity and the most tokens of a step, plus the
+  # largest part past L of the start of the Slice. The table is a tril (see causal?/1), and a
+  # larger tril gives the same values at every key of the smaller one. The largest capacity
+  # stays at the rows of the table of the export, which also bound the positions. A causal
+  # table of the export is large, so it is a param (see Transmuter.load!/2).
   defp extend_tables(model, _graph, _kinds, nil), do: model
 
   defp extend_tables(model, graph, kinds, rows) do
     tables =
-      for node = %{op_type: "Slice"} <- graph.node,
+      for node = %{op_type: "Slice", input: [name, starts | _]} <- graph.node,
           match?({:causal, _, _}, kinds[hd(node.output)]),
-          table = model.params[hd(node.input)],
-          Nx.axis_size(table, -1) < rows,
-          uniq: true,
-          do: hd(node.input)
+          table = model.params[name],
+          size = rows + shift_k(kinds[starts]),
+          Nx.axis_size(table, -1) < size,
+          do: {name, size}
 
     params =
-      Map.new(tables, fn name ->
+      tables
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Map.new(fn {name, sizes} ->
+        rows = Enum.max(sizes)
         table = model.params[name]
 
         rank = Nx.rank(table)
@@ -304,14 +307,15 @@ defmodule Transmuter.Generation.MergedDecoder do
   # The operators that keep L shifted: their value is L plus values that do not depend on L.
   @shifts ~w(Gather Cast Unsqueeze Squeeze Reshape Expand Identity Slice)
 
-  # The position reads of the branch with cache, and the smallest axis of the other static
-  # tables that a length of the buffer indexes, such as the causal table of GPT-2, which the
-  # rows of the buffer and the new token must fit. The values that depend on L have a kind:
-  # :shift for L plus other values, :int for other integers, :bool for comparisons and
-  # {:dims, axis, rank} for the shape of a tensor whose length follows the buffer. The lengths
-  # map gives the axis of that length from the end and the rank, or :unknown: axis 2 of 4 for
-  # the buffers of the cache, axis 1 of 2 for the attention mask, and the axes after Concat,
-  # Cast, Identity and Transpose.
+  # The position reads of the branch with cache, and the smallest axis of the static tables
+  # that a length of the buffer indexes, such as the position table of Marian and the causal
+  # table of GPT-2, less the largest part past L of the index, which the rows of the buffer and
+  # the new token must fit. The values that depend on L have a kind: {:shift, k} for L plus
+  # other values, of which k is the largest static part (see kind/3), :int for other integers,
+  # :bool for comparisons and {:dims, axis, rank} for the shape of a tensor whose length
+  # follows the buffer. The lengths map gives the axis of that length from the end and the
+  # rank, or :unknown: axis 2 of 4 for the buffers of the cache, axis 1 of 2 for the attention
+  # mask, and the axes after Concat, Cast, Identity and Transpose.
   defp past_uses(model, graph, index_ranges \\ MapSet.new()) do
     scope = static_scope(model, graph)
     lengths = Map.new(buffers(model), &{&1, {-2, 4}})
@@ -327,8 +331,8 @@ defmodule Transmuter.Generation.MergedDecoder do
       lengths = Map.merge(lengths, track(node, lengths, kinds))
 
       case past_use(%{scope: scope, lengths: lengths, index: index_ranges}, node, kinds) do
-        {:read, node} ->
-          {:cont, {[node | reads], kinds, lengths, limit, prefixes}}
+        {:read, node, rows} ->
+          {:cont, {[node | reads], kinds, lengths, min(limit, rows), prefixes}}
 
         {:positions, node, outputs} ->
           {:cont, {[node | reads], Map.merge(kinds, outputs), lengths, limit, prefixes}}
@@ -393,7 +397,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   # slice or a range between two shifts of L has a length without L.
   defp shaped?(node, kinds) do
     dep? = &Map.has_key?(kinds, &1)
-    same? = &((not dep?.(&1) and not dep?.(&2)) or (kinds[&1] == :shift and kinds[&2] == :shift))
+    same? = &((not dep?.(&1) and not dep?.(&2)) or (shift?(kinds[&1]) and shift?(kinds[&2])))
 
     case node do
       %{op_type: op, input: [_ | args]} when op in ["Reshape", "Expand", "Tile", "Pad"] ->
@@ -482,10 +486,11 @@ defmodule Transmuter.Generation.MergedDecoder do
         {:kinds, %{}}
 
       key_positions?(walk, node, deps) ->
-        {:positions, node, outputs(node, {:position, MapSet.new(node.output)})}
+        {:positions, node, outputs(node, {:position, MapSet.new(node.output), range_end(deps)})}
 
       input = candidate(walk, node, deps) ->
-        {:positions, {node, input}, outputs(node, {:position, MapSet.new(node.output)})}
+        {_input, {:shift, k}} = List.keyfind(deps, input, 0)
+        {:positions, {node, input}, outputs(node, {:position, MapSet.new(node.output), k + 1})}
 
       node.op_type in ["Gather", "Slice", "GatherElements", "GatherND"] ->
         gather_use(scope, node, kinds, deps)
@@ -494,7 +499,7 @@ defmodule Transmuter.Generation.MergedDecoder do
         {:bail, node}
 
       true ->
-        value_use(node, deps)
+        value_use(scope, node, deps)
     end
   end
 
@@ -504,7 +509,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp gather_use(scope, node, kinds, deps) do
     data = kinds[hd(node.input)]
     table_index? = &(&1 == 1 and node.op_type == "Gather" and hd(node.input) in scope.static)
-    bounds = for {i, {:position, r}} <- deps, i > 0, not table_index?.(i), do: r
+    bounds = for {i, {:position, r, _k}} <- deps, i > 0, not table_index?.(i), do: r
 
     cond do
       bounds != [] ->
@@ -526,7 +531,7 @@ defmodule Transmuter.Generation.MergedDecoder do
         {:bail, node}
 
       true ->
-        value_use(node, deps)
+        value_use(scope, node, deps)
     end
   end
 
@@ -537,7 +542,7 @@ defmodule Transmuter.Generation.MergedDecoder do
     steps = Enum.at(rest, 1, "")
     list = &static_list(scope, &1, node)
     all? = fn name, value -> list.(name) != nil and Enum.all?(list.(name), &(&1 == value)) end
-    all?.(starts, 0) and kinds[ends] == :shift and (steps == "" or all?.(steps, 1))
+    all?.(starts, 0) and shift?(kinds[ends]) and (steps == "" or all?.(steps, 1))
   end
 
   defp prefix?(_scope, _node, _kinds), do: false
@@ -551,13 +556,13 @@ defmodule Transmuter.Generation.MergedDecoder do
     picked =
       case {op, Enum.map(rest, list)} do
         {"Gather", [[index]]} ->
-          if from_end.(index) == axis, do: :shift
+          if from_end.(index) == axis, do: {:shift, 0}
 
         {"Slice", [[start], [stop] | axes]} when axes in [[], [[0]]] ->
           {start, stop} = {from_end.(start), if(stop >= rank, do: 0, else: from_end.(stop))}
 
           if start <= axis and stop > axis,
-            do: if(start == axis and stop == axis + 1, do: :shift, else: :int)
+            do: if(start == axis and stop == axis + 1, do: {:shift, 0}, else: :int)
 
         _other ->
           :int
@@ -567,30 +572,30 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   # The kind of the outputs of a node that reads values of L.
-  defp value_use(node, deps) do
+  defp value_use(scope, node, deps) do
     inputs = Map.get(@value_inputs, node.op_type, Enum.to_list(0..(length(node.input) - 1)//1))
     value_kinds = for {i, kind} <- deps, i in inputs, do: kind
 
     # Comparisons and causal tables are masks, which hold for the rows of a buffer.
     values = Enum.reject(value_kinds, &(&1 == :bool or match?({:causal, _, _}, &1)))
-    {positions, others} = Enum.split_with(values, &match?({:position, _}, &1))
+    {positions, others} = Enum.split_with(values, &match?({:position, _, _}, &1))
 
     ranges =
-      Enum.reduce(positions, MapSet.new(), fn {:position, r}, acc -> MapSet.union(acc, r) end)
+      Enum.reduce(positions, MapSet.new(), fn {:position, r, _k}, acc -> MapSet.union(acc, r) end)
 
     bounds =
-      for {i, {:position, r}} <- deps,
+      for {i, {:position, r, _k}} <- deps,
           i not in inputs or node.op_type in @sizes,
           do: r
 
     cond do
       bounds != [] -> {:mixed, Enum.reduce(bounds, &MapSet.union/2), node}
       positions != [] and others != [] -> {:mixed, ranges, node}
-      positions != [] -> position_use(node, ranges)
+      positions != [] -> position_use(scope, node, ranges, deps)
       node.op_type in @comparisons -> {:kinds, outputs(node, :bool)}
       values == [] -> {:kinds, %{}}
       node.op_type == "Cast" and float_cast?(node) -> float_use(node, deps)
-      true -> {:kinds, outputs(node, kind(node, deps))}
+      true -> {:kinds, outputs(node, kind(scope, node, deps))}
     end
   end
 
@@ -599,11 +604,13 @@ defmodule Transmuter.Generation.MergedDecoder do
   # The operators that make a position from a shift of L: a Mul by a value without L, as the
   # positions of M2M100 and NLLB, (cumsum(mask) + L) * mask + padding_idx. The offset goes on
   # the shift input, so a real token gets v + cumsum and a padding token keeps padding_idx.
+  # The cumulative count of a real token is at least 1, so its position is at least k + 1 past
+  # L for a shift {:shift, k}.
   # Gives the index of the shift input, unless an earlier walk sent this node back to the index
   # space (see value_use/2).
   @candidates ~w(Mul)
 
-  defp candidate(walk, node = %{op_type: op}, [{input, :shift}]) when op in @candidates do
+  defp candidate(walk, node = %{op_type: op}, [{input, {:shift, _k}}]) when op in @candidates do
     if length(node.input) == 2 and not MapSet.member?(walk.index, hd(node.output)), do: input
   end
 
@@ -613,19 +620,31 @@ defmodule Transmuter.Generation.MergedDecoder do
   # unless an earlier walk found that a use compares or mixes it with L (see value_use/2), as
   # the causal mask of moonshine compares the key index with the positions of L.
   defp key_positions?(walk, node = %{op_type: "Range", input: [start, _limit | _]}, deps) do
-    deps == [{1, :shift}] and static_list(walk.scope, start, node) == [0] and
+    match?([{1, {:shift, _k}}], deps) and static_list(walk.scope, start, node) == [0] and
       not MapSet.member?(walk.index, hd(node.output))
   end
 
   defp key_positions?(_walk, _node, _deps), do: false
 
   # A use of key positions (see key_positions?/3) alone: a float cast or a comparison ends
-  # them, and other operators keep them positions.
-  defp position_use(node, ranges) do
+  # them, and other operators keep them positions. Positions keep their largest part past L
+  # through moves and the addition of a static value, and lose it through other operators,
+  # such as the clamp of the buckets of T5, so a read of a table at them gives no limit.
+  defp position_use(scope, node, ranges, deps) do
+    ks = for {_i, {:position, _r, k}} <- deps, do: k
+
+    k =
+      cond do
+        nil in ks -> nil
+        node.op_type in @shifts -> Enum.max(ks)
+        node.op_type == "Add" -> added(scope, node, deps, Enum.max(ks))
+        true -> nil
+      end
+
     cond do
       node.op_type in @comparisons -> {:kinds, outputs(node, :bool)}
       node.op_type == "Cast" and float_cast?(node) -> {:kinds, %{}}
-      true -> {:kinds, outputs(node, {:position, ranges})}
+      true -> {:kinds, outputs(node, {:position, ranges, k})}
     end
   end
 
@@ -633,25 +652,61 @@ defmodule Transmuter.Generation.MergedDecoder do
   # float value no longer depends on the buffer. A float cast of another value of L stops the
   # rewrite.
   defp float_use(node, deps) do
-    if Enum.all?(deps, &(elem(&1, 1) == :shift)), do: {:read, node}, else: {:bail, node}
+    if Enum.all?(deps, &shift?(elem(&1, 1))), do: {:read, node, nil}, else: {:bail, node}
   end
 
-  # L + c, c + L and L - c are shifts, c - L is not.
-  defp kind(%{op_type: "Add"}, [{_i, :shift}]), do: :shift
-  defp kind(%{op_type: "Sub"}, [{0, :shift}]), do: :shift
+  # L + c, c + L and L - c are shifts, c - L is not. The largest part past L, k, adds the
+  # largest value of a static c, or subtracts its smallest. A c that is not static, such as the
+  # number of tokens of the step, adds nothing: a position read and a causal slice read the
+  # first token of a step at k past L, and the limit of the table counts that token.
+  defp kind(scope, node = %{op_type: "Add"}, deps = [{_i, {:shift, k}}]),
+    do: {:shift, added(scope, node, deps, k)}
 
-  # A range from L, whose step does not depend on L.
-  defp kind(%{op_type: "Range"}, deps) do
-    if List.keyfind(deps, 0, 0) == {0, :shift} and not List.keymember?(deps, 2, 0),
-      do: :shift,
+  defp kind(scope, node = %{op_type: "Sub"}, [{0, {:shift, k}}]) do
+    case static_list(scope, Enum.at(node.input, 1), node) do
+      nil -> {:shift, k}
+      values -> {:shift, k - Enum.min(values)}
+    end
+  end
+
+  # A range from L, whose step does not depend on L, starts at its start.
+  defp kind(_scope, %{op_type: "Range"}, deps) do
+    case List.keyfind(deps, 0, 0) do
+      {0, shift = {:shift, _k}} -> if List.keymember?(deps, 2, 0), do: :int, else: shift
+      _other -> :int
+    end
+  end
+
+  defp kind(_scope, %{op_type: op}, deps) when op in @shifts do
+    if Enum.all?(deps, &shift?(elem(&1, 1))),
+      do: {:shift, deps |> Enum.map(&shift_k(elem(&1, 1))) |> Enum.max()},
       else: :int
   end
 
-  defp kind(%{op_type: op}, deps) when op in @shifts do
-    if Enum.all?(deps, &(elem(&1, 1) == :shift)), do: :shift, else: :int
+  defp kind(_scope, _node, _deps), do: :int
+
+  # k plus the largest value of the static input of an Add whose other input is the one in
+  # `deps`, or k when that input is not static.
+  defp added(scope, node, [{i, _kind}], k) do
+    case static_list(scope, Enum.at(node.input, 1 - i), node) do
+      nil -> k
+      values -> k + Enum.max(values)
+    end
   end
 
-  defp kind(_node, _deps), do: :int
+  defp added(_scope, _node, _deps, _k), do: nil
+
+  defp shift?(kind), do: match?({:shift, _k}, kind)
+
+  defp shift_k({:shift, k}), do: k
+  defp shift_k(nil), do: 0
+
+  # The largest part past L of the values of a Range from 0 to a shift of L: the part of its
+  # limit, because the first token of a step is the last value of the range.
+  defp range_end(deps) do
+    {1, {:shift, k}} = List.keyfind(deps, 1, 0)
+    k
+  end
 
   defp float_cast?(node) do
     # FLOAT, FLOAT16, DOUBLE and BFLOAT16 of TensorProto.DataType.
@@ -659,18 +714,19 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   # A position read, or a Slice of a causal table (1 where the column is at most the row, as
-  # the bias of GPT-2) on its last two axes. Its rows and columns count the rows of the buffer,
-  # which is right while the buffer and the new token fit the table. Another read of a static
-  # table at L, such as a local attention window, stops the rewrite.
+  # the bias of GPT-2) on its last two axes. The rows of a position table and the rows and
+  # columns of a causal table count the rows of the buffer, which is right while the buffer and
+  # the new token fit the table. Another read of a static table at L, such as a local attention
+  # window, stops the rewrite.
   defp static_read(scope, node, kinds) do
     table = scope.values[hd(node.input)]
 
     cond do
       Nx.rank(table) == 2 and position_index?(scope, node, kinds) ->
-        {:read, node}
+        {:read, node, Nx.axis_size(table, 0) - shift_k(kinds[Enum.at(node.input, 1)])}
 
-      node.op_type == "Gather" and match?({:position, _}, kinds[Enum.at(node.input, 1)]) ->
-        {:kinds, %{}}
+      node.op_type == "Gather" and match?({:position, _, _}, kinds[Enum.at(node.input, 1)]) ->
+        position_table(node, table, kinds[Enum.at(node.input, 1)])
 
       node.op_type == "Slice" and causal?(table) ->
         causal_slice(scope, node, kinds, {Nx.rank(table), Nx.axis_size(table, -1)})
@@ -685,9 +741,10 @@ defmodule Transmuter.Generation.MergedDecoder do
     axes = static_list(scope, axes, node)
     last = [rank - 2, rank - 1, -2, -1]
 
-    if kinds[starts] in [nil, :shift] and kinds[ends] in [nil, :shift] and axes != nil and
+    if (kinds[starts] == nil or shift?(kinds[starts])) and
+         (kinds[ends] == nil or shift?(kinds[ends])) and axes != nil and
          Enum.all?(axes, &(&1 in last)),
-       do: {:limit, size, outputs(node, {:causal, rank, size})},
+       do: {:limit, size - shift_k(kinds[starts]), outputs(node, {:causal, rank, size})},
        else: {:bail, node}
   end
 
@@ -712,18 +769,28 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
+  # A Gather of a static table on axis 0 at positions, such as the position table of M2M100:
+  # with the largest part past L of the positions, the rows of the table limit the buffer.
+  defp position_table(node, table, {:position, _ranges, k}) do
+    axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
+
+    if axis == 0 and k != nil,
+      do: {:limit, Nx.axis_size(table, 0) - k, %{}},
+      else: {:kinds, %{}}
+  end
+
   # The index of a position read: a Gather on axis 0, or a Slice on axis 0 with step 1, whose
   # index or start is a shift of L.
   defp position_index?(_scope, node = %{op_type: "Gather", input: [_table, index]}, kinds) do
     axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
-    axis == 0 and kinds[index] == :shift
+    axis == 0 and shift?(kinds[index])
   end
 
   defp position_index?(scope, node = %{op_type: "Slice", input: [_, starts, ends | rest]}, kinds) do
     [axes, steps] = Enum.take(rest ++ ["", ""], 2)
     list = &static_list(scope, &1, node)
 
-    kinds[starts] == :shift and kinds[ends] == :shift and list.(axes) == [0] and
+    shift?(kinds[starts]) and shift?(kinds[ends]) and list.(axes) == [0] and
       (steps == "" or list.(steps) == [1])
   end
 
