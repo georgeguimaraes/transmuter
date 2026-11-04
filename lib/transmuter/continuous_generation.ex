@@ -26,7 +26,7 @@ defmodule Transmuter.ContinuousGeneration do
 
     * `:name` - the name of the server.
 
-    * `:task` - `Transmuter.Text.Generation`, the task of `Transmuter.Text.generation/2`, or `Transmuter.Vision.ImageTextToText`, the task of `Transmuter.Vision.image_text_to_text/2`. The default is `Transmuter.Text.Generation`.
+    * `:task` - the module of the task: `Transmuter.Text.Generation`, the task of `Transmuter.Text.generation/2`, `Transmuter.Text.TextToText`, the task of `Transmuter.Text.text_to_text/2`, `Transmuter.Vision.ImageTextToText`, the task of `Transmuter.Vision.image_text_to_text/2`, or `Transmuter.Vision.ImageToText`, the task of `Transmuter.Vision.image_to_text/2`. The default is `Transmuter.Text.Generation`. Each input of `Transmuter.Vision.ImageToText` gives its task of Florence-2, such as `%{image: image, task: "<OD>"}`.
 
     * `:source` - the model, as in the function of the task.
 
@@ -68,11 +68,13 @@ defmodule Transmuter.ContinuousGeneration do
 
   On EMLX, MLX keeps the freed buffers of each size in a cache, which has no limit by default. Set a limit, for example `EMLX.set_cache_limit(1_000_000_000)`, when the application starts.
 
-  ## Images
+  ## Encoders and images
 
   A request with images needs the features of its images before it joins, and for Qwen2-VL, Qwen2.5-VL and Qwen3-VL the 3-D positions of its prompt. A worker process of the server prepares one request at a time, in the order of the requests, and then puts the request in the queue. It runs the processor on the images and the tokenizer on the chat, and then the vision encoder on the images. So the steps of the running rows do not wait for the encoder, the caller does no work on the device, and the device memory of this work is that of one request. The processor and the encoder compile one time, in the worker. A request waits in the worker for the requests before it, also a request without images. The queue limit counts the requests in the worker. An error of the processor or of the encoder goes to the caller of the request (see "Failures").
 
   The encoder and the steps run on the same device. On CUDA, EXLA runs the calls of the two processes side by side: for SmolVLM-256M on an RTX 3060, a decode step takes about 7 ms alone and at most about 16 ms while the worker encodes. On EMLX, both processes use the one GPU stream of EMLX, so a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image, and on EMLX each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms alone and about 70 ms while the worker encodes in calls of one tile, against 863 ms with one call for the 13 tiles of an image, and the encoder takes about 1 s for each image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
+
+  A request of an encoder-decoder model, such as Marian with `Transmuter.Text.TextToText` or Florence-2 with `Transmuter.Vision.ImageToText`, needs the outputs of its encoder in the same way. The worker runs the encoder on the input of the request alone, and the request joins with these outputs. The group keeps the outputs of each row, and a request with more rows of the encoder than the group grows the outputs of all rows (see "Merged decoders" in `Transmuter.Generation`). When no row runs, the next request starts a new group, so it takes only the rows of its own outputs.
 
   The group keeps the features of the image tokens that its rows have not run, and the features of a request join them. Then the prompt of the request runs in parts of at most 64 tokens, next to the new tokens of the running rows (see "The KV cache").
 
@@ -80,7 +82,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of three widths, 1, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most three shapes for each capacity, 47 for a capacity of 4096 rows. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
 
-  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the vision encoder compile too. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
+  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
 
   ## Telemetry
 
@@ -120,7 +122,8 @@ defmodule Transmuter.ContinuousGeneration do
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
 
-    {ctx, tokenizer, task} = module.task(opts[:source], opts)
+    # :task is the module here, not an option of the task, such as the task of Florence-2.
+    {ctx, tokenizer, task} = module.task(opts[:source], Keyword.delete(opts, :task))
 
     if reason = Generation.cannot_join(ctx) do
       raise ArgumentError, "requests cannot join a running batch of this model: #{reason}"
@@ -171,7 +174,7 @@ defmodule Transmuter.ContinuousGeneration do
   @doc """
   Returns a stream of the text of `input`, as a serving of the task with `stream: true`. Consume the stream in the process that called this function.
 
-  The function returns when the worker has prepared the request (see "Images"), and it raises the exception of the worker on the request. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
+  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
   """
   def stream(server, input, opts \\ []) do
     opts = Keyword.validate!(opts, stream_done: false)
@@ -299,30 +302,34 @@ defmodule Transmuter.ContinuousGeneration do
     defn_options = state.defn_options
 
     # The worker loads the models of :prepare, such as the vision encoder, while the server
-    # compiles the steps. The server starts when both are ready, so an error of either fails
+    # compiles the decoder. The server starts when both are ready, so an error of either fails
     # the start.
     worker =
       spawn_link(fn ->
         task = {preprocess, prepare.(defn_options)}
 
-        # The features of the example show the shape of the features of a request.
-        features =
+        # The features and the encoder outputs of the example show the shapes of those of a
+        # request, so the steps compile for them.
+        example =
           if compile_steps? do
-            {:ok, %{features: features}, _run} = prepare_request(task, %{input: example})
-            features
+            {:ok, fields, _run} = prepare_request(task, %{input: example})
+            fields
           end
 
-        send(server, {self(), :ready, features})
+        send(server, {self(), :ready, example})
         :erlang.garbage_collect()
         prepare_requests(task, server)
       end)
 
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
-    if state.compile_steps, do: Generation.compile_steps(ctx, state.slots)
 
     receive do
-      {^worker, :ready, features} ->
-        if features, do: Generation.compile_features(ctx, state.slots, features)
+      {^worker, :ready, example} ->
+        if example do
+          Generation.compile_steps(ctx, state.slots, example.inputs)
+          if example.features, do: Generation.compile_features(ctx, state.slots, example.features)
+        end
+
         {:ok, start(state, ctx, worker)}
 
       {:EXIT, ^worker, reason} ->
@@ -462,7 +469,8 @@ defmodule Transmuter.ContinuousGeneration do
         prompts: Enum.count(state.group.left, &(&1 != [])) + length(admitted),
         waiting: :queue.len(state.queue),
         slots: state.slots,
-        capacity: state.group.state.capacity
+        capacity: state.group.state.capacity,
+        encoder_capacity: state.group.state.encoder_capacity
       }
 
       :telemetry.span([:transmuter, :continuous_generation, :step], metadata, fn ->
@@ -481,8 +489,11 @@ defmodule Transmuter.ContinuousGeneration do
 
     group = Generation.next(state.ctx, group)
     group = Generation.shrink(state.ctx, group)
-    # The group keeps the features, so the rows do not keep them for their callers.
-    admitted = Map.new(admitted, fn {row, request} -> {row, Map.drop(request, [:features])} end)
+    # The group keeps the features and the encoder outputs, so the rows do not keep them for
+    # their callers.
+    admitted =
+      Map.new(admitted, fn {row, request} -> {row, Map.drop(request, [:features, :inputs])} end)
+
     emit(%{state | rows: Map.merge(state.rows, admitted)}, group)
   end
 
@@ -519,7 +530,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   defp request(state, row, request) do
     request
-    |> Map.take([:prompt, :seed, :features, :position])
+    |> Map.take([:prompt, :seed, :features, :position, :inputs])
     |> Map.merge(%{row: row, budget: state.ctx.max_new_tokens})
   end
 
@@ -597,11 +608,13 @@ defmodule Transmuter.ContinuousGeneration do
     [run] = preprocess.(request.input)
     tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
 
-    inputs = prepare.(tensors, [run.prompt])
-    [position] = Map.get(inputs, :position_ids, [[]])
-    [features] = Map.get(inputs, :image_features, [nil])
-    fields = %{prompt: run.prompt, seed: run.seed, features: features}
-    {:ok, Map.put(fields, :position, position), Map.delete(run, :tensors)}
+    # The other inputs of the prompt, such as the outputs of an encoder, have a batch axis of 1.
+    # The worker evaluates them, so the encoder runs here and not in a step of the server.
+    {[position], inputs} = Map.pop(prepare.(tensors, [run.prompt]), :position_ids, [[]])
+    {[features], inputs} = Map.pop(inputs, :image_features, [nil])
+    features = features && Generation.evaluated(features)
+    fields = %{prompt: run.prompt, seed: run.seed, features: features, position: position}
+    {:ok, Map.put(fields, :inputs, Generation.evaluated(inputs)), Map.delete(run, :tensors)}
   rescue
     exception -> {:error, exception}
   end

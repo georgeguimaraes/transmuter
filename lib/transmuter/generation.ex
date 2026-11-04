@@ -798,7 +798,9 @@ defmodule Transmuter.Generation do
     end
   end
 
-  defp evaluated(outputs) do
+  @doc false
+  # The tensors of `outputs`, a container, evaluated on EMLX (see state_jit/2).
+  def evaluated(outputs) do
     Composite.traverse(outputs, fn
       tensor = %Nx.Tensor{data: %{__struct__: EMLX.Backend}} -> Transmuter.EMLX.evaluate(tensor)
       tensor -> tensor

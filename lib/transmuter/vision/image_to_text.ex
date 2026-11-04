@@ -10,49 +10,62 @@ defmodule Transmuter.Vision.ImageToText do
   alias Transmuter.{Featurizer, Generation, Hub, Repo, Serving, Tokenizer}
   alias Transmuter.Vision.Florence2Processor
 
+  @options [
+             :compile,
+             :variant,
+             :tokenizer,
+             :featurizer,
+             :backend,
+             :compute_type,
+             :max_new_tokens,
+             :strategy,
+             :temperature,
+             :top_k,
+             :top_p,
+             :repetition_penalty,
+             :num_beams,
+             :length_penalty,
+             :early_stopping,
+             :task,
+             :seed,
+             token_logprobs: false,
+             defn_options: []
+           ] ++ Hub.options()
+
+  @doc false
+  # The options of the task without the options of the serving. In
+  # `Transmuter.ContinuousGeneration`, `:task` is the module of the task, so each input gives
+  # its task of Florence-2.
+  def options, do: @options -- [:compile, :task]
+
   @doc false
   def image_to_text(source, opts) do
     opts =
-      Keyword.validate!(
-        opts,
-        [
-          :compile,
-          :variant,
-          :tokenizer,
-          :featurizer,
-          :backend,
-          :compute_type,
-          :max_new_tokens,
-          :strategy,
-          :temperature,
-          :top_k,
-          :top_p,
-          :repetition_penalty,
-          :num_beams,
-          :length_penalty,
-          :early_stopping,
-          :task,
-          :seed,
-          token_logprobs: false,
-          stream: false,
-          stream_done: false,
-          defn_options: []
-        ] ++ Hub.options()
-      )
+      opts
+      |> Keyword.validate!(@options ++ [stream: false, stream_done: false])
       |> Serving.generation_options!()
 
+    {ctx, tokenizer, task} = task(source, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
+  end
+
+  @doc false
+  # The context, the tokenizer and the task of `Serving.generation/4`, for image_to_text/2 and
+  # `Transmuter.ContinuousGeneration`. :init encodes the images of a batch, and :prepare the
+  # image of one request.
+  def task(source, opts) do
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
     tokenizer = Serving.tokenizer(repo, opts)
     featurizer = opts[:featurizer] || Featurizer.load!(repo)
     opts = Keyword.put(opts, :max_new_tokens, Generation.max_new_tokens(repo, opts, 1))
     models = %{repo: repo, encoder: encoder, decoder: decoder}
 
-    {ctx, task, compile} =
+    {ctx, task} =
       if "inputs_embeds" in encoder.inputs,
         do: embeds_task(models, tokenizer, featurizer, opts),
         else: pixels_task(models, tokenizer, featurizer, opts)
 
-    Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
+    {ctx, tokenizer, task}
   end
 
   defp pixels_task(%{repo: repo, encoder: encoder, decoder: decoder}, tokenizer, featurizer, opts) do
@@ -67,14 +80,14 @@ defmodule Transmuter.Vision.ImageToText do
     prompt = [start_token(repo)]
     ctx = Generation.context(repo, decoder, opts, ["encoder_hidden_states"])
 
-    init = fn defn_options ->
-      shape = {compile[:batch_size], 3, height, width}
-      template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
+    # The encoder of `rows` images, which gives the inputs of the decoder.
+    run_encoder = fn rows, defn_options ->
+      template = zeros({rows, 3, height, width}, :f32)
       encode = Transmuter.compile(encoder, %{"pixel_values" => template}, defn_options)
 
-      fn %{"pixel_values" => pixels}, prompts, generate ->
+      fn %{"pixel_values" => pixels} ->
         %{"last_hidden_state" => hidden} = encode.(%{"pixel_values" => pixels})
-        generate.(%{"encoder_hidden_states" => hidden}, prompts)
+        %{"encoder_hidden_states" => hidden}
       end
     end
 
@@ -88,11 +101,10 @@ defmodule Transmuter.Vision.ImageToText do
     task = %{
       validate: &validate(&1, false),
       preprocess: preprocess,
-      init: init,
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?)
     }
 
-    {ctx, task, compile}
+    {ctx, Map.merge(task, encoder_task(run_encoder, compile[:batch_size]))}
   end
 
   # Florence-2: the features of the image and the embeddings of the prompt go into the encoder.
@@ -123,8 +135,8 @@ defmodule Transmuter.Vision.ImageToText do
     prompt = [start_token(repo)]
     default_task = opts[:task] || "<CAPTION>"
 
-    init = fn defn_options ->
-      rows = compile[:batch_size]
+    # The encoder of `rows` images and prompts, which gives the inputs of the decoder.
+    run_encoder = fn rows, defn_options ->
       cache = [cache_size: length(lengths)] ++ defn_options
       %{inputs: [ids_name], outputs: [embeds_name]} = embed
       [features_name] = vision.outputs
@@ -152,7 +164,7 @@ defmodule Transmuter.Vision.ImageToText do
           cache
         )
 
-      fn inputs, prompts, generate ->
+      fn inputs ->
         features = see.(%{"pixel_values" => inputs["pixel_values"]})[features_name]
         text = embed_text.(%{ids_name => inputs["input_ids"]})[embeds_name]
         {rows, count, _hidden} = Nx.shape(features)
@@ -171,7 +183,7 @@ defmodule Transmuter.Vision.ImageToText do
         %{"last_hidden_state" => hidden} =
           encode.(%{"inputs_embeds" => embeds, "attention_mask" => mask})
 
-        generate.(%{"encoder_hidden_states" => hidden, "encoder_attention_mask" => mask}, prompts)
+        %{"encoder_hidden_states" => hidden, "encoder_attention_mask" => mask}
       end
     end
 
@@ -213,12 +225,36 @@ defmodule Transmuter.Vision.ImageToText do
     task = %{
       validate: &validate(&1, true),
       preprocess: preprocess,
-      init: init,
       postprocess: postprocess,
       keys: lengths
     }
 
-    {ctx, task, compile}
+    {ctx, Map.merge(task, encoder_task(run_encoder, compile[:batch_size]))}
+  end
+
+  # :init runs the encoder on the images of a batch of `batch_size` rows, and :prepare on the
+  # image of one request, whose tensors stay on the host until the encoder needs them. The
+  # example is the gray image of `Transmuter.Vision.image_text_to_text/2`, with the default task.
+  defp encoder_task(run_encoder, batch_size) do
+    init = fn defn_options ->
+      encode = run_encoder.(batch_size, defn_options)
+      fn inputs, prompts, generate -> generate.(encode.(inputs), prompts) end
+    end
+
+    prepare = fn defn_options ->
+      backend = Nx.Defn.to_backend(defn_options)
+      encode = run_encoder.(1, defn_options)
+
+      fn tensors, _prompts ->
+        tensors
+        |> Map.new(fn {name, tensor} -> {name, Nx.backend_transfer(tensor, backend)} end)
+        |> encode.()
+      end
+    end
+
+    image = Nx.broadcast(Nx.tensor(128, type: :u8, backend: Nx.BinaryBackend), {64, 64, 3})
+    example = %{image: image, seed: nil, task: nil, text: nil}
+    %{init: init, prepare: prepare, example: example}
   end
 
   defp start_token(repo),

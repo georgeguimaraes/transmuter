@@ -57,6 +57,8 @@ defmodule Transmuter.ContinuousGenerationTest do
 
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
 
+  @museum "The museum opens at nine in the morning, and the guides explain the history of each painting to the visitors. Many visitors stay until the evening, because the collection is very large and the rooms are quiet. On Sundays, the entry is free for children and students, so the halls are often full."
+
   # A server of 2 rows gets a long request, and after its first chunk two more requests: the
   # second joins the running batch, and the third takes the row of the first request that
   # ends, while the other row still runs. So two steps admit a request next to a running row.
@@ -234,7 +236,9 @@ defmodule Transmuter.ContinuousGenerationTest do
           {source, [model: merged],
            ~r/cannot join a running batch .* one length of the cache: .*, because \w+ \S+ reads/},
           {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, [num_beams: 2],
-           ~r/cannot join a running batch of this model: it has num_beams 2/}
+           ~r/cannot join a running batch of this model: it has num_beams 2/},
+          {{:hf, "Xenova/t5-small"}, [task: Text.TextToText, num_beams: 1],
+           ~r/cannot join a running batch .* one length of the cache: .*Range/}
         ] do
       assert_raise ArgumentError, message, fn ->
         ContinuousGeneration.start_link([source: source] ++ opts ++ @opts)
@@ -558,6 +562,104 @@ defmodule Transmuter.ContinuousGenerationTest do
 
     assert steps |> Enum.map(& &1.capacity) |> Enum.max() > 256
     assert [%{capacity: 256}, %{capacity: 256}] = Enum.filter(steps, &(&1.admitted > 0))
+  end
+
+  # The worker runs the encoder of Marian on each text alone, and each request joins with its
+  # outputs. A server of 2 rows gets 6 texts at once: two start a group, and each other text
+  # joins a running row when a row ends. The texts pad to 32 and 128 tokens, so a joining
+  # text can grow the encoder outputs of the group, or pad to them. Each text gives the
+  # translation that it gives alone.
+  test "requests of Marian that wait for a row give the text that they give alone" do
+    source = {:hf, "Xenova/opus-mt-en-de"}
+    opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 64] ++ @opts
+
+    texts = [
+      "The house is wonderful.",
+      @fox,
+      "My brother reads a book every evening.",
+      "The weather is cold today, so we stay at home and drink tea.",
+      @museum,
+      "Transmuter runs ONNX models on any Nx backend."
+    ]
+
+    single = Text.text_to_text(source, opts)
+    alone = for text <- texts, do: hd(Nx.Serving.run(single, text).results).text
+
+    spec = [source: source, task: Text.TextToText, slots: 2] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+
+    {results, steps} = step_events(server, fn -> ContinuousGeneration.run(server, texts) end)
+
+    assert Enum.map(results, &hd(&1.results).text) == alone
+    assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) >= 2
+  end
+
+  # When no row runs, the server opens a new group, which takes only the encoder outputs of its
+  # own rows. In a server of 1 row of Marian, a text of 128 tokens with padding runs first, and
+  # a text of 32 tokens waits for it. The second text starts a new group at 32 rows of the
+  # encoder. A group that stayed would keep 128 rows, because its encoder capacity does not
+  # shrink. The encoder capacity of a step event is the one before the step.
+  test "a request that waits for the last running row of Marian starts at its own encoder rows" do
+    source = {:hf, "Xenova/opus-mt-en-de"}
+    opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 64] ++ @opts
+    spec = [source: source, task: Text.TextToText, slots: 1] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+
+    {_results, steps} =
+      step_events(server, fn ->
+        ContinuousGeneration.run(server, [@museum, "The house is wonderful."])
+      end)
+
+    assert steps |> Enum.map(& &1.encoder_capacity) |> Enum.dedup() == [0, 128, 0, 32]
+  end
+
+  # A server of 2 rows of Marian with compile_steps, whose rows all give 64 tokens. A text of
+  # 128 tokens with padding runs alone first, so the worker has encoded both lengths. Then a
+  # text of 32 tokens runs in a new group, and after its first token a text of 128 tokens joins
+  # it: this join grows the encoder outputs of the group from 32 to 128 rows and runs the cross
+  # function. A text of 32 tokens waits for the first row to end, and then joins the row of 128
+  # tokens with its outputs padded to 128 rows. No step, no write of a row and no cross function
+  # compiles in the server.
+  test "requests of Marian with encoder outputs of uneven lengths compile nothing after compile_steps" do
+    source = {:hf, "Xenova/opus-mt-en-de"}
+    opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 64, min_new_tokens: 64] ++ @opts
+    spec = [source: source, task: Text.TextToText, slots: 2, capacity: 256, compile_steps: true]
+    server = start_supervised!({ContinuousGeneration, spec ++ opts})
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach_many(
+      id,
+      [[:transmuter, :segment, :compile, :stop], [:exla, :compilation]],
+      fn event, _measurements, _metadata, _config ->
+        if self() == server, do: send(parent, {id, event})
+      end,
+      nil
+    )
+
+    {_results, steps} =
+      step_events(server, fn ->
+        ContinuousGeneration.run(server, @museum)
+
+        streamer =
+          Task.async(fn ->
+            server
+            |> ContinuousGeneration.stream(@fox)
+            |> Enum.map_join(fn chunk ->
+              send(parent, {id, :chunk})
+              chunk
+            end)
+          end)
+
+        assert_receive {^id, :chunk}, 60_000
+        others = ContinuousGeneration.run(server, [@museum, "The house is wonderful."])
+        {Task.await(streamer, :infinity), others}
+      end)
+
+    :telemetry.detach(id)
+    refute_received {^id, [_ | _]}
+    assert steps |> Enum.map(& &1.encoder_capacity) |> Enum.dedup() == [0, 128, 0, 32, 128]
+    assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) == 2
   end
 
   # A server of tiny Gemma 3 with compile_steps runs chats with 1 and 3 images, whose
@@ -916,6 +1018,28 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
   test "chats of Qwen2-VL that join a running batch give the text that they give alone" do
     {server, alone} = server_and_alone({:hf, "onnx-community/Qwen2-VL-2B-Instruct"})
     assert ContinuousGenerationTest.join_while_reading(server, chats()) == alone
+  end
+
+  # The worker runs the vision encoder, the embeddings and the encoder of Florence-2 on the
+  # image and the prompt of each input alone. The caption runs first, the detailed caption
+  # joins next to it with its own encoder outputs, and the objects join at the next step (see
+  # join_while_reading/2). Each input gives the result of image_to_text/2 alone.
+  @tag :large_model
+  test "inputs of Florence-2 that join a running batch give the result that they give alone" do
+    source = {:hf, "onnx-community/Florence-2-base-ft"}
+    opts = [strategy: :greedy, num_beams: 1] ++ @opts
+    image = StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
+
+    inputs =
+      for task <- ~w(<CAPTION> <MORE_DETAILED_CAPTION> <OD>), do: %{image: image, task: task}
+
+    single = Vision.image_to_text(source, opts)
+    alone = Enum.map(inputs, &Nx.Serving.run(single, &1))
+    :erlang.garbage_collect()
+
+    spec = [task: Vision.ImageToText, source: source, slots: 3] ++ opts
+    server = start_supervised!({ContinuousGeneration, spec})
+    assert ContinuousGenerationTest.join_while_reading(server, inputs) == alone
   end
 
   defp chats do

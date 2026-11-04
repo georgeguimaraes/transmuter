@@ -10,42 +10,53 @@ defmodule Transmuter.Text.TextToText do
   alias Tokenizers.PostProcessor
   alias Transmuter.{Generation, Hub, Repo, Serving, Tokenizer}
 
+  @options [
+             :compile,
+             :variant,
+             :tokenizer,
+             :backend,
+             :compute_type,
+             :max_new_tokens,
+             :strategy,
+             :temperature,
+             :top_k,
+             :top_p,
+             :repetition_penalty,
+             :num_beams,
+             :length_penalty,
+             :early_stopping,
+             :no_repeat_ngram_size,
+             :min_length,
+             :min_new_tokens,
+             :forced_bos_token_id,
+             :forced_eos_token_id,
+             :seed,
+             :source_language_token,
+             :target_language_token,
+             token_logprobs: false,
+             defn_options: []
+           ] ++ Hub.options()
+
+  @doc false
+  # The options of the task without the options of the serving.
+  def options, do: @options -- [:compile]
+
   @doc false
   def text_to_text(source, opts) do
     opts =
-      Keyword.validate!(
-        opts,
-        [
-          :compile,
-          :variant,
-          :tokenizer,
-          :backend,
-          :compute_type,
-          :max_new_tokens,
-          :strategy,
-          :temperature,
-          :top_k,
-          :top_p,
-          :repetition_penalty,
-          :num_beams,
-          :length_penalty,
-          :early_stopping,
-          :no_repeat_ngram_size,
-          :min_length,
-          :min_new_tokens,
-          :forced_bos_token_id,
-          :forced_eos_token_id,
-          :seed,
-          :source_language_token,
-          :target_language_token,
-          token_logprobs: false,
-          stream: false,
-          stream_done: false,
-          defn_options: []
-        ] ++ Hub.options()
-      )
+      opts
+      |> Keyword.validate!(@options ++ [stream: false, stream_done: false])
       |> Serving.generation_options!()
 
+    {ctx, tokenizer, task} = task(source, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
+  end
+
+  @doc false
+  # The context, the tokenizer and the task of `Serving.generation/4`, for text_to_text/2 and
+  # `Transmuter.ContinuousGeneration`. :init encodes the texts of a batch, and :prepare the text
+  # of one request.
+  def task(source, opts) do
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)
 
     compile =
@@ -73,20 +84,19 @@ defmodule Transmuter.Text.TextToText do
       repo.generation_config["decoder_start_token_id"] || repo.config["decoder_start_token_id"]
 
     init = fn defn_options ->
-      shape = {compile[:batch_size], hd(lengths)}
-      template = Nx.broadcast(Nx.tensor(0, type: :s64, backend: Nx.BinaryBackend), shape)
-      opts = [cache_size: length(lengths)] ++ defn_options
-      encode = Transmuter.compile(encoder, Map.new(encoder.inputs, &{&1, template}), opts)
+      encode = encoder(encoder, lengths, compile[:batch_size], defn_options)
+      fn inputs, prompts, generate -> generate.(encode.(inputs), prompts) end
+    end
 
-      fn inputs, prompts, generate ->
-        %{"last_hidden_state" => hidden} = encode.(Map.take(inputs, encoder.inputs))
+    # The tensors of a request stay on the host until the encoder needs them.
+    prepare = fn defn_options ->
+      backend = Nx.Defn.to_backend(defn_options)
+      encode = encoder(encoder, lengths, 1, defn_options)
 
-        given = %{
-          "encoder_hidden_states" => hidden,
-          "encoder_attention_mask" => inputs["attention_mask"]
-        }
-
-        generate.(given, prompts)
+      fn tensors, _prompts ->
+        tensors
+        |> Map.new(fn {name, tensor} -> {name, Nx.backend_transfer(tensor, backend)} end)
+        |> encode.()
       end
     end
 
@@ -104,11 +114,28 @@ defmodule Transmuter.Text.TextToText do
       validate: &validate/1,
       preprocess: preprocess,
       init: init,
+      prepare: prepare,
+      example: %{text: "Hello"},
       postprocess: Serving.text_postprocess(tokenizer, ctx.token_logprobs?),
       keys: lengths
     }
 
-    Serving.generation(ctx, tokenizer, task, Keyword.put(opts, :compile, compile))
+    {ctx, tokenizer, task}
+  end
+
+  # The encoder of `rows` texts, padded to one of `lengths` tokens, which gives the inputs of
+  # the decoder: its outputs and the attention mask of the texts.
+  defp encoder(encoder, lengths, rows, defn_options) do
+    template =
+      Nx.broadcast(Nx.tensor(0, type: :s64, backend: Nx.BinaryBackend), {rows, hd(lengths)})
+
+    opts = [cache_size: length(lengths)] ++ defn_options
+    encode = Transmuter.compile(encoder, Map.new(encoder.inputs, &{&1, template}), opts)
+
+    fn inputs ->
+      %{"last_hidden_state" => hidden} = encode.(Map.take(inputs, encoder.inputs))
+      %{"encoder_hidden_states" => hidden, "encoder_attention_mask" => inputs["attention_mask"]}
+    end
   end
 
   @doc false
