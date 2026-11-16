@@ -20,7 +20,7 @@ defmodule Transmuter.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [mod: {Transmuter.Application, []}, extra_applications: [:logger]]
   end
 
   defp deps do
@@ -98,6 +98,7 @@ defmodule Transmuter.MixProject do
           Transmuter.UnknownValueError
         ],
         Internals: [
+          Transmuter.Application,
           Transmuter.Serving,
           Transmuter.Generation,
           Transmuter.Generation.MergedDecoder,
