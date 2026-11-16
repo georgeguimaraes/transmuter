@@ -94,7 +94,7 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Distribution
 
-  The server runs on a node with a device, and `run/3` takes its name on any node of the cluster. A call uses the server of that name on its own node when there is one, or else a random server of that name on another node. The caller node needs Transmuter, but not EMLX, EXLA, the tokenizers or the models: a proxy process on the node of the server validates the input, runs the request and postprocesses the result, and the caller gets the result, the exceptions and the exits of a local call. When the caller exits, the proxy exits, and the server frees the rows of the request. `stream/3` takes a server on the node of the caller.
+  The server runs on a node with a device, and `run/3` and `stream/3` take its name on any node of the cluster. A call tries the server of that name on its own node first, and then the servers of that name on the other nodes in a random order. It goes to the first server whose queue takes it, and it raises `QueueFullError` when no queue takes it. The caller node needs Transmuter, but not EMLX, EXLA, the tokenizers or the models: a proxy process on the node of the server validates the input, runs the request and postprocesses the result, and the caller gets the result, the exceptions and the exits of a local call. A stream gets each chunk of text as a message. When the caller exits, or stops a stream before its end, the proxy exits, and the server frees the rows of the request.
 
   An input goes to the other node as it is, so it must be data: strings, maps, lists, `StbImage` structs and `Nx.BinaryBackend` tensors. A tensor on a device backend refers to memory of the node of the caller, so copy it with `Nx.backend_copy(tensor, Nx.BinaryBackend)` first.
 
@@ -161,16 +161,17 @@ defmodule Transmuter.ContinuousBatching do
   @doc """
   Generates the text of `input`, an input of the task or a list of them, as `Nx.Serving.batched_run/2` with a serving of the task, and returns the same result.
 
-  Raises `QueueFullError` when the queue cannot take the inputs. After `timeout` milliseconds, the rows of the inputs end and the caller exits.
+  Raises `QueueFullError` when no queue of a server of the name can take the inputs (see "Distribution"). After `timeout` milliseconds, the rows of the inputs end and the caller exits.
   """
   def run(server, input, timeout \\ :infinity) do
     call = {__MODULE__, :run, [server, input, timeout]}
-
-    case locate!(server, call) do
-      {:local, info} -> run(info, server, input, timeout, call)
-      {:remote, pid} -> remote_run(pid, input, timeout, call)
-    end
+    server |> servers!(call) |> with_room(&run_on(&1, server, input, timeout, call))
   end
+
+  defp run_on(pid, server, input, timeout, call) when node(pid) == node(),
+    do: run(info!(pid, call), server, input, timeout, call)
+
+  defp run_on(pid, _server, input, timeout, call), do: remote_run(pid, input, timeout, call)
 
   defp run(info, server, input, timeout, call) do
     deadline = if timeout == :infinity, do: :infinity, else: now() + timeout
@@ -195,17 +196,16 @@ defmodule Transmuter.ContinuousBatching do
   @doc """
   Returns a stream of the text of `input`, as a serving of the task with `stream: true`. Consume the stream in the process that called this function.
 
-  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. An input that gives more than one row raises an `ArgumentError`. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
+  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. An input that gives more than one row raises an `ArgumentError`. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when no queue of a server of the name can take the input.
   """
   def stream(server, input, opts \\ []) do
     opts = Keyword.validate!(opts, stream_done: false)
     reason = {__MODULE__, :stream, [server, input, opts]}
+    server |> servers!(reason) |> with_room(&stream_on(&1, server, input, opts, reason))
+  end
 
-    info =
-      case locate!(server, reason) do
-        {:local, info} -> info
-        {:remote, _pid} -> raise ArgumentError, "stream/3 takes a server on this node"
-      end
+  defp stream_on(pid, server, input, opts, reason) when node(pid) == node() do
+    info = info!(pid, reason)
 
     input =
       case Serving.validate!(input, info.task.validate) do
@@ -264,57 +264,106 @@ defmodule Transmuter.ContinuousBatching do
     Serving.stream_text(events, info.tokenizer, run.summary, {opts[:stream_done], info.logprobs?})
   end
 
-  # The server of a call: a server on this node, or else a random server of the group of the
-  # name on another node. The info of a server on this node is the task, the tokenizer and the
-  # flags of the server, which it puts in :persistent_term when it starts, so a caller does
-  # not wait for a step of the server to read them.
-  defp locate!(server, call) do
-    pid = GenServer.whereis(server) || member(server)
+  defp stream_on(pid, _server, input, opts, reason), do: remote_stream(pid, input, opts, reason)
 
-    cond do
-      not is_pid(pid) -> exit({:noproc, call})
-      node(pid) != node() -> {:remote, pid}
-      info = :persistent_term.get({__MODULE__, pid}, nil) -> {:local, info}
-      true -> exit({:noproc, call})
+  # The servers of a call, in the order that the call tries them: the server on this node,
+  # and then the other servers of the group of the name in a random order.
+  defp servers!(server, call) do
+    members = if is_atom(server), do: :pg.get_members(Transmuter.PG, server), else: []
+    order = [GenServer.whereis(server) | Enum.shuffle(members)]
+
+    case for(pid <- order, is_pid(pid), uniq: true, do: pid) do
+      [] -> exit({:noproc, call})
+      pids -> pids
     end
   end
 
-  defp member(name) when is_atom(name) do
-    case :pg.get_members(Transmuter.PG, name) do
-      [] -> nil
-      pids -> Enum.random(pids)
-    end
+  # Calls `fun` on each server in turn until the queue of one takes the request.
+  defp with_room([pid], fun), do: fun.(pid)
+
+  defp with_room([pid | pids], fun) do
+    fun.(pid)
+  rescue
+    QueueFullError -> with_room(pids, fun)
   end
 
-  defp member(_server), do: nil
+  # The task, the tokenizer and the flags of a server on this node, which it puts in
+  # :persistent_term when it starts, so a caller does not wait for a step of the server to
+  # read them.
+  defp info!(pid, call), do: :persistent_term.get({__MODULE__, pid}, nil) || exit({:noproc, call})
 
   # The validation, the postprocessing and the tokenizer of a request stay on the node of the
-  # server: a proxy process there runs run/3 and exits with its result, as the process of a
-  # distributed call of Nx.Serving does. The caller only monitors the proxy, so it gets each
-  # end of the proxy as an exit of a local call. The timeout goes as a duration, because
-  # monotonic time is local to each node.
+  # server: a proxy process there runs run/3 or stream/3, and exits with the result, as the
+  # process of a distributed call of Nx.Serving does. The caller only monitors the proxy, so
+  # it gets each end of the proxy as an exit of a local call. The timeout goes as a duration,
+  # because monotonic time is local to each node.
   defp remote_run(pid, input, timeout, call) do
-    ref = make_ref()
-    args = [self(), ref, pid, input, timeout]
-    {_proxy, monitor} = Node.spawn_monitor(node(pid), __MODULE__, :__proxy__, args)
+    {_proxy, ref, monitor} = proxy(pid, :run, [input, timeout])
 
     receive do
       {:DOWN, ^monitor, :process, _proxy, {^ref, {:ok, result}}} -> result
-      {:DOWN, ^monitor, :process, _proxy, {^ref, {:raise, e, stack}}} -> reraise e, stack
-      {:DOWN, ^monitor, :process, _proxy, reason} -> exit({reason, call})
+      {:DOWN, ^monitor, :process, _proxy, reason} -> remote_exit!(ref, reason, call)
     end
   end
 
-  # The proxy runs run/3 in a linked runner, which the server knows as the caller of the
-  # request. The proxy monitors the caller and kills the runner when the caller exits, so the
-  # server frees the rows of the request. When the proxy ends, the link ends the runner too.
-  @doc false
-  def __proxy__(caller, ref, pid, input, timeout) do
-    Process.flag(:trap_exit, true)
-    monitor = Process.monitor(caller)
-    runner = spawn_link(fn -> exit(run_reply(ref, pid, input, timeout)) end)
+  # The proxy sends each chunk of the stream as a message, and the caller stops the proxy when
+  # it stops the stream before its end.
+  defp remote_stream(pid, input, opts, call) do
+    {proxy, ref, monitor} = proxy(pid, :stream, [input, opts])
 
     receive do
+      {^ref, :streaming} -> :ok
+      {:DOWN, ^monitor, :process, _proxy, reason} -> remote_exit!(ref, reason, call)
+    end
+
+    Stream.resource(
+      fn -> false end,
+      fn false ->
+        receive do
+          {^ref, {:chunk, chunk}} -> {[chunk], false}
+          {:DOWN, ^monitor, :process, _proxy, {^ref, :done}} -> {:halt, true}
+          {:DOWN, ^monitor, :process, _proxy, reason} -> remote_exit!(ref, reason, call)
+        end
+      end,
+      fn done? ->
+        unless done?, do: Process.exit(proxy, :kill)
+        Process.demonitor(monitor, [:flush])
+      end
+    )
+  end
+
+  defp proxy(pid, fun, args) do
+    ref = make_ref()
+    args = [self(), ref, fun, [pid | args]]
+    {proxy, monitor} = Node.spawn_monitor(node(pid), __MODULE__, :__proxy__, args)
+    {proxy, ref, monitor}
+  end
+
+  defp remote_exit!(ref, {ref, {:raise, exception, stacktrace}}, _call),
+    do: reraise(exception, stacktrace)
+
+  defp remote_exit!(_ref, reason, call), do: exit({reason, call})
+
+  # The proxy runs the call in a linked runner, which the server knows as the caller of the
+  # request, and sends the messages of the runner to the caller. The messages and the end of
+  # the proxy then reach the caller in order. The proxy monitors the caller and kills the
+  # runner when the caller exits, so the server frees the rows of the request. When the proxy
+  # ends, the link ends the runner too.
+  @doc false
+  def __proxy__(caller, ref, fun, args) do
+    Process.flag(:trap_exit, true)
+    proxy = self()
+    monitor = Process.monitor(caller)
+    runner = spawn_link(fn -> exit(reply(proxy, ref, fun, args)) end)
+    relay(caller, ref, runner, monitor)
+  end
+
+  defp relay(caller, ref, runner, monitor) do
+    receive do
+      {^ref, _event} = message ->
+        send(caller, message)
+        relay(caller, ref, runner, monitor)
+
       {:EXIT, ^runner, reason} ->
         exit(reason)
 
@@ -324,14 +373,23 @@ defmodule Transmuter.ContinuousBatching do
     end
   end
 
-  # An exit of run/3 gives its reason without the call on this node, and the caller adds its
-  # own call.
-  defp run_reply(ref, pid, input, timeout) do
-    {ref, {:ok, run(pid, input, timeout)}}
+  # An exit of run/3 or stream/3 gives its reason without the call on this node, and the
+  # caller adds its own call.
+  defp reply(proxy, ref, fun, args) do
+    {ref, local_call(proxy, ref, fun, args)}
   rescue
     exception -> {ref, {:raise, exception, __STACKTRACE__}}
   catch
     :exit, {reason, {__MODULE__, _fun, _args}} -> reason
+  end
+
+  defp local_call(_proxy, _ref, :run, [pid, input, timeout]), do: {:ok, run(pid, input, timeout)}
+
+  defp local_call(proxy, ref, :stream, [pid, input, opts]) do
+    chunks = stream(pid, input, opts)
+    send(proxy, {ref, :streaming})
+    Enum.each(chunks, &send(proxy, {ref, {:chunk, &1}}))
+    :done
   end
 
   # The server reads its mailbox between two steps, so the reply waits for the step that runs,
