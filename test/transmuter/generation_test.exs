@@ -2006,11 +2006,13 @@ defmodule Transmuter.GenerationBitsTest do
   # A decoder in the form of the Apertus export: GroupQueryAttention counts its rows from the
   # length of the mask, and the positions come from the length of the past, Range(L, L + n),
   # cast to a float for a sinusoid that the embeddings add. MergedDecoder gives the cast the
-  # position offset, so the decoder runs in :in_place, with the prompts of each length in a
-  # group of their own. The prompt of 20 tokens runs in parts of 16 and 4 tokens, and its 16
-  # new tokens grow the buffers from 32 to 64 rows. In a batch, each row gives the greedy
-  # tokens of the same decoder without a cache, computed with Nx, and log-probabilities within
-  # 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
+  # position offset, so the decoder runs in :in_place. The cast of the [n] positions takes one
+  # offset for all rows, so the prompts of each length run in a group of their own. In the
+  # export, the cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset has
+  # one value for each row, {batch, 1, 1} there, and the rows join one group. With one offset,
+  # the prompt of 20 tokens runs in parts of 16 and 4 tokens. Its 16 new tokens grow the
+  # buffers from 32 to 64 rows. In a batch, each row gives the greedy tokens of the same
+  # decoder without a cache, computed with Nx, and log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
   # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
   # reads a slice of the shape of the past keeps the decoder in :grow.
   test "a decoder without an If takes positions from the length of its past with the offset" do
@@ -2028,6 +2030,8 @@ defmodule Transmuter.GenerationBitsTest do
       "wo" => weight.({8, 50}, 1.7),
       "freq" => host.([[1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015, 0.008]])
     }
+
+    params = Map.put(params, "freq_column", Nx.reshape(params["freq"], {1, 8, 1}))
 
     attention = %{
       node.("GroupQueryAttention", ~w(q k v) ++ past ++ ~w(seqlens_k total_length), [
@@ -2143,11 +2147,6 @@ defmodule Transmuter.GenerationBitsTest do
 
     repo = %{generation_config: %{}, config: %{"eos_token_id" => -1, "vocab_size" => 50}}
     context = &Generation.context(repo, &1, max_new_tokens: 16, token_logprobs: true)
-    ctx = context.(model)
-    assert ctx.mode == :in_place
-    assert Generation.MergedDecoder.position_offset() in ctx.model.inputs
-    refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
-
     start = int.("start", 2)
 
     grow = %{
@@ -2158,17 +2157,49 @@ defmodule Transmuter.GenerationBitsTest do
     assert capture_log([level: :debug], fn -> assert context.(grow).mode == :grow end) =~
              "because Shape reads reads the cache or its length"
 
+    # The positions of the export: an Unsqueeze on axis 0 gives [1, n], an Unsqueeze on axis 1
+    # gives [1, 1, n], and a MatMul with the frequencies [1, 8, 1] gives the angles.
+    rotary = [
+      node.("Unsqueeze", ["positions", "axis_0"], ["position_ids"]),
+      node.("Unsqueeze", ["position_ids", "axis_1"], ["position_column"]),
+      %{node.("Cast", ["position_column"], ["float_positions"]) | attribute: [int.("to", 1)]},
+      node.("MatMul", ["freq_column", "float_positions"], ["frequencies"]),
+      %{
+        node.("Transpose", ["frequencies"], ["angles"])
+        | attribute: [%AttributeProto{name: "perm", type: :INTS, ints: [0, 2, 1]}]
+      },
+      node.("Sin", ["angles"], ["wave"])
+    ]
+
+    export = %{
+      model
+      | nodes:
+          Enum.flat_map(nodes, fn
+            %{name: "float_positions"} -> rotary
+            %{name: name} when name in ["column", "angles", "wave"] -> []
+            other -> [other]
+          end)
+    }
+
     prompts =
       for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
 
-    ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
-    rows = Generation.generate(ctx, prompts, [0, 0, 0])
+    for {model, offset} <- [{model, []}, {export, ["batch_size", 1]}] do
+      ctx = context.(model)
+      assert ctx.mode == :in_place
+      assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == {:s64, offset}
+      refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
+      assert Generation.joins?(ctx) == (offset != [])
 
-    for {row, prompt} <- Enum.zip(rows, prompts) do
-      expected = greedy.(prompt)
-      assert Enum.map(row, &hd/1) == Enum.map(expected, &hd/1)
-      diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
-      assert diff < 1.0e-4, "#{diff}"
+      ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
+      rows = Generation.generate(ctx, prompts, [0, 0, 0])
+
+      for {row, prompt} <- Enum.zip(rows, prompts) do
+        expected = greedy.(prompt)
+        assert Enum.map(row, &hd/1) == Enum.map(expected, &hd/1)
+        diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+        assert diff < 1.0e-4, "#{diff}"
+      end
     end
   end
 

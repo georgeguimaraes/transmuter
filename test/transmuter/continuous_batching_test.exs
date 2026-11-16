@@ -1002,7 +1002,7 @@ defmodule Transmuter.ContinuousBatchingLargeModelTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
-  alias Transmuter.{ContinuousBatching, ContinuousBatchingTest, Vision}
+  alias Transmuter.{ContinuousBatching, ContinuousBatchingTest, Text, Vision}
 
   # SmolVLM gives 64 image tokens for each tile of an image. A chat with an image joins a
   # running chat without images, and a chat with another image joins while the image tokens
@@ -1040,6 +1040,42 @@ defmodule Transmuter.ContinuousBatchingLargeModelTest do
     spec = [task: Vision.ImageToText, source: source, slots: 3] ++ opts
     server = start_supervised!({ContinuousBatching, spec})
     assert ContinuousBatchingTest.join_while_reading(server, inputs) == alone
+  end
+
+  # Apertus takes its rotary positions from the length of its past, as [1, 1, n] positions
+  # that a float cast reads, so MergedDecoder gives it a position offset for each row. Chats
+  # of different lengths run together in a batch of 3 of the serving, and join a running chat
+  # in a server of 3 rows. Each chat gives the text of the serving alone, with
+  # log-probabilities within 1e-4. The model file is 811 MB.
+  @tag :large_model
+  test "chats of Apertus that join a running batch give the result that they give alone" do
+    source = {:hf, "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX"}
+    opts = [strategy: :greedy, max_new_tokens: 24, token_logprobs: true] ++ @opts
+
+    chats =
+      Enum.map(
+        [
+          "What is the capital of France?",
+          "Explain in two sentences how a rainbow forms after the rain on a summer day.",
+          "Name three animals."
+        ],
+        &ContinuousBatchingTest.chat/1
+      )
+
+    alone = Enum.map(chats, &Nx.Serving.run(Text.generation(source, opts), &1))
+    batched = Nx.Serving.run(Text.generation(source, [compile: [batch_size: 3]] ++ opts), chats)
+    :erlang.garbage_collect()
+
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 3] ++ opts})
+    joined = ContinuousBatchingTest.join_while_reading(server, chats)
+
+    for results <- [batched, joined],
+        {%{results: [result]}, %{results: [expected]}} <- Enum.zip(results, alone) do
+      assert result.text == expected.text
+
+      for {got, want} <- Enum.zip(result.token_logprobs, expected.token_logprobs),
+          do: assert_in_delta(got, want, 1.0e-4)
+    end
   end
 
   defp chats do
