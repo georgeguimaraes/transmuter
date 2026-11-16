@@ -51,7 +51,7 @@ defmodule Transmuter.Text.Generation do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for generation/2 and
-  # `Transmuter.ContinuousGeneration`.
+  # `Transmuter.ContinuousBatching`.
   def task(source, opts) do
     load_opts = [outputs: &Generation.outputs/1] ++ opts
     components = ["model", "decoder_model_merged"]

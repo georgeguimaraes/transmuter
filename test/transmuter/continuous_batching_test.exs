@@ -1,4 +1,4 @@
-defmodule Transmuter.ContinuousGenerationTest.FailingTask do
+defmodule Transmuter.ContinuousBatchingTest.FailingTask do
   @moduledoc false
   # The text generation task, whose :prepare raises on the prompt "boom", as an out-of-memory
   # error of the device in the vision encoder would.
@@ -25,7 +25,7 @@ defmodule Transmuter.ContinuousGenerationTest.FailingTask do
   end
 end
 
-defmodule Transmuter.ContinuousGenerationTest.BrokenTask do
+defmodule Transmuter.ContinuousBatchingTest.BrokenTask do
   @moduledoc false
   # The text generation task, whose :prepare raises when it loads its models.
 
@@ -39,7 +39,7 @@ defmodule Transmuter.ContinuousGenerationTest.BrokenTask do
   end
 end
 
-defmodule Transmuter.ContinuousGenerationTest do
+defmodule Transmuter.ContinuousBatchingTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
@@ -52,8 +52,8 @@ defmodule Transmuter.ContinuousGenerationTest do
     variant: :fp32
   ]
 
-  alias Transmuter.{ContinuousGeneration, Text, Vision}
-  alias Transmuter.ContinuousGenerationTest.{BrokenTask, FailingTask}
+  alias Transmuter.{ContinuousBatching, Text, Vision}
+  alias Transmuter.ContinuousBatchingTest.{BrokenTask, FailingTask}
 
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
 
@@ -81,7 +81,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       single = Text.generation(source, opts)
       alone = for input <- [fox, story, rainbow], do: Nx.Serving.run(single, input)
 
-      server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+      server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
 
       {{fox_text, others}, steps} =
         step_events(server, fn ->
@@ -91,7 +91,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           streamer =
             Task.async(fn ->
               server
-              |> ContinuousGeneration.stream(fox)
+              |> ContinuousBatching.stream(fox)
               |> Enum.map_join(fn chunk ->
                 send(parent, {ref, :chunk})
                 chunk
@@ -99,14 +99,14 @@ defmodule Transmuter.ContinuousGenerationTest do
             end)
 
           assert_receive {^ref, :chunk}, 60_000
-          others = ContinuousGeneration.run(server, [story, rainbow])
+          others = ContinuousBatching.run(server, [story, rainbow])
           {Task.await(streamer, :infinity), others}
         end)
 
       [%{results: [%{text: text}]} | rest] = alone
       assert {fox_text, others} == {text, rest}, inspect(strategy)
       assert Enum.count(steps, &(&1.admitted == 1 and &1.running == 1)) == 2
-      stop_supervised!(ContinuousGeneration)
+      stop_supervised!(ContinuousBatching)
     end
   end
 
@@ -122,11 +122,11 @@ defmodule Transmuter.ContinuousGenerationTest do
     opts = [strategy: :greedy, max_new_tokens: 200, min_new_tokens: 200] ++ @opts
     alone = Nx.Serving.run(Text.generation(source, opts), "Once upon a time")
 
-    spec = {ContinuousGeneration, [source: source, slots: 1, max_queue: 1] ++ opts}
+    spec = {ContinuousBatching, [source: source, slots: 1, max_queue: 1] ++ opts}
     server = start_supervised!(Supervisor.child_spec(spec, restart: :temporary))
 
     {_result, own_calls} =
-      count_calls(server, fn _calls -> ContinuousGeneration.run(server, "Once upon a time") end)
+      count_calls(server, fn _calls -> ContinuousBatching.run(server, "Once upon a time") end)
 
     parent = self()
 
@@ -135,7 +135,7 @@ defmodule Transmuter.ContinuousGenerationTest do
         streamer =
           spawn(fn ->
             server
-            |> ContinuousGeneration.stream(@fox)
+            |> ContinuousBatching.stream(@fox)
             |> Enum.each(fn _chunk -> send(parent, :chunk) end)
           end)
 
@@ -145,7 +145,7 @@ defmodule Transmuter.ContinuousGenerationTest do
 
         :telemetry.attach(
           id,
-          [:transmuter, :continuous_generation, :prepare, :start],
+          [:transmuter, :continuous_batching, :prepare, :start],
           fn _event, _measurements, _metadata, _config ->
             if self() == worker do
               send(parent, {id, :preparing})
@@ -155,12 +155,12 @@ defmodule Transmuter.ContinuousGenerationTest do
           nil
         )
 
-        waiting = Task.async(fn -> ContinuousGeneration.run(server, "Once upon a time") end)
+        waiting = Task.async(fn -> ContinuousBatching.run(server, "Once upon a time") end)
         assert_receive {^id, :preparing}, 60_000
 
         full = fn ->
-          assert_raise ContinuousGeneration.QueueFullError, ~r/holds 1 requests/, fn ->
-            ContinuousGeneration.run(server, "Explain how a rainbow forms.", 60_000)
+          assert_raise ContinuousBatching.QueueFullError, ~r/holds 1 requests/, fn ->
+            ContinuousBatching.run(server, "Explain how a rainbow forms.", 60_000)
           end
         end
 
@@ -178,12 +178,12 @@ defmodule Transmuter.ContinuousGenerationTest do
     assert result == alone
     assert calls <= killed_at + 2 + own_calls
 
-    {caller, monitor} = spawn_monitor(fn -> ContinuousGeneration.run(server, @fox) end)
+    {caller, monitor} = spawn_monitor(fn -> ContinuousBatching.run(server, @fox) end)
     wait_for(fn -> map_size(:sys.get_state(server).rows) == 1 end)
     Process.exit(server, :kill)
 
     assert_receive {:DOWN, ^monitor, :process, ^caller,
-                    {:killed, {ContinuousGeneration, :run, _args}}},
+                    {:killed, {ContinuousBatching, :run, _args}}},
                    60_000
   end
 
@@ -195,13 +195,13 @@ defmodule Transmuter.ContinuousGenerationTest do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 8] ++ @opts
     alone = Nx.Serving.run(Text.generation(source, opts), "Once upon a time")
-    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
     parent = self()
     id = make_ref()
 
     :telemetry.attach(
       id,
-      [:transmuter, :continuous_generation, :step, :start],
+      [:transmuter, :continuous_batching, :step, :start],
       fn _event, _measurements, _metadata, _config ->
         if self() == server and Process.get(id) == nil do
           Process.put(id, :slept)
@@ -212,9 +212,9 @@ defmodule Transmuter.ContinuousGenerationTest do
       nil
     )
 
-    first = Task.async(fn -> ContinuousGeneration.run(server, @fox) end)
+    first = Task.async(fn -> ContinuousBatching.run(server, @fox) end)
     assert_receive {^id, :sleeping}, 60_000
-    second = Task.async(fn -> ContinuousGeneration.run(server, "Once upon a time") end)
+    second = Task.async(fn -> ContinuousBatching.run(server, "Once upon a time") end)
     assert Task.await(second, :infinity) == alone
     Task.await(first, :infinity)
     :telemetry.detach(id)
@@ -241,7 +241,7 @@ defmodule Transmuter.ContinuousGenerationTest do
            ~r/cannot join a running batch .* one length of the cache: .*Range/}
         ] do
       assert_raise ArgumentError, message, fn ->
-        ContinuousGeneration.start_link([source: source] ++ opts ++ @opts)
+        ContinuousBatching.start_link([source: source] ++ opts ++ @opts)
       end
     end
   end
@@ -260,7 +260,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     alone = Map.new(texts, &{&1, Nx.Serving.run(single, &1)})
 
     spec =
-      {ContinuousGeneration, [source: source, slots: 2, max_queue: 12, capacity: 256] ++ opts}
+      {ContinuousBatching, [source: source, slots: 2, max_queue: 12, capacity: 256] ++ opts}
 
     server = start_supervised!(spec)
 
@@ -274,7 +274,7 @@ defmodule Transmuter.ContinuousGenerationTest do
         streamer =
           Task.async(fn ->
             server
-            |> ContinuousGeneration.stream(first)
+            |> ContinuousBatching.stream(first)
             |> Enum.map_join(fn chunk ->
               send(parent, {ref, :chunk})
               chunk
@@ -282,7 +282,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           end)
 
         assert_receive {^ref, :chunk}, 60_000
-        others = ContinuousGeneration.run(server, rest)
+        others = ContinuousBatching.run(server, rest)
         {Task.await(streamer, :infinity), others}
       end)
 
@@ -304,7 +304,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     shorts = ["Once upon a time", "Explain how a rainbow forms."]
     single = Text.generation(source, opts)
     alone = for input <- [long | shorts], do: Nx.Serving.run(single, input)
-    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
 
     {{long_text, others}, steps} =
       step_events(server, fn ->
@@ -314,7 +314,7 @@ defmodule Transmuter.ContinuousGenerationTest do
         streamer =
           Task.async(fn ->
             server
-            |> ContinuousGeneration.stream(long)
+            |> ContinuousBatching.stream(long)
             |> Enum.map_join(fn chunk ->
               send(parent, {ref, :chunk})
               chunk
@@ -322,7 +322,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           end)
 
         assert_receive {^ref, :chunk}, 60_000
-        others = ContinuousGeneration.run(server, shorts)
+        others = ContinuousBatching.run(server, shorts)
         {Task.await(streamer, :infinity), others}
       end)
 
@@ -362,10 +362,10 @@ defmodule Transmuter.ContinuousGenerationTest do
       single = Vision.image_text_to_text(source, opts)
       alone = Enum.map(chats, &Nx.Serving.run(single, Map.put(&1, :seed, 7)))
       spec = [task: Vision.ImageTextToText, source: source, slots: 3] ++ opts
-      server = start_supervised!({ContinuousGeneration, spec})
+      server = start_supervised!({ContinuousBatching, spec})
 
       assert_raise ArgumentError, ~r/has 1 image tokens .*, and the images give 0/, fn ->
-        ContinuousGeneration.run(server, literal)
+        ContinuousBatching.run(server, literal)
       end
 
       results = join_while_reading(server, Enum.map(chats, &Map.put(&1, :seed, 7)))
@@ -375,7 +375,7 @@ defmodule Transmuter.ContinuousGenerationTest do
         assert_all_close(result.token_logprobs, expected.token_logprobs)
       end
 
-      stop_supervised!(ContinuousGeneration)
+      stop_supervised!(ContinuousBatching)
     end
   end
 
@@ -388,13 +388,13 @@ defmodule Transmuter.ContinuousGenerationTest do
     single = Text.generation(source, opts)
     alone = for text <- [@fox, "Once upon a time"], do: Nx.Serving.run(single, text)
     spec = [task: FailingTask, source: source, slots: 2] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
+    server = start_supervised!({ContinuousBatching, spec})
     parent = self()
 
     streamer =
       Task.async(fn ->
         server
-        |> ContinuousGeneration.stream(@fox)
+        |> ContinuousBatching.stream(@fox)
         |> Enum.map_join(fn chunk ->
           send(parent, :chunk)
           chunk
@@ -404,10 +404,10 @@ defmodule Transmuter.ContinuousGenerationTest do
     assert_receive :chunk, 60_000
 
     assert_raise RuntimeError, "out of memory", fn ->
-      ContinuousGeneration.run(server, "boom")
+      ContinuousBatching.run(server, "boom")
     end
 
-    assert ContinuousGeneration.run(server, "Once upon a time") == Enum.at(alone, 1)
+    assert ContinuousBatching.run(server, "Once upon a time") == Enum.at(alone, 1)
     [%{results: [%{text: text}]} | _rest] = alone
     assert Task.await(streamer, :infinity) == text
   end
@@ -419,14 +419,14 @@ defmodule Transmuter.ContinuousGenerationTest do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 8] ++ @opts
     alone = Nx.Serving.run(Text.generation(source, opts), "Once upon a time")
-    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
     %{worker: worker} = :sys.get_state(server)
     parent = self()
     id = make_ref()
 
     :telemetry.attach(
       id,
-      [:transmuter, :continuous_generation, :prepare, :start],
+      [:transmuter, :continuous_batching, :prepare, :start],
       fn _event, _measurements, _metadata, _config ->
         if self() == worker and Process.put(id, :held) == nil do
           send(parent, {id, :preparing})
@@ -436,7 +436,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       nil
     )
 
-    {caller, monitor} = spawn_monitor(fn -> ContinuousGeneration.run(server, @fox) end)
+    {caller, monitor} = spawn_monitor(fn -> ContinuousBatching.run(server, @fox) end)
     assert_receive {^id, :preparing}, 60_000
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^caller, :killed}
@@ -445,7 +445,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     {result, steps} =
       step_events(server, fn ->
         send(worker, {id, :go})
-        ContinuousGeneration.run(server, "Once upon a time")
+        ContinuousBatching.run(server, "Once upon a time")
       end)
 
     :telemetry.detach(id)
@@ -457,7 +457,7 @@ defmodule Transmuter.ContinuousGenerationTest do
   # start.
   test "a server whose worker cannot load its models does not start" do
     spec = [task: BrokenTask, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}] ++ @opts
-    assert {:error, reason} = start_supervised({ContinuousGeneration, spec})
+    assert {:error, reason} = start_supervised({ContinuousBatching, spec})
     assert inspect(reason) =~ "no encoder"
   end
 
@@ -469,7 +469,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 300, min_new_tokens: 300] ++ @opts
     spec = [source: source, slots: 2, capacity: 512, compile_steps: true] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
+    server = start_supervised!({ContinuousBatching, spec})
     parent = self()
     id = make_ref()
 
@@ -487,7 +487,7 @@ defmodule Transmuter.ContinuousGenerationTest do
         streamer =
           Task.async(fn ->
             server
-            |> ContinuousGeneration.stream(@fox)
+            |> ContinuousBatching.stream(@fox)
             |> Enum.map_join(fn chunk ->
               send(parent, {id, :chunk})
               chunk
@@ -495,7 +495,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           end)
 
         assert_receive {^id, :chunk}, 60_000
-        others = ContinuousGeneration.run(server, ["Once upon a time", "Why is the sky blue?"])
+        others = ContinuousBatching.run(server, ["Once upon a time", "Why is the sky blue?"])
         {Task.await(streamer, :infinity), others}
       end)
 
@@ -525,7 +525,7 @@ defmodule Transmuter.ContinuousGenerationTest do
 
     opts = [strategy: :greedy, max_new_tokens: 30, min_new_tokens: 30] ++ @opts
     spec = [source: source, slots: 1, capacity: 256, compile_steps: true] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
+    server = start_supervised!({ContinuousBatching, spec})
     parent = self()
     id = make_ref()
 
@@ -540,7 +540,7 @@ defmodule Transmuter.ContinuousGenerationTest do
 
     {_results, steps} =
       step_events(server, fn ->
-        ContinuousGeneration.run(server, ["Once upon a time", waiting])
+        ContinuousBatching.run(server, ["Once upon a time", waiting])
       end)
 
     :telemetry.detach(id)
@@ -555,10 +555,10 @@ defmodule Transmuter.ContinuousGenerationTest do
   test "a request that waits for the last running row of :in_place starts at the start capacity" do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 300, min_new_tokens: 300] ++ @opts
-    server = start_supervised!({ContinuousGeneration, [source: source, slots: 1] ++ opts})
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 1] ++ opts})
 
     {_results, steps} =
-      step_events(server, fn -> ContinuousGeneration.run(server, [@fox, "Once upon a time"]) end)
+      step_events(server, fn -> ContinuousBatching.run(server, [@fox, "Once upon a time"]) end)
 
     assert steps |> Enum.map(& &1.capacity) |> Enum.max() > 256
     assert [%{capacity: 256}, %{capacity: 256}] = Enum.filter(steps, &(&1.admitted > 0))
@@ -586,9 +586,9 @@ defmodule Transmuter.ContinuousGenerationTest do
     alone = for text <- texts, do: hd(Nx.Serving.run(single, text).results).text
 
     spec = [source: source, task: Text.TextToText, slots: 2] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
+    server = start_supervised!({ContinuousBatching, spec})
 
-    {results, steps} = step_events(server, fn -> ContinuousGeneration.run(server, texts) end)
+    {results, steps} = step_events(server, fn -> ContinuousBatching.run(server, texts) end)
 
     assert Enum.map(results, &hd(&1.results).text) == alone
     assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) >= 2
@@ -603,11 +603,11 @@ defmodule Transmuter.ContinuousGenerationTest do
     source = {:hf, "Xenova/opus-mt-en-de"}
     opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 64] ++ @opts
     spec = [source: source, task: Text.TextToText, slots: 1] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
+    server = start_supervised!({ContinuousBatching, spec})
 
     {_results, steps} =
       step_events(server, fn ->
-        ContinuousGeneration.run(server, [@museum, "The house is wonderful."])
+        ContinuousBatching.run(server, [@museum, "The house is wonderful."])
       end)
 
     assert steps |> Enum.map(& &1.encoder_capacity) |> Enum.dedup() == [0, 128, 0, 32]
@@ -624,7 +624,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     source = {:hf, "Xenova/opus-mt-en-de"}
     opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 64, min_new_tokens: 64] ++ @opts
     spec = [source: source, task: Text.TextToText, slots: 2, capacity: 256, compile_steps: true]
-    server = start_supervised!({ContinuousGeneration, spec ++ opts})
+    server = start_supervised!({ContinuousBatching, spec ++ opts})
     parent = self()
     id = make_ref()
 
@@ -639,12 +639,12 @@ defmodule Transmuter.ContinuousGenerationTest do
 
     {_results, steps} =
       step_events(server, fn ->
-        ContinuousGeneration.run(server, @museum)
+        ContinuousBatching.run(server, @museum)
 
         streamer =
           Task.async(fn ->
             server
-            |> ContinuousGeneration.stream(@fox)
+            |> ContinuousBatching.stream(@fox)
             |> Enum.map_join(fn chunk ->
               send(parent, {id, :chunk})
               chunk
@@ -652,7 +652,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           end)
 
         assert_receive {^id, :chunk}, 60_000
-        others = ContinuousGeneration.run(server, [@museum, "The house is wonderful."])
+        others = ContinuousBatching.run(server, [@museum, "The house is wonderful."])
         {Task.await(streamer, :infinity), others}
       end)
 
@@ -671,7 +671,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     variant = %{vision_encoder: :fp32, embed_tokens: :fp32, decoder_model_merged: :fp32}
     opts = Keyword.merge(@opts, variant: variant, strategy: :greedy, max_new_tokens: 24)
     spec = [task: Vision.ImageTextToText, source: source, slots: 3, capacity: 512]
-    server = start_supervised!({ContinuousGeneration, spec ++ [compile_steps: true] ++ opts})
+    server = start_supervised!({ContinuousBatching, spec ++ [compile_steps: true] ++ opts})
     image = StbImage.read_file!(Path.expand("../fixtures/cats.png", __DIR__))
     images = &List.duplicate(%{type: "image", image: image}, &1)
     text = %{type: "text", text: "What is here?"}
@@ -691,7 +691,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     streamer =
       Task.async(fn ->
         server
-        |> ContinuousGeneration.stream(chat([text]))
+        |> ContinuousBatching.stream(chat([text]))
         |> Enum.map_join(fn chunk ->
           send(parent, {id, :chunk})
           chunk
@@ -699,7 +699,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       end)
 
     assert_receive {^id, :chunk}, 60_000
-    ContinuousGeneration.run(server, [one, three, three, one])
+    ContinuousBatching.run(server, [one, three, three, one])
     Task.await(streamer, :infinity)
     :telemetry.detach(id)
     refute_received {^id, [_ | _]}
@@ -722,7 +722,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       single = Text.generation(source, opts)
       alone = for input <- [@fox, long], do: Nx.Serving.run(single, input)
       spec = [source: source, slots: 2, capacity: 512, compile_steps: true] ++ opts
-      server = start_supervised!({ContinuousGeneration, spec})
+      server = start_supervised!({ContinuousBatching, spec})
       parent = self()
       id = make_ref()
 
@@ -740,7 +740,7 @@ defmodule Transmuter.ContinuousGenerationTest do
           streamer =
             Task.async(fn ->
               server
-              |> ContinuousGeneration.stream(@fox)
+              |> ContinuousBatching.stream(@fox)
               |> Enum.map_join(fn chunk ->
                 send(parent, {id, :chunk})
                 chunk
@@ -748,7 +748,7 @@ defmodule Transmuter.ContinuousGenerationTest do
             end)
 
           assert_receive {^id, :chunk}, 60_000
-          other = ContinuousGeneration.run(server, long)
+          other = ContinuousBatching.run(server, long)
           {Task.await(streamer, :infinity), other}
         end)
 
@@ -761,7 +761,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       ladder = [256, 320, 384, 448, 512]
       steps = Enum.map(capacities, &Enum.find_index(ladder, fn capacity -> capacity == &1 end))
       assert Enum.any?(Enum.chunk_every(steps, 2, 1, :discard), fn [a, b] -> b - a >= 2 end)
-      stop_supervised!(ContinuousGeneration)
+      stop_supervised!(ContinuousBatching)
     end
   end
 
@@ -783,9 +783,9 @@ defmodule Transmuter.ContinuousGenerationTest do
       single = Text.generation(source, opts)
       alone = for input <- [long, joining], do: Nx.Serving.run(single, input)
       spec = [source: source, slots: 2, capacity: 512] ++ opts
-      server = start_supervised!({ContinuousGeneration, spec})
+      server = start_supervised!({ContinuousBatching, spec})
       assert results_after_first_chunk(server, long, joining) == alone, inspect(source)
-      stop_supervised!(ContinuousGeneration)
+      stop_supervised!(ContinuousBatching)
     end
   end
 
@@ -802,7 +802,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     opts = opts ++ @opts
     single = Text.generation(source, opts)
     alone = for input <- [long, joining], do: Nx.Serving.run(single, input)
-    server = start_supervised!({ContinuousGeneration, [source: source, slots: 2] ++ opts})
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
 
     {results, steps} =
       step_events(server, fn -> results_after_first_chunk(server, long, joining) end)
@@ -823,7 +823,7 @@ defmodule Transmuter.ContinuousGenerationTest do
     streamer =
       Task.async(fn ->
         server
-        |> ContinuousGeneration.stream(first, stream_done: true)
+        |> ContinuousBatching.stream(first, stream_done: true)
         |> Enum.reduce({"", nil}, fn
           {:done, %{token_summary: summary}}, {text, _summary} ->
             {text, summary}
@@ -835,7 +835,7 @@ defmodule Transmuter.ContinuousGenerationTest do
       end)
 
     assert_receive {^ref, :chunk}, 60_000
-    other = ContinuousGeneration.run(server, second)
+    other = ContinuousBatching.run(server, second)
     {text, summary} = Task.await(streamer, :infinity)
     [%{results: [%{text: text, token_summary: summary}]}, other]
   end
@@ -856,13 +856,13 @@ defmodule Transmuter.ContinuousGenerationTest do
     id = make_ref()
 
     events = [
-      [:transmuter, :continuous_generation, :prepare, :start],
-      [:transmuter, :continuous_generation, :prepare, :stop],
-      [:transmuter, :continuous_generation, :step, :start]
+      [:transmuter, :continuous_batching, :prepare, :start],
+      [:transmuter, :continuous_batching, :prepare, :stop],
+      [:transmuter, :continuous_batching, :step, :start]
     ]
 
     :telemetry.attach_many(id, events, &__MODULE__.hold/4, {id, parent, worker, pid})
-    task = Task.async(fn -> ContinuousGeneration.run(server, chats) end)
+    task = Task.async(fn -> ContinuousBatching.run(server, chats) end)
 
     # The server holds a step of the first chat when the second chat is not ready yet.
     receive do
@@ -939,7 +939,7 @@ defmodule Transmuter.ContinuousGenerationTest do
 
     :telemetry.attach(
       id,
-      [:transmuter, :continuous_generation, :step, :start],
+      [:transmuter, :continuous_batching, :step, :start],
       fn _event, _measurements, metadata, _config ->
         if self() == pid, do: send(parent, {id, metadata})
       end,
@@ -991,7 +991,7 @@ end
 # --only ci_partition:N in CI would also include :large_model tests, because an included tag
 # wins over an excluded one. So these tests are in a module without a :ci_partition tag, and
 # CI leaves them out.
-defmodule Transmuter.ContinuousGenerationLargeModelTest do
+defmodule Transmuter.ContinuousBatchingLargeModelTest do
   use ExUnit.Case, async: true
 
   @moduletag :hub
@@ -1002,7 +1002,7 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
     defn_options: Transmuter.TestBackend.compiler_opts()
   ]
 
-  alias Transmuter.{ContinuousGeneration, ContinuousGenerationTest, Vision}
+  alias Transmuter.{ContinuousBatching, ContinuousBatchingTest, Vision}
 
   # SmolVLM gives 64 image tokens for each tile of an image. A chat with an image joins a
   # running chat without images, and a chat with another image joins while the image tokens
@@ -1010,14 +1010,14 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
   @tag :large_model
   test "chats of SmolVLM that join a running batch give the text that they give alone" do
     {server, alone} = server_and_alone({:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"})
-    assert ContinuousGenerationTest.join_while_reading(server, chats()) == alone
+    assert ContinuousBatchingTest.join_while_reading(server, chats()) == alone
   end
 
   # The same joins with Qwen2-VL, whose image tokens have the 3-D positions of M-RoPE.
   @tag :large_model
   test "chats of Qwen2-VL that join a running batch give the text that they give alone" do
     {server, alone} = server_and_alone({:hf, "onnx-community/Qwen2-VL-2B-Instruct"})
-    assert ContinuousGenerationTest.join_while_reading(server, chats()) == alone
+    assert ContinuousBatchingTest.join_while_reading(server, chats()) == alone
   end
 
   # The worker runs the vision encoder, the embeddings and the encoder of Florence-2 on the
@@ -1038,8 +1038,8 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
     :erlang.garbage_collect()
 
     spec = [task: Vision.ImageToText, source: source, slots: 3] ++ opts
-    server = start_supervised!({ContinuousGeneration, spec})
-    assert ContinuousGenerationTest.join_while_reading(server, inputs) == alone
+    server = start_supervised!({ContinuousBatching, spec})
+    assert ContinuousBatchingTest.join_while_reading(server, inputs) == alone
   end
 
   defp chats do
@@ -1052,7 +1052,7 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
         [%{type: "image", image: image}, %{type: "text", text: "Can you describe this image?"}],
         [%{type: "image", image: tall}, %{type: "text", text: "What animals are in the image?"}]
       ],
-      &ContinuousGenerationTest.chat/1
+      &ContinuousBatchingTest.chat/1
     )
   end
 
@@ -1063,7 +1063,7 @@ defmodule Transmuter.ContinuousGenerationLargeModelTest do
     alone = alone(source, opts)
     :erlang.garbage_collect()
     spec = [task: Vision.ImageTextToText, source: source, slots: 3] ++ opts
-    {start_supervised!({ContinuousGeneration, spec}), alone}
+    {start_supervised!({ContinuousBatching, spec}), alone}
   end
 
   defp alone(source, opts) do

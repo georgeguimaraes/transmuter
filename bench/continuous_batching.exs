@@ -1,4 +1,4 @@
-# Requests that arrive over time, to a server of Transmuter.ContinuousGeneration with 8
+# Requests that arrive over time, to a server of Transmuter.ContinuousBatching with 8
 # slots or to a started serving of Transmuter.Text.generation/2 with batch_size: 8 and
 # batch_timeout: 10, on the GPU of EMLX, or of EXLA with CUDA when BENCH_BACKEND is exla.
 # EXLA allocates device memory when it needs it, not in one arena at the start, so the memory
@@ -31,11 +31,11 @@
 #   - for the server, the time between tokens in the decode steps (no prompt part), with and without a
 #     run of :prepare in the worker at the same time (p50, p99 and the largest).
 #
-# Usage: mix run bench/continuous_generation.exs smollm2|smollm2-onnx|qwen3|smolvlm server|serving <rate> [requests]
+# Usage: mix run bench/continuous_batching.exs smollm2|smollm2-onnx|qwen3|smolvlm server|serving <rate> [requests]
 Logger.configure(level: :warning)
 
 # The MLX cache of freed buffers has no limit by default, see the moduledoc of
-# Transmuter.ContinuousGeneration. Both modes run with the same limit.
+# Transmuter.ContinuousBatching. Both modes run with the same limit.
 device =
   if System.get_env("BENCH_BACKEND", "emlx") == "emlx" do
     EMLX.set_cache_limit(1_000_000_000)
@@ -120,12 +120,12 @@ stream =
   case mode do
     "server" ->
       {:ok, _pid} =
-        Transmuter.ContinuousGeneration.start_link(
+        Transmuter.ContinuousBatching.start_link(
           [name: Bench, task: task, source: {:hf, repo}, slots: 8, max_queue: count] ++
             [compile_steps: true] ++ opts
         )
 
-      &Transmuter.ContinuousGeneration.stream(Bench, &1, stream_done: true)
+      &Transmuter.ContinuousBatching.stream(Bench, &1, stream_done: true)
 
     "serving" ->
       serving_opts = [compile: [batch_size: 8], stream: true, stream_done: true] ++ opts
@@ -253,8 +253,8 @@ events = :ets.new(:events, [:public, :bag])
   :bench,
   [
     [:transmuter, :call, :stop],
-    [:transmuter, :continuous_generation, :step, :stop],
-    [:transmuter, :continuous_generation, :prepare, :stop]
+    [:transmuter, :continuous_batching, :step, :stop],
+    [:transmuter, :continuous_batching, :prepare, :stop]
   ],
   fn event, measurements, metadata, _config ->
     :ets.insert(
@@ -277,8 +277,8 @@ tokens = results |> Enum.map(& &1.tokens) |> Enum.sum()
 span = Enum.max(Enum.map(results, & &1.end)) - Enum.min(Enum.map(results, & &1.arrival))
 first = Enum.map(results, &(&1.first - &1.arrival))
 calls = :ets.lookup(events, [:transmuter, :call, :stop])
-steps = :ets.lookup(events, [:transmuter, :continuous_generation, :step, :stop])
-prepares = :ets.lookup(events, [:transmuter, :continuous_generation, :prepare, :stop])
+steps = :ets.lookup(events, [:transmuter, :continuous_batching, :step, :stop])
+prepares = :ets.lookup(events, [:transmuter, :continuous_batching, :prepare, :stop])
 
 between =
   case mode do

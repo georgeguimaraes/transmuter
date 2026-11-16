@@ -54,7 +54,7 @@ defmodule Transmuter.Text.TextToText do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for text_to_text/2 and
-  # `Transmuter.ContinuousGeneration`. :init encodes the texts of a batch, and :prepare the text
+  # `Transmuter.ContinuousBatching`. :init encodes the texts of a batch, and :prepare the text
   # of one request.
   def task(source, opts) do
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)

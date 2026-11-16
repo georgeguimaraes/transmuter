@@ -1,22 +1,22 @@
-defmodule Transmuter.ContinuousGeneration do
+defmodule Transmuter.ContinuousBatching do
   @moduledoc """
-  A server of generation with continuous batching: a request joins the running batch at the next step, and a row that ends gives its place to the next request.
+  A server of generation with continuous batching, also called iteration-level scheduling or in-flight batching: a request joins the running batch at the next step, and a row that ends gives its place to the next request.
 
   A serving of `Transmuter.Text.generation/2` or `Transmuter.Vision.image_text_to_text/2` runs each batch until its longest row ends, so a request that arrives during a batch waits for all of it, and the rows that end early stay empty. This server keeps `:slots` rows, and between two steps it gives each free row to a waiting request. The text of a request does not depend on the other rows: with greedy selection, and with sampling from a seed, a request gives the same text as alone.
 
       children = [
-        {Transmuter.ContinuousGeneration,
+        {Transmuter.ContinuousBatching,
          name: MyGen, source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, slots: 8}
       ]
 
       Supervisor.start_link(children, strategy: :one_for_one)
 
       %{results: [%{text: text}]} =
-        Transmuter.ContinuousGeneration.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
+        Transmuter.ContinuousBatching.run(MyGen, %{messages: [%{role: "user", content: "Hi"}]})
 
   A server of a vision language model takes the chats of `Transmuter.Vision.image_text_to_text/2`:
 
-      {Transmuter.ContinuousGeneration,
+      {Transmuter.ContinuousBatching,
        name: MyChat,
        task: Transmuter.Vision.ImageTextToText,
        source: {:hf, "HuggingFaceTB/SmolVLM-256M-Instruct"},
@@ -32,7 +32,7 @@ defmodule Transmuter.ContinuousGeneration do
 
     * `:slots` - the number of rows that generate together. The default is `8`.
 
-    * `:max_queue` - the number of requests that can wait for a row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousGeneration.QueueFullError`, so the caller can rescue this case and reject the request.
+    * `:max_queue` - the number of requests that can wait for a row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousBatching.QueueFullError`, so the caller can rescue this case and reject the request.
 
     * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. The default is `4096`.
 
@@ -52,7 +52,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   ## The server and the serving
 
-  These numbers come from `bench/continuous_generation.exs` on CUDA (RTX 3060), with the server and a serving of batch size 8 at the same request rates. The gap is the time between two chunks of text of a stream in the caller.
+  These numbers come from `bench/continuous_batching.exs` on CUDA (RTX 3060), with the server and a serving of batch size 8 at the same request rates. The gap is the time between two chunks of text of a stream in the caller.
 
   For text, the server gives more tokens per second and earlier first tokens. With SmolLM2-135M, the limit of the server is about 3.9 requests per second. At 1.94, 3.10 and 4.65 requests per second, the server gives 7%, 7% and 13% more tokens per second than the serving. Below the limit, the first token comes about 20 times earlier: 61 ms against 1284 ms at 1.94 requests per second, and 64 ms against 1715 ms at 3.10. The gap at p99 is about 11 ms longer: 44 ms against 33 ms.
 
@@ -86,7 +86,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   ## Telemetry
 
-  Each step emits `[:transmuter, :continuous_generation, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_generation, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
+  Each step emits `[:transmuter, :continuous_batching, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_batching, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
 
   ## Failures
 
@@ -101,7 +101,7 @@ defmodule Transmuter.ContinuousGeneration do
 
   defmodule QueueFullError do
     @moduledoc """
-    The queue of a `Transmuter.ContinuousGeneration` server is full.
+    The queue of a `Transmuter.ContinuousBatching` server is full.
     """
     defexception [:message]
   end
@@ -473,7 +473,7 @@ defmodule Transmuter.ContinuousGeneration do
         encoder_capacity: state.group.state.encoder_capacity
       }
 
-      :telemetry.span([:transmuter, :continuous_generation, :step], metadata, fn ->
+      :telemetry.span([:transmuter, :continuous_batching, :step], metadata, fn ->
         {step(state, admitted), metadata}
       end)
     end
@@ -591,7 +591,7 @@ defmodule Transmuter.ContinuousGeneration do
         metadata = %{wait: System.monotonic_time() - request.enqueued}
 
         reply =
-          :telemetry.span([:transmuter, :continuous_generation, :prepare], metadata, fn ->
+          :telemetry.span([:transmuter, :continuous_batching, :prepare], metadata, fn ->
             {prepare_request(task, request), metadata}
           end)
 

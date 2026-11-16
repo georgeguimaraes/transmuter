@@ -34,7 +34,7 @@ defmodule Transmuter.Vision.ImageToText do
 
   @doc false
   # The options of the task without the options of the serving. In
-  # `Transmuter.ContinuousGeneration`, `:task` is the module of the task, so each input gives
+  # `Transmuter.ContinuousBatching`, `:task` is the module of the task, so each input gives
   # its task of Florence-2.
   def options, do: @options -- [:compile, :task]
 
@@ -51,7 +51,7 @@ defmodule Transmuter.Vision.ImageToText do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for image_to_text/2 and
-  # `Transmuter.ContinuousGeneration`. :init encodes the images of a batch, and :prepare the
+  # `Transmuter.ContinuousBatching`. :init encodes the images of a batch, and :prepare the
   # image of one request.
   def task(source, opts) do
     {repo, encoder, decoder} = Serving.load_encoder_decoder!(source, opts)

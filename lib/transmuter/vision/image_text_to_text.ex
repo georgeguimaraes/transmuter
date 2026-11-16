@@ -64,7 +64,7 @@ defmodule Transmuter.Vision.ImageTextToText do
 
   @doc false
   # The context, the tokenizer and the task of `Serving.generation/4`, for image_text_to_text/2
-  # and `Transmuter.ContinuousGeneration`.
+  # and `Transmuter.ContinuousBatching`.
   def task(source, opts) do
     repo = Repo.load!(source, Keyword.take(opts, [:variant | Hub.options()]))
     tokenizer = Serving.tokenizer(repo, opts)
@@ -134,7 +134,7 @@ defmodule Transmuter.Vision.ImageTextToText do
     {ctx, tokenizer, task}
   end
 
-  # A chat with the example image, which `Transmuter.ContinuousGeneration` prepares when it
+  # A chat with the example image, which `Transmuter.ContinuousBatching` prepares when it
   # starts with compile_steps: true, so the processor and the encoder compile for it.
   defp example do
     image = example_image()
@@ -435,7 +435,7 @@ defmodule Transmuter.Vision.ImageTextToText do
   # EMLX keeps the outputs as expressions until a read, and then the device runs all calls
   # as one piece of work, which the steps of another process wait for. So on EMLX each call
   # evaluates its outputs. A call keeps the device until it ends, also for the steps of a
-  # server of ContinuousGeneration on the same device, so small calls make the steps wait
+  # server of ContinuousBatching on the same device, so small calls make the steps wait
   # less.
   defp evaluate(tensor = %Nx.Tensor{data: %{__struct__: EMLX.Backend}}),
     do: Transmuter.EMLX.evaluate(tensor)

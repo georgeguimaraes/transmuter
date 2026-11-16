@@ -69,20 +69,20 @@ defmodule Transmuter.Telemetry do
 
   Inside `Nx.Defn.jit/2`, `Transmuter.run/4` traces the graph. Then the duration is the time of the trace.
 
-  ### Continuous generation events
+  ### Continuous batching events
 
-    * `[:transmuter, :continuous_generation, :step, :start]` - a server of `Transmuter.ContinuousGeneration` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
+    * `[:transmuter, :continuous_batching, :step, :start]` - a server of `Transmuter.ContinuousBatching` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
       * Metadata: `%{running: integer, admitted: integer, prompts: integer, waiting: integer, slots: integer, capacity: integer, encoder_capacity: integer}`
 
-    * `[:transmuter, :continuous_generation, :step, :stop]` - the step ends, and the server has sent its tokens.
+    * `[:transmuter, :continuous_batching, :step, :stop]` - the step ends, and the server has sent its tokens.
       * Metadata: the same as the start
 
-  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:prompts` the number of rows that run a part of their prompt in it, `:waiting` the number of requests in the queue after it, `:capacity` the rows of the buffers before it, and `:encoder_capacity` the rows of the encoder outputs of the rows before it, 0 for a model without an encoder. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.ContinuousGeneration`).
+  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:prompts` the number of rows that run a part of their prompt in it, `:waiting` the number of requests in the queue after it, `:capacity` the rows of the buffers before it, and `:encoder_capacity` the rows of the encoder outputs of the rows before it, 0 for a model without an encoder. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.ContinuousBatching`).
 
-    * `[:transmuter, :continuous_generation, :prepare, :start]` - the worker of a server of `Transmuter.ContinuousGeneration` starts to prepare a request: it runs the processor and the tokenizer on its input, and the encoder, such as the vision encoder on its images (see "Encoders and images" in `Transmuter.ContinuousGeneration`).
+    * `[:transmuter, :continuous_batching, :prepare, :start]` - the worker of a server of `Transmuter.ContinuousBatching` starts to prepare a request: it runs the processor and the tokenizer on its input, and the encoder, such as the vision encoder on its images (see "Encoders and images" in `Transmuter.ContinuousBatching`).
       * Metadata: `%{wait: integer}`
 
-    * `[:transmuter, :continuous_generation, :prepare, :stop]` - the request is ready, and it goes to the queue of the server.
+    * `[:transmuter, :continuous_batching, :prepare, :stop]` - the request is ready, and it goes to the queue of the server.
       * Metadata: the same as the start
 
   `:wait` is the time from the call of the request to the start, in `:native` time units, so the time that the request waited for the requests before it in the worker.
