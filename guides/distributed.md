@@ -69,16 +69,18 @@ The serving runs the tokenizer, the featurizer, the model and the postprocessing
 
 When several model nodes start a serving with the same name, `Nx.Serving` sends each call to one of them at random.
 
-### Pipelines that do not work across nodes yet
+Generation with `stream: true` gives a stream of text to a caller on another node too. Consume the stream in the process that called the serving.
 
-The pipelines of `Transmuter.Serving.each/2`, generation without `stream: true`, and zero-shot entity recognition do not give the result of a local call to a caller on another node. The caller gets a stream of the parts of the result: a map comes as a list of `{key, value}` tuples. These are the pipelines:
+### Lists and the pipelines that run each input alone
 
-- `Transmuter.Vision.depth_estimation/2`, `Transmuter.Vision.image_to_image/2`, `Transmuter.Vision.mask_generation/2`, and `Transmuter.Vision.zero_shot_object_detection/3` with Grounding DINO.
-- `Transmuter.Audio.text_to_speech/2`.
-- `Transmuter.Text.zero_shot_entity_recognition/2`.
-- `Transmuter.Text.generation/2`, `Transmuter.Text.text_to_text/2`, `Transmuter.Vision.image_to_text/2`, `Transmuter.Vision.image_text_to_text/2` and `Transmuter.Audio.speech_to_text/2` without `stream: true`.
+Nx.Serving joins the outputs of the batches of a call. Some pipelines give outputs whose shapes depend on the input, so a call to them takes no more inputs than the batch size:
 
-A change in Transmuter will make these pipelines give the result of a local call across nodes. Until then, call them on the model node. Generation with `stream: true` gives its stream of text to a caller on another node.
+- `Transmuter.Vision.depth_estimation/2`, `Transmuter.Vision.image_to_image/2`, `Transmuter.Vision.mask_generation/2`, `Transmuter.Audio.text_to_speech/2`, and `Transmuter.Vision.zero_shot_object_detection/3` with Grounding DINO, run each input as a batch of its own. A call takes one input, or a list of one input.
+- `Transmuter.Text.zero_shot_entity_recognition/2` takes a list of no more inputs than the `:batch_size` of `:compile`.
+
+A longer list raises an `ArgumentError`. Call the serving once for each input, or for each part of the list.
+
+The serving of `Transmuter.Audio.speech_to_text/2` gives its result only to a caller on the node of the serving. Its passes over a window can run until the end of the window, so its outputs have no fixed shape. For speech-to-text from other nodes, start `Transmuter.ContinuousBatching` with `task: Transmuter.Audio.SpeechToText` on the model node, without `:timestamps`, and call its `run/3`.
 
 An input error raises an `ArgumentError` in a local caller. A caller on another node gets an exit until [elixir-nx/nx#1903](https://github.com/elixir-nx/nx/pull/1903).
 
