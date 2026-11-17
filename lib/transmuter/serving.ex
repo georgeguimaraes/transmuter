@@ -7,6 +7,8 @@ defmodule Transmuter.Serving do
   `each/2` builds the servings that run each input as a batch of its own, such as text-to-speech, whose outputs have a shape that depends on the input.
 
   `generation/4` builds the servings that generate tokens with `Transmuter.Generation`. The rows of a batch generate together in one loop. With `stream: true`, the loop sends each new token to the client through the `:token` hook of `Nx.Serving.streaming/2`, and the client decodes the text.
+
+  A serving without `stream: true` gives the outputs of its batches to Nx.Serving, which joins the outputs of the batches of a call. So a caller on another node gets the result of a local call (see the distributed nodes guide). The outputs of two batches can be joined only when they have the same shapes after the batch axis. Generation pads the tokens of each row to one width for each serving. A serving whose outputs of two batches can have different shapes, such as `each/2`, takes no more inputs in a call than its batch size (see `batch_limit!/2`).
   """
 
   @behaviour Nx.Serving
@@ -322,7 +324,7 @@ defmodule Transmuter.Serving do
 
     * `:prepare` - optional, a function that takes the inputs of a batch, padded to the batch size, and the number of rows that are not padding. It returns the inputs of the batch for the model, such as inputs whose shapes depend on the values of the batch. The fixed inputs and the inputs of the steps join them after this function. The serving compiles the model for the templates through this function too, as a full batch. The rows of the batch stay first. `fun` gets the outputs of the prepared batch, which can have one more row than the inputs. The serving gives the outputs of the rows that are not padding to the client.
 
-    * `:streaming` - optional, `true` when the outputs of a batch can have other shapes than those of another batch, such as with `:prepare`. The serving then streams the outputs of each batch to the client, so that Nx.Serving does not join them.
+    * `:one_batch` - optional, `true` when the outputs of a batch can have other shapes than those of another batch, such as with `:prepare`. Nx.Serving cannot join such outputs, so a call takes no more inputs than the batch size (see `batch_limit!/2`).
 
   `validate` gives the sequences of each input. `preprocess` takes the sequences of all inputs and gives a list of `{tensors, batch key}`, one for each batch, and for each sequence the list of its rows. The rows of the batches are those of the sequences, in order. `fun` and `postprocess` are as in `text/7`.
   """
@@ -375,9 +377,9 @@ defmodule Transmuter.Serving do
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
-    |> then(&if(shapes[:streaming], do: Nx.Serving.streaming(&1), else: &1))
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
+      if shapes[:one_batch], do: batch_limit!(length(inputs), batch_size)
       {groups, rows} = preprocess.(Enum.concat(inputs))
 
       batches =
@@ -393,10 +395,11 @@ defmodule Transmuter.Serving do
       {batches, {multi?, items}}
     end)
     |> Nx.Serving.client_postprocessing(fn result, {multi?, items} ->
+      {outputs, _metadata} = result
+
       results =
-        result
-        |> batch_outputs()
-        |> Enum.flat_map(&output_rows/1)
+        outputs
+        |> output_rows()
         |> split_like(items)
         |> Enum.zip_with(items, postprocess)
 
@@ -410,13 +413,23 @@ defmodule Transmuter.Serving do
   defp batch_outputs(stream),
     do: Stream.map(stream, fn {:batch, outputs, _metadata} -> outputs end)
 
+  @doc """
+  Raises unless a call of `count` inputs fits in one batch of `batch_size` rows. Nx.Serving joins the outputs of the batches of a call, which works only when they have the same shapes. A serving whose outputs of two batches can have different shapes, such as the depth maps of two image sizes, calls this function, because it cannot know the shapes before the batches run.
+  """
+  def batch_limit!(count, batch_size) when count <= batch_size, do: :ok
+
+  def batch_limit!(count, batch_size) do
+    raise ArgumentError,
+          "the outputs of two batches of this serving can have different shapes, so a call takes no more inputs than the batch size of #{batch_size}, got: #{count}. Call the serving once for each part of the list"
+  end
+
   defp output_rows(outputs) do
     rows = outputs |> Map.values() |> hd() |> Nx.axis_size(0)
     for i <- 0..(rows - 1)//1, do: Map.new(outputs, fn {name, t} -> {name, t[i]} end)
   end
 
   @doc """
-  Returns an `Nx.Serving` that runs each input as a batch of one row, for outputs whose shapes depend on the input, such as the audio of text-to-speech. The serving streams the outputs of each batch to the client, so the outputs of the inputs of a list can have different shapes.
+  Returns an `Nx.Serving` that runs each input as a batch of one row, for outputs whose shapes depend on the input, such as the audio of text-to-speech. Nx.Serving cannot join the outputs of two such batches, so a call takes one input, or a list of one input (see `batch_limit!/2`).
 
   `task` is a map:
 
@@ -447,18 +460,14 @@ defmodule Transmuter.Serving do
       opts[:defn_options]
     )
     |> Nx.Serving.batch_size(1)
-    |> Nx.Serving.streaming()
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
-      {Enum.map(inputs, &Nx.Batch.stack([preprocess.(&1)])), multi?}
+      batch_limit!(length(inputs), 1)
+      {Nx.Batch.stack(Enum.map(inputs, preprocess)), multi?}
     end)
-    |> Nx.Serving.client_postprocessing(fn stream, multi? ->
-      results =
-        Enum.map(stream, fn {:batch, outputs, _metadata} ->
-          outputs |> Map.new(fn {name, t} -> {name, t[0]} end) |> postprocess.()
-        end)
-
-      if multi?, do: results, else: hd(results)
+    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, multi? ->
+      result = outputs |> Map.new(fn {name, t} -> {name, t[0]} end) |> postprocess.()
+      if multi?, do: [result], else: result
     end)
   end
 
@@ -474,9 +483,9 @@ defmodule Transmuter.Serving do
   # Nx.Serving runs each batch of a serving process in a new process, which copies the
   # function of the batch and all that it holds, such as the compiled models. So a serving
   # process keeps the functions in a scope of Transmuter.Shared, and each batch reads them
-  # without a copy. Nx.Serving.run/2 runs init in the caller, or for a streaming serving in a
-  # process that it starts for the call, which keeps the functions only as long as it needs
-  # them.
+  # without a copy. Nx.Serving.run/2 runs init and the batches in the caller, or for a stream
+  # in a process that it starts for the call, which keeps the functions only as long as it
+  # needs them.
   @doc false
   @impl Nx.Serving
   def init(type, init, partitions) do
@@ -542,12 +551,16 @@ defmodule Transmuter.Serving do
 
     * `:keys` lists the keys of the runs. The default is `[nil]`.
 
+    * `:width` is the largest number of integers in a row from `:init`. The rows of the ids of each batch have this width, so Nx.Serving can join the outputs of the batches of a call, also for a caller on another node. The default is `:max_new_tokens` of the context, times 2 with `token_logprobs: true`: the tokens of one call of `generate`. `nil` means that the task has no bound, such as Whisper with timestamps, whose passes run until the end of the window. Then the serving streams the outputs of each batch to the client, and only a caller on the node of the serving gets the result of a local call.
+
   `opts` are the options of the task, after `generation_options!/1`. The serving reads `:batch_size` of `:compile`, `:stream`, `:stream_done` and `:defn_options`. The done event of a stream has the log-probabilities when the context has `token_logprobs: true`.
   """
   def generation(ctx, tokenizer, task, opts) do
     batch_size = Keyword.get(opts[:compile] || [], :batch_size, 1)
     keys = for key <- Map.get(task, :keys, [nil]), width <- @prompt_widths, do: {key, width}
     stream? = Keyword.get(opts, :stream, false)
+    values = if ctx.token_logprobs?, do: 2, else: 1
+    width = Map.get(task, :width, values * ctx.max_new_tokens)
 
     # The closures of the serving copy what they reference, so each one takes only its
     # function of the task.
@@ -564,39 +577,43 @@ defmodule Transmuter.Serving do
         run = init.(defn_options)
         ctx = Generation.compile(ctx, batch_size, defn_options)
 
+        # With Nx.Serving.run/2 the batch runs in the caller, so the flags go back after it.
         fn batch ->
-          Enum.each(generation_flags(), fn {flag, value} -> Process.flag(flag, value) end)
-          inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-          {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
+          flags = for {flag, value} <- generation_flags(), do: {flag, Process.flag(flag, value)}
 
-          # Padding rows have no prompt.
-          padding = batch_size - batch.size
+          try do
+            inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+            {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
 
-          prompts =
-            Enum.zip_with(Nx.to_list(rows["prompt"]), Nx.to_list(rows["length"]), &Enum.take/2)
+            # Padding rows have no prompt.
+            padding = batch_size - batch.size
 
-          prompts = prompts ++ List.duplicate([], padding)
-          seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
-          generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
-          generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
-          lengths = Enum.map(generated, &length/1)
+            prompts =
+              Enum.zip_with(Nx.to_list(rows["prompt"]), Nx.to_list(rows["length"]), &Enum.take/2)
 
-          # A trailing zero, because Nx has no tensors of length 0.
-          width = Enum.max(lengths) + 1
-          ids = for ids <- generated, do: ids ++ List.duplicate(0, width - length(ids))
+            prompts = prompts ++ List.duplicate([], padding)
+            seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
+            generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
+            generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
+            lengths = Enum.map(generated, &length/1)
+            row_width = row_width!(width, lengths)
+            ids = for ids <- generated, do: ids ++ List.duplicate(0, row_width - length(ids))
 
-          %{
-            ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
-            length: Nx.tensor(lengths, backend: Nx.BinaryBackend),
-            input: pad_rows(rows["input"], padding, Nx.BinaryBackend)
-          }
+            %{
+              ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
+              length: Nx.tensor(lengths, backend: Nx.BinaryBackend),
+              input: pad_rows(rows["input"], padding, Nx.BinaryBackend)
+            }
+          after
+            Enum.each(flags, fn {flag, value} -> Process.flag(flag, value) end)
+          end
         end
       end,
       opts[:defn_options]
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: keys)
-    |> Nx.Serving.streaming(hooks: if(stream?, do: [:token], else: []))
+    |> generation_mode(stream?, width)
     |> Nx.Serving.client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
 
@@ -627,6 +644,27 @@ defmodule Transmuter.Serving do
       stream?,
       {opts[:stream_done], ctx.token_logprobs?}
     )
+  end
+
+  # A stream sends each token through the :token hook. Without a stream, Nx.Serving joins the
+  # outputs of the batches of a call. A task without a bound on the integers of a row streams
+  # the outputs of each batch to the client, which works only on the node of the serving.
+  defp generation_mode(serving, true, _width), do: Nx.Serving.streaming(serving, hooks: [:token])
+  defp generation_mode(serving, false, nil), do: Nx.Serving.streaming(serving)
+  defp generation_mode(serving, false, _width), do: serving
+
+  # The width of the rows of the ids of a batch, with a trailing zero, because Nx has no
+  # tensors of length 0. With the width of the task, the batches of a call have one shape.
+  defp row_width!(nil, lengths), do: Enum.max(lengths) + 1
+
+  defp row_width!(width, lengths) do
+    longest = Enum.max(lengths)
+
+    if longest > width do
+      raise "a row of #{longest} integers is longer than the #{width} integers of the :width of the task"
+    end
+
+    width + 1
   end
 
   # The function of a batch from :init or :prepare of a task, which takes the tensors of the
@@ -717,8 +755,8 @@ defmodule Transmuter.Serving do
         stream_text(stream, tokenizer, run.summary, flags)
       end)
     else
-      Nx.Serving.client_postprocessing(serving, fn stream, {multi?, runs} ->
-        rows = rows_by_input(stream)
+      Nx.Serving.client_postprocessing(serving, fn result, {multi?, runs} ->
+        rows = rows_by_input(result)
 
         results =
           for {runs, input} <- Enum.with_index(runs),
@@ -731,9 +769,10 @@ defmodule Transmuter.Serving do
 
   # The integers of the rows of each input, from the index of its input that each row gives
   # back.
-  defp rows_by_input(stream) do
-    stream
-    |> Enum.flat_map(fn {:batch, %{ids: ids, length: length, input: input}, _metadata} ->
+  defp rows_by_input(result) do
+    result
+    |> batch_outputs()
+    |> Enum.flat_map(fn %{ids: ids, length: length, input: input} ->
       Enum.zip_with([Nx.to_list(input), Nx.to_list(ids), Nx.to_list(length)], fn
         [input, ids, length] -> {input, Enum.take(ids, length)}
       end)
@@ -888,7 +927,11 @@ defmodule Transmuter.Serving do
   end
 
   @doc false
-  # The inputs of a call, and whether the call gave a list of inputs.
+  # The inputs of a call, and whether the call gave a list of inputs. Nx.Serving runs at least
+  # one batch for a call, so a list has at least one input.
+  def validate!([], _validate),
+    do: raise(ArgumentError, "invalid input, a list of inputs must have at least one input")
+
   def validate!(inputs, validate) when is_list(inputs) do
     inputs =
       for input <- inputs do

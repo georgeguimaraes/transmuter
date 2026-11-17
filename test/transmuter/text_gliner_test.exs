@@ -138,18 +138,25 @@ defmodule Transmuter.TextGLiNERModelTest do
         [variant: :fp16, compile: [batch_size: 2]] ++ @opts
       )
 
-    results =
-      Nx.Serving.run(serving, [
-        %{
-          text:
-            "Cristiano Ronaldo dos Santos Aveiro, born 5 February 1985, is a Portuguese footballer who plays for Al Nassr and the Portugal national team.",
-          labels: ["person", "date", "organization", "country"]
-        },
-        %{text: "José Müller visitó São Paulo y Zürich en 2023.", labels: ["person", "city"]},
-        %{text: "Cristiano Ronaldo plays for Al Nassr.", labels: ["person", "organization"]},
-        # gliner gives no entities for a text without words.
-        %{text: "   ", labels: ["person"]}
-      ])
+    inputs = [
+      %{
+        text:
+          "Cristiano Ronaldo dos Santos Aveiro, born 5 February 1985, is a Portuguese footballer who plays for Al Nassr and the Portugal national team.",
+        labels: ["person", "date", "organization", "country"]
+      },
+      %{text: "José Müller visitó São Paulo y Zürich en 2023.", labels: ["person", "city"]},
+      %{text: "Cristiano Ronaldo plays for Al Nassr.", labels: ["person", "organization"]},
+      # gliner gives no entities for a text without words.
+      %{text: "   ", labels: ["person"]}
+    ]
+
+    # The scores of two batches can have different shapes, so a call takes no more inputs than
+    # the batch size.
+    assert_raise ArgumentError, ~r/no more inputs than the batch size of 2, got: 4/, fn ->
+      Nx.Serving.run(serving, inputs)
+    end
+
+    results = inputs |> Enum.chunk_every(2) |> Enum.flat_map(&Nx.Serving.run(serving, &1))
 
     # The export is fp16, so the scores differ from ONNX Runtime by up to about 1e-3.
     expected = [
@@ -227,7 +234,9 @@ defmodule Transmuter.TextGLiNERModelTest do
       1.0e-4
     )
 
-    assert Nx.Serving.run(serving, []) == []
+    assert_raise ArgumentError, ~r/must have at least one input/, fn ->
+      Nx.Serving.run(serving, [])
+    end
   end
 
   test "a started serving compiles nothing for a new text of the same sequence length and word bucket" do

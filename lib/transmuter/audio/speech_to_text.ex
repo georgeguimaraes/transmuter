@@ -287,13 +287,17 @@ defmodule Transmuter.Audio.SpeechToText do
       Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), {featurizer.sampling_rate})
     ]
 
+    # The passes of a window can run until the end of the window, also without timestamps when
+    # the tokens have two timestamps together, so a row has no bound, and the serving gives its
+    # result only to a caller on its own node (see Transmuter.Serving.generation/4).
     task = %{
       validate: &Featurizer.audio(&1, featurizer.sampling_rate),
       preprocess: preprocess,
       init: init,
       prepare: prepare,
       example: example,
-      postprocess: postprocess
+      postprocess: postprocess,
+      width: nil
     }
 
     {ctx, tokenizer, task, settings}

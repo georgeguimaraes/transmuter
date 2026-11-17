@@ -66,16 +66,12 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
         {{:sequence_length, length}, tensors}
       end)
 
-    preprocess = fn
-      [] ->
-        {[], []}
-
-      inputs ->
-        rows = Enum.map(inputs, &encode(encoder, &1))
-        longest = rows |> Enum.map(&length(&1.ids)) |> Enum.max()
-        length = Enum.find(lengths, &(&1 >= longest))
-        tensors = tensors(types, rows, length, encoder.pad_id)
-        {[{tensors, {:sequence_length, length}}], Enum.map(rows, &[&1])}
+    preprocess = fn inputs ->
+      rows = Enum.map(inputs, &encode(encoder, &1))
+      longest = rows |> Enum.map(&length(&1.ids)) |> Enum.max()
+      length = Enum.find(lengths, &(&1 >= longest))
+      tensors = tensors(types, rows, length, encoder.pad_id)
+      {[{tensors, {:sequence_length, length}}], Enum.map(rows, &[&1])}
     end
 
     shapes = %{
@@ -83,7 +79,7 @@ defmodule Transmuter.Text.ZeroShotEntityRecognition do
       templates: templates,
       inputs: %{},
       prepare: &prepare(&1, &2, kind, types, buckets, config["max_width"]),
-      streaming: true,
+      one_batch: true,
       # With a batch size of 1, all batches are full. With more, a full batch and a batch
       # with padding rows have different shapes.
       cache_size: min(compile[:batch_size], 2) * length(buckets) * @label_counts

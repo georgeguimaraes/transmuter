@@ -1269,7 +1269,7 @@ defmodule Transmuter.VisionTest do
       {"remote control", 0.121832, [24.6725, -0.1015, 67.9243, 86.3368]}
     ]
 
-    assert_zero_shot_detections(serving, wide, tall, 2.0e-4)
+    assert_zero_shot_detections(serving, 2, wide, tall, 2.0e-4)
   end
 
   @doc """
@@ -1277,11 +1277,15 @@ defmodule Transmuter.VisionTest do
 
   The detections come from the highest score. Grounding DINO can swap two detections with near scores, so the comparison with the reference sorts the detections by label and `xmin`. The boxes have a tolerance of 1e-3 of the side of the image, 0.32 pixels.
   """
-  def assert_zero_shot_detections(serving, wide, tall, score_delta) do
+  # A call takes no more images than the batch size, because the serving of Grounding DINO
+  # runs each image as a batch of its own.
+  def assert_zero_shot_detections(serving, batch_size, wide, tall, score_delta) do
     tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
 
     [image, tensor, tall_result] =
-      Nx.Serving.run(serving, [@image, StbImage.to_nx(@image), tall_image])
+      [@image, StbImage.to_nx(@image), tall_image]
+      |> Enum.chunk_every(batch_size)
+      |> Enum.flat_map(&Nx.Serving.run(serving, &1))
 
     assert image == tensor
     assert Nx.Serving.run(serving, tall_image) == tall_result
@@ -1321,11 +1325,16 @@ defmodule Transmuter.VisionTest do
         ] do
       serving = Vision.depth_estimation({:hf, repo}, @opts)
       tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
-      # A tensor and a StbImage give the same result.
+      # A tensor and a StbImage give the same result. A call takes one image, because the
+      # depth maps of two images can have different shapes.
       [image, tensor, tall_result] =
-        Nx.Serving.run(serving, [@image, StbImage.to_nx(@image), tall_image])
+        Enum.map([@image, StbImage.to_nx(@image), tall_image], &Nx.Serving.run(serving, &1))
 
       assert image == tensor
+
+      assert_raise ArgumentError, ~r/no more inputs than the batch size of 1, got: 2/, fn ->
+        Nx.Serving.run(serving, [@image, tall_image])
+      end
 
       for {result, size, {depth, mean, u8, u8_mean}} <- [
             {image, {240, 320}, wide},
@@ -1456,10 +1465,10 @@ defmodule Transmuter.VisionTest do
     tall_image = Nx.transpose(StbImage.to_nx(@image), axes: [1, 0, 2])
 
     results =
-      Nx.Serving.run(serving, [
-        %{image: @image, prompts: prompts},
-        %{image: tall_image, prompts: prompts}
-      ])
+      Enum.map(
+        [%{image: @image, prompts: prompts}, %{image: tall_image, prompts: prompts}],
+        &Nx.Serving.run(serving, &1)
+      )
 
     for {result, picture, scores} <- Enum.zip([results, ["wide", "tall"], [wide, tall]]) do
       expected = fixture("sam_#{name}_#{picture}.png")
@@ -1624,7 +1633,14 @@ defmodule Transmuter.VisionLargeModelTest do
            ], 1.0e-3}
         ] do
       serving = Vision.zero_shot_object_detection(repo, labels, [compile: compile] ++ @opts)
-      VisionTest.assert_zero_shot_detections(serving, wide, tall, score_delta)
+
+      VisionTest.assert_zero_shot_detections(
+        serving,
+        compile[:batch_size],
+        wide,
+        tall,
+        score_delta
+      )
     end
 
     # A period ends a phrase of Grounding DINO.

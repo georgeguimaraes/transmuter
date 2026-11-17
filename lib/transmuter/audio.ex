@@ -47,6 +47,8 @@ defmodule Transmuter.Audio do
 
   The audio can have any length. The serving does the steps of the `automatic-speech-recognition` pipeline of transformers with `chunk_length_s` and `stride_length_s`. It splits the audio into windows that overlap, transcribes each window, and merges the tokens of the windows at the overlaps (`_decode_asr` of the Whisper tokenizer). Audio of 30 s or less is one window.
 
+  The serving gives its result only to a caller on its own node, because the passes over a window can run until the end of the window, so its outputs have no fixed shape. For a caller on another node, start `Transmuter.ContinuousBatching` with `task: Transmuter.Audio.SpeechToText` on the node of the model, without `:timestamps`. Its `run/3` works from any node of the cluster (see the distributed nodes guide).
+
   The repository must have `onnx/encoder_model.onnx` and `onnx/decoder_model_merged.onnx`, as the Whisper exports of Xenova and onnx-community. The default variant is fp32. The prompt of the decoder is the one of Python transformers: the start token, the language and the task for a multilingual model, and `<|notimestamps|>` without timestamps. The settings of generation come from `generation_config.json`, such as `suppress_tokens` and `begin_suppress_tokens`.
 
       serving = Transmuter.Audio.speech_to_text({:hf, "onnx-community/whisper-base"}, language: "fr")
@@ -147,7 +149,7 @@ defmodule Transmuter.Audio do
   @doc """
   Builds a serving that turns text into speech with VITS (MMS-TTS) or SpeechT5.
 
-  The input is a string, or a map with the text in `:text`, and optionally `:seed` and `:speaker_embedding`. The input can also be a list of them. The result is `%{audio: audio, sampling_rate: rate}`, as the `text-to-speech` pipeline of Python transformers. `audio` is an f32 tensor of PCM samples `{samples}`, and `rate` is the sampling rate in Hz.
+  The input is a string, or a map with the text in `:text`, and optionally `:seed` and `:speaker_embedding`. The outputs of two inputs can have different shapes, which Nx.Serving cannot join, so a call takes one input, or a list of one input. Call the serving once for each input. The result is `%{audio: audio, sampling_rate: rate}`, as the `text-to-speech` pipeline of Python transformers. `audio` is an f32 tensor of PCM samples `{samples}`, and `rate` is the sampling rate in Hz.
 
   The model type in `config.json` selects the steps:
 

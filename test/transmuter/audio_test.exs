@@ -195,12 +195,12 @@ defmodule Transmuter.AudioTest do
   end
 
   # The noise of VITS and the dropout of SpeechT5 come from the seed, so there is no
-  # reference. The audio of a seed is the same alone and in a list, and its length is near
-  # the length without noise.
+  # reference. The audio of a seed is the same in two calls, and its length is near the length
+  # without noise.
   defp assert_seeded_audio({repo, text, path, opts}) do
     serving = Transmuter.Audio.text_to_speech({:hf, repo}, opts ++ @speech_opts)
     inputs = [%{text: text, seed: 1}, %{text: text, seed: 2}]
-    results = [one, two] = Nx.Serving.run(serving, inputs)
+    results = [one, two] = Enum.map(inputs, &Nx.Serving.run(serving, &1))
 
     assert results == Enum.map(inputs, &Nx.Serving.run(serving, &1))
     refute one.audio == two.audio

@@ -124,7 +124,7 @@ defmodule Transmuter.Vision do
   @doc """
   Builds a serving that finds objects in images with labels that you give, such as OWL-ViT, OWLv2 and Grounding DINO.
 
-  `labels` is a list of strings. The input is an image or a list of images. The result is `%{detections: [%{label: label, score: score, box: box}]}`, from the highest score, as the `zero-shot-object-detection` pipeline of Python transformers gives. A box is `%{xmin: x, ymin: y, xmax: x, ymax: y}`, in pixels of the input image. The coordinates are floats. The pipeline of Python transformers truncates them to integers.
+  `labels` is a list of strings. The input is an image or a list of images. With Grounding DINO, each image is a batch of its own, and a call takes one image, or a list of one image. The result is `%{detections: [%{label: label, score: score, box: box}]}`, from the highest score, as the `zero-shot-object-detection` pipeline of Python transformers gives. A box is `%{xmin: x, ymin: y, xmax: x, ymax: y}`, in pixels of the input image. The coordinates are floats. The pipeline of Python transformers truncates them to integers.
 
       serving = Transmuter.Vision.zero_shot_object_detection({:hf, "Xenova/owlv2-base-patch16-ensemble"}, ["cat", "remote control"])
       Nx.Serving.run(serving, image)
@@ -156,7 +156,7 @@ defmodule Transmuter.Vision do
   @doc """
   Builds a serving that estimates the depth of each pixel of an image, such as Depth Anything.
 
-  The input is an image or a list of images. The result is `%{predicted_depth: tensor, depth: tensor}`, as the `depth-estimation` pipeline of Python transformers gives. Both tensors have the shape `{height, width}` of the input image.
+  The input is an image. The outputs of two inputs can have different shapes, which Nx.Serving cannot join, so a call takes one image, or a list of one image. Call the serving once for each image. The result is `%{predicted_depth: tensor, depth: tensor}`, as the `depth-estimation` pipeline of Python transformers gives. Both tensors have the shape `{height, width}` of the input image.
 
       serving = Transmuter.Vision.depth_estimation({:hf, "onnx-community/depth-anything-v2-small"})
       Nx.Serving.run(serving, image)
@@ -218,7 +218,7 @@ defmodule Transmuter.Vision do
   @doc """
   Builds a serving that gives the masks of the objects at prompts of points and boxes, with SAM, SAM 2 or the SAM 3 tracker.
 
-  The input is `%{image: image, prompts: prompts}` or a list of them. Each prompt is a map:
+  The input is `%{image: image, prompts: prompts}`. The outputs of two inputs can have different shapes, which Nx.Serving cannot join, so a call takes one input, or a list of one input. Call the serving once for each input. Each prompt is a map:
 
     * `:points` - a list of `[x, y]` in pixels of the image.
 
@@ -245,7 +245,7 @@ defmodule Transmuter.Vision do
   @doc """
   Builds a serving that turns an image into a new image, with a super-resolution model such as Swin2SR.
 
-  The input is an image or a list of images. The result is `%{image: tensor}`, a `:u8` tensor of shape `{height, width, 3}`. Its size is the size of the input image times `upscale` of `config.json`.
+  The input is an image. The outputs of two inputs can have different shapes, which Nx.Serving cannot join, so a call takes one image, or a list of one image. Call the serving once for each image. The result is `%{image: tensor}`, a `:u8` tensor of shape `{height, width, 3}`. Its size is the size of the input image times `upscale` of `config.json`.
 
       serving = Transmuter.Vision.image_to_image({:hf, "Xenova/swin2SR-classical-sr-x2-64"})
       %{image: image} = Nx.Serving.run(serving, image)
