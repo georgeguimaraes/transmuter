@@ -32,7 +32,7 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:slots` - the number of rows that generate together. The default is `8`.
 
-    * `:max_queue` - the number of requests that can wait for a row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousBatching.QueueFullError`, so the caller can rescue this case and reject the request.
+    * `:max_queue` - the number of requests that can wait for their rows. A request counts one time, also when its input gives more than one row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousBatching.QueueFullError`, so the caller can rescue this case and reject the request.
 
     * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. The default is `4096`.
 
@@ -49,6 +49,8 @@ defmodule Transmuter.ContinuousBatching do
     * A merged decoder whose cross-attention cache reads other values than the outputs of the encoder cannot compute that cache for one request (see `Transmuter.Generation.MergedDecoder.cross/1`).
 
   A merged decoder with an offset for each row, such as `Xenova/gpt2`, runs the prompt of a request on its branch with cache, next to the new tokens of the other rows (see "Merged decoders" in `Transmuter.Generation`).
+
+  The input of a request gives the runs of `:preprocess` of its task, as in a serving of the task, and each run is one row. The rows of a request take the free rows in their order, and the request stays first in the queue until each of its rows has a row. `run/3` gives the result when all rows of the request end, and `stream/3` takes an input of one row.
 
   ## The server and the serving
 
@@ -174,11 +176,14 @@ defmodule Transmuter.ContinuousBatching do
     refs = for input <- inputs, do: {make_ref(), input}
     monitor = enqueue!(info, refs, false, server, deadline, call)
 
+    # The rows of an input end in any order, and :postprocess takes them in the order of
+    # their runs.
     results =
       for {ref, _input} <- refs do
-        run = await(info, monitor, {ref, :run}, deadline, refs, call)
-        tokens = await(info, monitor, {ref, :done}, deadline, refs, call)
-        info.task.postprocess.([Serving.integers(tokens)], [run])
+        runs = await(info, monitor, {ref, :run}, deadline, refs, call)
+        rows = for _run <- runs, do: await(info, monitor, {ref, :done}, deadline, refs, call)
+        rows = rows |> List.keysort(0) |> Enum.map(&Serving.integers(elem(&1, 1)))
+        info.task.postprocess.(rows, runs)
       end
 
     Process.demonitor(monitor, [:flush])
@@ -188,7 +193,7 @@ defmodule Transmuter.ContinuousBatching do
   @doc """
   Returns a stream of the text of `input`, as a serving of the task with `stream: true`. Consume the stream in the process that called this function.
 
-  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
+  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. An input that gives more than one row raises an `ArgumentError`. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when the queue is full.
   """
   def stream(server, input, opts \\ []) do
     opts = Keyword.validate!(opts, stream_done: false)
@@ -208,7 +213,19 @@ defmodule Transmuter.ContinuousBatching do
 
     ref = make_ref()
     monitor = enqueue!(info, [{ref, input}], true, server, :infinity, reason)
-    run = await(info, monitor, {ref, :run}, :infinity, [{ref, input}], reason)
+
+    run =
+      case await(info, monitor, {ref, :run}, :infinity, [{ref, input}], reason) do
+        [run] ->
+          run
+
+        runs ->
+          GenServer.cast(info.pid, {:cancel, [ref]})
+          Process.demonitor(monitor, [:flush])
+
+          raise ArgumentError,
+                "stream/3 takes an input of one row, and this input gives #{length(runs)} rows"
+      end
 
     events =
       Stream.resource(
@@ -344,8 +361,9 @@ defmodule Transmuter.ContinuousBatching do
     end
   end
 
-  # The value of the message `tag` of the request `ref`: :run when the worker has run
-  # :preprocess on its input, and :done with its tokens when its row ends.
+  # The value of the message `tag` of the request `ref`: :run with its runs when the worker
+  # has run :preprocess on its input, and :done with the index and the tokens of a row when
+  # that row ends.
   defp await(info, monitor, {ref, tag}, deadline, refs, call) do
     receive do
       {^ref, {^tag, value}} ->
@@ -390,7 +408,7 @@ defmodule Transmuter.ContinuousBatching do
         # request, so the steps compile for them.
         example =
           if compile_steps? do
-            {:ok, fields, _run} = prepare_request(task, %{input: example})
+            {:ok, [fields | _rows], _runs} = prepare_request(task, %{input: example})
             fields
           end
 
@@ -474,9 +492,9 @@ defmodule Transmuter.ContinuousBatching do
       {{nil, _preparing}, _reply} ->
         {:noreply, state}
 
-      {{request, preparing}, {:ok, fields, run}} ->
-        send(request.pid, {ref, {:run, run}})
-        request = request |> Map.delete(:input) |> Map.merge(fields)
+      {{request, preparing}, {:ok, rows, runs}} ->
+        send(request.pid, {ref, {:run, runs}})
+        request = request |> Map.delete(:input) |> Map.put(:rows, Enum.with_index(rows))
         {:noreply, kick(%{state | preparing: preparing, queue: :queue.in(request, state.queue)})}
 
       {{request, preparing}, {:error, exception}} ->
@@ -533,9 +551,10 @@ defmodule Transmuter.ContinuousBatching do
   defp active?(%{group: nil}), do: false
   defp active?(%{group: group}), do: not Enum.all?(group.done)
 
-  # Gives the free rows to the waiting requests in their order, while the cache fits them,
-  # and runs the step. A request that does not fit a group without running rows never fits,
-  # so its caller gets an error.
+  # Gives the free rows to the rows of the waiting requests in their order, while the cache
+  # fits them, and runs the step. A request stays first in the queue until all its rows have
+  # a row of the group. A row that does not fit a group without running rows never fits, so
+  # the caller of its request gets an error.
   defp step(state) do
     {admitted, state} = admissions(state)
 
@@ -588,8 +607,11 @@ defmodule Transmuter.ContinuousBatching do
       {:empty, _queue} ->
         {Enum.reverse(admitted), state}
 
-      {{:value, waiting}, queue} ->
-        candidates = [{row, waiting} | admitted]
+      {{:value, waiting}, rest} ->
+        [{fields, index} | rows] = waiting.rows
+        next = waiting |> Map.delete(:rows) |> Map.merge(fields) |> Map.put(:index, index)
+        queue = if rows == [], do: rest, else: :queue.in_r(%{waiting | rows: rows}, rest)
+        candidates = [{row, next} | admitted]
         requests = for {row, waiting} <- candidates, do: request(state, row, waiting)
 
         cond do
@@ -597,9 +619,9 @@ defmodule Transmuter.ContinuousBatching do
             admissions(%{state | queue: queue}, free, candidates)
 
           admitted == [] and not active?(state) ->
-            exception = ArgumentError.exception(too_long(state, waiting))
+            exception = ArgumentError.exception(too_long(state, next))
             send(waiting.pid, {waiting.ref, {:error, exception}})
-            admissions(%{state | queue: queue}, [row | free], admitted)
+            admissions(%{state | queue: rest}, [row | free], admitted)
 
           true ->
             {Enum.reverse(admitted), state}
@@ -635,7 +657,8 @@ defmodule Transmuter.ContinuousBatching do
             send(request.pid, {request.ref, {:token, token || -1, logprob, done?}})
 
           done? ->
-            send(request.pid, {request.ref, {:done, Generation.row_tokens(group, row)}})
+            tokens = Generation.row_tokens(group, row)
+            send(request.pid, {request.ref, {:done, {request.index, tokens}}})
 
           true ->
             :ok
@@ -662,8 +685,8 @@ defmodule Transmuter.ContinuousBatching do
   end
 
   # The worker runs :preprocess of the task on the input of each request alone, and :prepare
-  # on its tensors on the host and its prompt. It sends the server the fields of the request
-  # for Generation and the run without its tensors, or the exception.
+  # on the tensors on the host and the prompt of each run. It sends the server the fields of
+  # each row for Generation and the runs without their tensors, or the exception.
   defp prepare_requests(task, server) do
     receive do
       {:prepare, request} ->
@@ -684,7 +707,14 @@ defmodule Transmuter.ContinuousBatching do
   end
 
   defp prepare_request({preprocess, prepare}, request) do
-    [run] = preprocess.(request.input)
+    runs = Enum.to_list(preprocess.(request.input))
+    rows = Enum.map(runs, &prepare_row(prepare, &1))
+    {:ok, rows, Enum.map(runs, &Map.delete(&1, :tensors))}
+  rescue
+    exception -> {:error, exception}
+  end
+
+  defp prepare_row(prepare, run) do
     tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)
 
     # The other inputs of the prompt, such as the outputs of an encoder, have a batch axis of 1.
@@ -693,8 +723,6 @@ defmodule Transmuter.ContinuousBatching do
     {[features], inputs} = Map.pop(inputs, :image_features, [nil])
     features = features && Generation.evaluated(features)
     fields = %{prompt: run.prompt, seed: run.seed, features: features, position: position}
-    {:ok, Map.put(fields, :inputs, Generation.evaluated(inputs)), Map.delete(run, :tensors)}
-  rescue
-    exception -> {:error, exception}
+    Map.put(fields, :inputs, Generation.evaluated(inputs))
   end
 end
