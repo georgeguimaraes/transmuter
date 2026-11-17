@@ -46,6 +46,62 @@ defmodule Transmuter.DistributedTest do
     assert %Nx.BinaryBackend{} = remote.embedding.data
   end
 
+  # The servings of each/2, of generation without a stream and of zero-shot entity recognition
+  # give Nx.Serving the outputs of their batches, so a remote call returns the map of a local
+  # call on Nx 1.0. The 3 prompts with a batch size of 2 give two batches, whose outputs
+  # Nx.Serving joins. A list that does not fit in one batch of depth estimation raises an
+  # ArgumentError in a local caller, and a remote caller gets it as an exit.
+  test "servings that run each input alone or generate give a remote caller the result of a local call",
+       %{peer: peer} do
+    image = Nx.iota({48, 64, 3}, type: :u8, backend: Nx.BinaryBackend)
+    prompts = ["Once upon a time", "Explain how a rainbow forms.", "The capital of France is"]
+
+    entities = %{
+      text: "Cristiano Ronaldo plays for Al Nassr.",
+      labels: ["person", "organization"]
+    }
+
+    servings = [
+      {__MODULE__.Depth,
+       Transmuter.Vision.depth_estimation({:hf, "onnx-community/depth-anything-v2-small"}, @opts),
+       image},
+      {__MODULE__.Generation,
+       Transmuter.Text.generation(
+         {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+         [strategy: :greedy, max_new_tokens: 8, compile: [batch_size: 2]] ++ @opts
+       ), prompts},
+      {__MODULE__.Entities,
+       Transmuter.Text.zero_shot_entity_recognition(
+         {:hf, "onnx-community/gliner_small-v2.1"},
+         [variant: :fp16] ++ @opts
+       ), entities}
+    ]
+
+    for {name, serving, input} <- servings do
+      start_supervised!(
+        Supervisor.child_spec({Nx.Serving, serving: serving, name: name}, id: name)
+      )
+
+      wait_for(fn -> member?(peer, Nx.Serving.PG, name) end)
+      local = Nx.Serving.batched_run(name, input)
+      assert :erpc.call(peer, Nx.Serving, :batched_run, [name, input]) == local, inspect(name)
+    end
+
+    assert %{depth: %Nx.Tensor{}, predicted_depth: %Nx.Tensor{}} =
+             Nx.Serving.batched_run(__MODULE__.Depth, image)
+
+    assert_raise ArgumentError, ~r/batch size of 1, got: 2/, fn ->
+      Nx.Serving.batched_run(__MODULE__.Depth, [image, image])
+    end
+
+    assert {:exception, {{%ArgumentError{message: message}, _stacktrace}, _call}} =
+             catch_exit(
+               :erpc.call(peer, Nx.Serving, :batched_run, [__MODULE__.Depth, [image, image]])
+             )
+
+    assert message =~ "batch size of 1, got: 2"
+  end
+
   test "a caller on another node gets the text of a local call and its errors", %{peer: peer} do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
