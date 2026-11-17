@@ -16,6 +16,8 @@ defmodule Transmuter do
   `Nx.Defn.jit/2`, gradients or eager execution.
   """
 
+  @compile {:no_warn_undefined, Transmuter.EMLX}
+
   alias Nx.Defn.{Compiler, Composite, Expr, Tree}
   alias Transmuter.{DeferredTensor, Ops}
   alias Transmuter.Onnx.ModelProto

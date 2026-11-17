@@ -144,6 +144,14 @@ jobs:
         env:
           MIX_ENV: test
         run: mix compile --force --warnings-as-errors
+      # A node without a device, such as a caller of a ContinuousBatching server on another
+      # node, compiles Transmuter without EMLX, EXLA and the other optional dependencies. The
+      # build goes to its own directory, so it does not change the build of the tests.
+      - name: Compile without optional dependencies
+        if: matrix.partition == 1
+        env:
+          MIX_BUILD_PATH: ${{ github.workspace }}/_build/no_optional_deps
+        run: mix compile --no-optional-deps --warnings-as-errors
       # The cache has the deps compiled for the test environment only, so Credo runs there.
       - name: Run Credo
         if: matrix.partition == 1

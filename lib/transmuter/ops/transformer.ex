@@ -11,6 +11,8 @@ defmodule Transmuter.Ops.Transformer do
   `AttentionCore` (domain `transmuter`) is the attention core that `Transmuter.Fusion` finds in a graph: `softmax(where(keep, q · k * scale / divisor, fill) + mask) · v`, with the `MatMul` broadcasting of ONNX and the softmax along its `axis` attribute. Its inputs are q, k, v and the optional mask, keep, divisor, the two shapes of a `Reshape` pair of the probabilities, the key mask of a KV buffer (see `Transmuter.Generation.MergedDecoder`) and the factors of q and k, which multiply q and k before their product. Its `k` is the right operand of the first `MatMul`. A factor that the host can read becomes part of the scale. It runs as the shared attention core, the kernel on EMLX or the chunks of query rows, when q, k and v are 4-D heads of the same batch, or 3-D with the heads in the batch, the softmax is along the last axis, the masks broadcast to the scores, the host can read the divisor and the `Reshape` pair gives back the shape of the probabilities. The other layouts keep the plain operations of the graph and build the scores of all rows at once: the `MatMul` broadcasting, a divisor tensor, a softmax along another axis and a `Reshape` pair do not split by query row.
   """
 
+  @compile {:no_warn_undefined, EMLX.Fast}
+
   alias Nx.Defn.Expr
   alias Transmuter.Ops.Attention
 

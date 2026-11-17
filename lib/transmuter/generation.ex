@@ -100,6 +100,8 @@ defmodule Transmuter.Generation do
   A backend that frees a released buffer only when the BEAM collects its tensor, such as EMLX 0.5 (see elixir-nx/emlx#159), still keeps the dead caches of the steps until a collection. A loop with little host garbage collects rarely, so these caches pile up. So the generation process collects its garbage after it releases 256 MB of device buffers. A small cache then rarely costs a collection, and a large one gets one before its dead copies take much memory.
   """
 
+  @compile {:no_warn_undefined, Transmuter.EMLX}
+
   alias Nx.Defn.Composite
   alias Transmuter.Generation.MergedDecoder
   alias Transmuter.{GraphBreaks, Serving}

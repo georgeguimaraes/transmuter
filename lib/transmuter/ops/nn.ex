@@ -20,6 +20,8 @@ defmodule Transmuter.Ops.NN do
       widen: 2
     ]
 
+  @compile {:no_warn_undefined, EMLX.Fast}
+
   alias Transmuter.Onnx.AttributeProto
 
   @op_types ~w(Conv InstanceNormalization BatchNormalization LayerNormalization
