@@ -523,16 +523,16 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # The position offset is one value for each row only when every use of it reads a position
-  # table (see MergedDecoder). The relative bias of T5 takes the key positions from the union
-  # of the key masks, which has no gap rows, and moonshine adds the offset to a rotary angle
-  # and keeps a prefix of its causal mask, so both keep one offset for all rows and one group
-  # for each prompt length.
-  test "only a merged decoder that reads position tables gets a position offset for each row" do
+  # The position offset is one value for each row only when the value that takes it at each
+  # read has the batch on axis 0 or meets the tokens (see MergedDecoder). gpt2 reads a table at
+  # [1, n] positions, and moonshine casts [1, 1, n] positions for its rotary angles. The
+  # relative bias of T5 takes the key positions from the union of the key masks, which has no
+  # gap rows, so it keeps one offset for all rows and one group for each prompt length.
+  test "a merged decoder gets a position offset for each row when its reads have the batch" do
     for {source, per_row?} <- [
           {{:hf, "Xenova/gpt2", "onnx/decoder_model_merged.onnx"}, true},
           {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, false},
-          {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, false}
+          {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, true}
         ] do
       rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite(1)
       assert "transmuter.position_offset" in rewritten.inputs, inspect(source)
@@ -1000,6 +1000,37 @@ defmodule Transmuter.GenerationTest do
     %{"last_hidden_state" => states} = Transmuter.run(encoder, encoder.params, inputs)
     given = %{"encoder_hidden_states" => states, "encoder_attention_mask" => mask}
     repo = %{repo | generation_config: Map.put(repo.generation_config, "num_beams", 1)}
+    assert_rows_alone(repo, decoder, given, repo.config["decoder_start_token_id"])
+  end
+
+  # moonshine takes its rotary positions from a float cast of [1, 1, n] positions, and keeps a
+  # prefix of its causal mask, which compares the positions of L with the key index. The rows
+  # of the prefix are rows of the buffer, the same for each row, so the rewrite gives moonshine
+  # a position offset for each row, and decoder prompts of 1 and 3 tokens run in one group with
+  # gap rows, as for Marian. The encoder outputs are a fixed pattern.
+  @tag ci_partition: 10
+  test "a merged decoder with a prefix of its causal mask takes an offset for each row" do
+    decoder =
+      Transmuter.load!(
+        {:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"},
+        backend: @opts[:backend],
+        outputs: &Generation.outputs/1
+      )
+
+    states =
+      Nx.iota({1, 40, 416}, type: :f32, backend: @opts[:backend])
+      |> Nx.remainder(17)
+      |> Nx.subtract(8)
+      |> Nx.divide(8)
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => -1}}
+    assert_rows_alone(repo, decoder, %{"encoder_hidden_states" => states}, 1)
+  end
+
+  # Decoder prompts of 1 and 3 tokens of `decoder` run in one group: the shorter row has gap
+  # rows and another valid length at each step. Each row gives the tokens that it gives alone,
+  # with log-probabilities within 1e-4.
+  defp assert_rows_alone(repo, decoder, given, start) do
     opts = [max_new_tokens: 20, token_logprobs: true]
     ctx = Generation.context(repo, decoder, opts, Map.keys(given))
     assert {:s64, ["batch_size", 1]} = ctx.model.input_types["transmuter.position_offset"]
@@ -1016,7 +1047,6 @@ defmodule Transmuter.GenerationTest do
       Generation.generate(compiled, prompts, List.duplicate(0, rows), inputs)
     end
 
-    start = repo.config["decoder_start_token_id"]
     [answer] = generate.([[start]])
     long = [start | answer |> Enum.take(2) |> Enum.map(&hd/1)]
 
