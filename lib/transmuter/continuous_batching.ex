@@ -96,7 +96,7 @@ defmodule Transmuter.ContinuousBatching do
 
   The server runs on a node with a device, and `run/3` and `stream/3` take its name on any node of the cluster. A call tries the server of that name on its own node first, and then the servers of that name on the other nodes in a random order. It goes to the first server whose queue takes it, and it raises `QueueFullError` when no queue takes it. The caller node needs Transmuter, but not EMLX, EXLA, the tokenizers or the models: a proxy process on the node of the server validates the input, runs the request and postprocesses the result, and the caller gets the result, the exceptions and the exits of a local call. A stream gets each chunk of text as a message. When the caller exits, or stops a stream before its end, the proxy exits, and the server frees the rows of the request.
 
-  An input goes to the other node as it is, so it must be data: strings, maps, lists, `StbImage` structs and `Nx.BinaryBackend` tensors. A tensor on a device backend refers to memory of the node of the caller, so copy it with `Nx.backend_copy(tensor, Nx.BinaryBackend)` first.
+  An input goes to the other node, so it must be data, such as strings, maps, lists, `StbImage` structs and tensors. A call copies the tensors of the input to `Nx.BinaryBackend` first, with `Transmuter.to_host/1`, because a tensor on a device backend refers to memory of the node of the caller.
 
   ## Failures
 
@@ -332,9 +332,10 @@ defmodule Transmuter.ContinuousBatching do
     )
   end
 
+  # The arguments go to the other node as data, so their device tensors become host tensors.
   defp proxy(pid, fun, args) do
     ref = make_ref()
-    args = [self(), ref, fun, [pid | args]]
+    args = [self(), ref, fun, [pid | Transmuter.to_host(args)]]
     {proxy, monitor} = Node.spawn_monitor(node(pid), __MODULE__, :__proxy__, args)
     {proxy, ref, monitor}
   end

@@ -238,6 +238,19 @@ defmodule TransmuterTest do
     end
   end
 
+  # A struct is data that goes to another node as it is, so to_host/1 does not walk it.
+  test "to_host copies the tensors in lists, tuples and maps to the binary backend" do
+    tensor = Nx.tensor([1.0, 2.0], backend: @backend)
+    uri = URI.parse("https://huggingface.co")
+    input = %{messages: [%{content: [{:image, tensor}, "text"]}], seed: 1, uri: uri}
+
+    assert %{messages: [%{content: [{:image, host}, "text"]}], seed: 1, uri: ^uri} =
+             Transmuter.to_host(input)
+
+    assert %Nx.BinaryBackend{} = host.data
+    assert Nx.to_list(host) == [1.0, 2.0]
+  end
+
   test "draws new random values on each call" do
     model = load_fixture("RandomNormal_mean_scale")
     compiled = Transmuter.compile(model, %{}, @compiler)

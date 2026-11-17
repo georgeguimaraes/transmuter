@@ -546,6 +546,26 @@ defmodule Transmuter do
     |> tag_literals(Compiler.current())
   end
 
+  @doc """
+  Returns `term` with each tensor in it copied to `Nx.BinaryBackend`. The function walks lists, tuples and maps, and keeps the other values as they are, such as strings and `StbImage` structs.
+
+  A tensor on a device backend, such as EMLX or EXLA, refers to memory of its own node, so it cannot go to another node. Give this function as the third argument of `Nx.Serving.batched_run/3` when the input for a serving on another node can have such tensors:
+
+      Nx.Serving.batched_run(MyServing, input, &Transmuter.to_host/1)
+
+  `Transmuter.ContinuousBatching` calls it on the input of a request for a server on another node.
+  """
+  def to_host(tensor = %Nx.Tensor{}), do: Nx.backend_copy(tensor, Nx.BinaryBackend)
+  def to_host(list) when is_list(list), do: Enum.map(list, &to_host/1)
+
+  def to_host(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> to_host() |> List.to_tuple()
+
+  def to_host(map) when is_map(map) and not is_struct(map),
+    do: Map.new(map, fn {key, value} -> {key, to_host(value)} end)
+
+  def to_host(term), do: term
+
   @doc group: "Internals"
   @doc """
   Prepares the outputs of a graph to leave the function that runs it.
