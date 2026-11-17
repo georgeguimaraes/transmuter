@@ -52,12 +52,17 @@ defmodule Transmuter.ContinuousBatchingTest do
     variant: :fp32
   ]
 
-  alias Transmuter.{ContinuousBatching, Text, Vision}
+  alias Transmuter.{Audio, ContinuousBatching, Text, Vision}
   alias Transmuter.ContinuousBatchingTest.{BrokenTask, FailingTask}
 
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
 
   @museum "The museum opens at nine in the morning, and the guides explain the history of each painting to the visitors. Many visitors stay until the evening, because the collection is very large and the rooms are quiet. On Sundays, the entry is free for children and students, so the halls are often full."
+
+  # librispeech_0 is 5.86 s, one window. librispeech_long is 62.46 s, three windows of 30 s
+  # every 20 s.
+  @speech Nx.from_binary(File.read!("test/fixtures/librispeech_0.f32"), :f32)
+  @long_speech Nx.from_binary(File.read!("test/fixtures/librispeech_long.f32"), :f32)
 
   # A server of 2 rows gets a long request, and after its first chunk two more requests: the
   # second joins the running batch, and the third takes the row of the first request that
@@ -816,6 +821,79 @@ defmodule Transmuter.ContinuousBatchingTest do
 
   # Streams `first`, and after its first chunk runs `second`. Returns the result of each, as
   # a run of a serving gives it.
+  # One call takes the long audio and the short audio, 4 rows. With 2 rows, the long audio
+  # takes its rows in two steps, and the short audio joins when a window ends. With 3 rows,
+  # the three windows run together and end in another order than their order in the audio.
+  # Each audio gives the result and the log-probabilities of the serving.
+  test "audio of Whisper that joins a running batch gives the result that it gives alone" do
+    for source <- [{:hf, "Xenova/whisper-tiny.en"}, {:hf, "onnx-community/whisper-base"}] do
+      opts = [token_logprobs: true] ++ @opts
+      single = Transmuter.Audio.speech_to_text(source, opts)
+      alone = for audio <- [@long_speech, @speech], do: Nx.Serving.run(single, audio)
+
+      for slots <- [2, 3] do
+        spec = [source: source, task: Audio.SpeechToText, slots: slots] ++ opts
+        server = start_supervised!({ContinuousBatching, spec})
+
+        {results, steps} =
+          step_events(server, fn ->
+            ContinuousBatching.run(server, [@long_speech, @speech], 120_000)
+          end)
+
+        for {%{chunks: [got]}, %{chunks: [expected]}} <- Enum.zip(results, alone) do
+          assert Map.delete(got, :token_logprobs) == Map.delete(expected, :token_logprobs)
+          assert_all_close(got.token_logprobs, expected.token_logprobs)
+        end
+
+        assert Enum.any?(steps, &(&1.admitted > 0 and &1.running > 0)), inspect({source, slots})
+        stop_supervised!(ContinuousBatching)
+      end
+    end
+  end
+
+  test "a server of speech-to-text with :timestamps raises at the start" do
+    spec = [source: {:hf, "Xenova/whisper-tiny.en"}, task: Audio.SpeechToText] ++ @opts
+
+    assert_raise ArgumentError, ~r/without :timestamps, because each pass/, fn ->
+      ContinuousBatching.start_link([timestamps: :segments] ++ spec)
+    end
+  end
+
+  # A server of 1 row. The caller of the long audio exits while its first window runs and the
+  # two other windows wait in the queue. The server sees the exit at most 2 steps later and
+  # ends all rows of the request, so the short audio then takes at most its own steps and 2.
+  test "a caller that exits frees all rows of its audio" do
+    spec = [source: {:hf, "Xenova/whisper-tiny.en"}, task: Audio.SpeechToText, slots: 1]
+    server = start_supervised!({ContinuousBatching, spec ++ @opts})
+    {alone, own_steps} = step_events(server, fn -> ContinuousBatching.run(server, @speech) end)
+
+    caller = spawn(fn -> ContinuousBatching.run(server, @long_speech) end)
+    wait_for(fn -> map_size(:sys.get_state(server).rows) == 1 end)
+
+    {result, steps} =
+      step_events(server, fn ->
+        Process.exit(caller, :kill)
+        ContinuousBatching.run(server, @speech)
+      end)
+
+    assert result == alone
+    assert length(steps) <= length(own_steps) + 2
+  end
+
+  # A stream takes an input of one row. The long audio raises, and its rows do not run, so the
+  # short audio then streams the text of run/3.
+  test "a stream of short audio gives the text of run/3, and a stream of long audio raises" do
+    spec = [source: {:hf, "Xenova/whisper-tiny.en"}, task: Audio.SpeechToText, slots: 2]
+    server = start_supervised!({ContinuousBatching, spec ++ @opts})
+
+    assert_raise ArgumentError, ~r/one row, and this input gives 3 rows/, fn ->
+      ContinuousBatching.stream(server, @long_speech)
+    end
+
+    %{chunks: [%{text: text}]} = ContinuousBatching.run(server, @speech)
+    assert server |> ContinuousBatching.stream(@speech) |> Enum.join() == text
+  end
+
   defp results_after_first_chunk(server, first, second) do
     parent = self()
     ref = make_ref()

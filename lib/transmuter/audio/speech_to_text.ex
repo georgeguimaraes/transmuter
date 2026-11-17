@@ -28,42 +28,107 @@ defmodule Transmuter.Audio.SpeechToText do
   # The bytes of an f32 sample of Featurizer.audio/2.
   @bytes 4
 
+  @options [
+             :variant,
+             :tokenizer,
+             :backend,
+             :compute_type,
+             :max_new_tokens,
+             :strategy,
+             :temperature,
+             :top_k,
+             :top_p,
+             :repetition_penalty,
+             :num_beams,
+             :length_penalty,
+             :early_stopping,
+             :no_repeat_ngram_size,
+             :min_length,
+             :min_new_tokens,
+             :seed,
+             :language,
+             :chunk_num_seconds,
+             :context_num_seconds,
+             :timestamps,
+             task: :transcribe,
+             token_logprobs: false,
+             compile: [],
+             defn_options: []
+           ] ++ Hub.options()
+
+  @doc false
+  # The options of the task without the options of the serving. In
+  # `Transmuter.ContinuousBatching`, `:task` is the module of the task, so the server only
+  # transcribes.
+  def options, do: Enum.reject(@options, &(option_name(&1) in [:compile, :task]))
+
+  defp option_name({name, _default}), do: name
+  defp option_name(name), do: name
+
   @doc false
   def speech_to_text(source, opts) do
-    opts =
-      Keyword.validate!(
-        opts,
-        [
-          :variant,
-          :tokenizer,
-          :backend,
-          :compute_type,
-          :max_new_tokens,
-          :strategy,
-          :temperature,
-          :top_k,
-          :top_p,
-          :repetition_penalty,
-          :num_beams,
-          :length_penalty,
-          :early_stopping,
-          :no_repeat_ngram_size,
-          :min_length,
-          :min_new_tokens,
-          :seed,
-          :language,
-          :chunk_num_seconds,
-          :context_num_seconds,
-          :timestamps,
-          task: :transcribe,
-          token_logprobs: false,
-          compile: [],
-          defn_options: []
-        ] ++ Hub.options()
-      )
-      |> Serving.generation_options!()
+    opts = opts |> Keyword.validate!(@options) |> Serving.generation_options!()
+    {ctx, tokenizer, task, _settings} = build(source, opts)
+    Serving.generation(ctx, tokenizer, task, opts)
+  end
 
-    compile = Keyword.validate!(opts[:compile], batch_size: 1)
+  @doc false
+  # The context, the tokenizer and the task of `Transmuter.ContinuousBatching`. The worker of
+  # the server runs the featurizer and the encoder on each window of a request (:prepare), and
+  # each window is one row. The rows of the server have no stride and no times, so :postprocess
+  # puts the stride of the run of each row and a time of 0 after each token, as the aligner
+  # without word timestamps gives. A stream of audio is read in the caller, so the worker does
+  # not wait for its chunks.
+  def task(source, opts) do
+    if opts[:timestamps] do
+      raise ArgumentError,
+            "Transmuter.ContinuousBatching takes speech-to-text without :timestamps, because each pass of a window with timestamps starts where the pass before it ended, got: timestamps: #{inspect(opts[:timestamps])}"
+    end
+
+    {ctx, tokenizer, task, settings} = build(source, Keyword.put(opts, :task, :transcribe))
+    %{validate: validate, postprocess: postprocess} = task
+    width = if ctx.token_logprobs?, do: 2, else: 1
+
+    postprocess = fn rows, runs ->
+      rows =
+        rows
+        |> Enum.with_index()
+        |> Enum.zip_with(runs, fn {integers, index}, run ->
+          tokens = Enum.chunk_every(integers, width)
+          one_pass!(Enum.map(tokens, &hd/1), index, settings)
+          Tuple.to_list(run.stride) ++ Enum.flat_map(tokens, fn [id | bits] -> [id, 0 | bits] end)
+        end)
+
+      postprocess.(rows, runs)
+    end
+
+    validate = fn input ->
+      with {:ok, chunks} <- validate.(input), do: {:ok, Enum.to_list(chunks)}
+    end
+
+    {ctx, tokenizer, %{task | validate: validate, postprocess: postprocess}}
+  end
+
+  @doc false
+  # Raises when the tokens `ids` of the window `index` would start a second pass in
+  # transcribe/5, which the server does not run: the window would then give another text than
+  # `Transmuter.Audio.speech_to_text/2`.
+  def one_pass!(ids, index, settings) do
+    {_kept, seek} = next_pass(Enum.map(ids, &{&1}), 0, settings)
+
+    if seek < settings.frames do
+      raise ArgumentError,
+            "the tokens of window #{index} have two timestamps together, so Transmuter.Audio.speech_to_text/2 transcribes this window again from the last timestamp, and Transmuter.ContinuousBatching does not. Use Transmuter.Audio.speech_to_text/2 for this audio"
+    end
+
+    :ok
+  end
+
+  # The context, the tokenizer, the task of `Serving.generation/4` and the settings of the
+  # windows, for speech_to_text/2 and task/2. :init transcribes the windows of a batch with
+  # each pass of transcribe/5, and :prepare encodes one window.
+  defp build(source, opts) do
+    compile = Keyword.validate!(opts[:compile] || [], batch_size: 1)
     mode = opts[:timestamps]
 
     unless mode in [nil, :segments, :words] do
@@ -101,23 +166,31 @@ defmodule Transmuter.Audio.SpeechToText do
 
     aligner = aligner(mode, repo, decoder, settings, length(prompt), max_new_tokens)
 
-    init = fn defn_options ->
+    # The featurizer and the encoder of `rows` windows, which give the inputs of the decoder.
+    run_encoder = fn rows, defn_options ->
       features = GraphBreaks.jit(&features(&1, &2, &3, featurizer.hop_length), defn_options)
-      shape = {compile[:batch_size], featurizer.feature_size, settings.frames}
+      shape = {rows, featurizer.feature_size, settings.frames}
       template = Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), shape)
       encode = Transmuter.compile(encoder, %{input => template}, defn_options)
-      align = aligner.(defn_options)
+      featurize = &features.(&1, featurizer.filters, featurizer.window)
 
       encode = fn features ->
         %{"last_hidden_state" => hidden} = encode.(%{input => features})
         %{"encoder_hidden_states" => hidden}
       end
 
+      {featurize, encode}
+    end
+
+    init = fn defn_options ->
+      {featurize, encode} = run_encoder.(compile[:batch_size], defn_options)
+      align = aligner.(defn_options)
+
       # A row goes out as its stride, then each token as [id, end time in feature frames], with
       # its log-probability after them with token_logprobs. The frames of the audio are the frames of the attention mask of
       # WhisperFeatureExtractor, which word timestamps read.
       fn %{"audio" => audio, "stride" => strides}, prompts, generate ->
-        features = features.(audio, featurizer.filters, featurizer.window)
+        features = featurize.(audio)
         strides = Nx.to_list(strides)
         hop = featurizer.hop_length
         frames = for [size, _left, _right] <- strides, do: div(size + hop - 1, hop)
@@ -137,8 +210,19 @@ defmodule Transmuter.Audio.SpeechToText do
       end
     end
 
+    # The audio of one window stays on the host until the encoder needs it.
+    prepare = fn defn_options ->
+      backend = Nx.Defn.to_backend(defn_options)
+      {featurize, encode} = run_encoder.(1, defn_options)
+
+      fn %{"audio" => audio}, _prompts ->
+        audio |> Nx.backend_transfer(backend) |> featurize.() |> encode.()
+      end
+    end
+
     # The windows of a tensor or a file are a list, so an error in them raises in the caller.
-    # Zero bits are the zero of f32.
+    # Zero bits are the zero of f32. A run keeps its stride as data too, because the worker of
+    # Transmuter.ContinuousBatching gives the runs to the caller without their tensors.
     preprocess = fn chunks ->
       seed = opts[:seed] || :rand.uniform(2 ** 32)
 
@@ -153,8 +237,13 @@ defmodule Transmuter.Audio.SpeechToText do
               backend: Nx.BinaryBackend
             )
 
-          stride = Nx.tensor(Tuple.to_list(stride), backend: Nx.BinaryBackend)
-          %{prompt: prompt, seed: seed, tensors: %{"audio" => audio, "stride" => stride}}
+          tensors = %{
+            "audio" => audio,
+            "stride" => Nx.tensor(Tuple.to_list(stride), backend: Nx.BinaryBackend)
+          }
+
+          summary = %{input: length(prompt), padding: 0}
+          %{prompt: prompt, seed: seed, tensors: tensors, stride: stride, summary: summary}
         end)
 
       if is_list(chunks), do: Enum.to_list(runs), else: runs
@@ -193,14 +282,21 @@ defmodule Transmuter.Audio.SpeechToText do
       %{chunks: chunks}
     end
 
+    # One second of silence, so that the steps compile for the encoder outputs of a window.
+    example = [
+      Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), {featurizer.sampling_rate})
+    ]
+
     task = %{
       validate: &Featurizer.audio(&1, featurizer.sampling_rate),
       preprocess: preprocess,
       init: init,
+      prepare: prepare,
+      example: example,
       postprocess: postprocess
     }
 
-    Serving.generation(ctx, tokenizer, task, opts)
+    {ctx, tokenizer, task, settings}
   end
 
   defp ids(tokens), do: Enum.map(tokens, &hd/1)

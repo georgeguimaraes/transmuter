@@ -603,6 +603,20 @@ defmodule Transmuter.Audio.SpeechToTextTest do
     features = Nx.broadcast(0.0, {1, 1, 4})
     assert SpeechToText.transcribe(features, [[1]], [0], settings, pass) == [tokens]
   end
+
+  # Transmuter.ContinuousBatching runs one pass for each window. Tokens without timestamps,
+  # with two timestamps together at the start, or with one timestamp at the end need no other
+  # pass. Two timestamps together after text move the seek, so the server raises.
+  test "a window whose tokens would start a second pass raises in the server" do
+    settings = %{frames: 3000, frames_per_timestamp: 2, timestamp_begin: 100}
+
+    for ids <- [[7, 8, 99], [100, 100, 7, 99], [7, 125]],
+        do: assert(SpeechToText.one_pass!(ids, 0, settings) == :ok)
+
+    assert_raise ArgumentError, ~r/window 2 have two timestamps .* Use Transmuter.Audio/, fn ->
+      SpeechToText.one_pass!([7, 110, 110, 8], 2, settings)
+    end
+  end
 end
 
 defmodule Transmuter.Audio.WindowsTest do
