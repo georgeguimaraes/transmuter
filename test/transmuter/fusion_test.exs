@@ -360,6 +360,78 @@ defmodule Transmuter.FusionTest do
     end
   end
 
+  # q, k and v read x, but another node also reads the weight of v, so its matmul stays. The
+  # merge happens when the model moves to a backend.
+  test "matmuls that read one input become one MatMul and a Split", %{tmp_dir: dir} do
+    weight = fn n, factor ->
+      Nx.iota({8, n}, type: :f32) |> Nx.multiply(factor) |> Nx.remainder(7.0) |> Nx.subtract(3.0)
+    end
+
+    constants = %{"wq" => weight.(4, 3.0), "wk" => weight.(3, 5.0), "wv" => weight.(4, 11.0)}
+
+    nodes = [
+      node("MatMul", ["x", "wq"], ["q"]),
+      node("MatMul", ["x", "wk"], ["k"]),
+      node("MatMul", ["x", "wv"], ["v"]),
+      node("Add", ["wv", "wv"], ["wv2"])
+    ]
+
+    path = write(dir, nodes, constants, ["x"], ["q", "k", "v", "wv2"])
+    model = Transmuter.load!(path, backend: Nx.BinaryBackend)
+
+    assert Enum.map(model.nodes, &{&1.op_type, &1.input, &1.output}) == [
+             {"MatMul", ["x", "wq:merged"], ["q:merged"]},
+             {"Split", ["q:merged"], ["q", "k"]},
+             {"MatMul", ["x", "wv"], ["v"]},
+             {"Add", ["wv", "wv"], ["wv2"]}
+           ]
+
+    assert model.params["wq:merged"] ==
+             Nx.concatenate([constants["wq"], constants["wk"]], axis: 1)
+
+    refute Map.has_key?(model.params, "wq") or Map.has_key?(model.params, "wk")
+    assert_same_outputs(path, %{"x" => @x})
+  end
+
+  # Two MatMulNBits nodes of 4 bits read x. The move gives each one float weight, which then
+  # merge. B is larger than a static value, so it is a param that the move packs.
+  test "MatMulNBits nodes that read one input become one MatMulNBits and a Split", %{
+    tmp_dir: dir
+  } do
+    packed = fn n, factor ->
+      Nx.iota({n, 32, 16}) |> Nx.multiply(factor) |> Nx.remainder(256) |> Nx.as_type(:u8)
+    end
+
+    constants = %{
+      "bq" => packed.(32, 7),
+      "sq" => Nx.broadcast(0.01, {32 * 32}),
+      "bk" => packed.(16, 13),
+      "sk" => Nx.broadcast(0.02, {16 * 32})
+    }
+
+    nbits = fn b, scales, out, n ->
+      %{
+        node("MatMulNBits", ["x", b, scales], [out], K: 1024, N: n, bits: 4, block_size: 32)
+        | domain: "com.microsoft"
+      }
+    end
+
+    path =
+      write(dir, [nbits.("bq", "sq", "q", 32), nbits.("bk", "sk", "k", 16)], constants, ["x"], [
+        "q",
+        "k"
+      ])
+
+    model = Transmuter.load!(path, backend: Nx.BinaryBackend)
+    assert Enum.map(model.nodes, & &1.op_type) == ["MatMulNBits", "Split"]
+
+    inputs = %{"x" => Nx.iota({1, 2, 1024}, type: :f32) |> Nx.remainder(17.0) |> Nx.subtract(8.0)}
+    raw = Transmuter.load!(path)
+    expected = Transmuter.run(raw, raw.params, inputs)
+    assert_close(Transmuter.run(model, model.params, inputs), expected)
+    assert_same_outputs(path, inputs)
+  end
+
   defp ops(path), do: Enum.map(Transmuter.load!(path).nodes, & &1.op_type)
 
   # The fused model gives the outputs of the graph without the rewrite, on Nx.BinaryBackend
@@ -396,7 +468,7 @@ defmodule Transmuter.FusionTest do
         %TensorProto{
           name: name,
           dims: Tuple.to_list(Nx.shape(t)),
-          data_type: if(Nx.type(t) == {:s, 64}, do: 7, else: 1),
+          data_type: Map.fetch!(%{{:s, 64} => 7, {:u, 8} => 2, {:f, 32} => 1}, Nx.type(t)),
           raw_data: Nx.to_binary(t)
         }
       end

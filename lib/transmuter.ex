@@ -1168,7 +1168,9 @@ defmodule Transmuter do
       end
 
     static = Map.drop(model.static, MapSet.to_list(freed))
+
     %{model | nodes: nodes, params: params, static: static, backend: backend}
+    |> Transmuter.Fusion.matmuls(evaluate)
   end
 
   # The inputs of a packed node: the weight in place of B, and no scales or zero points.

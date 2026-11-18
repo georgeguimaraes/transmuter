@@ -10,6 +10,8 @@ defmodule Transmuter.Fusion do
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
+  When a model moves to a backend, `matmuls/2` also merges the matmuls that read one input, such as q, k and v, into one matmul and a `Split`.
+
   Each replacement node has a `metadata_props` entry with the key `transmuter.fused`. Its value lists the op type and the name of each node that the replacement replaces, the anchor first, separated by ", ". `Transmuter.Graph` shows these lists.
 
   A subgraph matches only when the replacement computes the same function:
@@ -424,4 +426,115 @@ defmodule Transmuter.Fusion do
         nil
     end
   end
+
+  @doc """
+  Merges the matmuls of a moved model that read one input, such as q, k and v, or gate and up, into one matmul over the concatenated weights and a `Split` of its output. The weights concatenate once, here, so a compiled step does not concatenate them on each call, as the dot merger of XLA does with weights that are arguments.
+
+  A matmul merges when it reads a non-empty input that another merged matmul also reads, and its weight is a float param of 2 axes that no other node, subgraph or graph output reads. A `MatMul` reads a `{K, N}` weight. A `MatMulNBits` reads the `{N, K}` float weight of `Transmuter.move/2`, with no bias. The matmuls of a group have one op type, one weight type and one K. `evaluate` finishes each merged weight on the device. The merged node keeps the name of the first matmul and lists the matmuls that it replaces under the key `transmuter.fused`.
+  """
+  def matmuls(model, evaluate) do
+    uses =
+      Enum.frequencies(Enum.flat_map(model.nodes, &Transmuter.dependencies/1) ++ model.outputs)
+
+    groups =
+      model.nodes
+      |> Enum.filter(&mergeable?(&1, model, uses))
+      |> Enum.group_by(&merge_key(&1, model))
+      |> Map.values()
+      |> Enum.filter(&match?([_, _ | _], &1))
+
+    # The model leaves the params, so the weights of a group have no reference after their
+    # merge, and a garbage collection frees them before the next group concatenates. The device
+    # memory then grows by one group at most, also on EMLX, where only a collection frees arrays.
+    {params, model} = Map.pop!(model, :params)
+
+    {replacements, params} =
+      Enum.map_reduce(groups, params, fn group, params ->
+        merged = merge(group, params, evaluate)
+        :erlang.garbage_collect()
+        merged
+      end)
+
+    replacements = Map.new(Enum.concat(replacements))
+
+    nodes =
+      Enum.flat_map(model.nodes, fn node -> Map.get(replacements, node.output, [node]) end)
+
+    model |> Map.put(:params, params) |> Map.put(:nodes, nodes)
+  end
+
+  defp mergeable?(node = %{input: [a, w | rest]}, model, uses) do
+    weight = model.params[w]
+
+    node.op_type in ["MatMul", "MatMulNBits"] and node.domain in [nil, "", "com.microsoft"] and
+      a != "" and Enum.all?(rest, &(&1 == "")) and uses[w] == 1 and
+      match?(%Nx.Tensor{shape: {_, _}}, weight) and Nx.Type.float?(Nx.type(weight)) and
+      (node.op_type == "MatMul" or Nx.shape(weight) == nbits_shape(node))
+  end
+
+  defp mergeable?(_node, _model, _uses), do: false
+
+  defp nbits_shape(node) do
+    {k, n, _bits, _block_size} = Ops.Quantized.nbits_sizes(node)
+    {n, k}
+  end
+
+  # A MatMul contracts the first axis of its weight, and a MatMulNBits the last.
+  defp merge_key(node = %{input: [a, w | _]}, model) do
+    weight = model.params[w]
+    {node.op_type, a, Nx.type(weight), Nx.axis_size(weight, contraction(node))}
+  end
+
+  defp contraction(%{op_type: "MatMul"}), do: 0
+  defp contraction(%{op_type: "MatMulNBits"}), do: 1
+
+  defp merge(group = [first | _], params, evaluate) do
+    weights = Enum.map(group, &params[Enum.at(&1.input, 1)])
+    axis = 1 - contraction(first)
+    sizes = Enum.map(weights, &Nx.axis_size(&1, axis))
+    name = Enum.at(first.input, 1) <> ":merged"
+    output = hd(first.output) <> ":merged"
+
+    if Map.has_key?(params, name),
+      do: raise(ArgumentError, "the model already has a param #{name}")
+
+    merged = %{
+      first
+      | input: [hd(first.input), name | Enum.drop(first.input, 2)],
+        output: [output],
+        attribute: merged_attributes(first, Enum.sum(sizes))
+    }
+
+    split = %NodeProto{
+      op_type: "Split",
+      name: "#{first.name}:split",
+      input: [output],
+      output: Enum.map(group, &hd(&1.output)),
+      attribute: [
+        %AttributeProto{name: "axis", type: :INT, i: -1},
+        %AttributeProto{name: "split", type: :INTS, ints: sizes}
+      ]
+    }
+
+    params =
+      params
+      |> Map.drop(Enum.map(group, &Enum.at(&1.input, 1)))
+      |> Map.put(name, evaluate.(Nx.concatenate(weights, axis: axis)))
+
+    # The merged node and the Split take the place of the first matmul, and the others go.
+    replacements = [
+      {first.output, [record(merged, group), split]} | Enum.map(tl(group), &{&1.output, []})
+    ]
+
+    {replacements, params}
+  end
+
+  defp merged_attributes(node = %{op_type: "MatMulNBits"}, n) do
+    Enum.map(node.attribute, fn
+      a = %{name: "N"} -> %{a | i: n}
+      a -> a
+    end)
+  end
+
+  defp merged_attributes(node, _n), do: node.attribute
 end
