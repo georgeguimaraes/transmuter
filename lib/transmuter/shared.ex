@@ -37,6 +37,10 @@ defmodule Transmuter.Shared do
     try do
       result = fun.()
       {result, Process.get(@collect)}
+    catch
+      kind, reason ->
+        Enum.each(Process.get(@collect), &erase_scope/1)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     after
       if previous, do: Process.put(@collect, previous), else: Process.delete(@collect)
     end

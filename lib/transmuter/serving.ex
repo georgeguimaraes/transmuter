@@ -490,8 +490,8 @@ defmodule Transmuter.Serving do
   # The compiles of init and of a batch make scopes of Transmuter.Shared, which live as long
   # as the process that makes them. In the caller of Nx.Serving.run/2 they belong to the call,
   # so the call ends them: the client postprocessing ends them after the result, and a batch
-  # that raises ends them (see end_run/0). In a serving process and in its batches, the run
-  # list stays empty, and the scopes end with their process.
+  # that raises ends them (see end_run/0). A serving process keeps the scopes of its init,
+  # which end with it. Its batches run in tasks, so the scopes of a batch end with its task.
   @run {__MODULE__, :run}
 
   @doc false
