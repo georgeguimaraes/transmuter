@@ -23,6 +23,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   @position_offset "transmuter.position_offset"
   @key_mask "transmuter.key_mask"
+  @past_length "transmuter.past_length."
 
   @doc false
   def position_offset, do: @position_offset
@@ -1627,6 +1628,115 @@ defmodule Transmuter.Generation.MergedDecoder do
         output: node.output
       }
     ]
+  end
+
+  @doc """
+  Returns `model` for a cache of exact length (`:grow`), whose length a node of the graph reads from the attention mask. That cache starts with one placeholder row, because Nx has no tensors of length 0, so its first step has a past of 1 row where the true past has 0 rows. GroupQueryAttention writes the new rows of that step over the placeholder row, so the cache has its exact length after the first step. A merged decoder runs its first step on the branch without cache, which does not read the past.
+
+  The nodes of the main graph run in the first step. Each of them that takes the `Shape` of a buffer (see `buffers/1`) gets a shape whose length is the length of the attention mask less the new tokens, as `:grow` gives the mask of the past and the new tokens. So each position and each mask that the graph makes from that length sees the true past. Only the nodes whose outputs reach an output of the graph count.
+
+  Raises an `ArgumentError` for a decoder that this does not cover, so that it never gives wrong tokens: a node of the main graph that reads the values of a buffer, other than GroupQueryAttention and the `If` on `use_cache_branch`, as the `Concat` attention of Gemma 4 E2B, which would read the placeholder row as a key, or a `Shape` of a buffer without an `attention_mask` input.
+  """
+  def past_length(model) do
+    buffers = MapSet.new(buffers(model))
+    live = slice(model.nodes, MapSet.new(model.outputs), &Transmuter.dependencies/1)
+
+    shapes =
+      for node <- live,
+          Enum.any?(Transmuter.dependencies(node), &MapSet.member?(buffers, &1)),
+          not past_reader?(node),
+          do: length_read!(node)
+
+    cond do
+      shapes == [] ->
+        model
+
+      "attention_mask" not in model.inputs ->
+        raise ArgumentError, no_mask(hd(shapes))
+
+      true ->
+        tokens = if "input_ids" in model.inputs, do: "input_ids", else: "inputs_embeds"
+        rewritten = Map.new(shapes, &{&1, past_shape(&1, tokens)})
+
+        nodes =
+          Enum.flat_map(model.nodes, fn node ->
+            if Map.has_key?(rewritten, node), do: elem(rewritten[node], 0), else: [node]
+          end)
+
+        static =
+          rewritten
+          |> Map.values()
+          |> Enum.reduce(model.static, &Map.merge(&2, elem(&1, 1)))
+          |> Map.merge(Map.new(0..4, &{@past_length <> Integer.to_string(&1), index([&1])}))
+
+        %{model | nodes: nodes, static: static}
+    end
+  end
+
+  defp index(values), do: Nx.tensor(values, type: :s64, backend: Nx.BinaryBackend)
+
+  # The readers of a buffer that do not read its placeholder row as a valid row.
+  defp past_reader?(%{op_type: "GroupQueryAttention"}), do: true
+  defp past_reader?(%{op_type: "If", input: ["use_cache_branch" | _]}), do: true
+  defp past_reader?(_node), do: false
+
+  defp length_read!(node = %{op_type: "Shape"}), do: node
+
+  defp length_read!(node) do
+    raise ArgumentError,
+          "generation cannot run this decoder with a cache of exact length (:grow), because " <>
+            "#{where(node)} reads the values of the cache. That cache starts with one " <>
+            "placeholder row, because Nx has no tensors of length 0, and the first step would " <>
+            "read that row as a valid row"
+  end
+
+  defp no_mask(node) do
+    "generation cannot run this decoder with a cache of exact length (:grow), because " <>
+      "#{where(node)} reads the length of the cache, and the decoder has no attention_mask " <>
+      "input. That cache starts with one placeholder row, because Nx has no tensors of " <>
+      "length 0, so the length of the past must come from the attention mask"
+  end
+
+  # The shape of a buffer with the length of the attention mask less the new tokens on axis 2,
+  # and the start and end of the Shape node.
+  defp past_shape(node = %{input: [past], output: [out]}, tokens) do
+    value = &(@past_length <> out <> "." <> &1)
+    c = &(@past_length <> Integer.to_string(&1))
+    start = Enum.find_value(node.attribute, 0, &(&1.name == "start" && &1.i))
+    stop = Enum.find_value(node.attribute, 4, &(&1.name == "end" && &1.i))
+    bounds = %{value.("start") => index([start]), value.("end") => index([stop])}
+
+    step = fn op, inputs, name, attribute ->
+      %NodeProto{
+        op_type: op,
+        name: value.(name),
+        input: inputs,
+        output: [value.(name)],
+        attribute: attribute
+      }
+    end
+
+    nodes = [
+      step.("Shape", [past], "full", []),
+      step.("Shape", ["attention_mask"], "mask", []),
+      step.("Shape", [tokens], "tokens", []),
+      step.("Slice", [value.("mask"), c.(1), c.(2)], "total", []),
+      step.("Slice", [value.("tokens"), c.(1), c.(2)], "new", []),
+      step.("Sub", [value.("total"), value.("new")], "length", []),
+      step.("Slice", [value.("full"), c.(0), c.(2)], "head", []),
+      step.("Slice", [value.("full"), c.(3), c.(4)], "tail", []),
+      step.("Concat", [value.("head"), value.("length"), value.("tail")], "shape", [
+        %AttributeProto{name: "axis", type: :INT, i: 0}
+      ]),
+      %NodeProto{
+        op_type: "Slice",
+        name: node.name,
+        input: [value.("shape"), value.("start"), value.("end")],
+        output: [out]
+      }
+    ]
+
+    {nodes, bounds}
   end
 
   @doc """

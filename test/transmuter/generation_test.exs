@@ -2144,7 +2144,10 @@ defmodule Transmuter.GenerationBitsTest do
   # the greedy tokens of the same decoder without a cache, computed with Nx, and
   # log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
   # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
-  # reads a slice of the shape of the past keeps the decoder in :grow.
+  # reads a slice of the shape of the past keeps the decoder in :grow. When the positions read
+  # such a slice, the first step of :grow sees a past of 0 rows from the attention mask, not
+  # the placeholder row of the cache, and the rows give the same tokens. A Concat of the cache
+  # would read that placeholder row as a valid row, so its context raises.
   test "a decoder without an If takes positions from the length of its past with the offset" do
     node = &%NodeProto{op_type: &1, name: hd(&3), input: &2, output: &3}
     int = &%AttributeProto{name: &1, type: :INT, i: &2}
@@ -2342,12 +2345,46 @@ defmodule Transmuter.GenerationBitsTest do
         static: Map.put(model.static, "column_shape", host.([-1, 1]))
     }
 
+    # The length of the past from a Shape with start 2, which the rewrite does not follow, so
+    # the decoder keeps a cache of exact length (:grow). That cache starts with a placeholder
+    # row, and the length of the past comes from the attention mask (see
+    # MergedDecoder.past_length/1), so the first step sees a past of 0 rows.
+    sliced = %{
+      model
+      | nodes:
+          Enum.map(nodes, fn
+            %{name: "past_shape"} = shape -> %{shape | attribute: [int.("start", 2)]}
+            %{name: "past"} -> node.("Gather", ["past_shape", "zero"], ["past"])
+            other -> other
+          end)
+    }
+
+    # A node that reads the values of the cache, other than GroupQueryAttention, would read the
+    # placeholder row of :grow as a valid row, so the context raises and names it.
+    doubled = %{
+      sliced
+      | nodes:
+          sliced.nodes ++
+            [%{node.("Concat", [hd(past), hd(past)], ["doubled"]) | attribute: [int.("axis", 2)]}],
+        outputs: sliced.outputs ++ ["doubled"]
+    }
+
+    assert_raise ArgumentError, ~r/because Concat doubled reads the values of the cache/, fn ->
+      context.(doubled)
+    end
+
     prompts =
       for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
 
     per_row = ["batch_size", 1]
 
-    forms = [{model, per_row}, {export, per_row}, {column, per_row}, {reshaped, []}]
+    forms = [
+      {model, :in_place, per_row},
+      {export, :in_place, per_row},
+      {column, :in_place, per_row},
+      {reshaped, :in_place, []},
+      {sliced, :grow, nil}
+    ]
 
     # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
     # the lift of the [n] form stops at the sum with the embeddings, without an error.
@@ -2355,13 +2392,14 @@ defmodule Transmuter.GenerationBitsTest do
     unknown = context.(%{model | input_types: types}).model.input_types
     assert unknown[Generation.MergedDecoder.position_offset()] == {:s64, []}
 
-    for {model, offset} <- forms do
+    for {model, mode, offset} <- forms do
       ctx = context.(model)
-      assert ctx.mode == :in_place
-      assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == {:s64, offset}
+      assert ctx.mode == mode
+      offset = offset && {:s64, offset}
+      assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == offset
       refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
-      assert Generation.joins?(ctx) == (offset != [])
-      if offset != [], do: assert_step_alone(ctx.model)
+      assert Generation.joins?(ctx) == (offset == {:s64, per_row})
+      if offset == {:s64, per_row}, do: assert_step_alone(ctx.model)
 
       ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
       rows = Generation.generate(ctx, prompts, [0, 0, 0])

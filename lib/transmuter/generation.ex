@@ -195,10 +195,13 @@ defmodule Transmuter.Generation do
       |> MergedDecoder.rewrite(List.last(@step_widths))
       |> count_rows()
 
+    mode = mode(model, given, opts[:embed])
+    model = exact_length(model, mode)
+
     %{
       model: model,
       vocab: vocab(model, repo.config),
-      mode: mode(model, given, opts[:embed]),
+      mode: mode,
       embed: opts[:embed],
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
@@ -226,6 +229,12 @@ defmodule Transmuter.Generation do
     }
     |> Map.merge(beam_search(gen, opts, sampling?))
   end
+
+  # The length of the past comes from the mask only in :grow (see MergedDecoder.past_length/1),
+  # after count_rows/1, which would take a decoder whose past only GroupQueryAttention reads to
+  # :in_place.
+  defp exact_length(model, :grow), do: MergedDecoder.past_length(model)
+  defp exact_length(model, _mode), do: model
 
   # The widths of the steps on the branch with cache (see plan/3): one token for a merged decoder
   # whose branch with cache has no causal mask (see "Merged decoders").
