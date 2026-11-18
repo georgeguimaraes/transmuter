@@ -1626,9 +1626,9 @@ defmodule Transmuter.GenerationTest do
   defp row_tokens(group, row), do: group.ids |> Enum.at(row) |> Enum.reverse()
 
   # The merged T5 decoder reads the positions of all keys for its relative bias, and the
-  # rewrite takes them from the union of the key masks of the rows. Row 0 ends early, at a
-  # token of its own answer that row 1 does not give, so its key mask has fewer valid rows
-  # for the later steps of row 1. Each row gives the tokens that it gives alone.
+  # rewrite takes them from the key mask of each row. Row 0 ends early, at a token of its own
+  # answer that row 1 does not give, so its key mask has fewer valid rows for the later steps
+  # of row 1. Each row gives the tokens that it gives alone.
   @tag ci_partition: 10
   test "the relative bias of T5 takes the positions of the active rows" do
     {repo, encoder, decoder} =
@@ -1677,6 +1677,100 @@ defmodule Transmuter.GenerationTest do
     assert rows == alone
     assert length(hd(rows)) < 40
     assert length(Enum.at(rows, 1)) == 40
+  end
+
+  # The positions of the relative bias of T5 count the valid rows of each row, so gap rows
+  # do not move them. One step of 2 new tokens for 2 rows in a buffer of 32 rows, where row 0
+  # has 4 valid rows and then 3 gap rows of noise and row 1 has 7 valid rows, gives the logits
+  # of each row alone with a cache of exact length. The union of the key masks of the rows
+  # counts the gap rows of row 0 as valid, and moves the positions of its new tokens.
+  @tag ci_partition: 10
+  test "the relative bias of T5 counts the valid rows of each row with gap rows" do
+    model =
+      Transmuter.load!({:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"},
+        backend: @opts[:backend],
+        outputs: &Generation.outputs/1
+      )
+
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => -1}}
+    given = ["encoder_hidden_states", "encoder_attention_mask"]
+    ctx = Generation.context(repo, model, [], given)
+    assert {:s64, ["batch_size", 1]} = ctx.model.input_types["transmuter.position_offset"]
+
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    flag = &%{"use_cache_branch" => Nx.tensor([&1], type: :u8, backend: Nx.BinaryBackend)}
+    run = &Transmuter.run(&1, &1.params, Map.take(&2, &1.inputs), &3)
+
+    encoder = %{
+      "encoder_hidden_states" =>
+        Nx.iota({1, 12, 512}, type: :f32, backend: @opts[:backend])
+        |> Nx.remainder(17)
+        |> Nx.subtract(8)
+        |> Nx.divide(8),
+      "encoder_attention_mask" => host.([List.duplicate(1, 12)])
+    }
+
+    rows =
+      for {prompt, tokens} <- [
+            {[0, 400, 500, 600], [77, 88]},
+            {[0, 401, 501, 601, 701, 801, 901], [99, 111]}
+          ] do
+        {inputs, _static} = Generation.prompt_inputs(model, 1, length(prompt))
+
+        first =
+          run.(model, Map.merge(inputs, Map.put(encoder, "input_ids", host.([prompt]))), flag.(0))
+
+        past =
+          for {"present." <> name, value} <- first,
+              into: %{},
+              do: {"past_key_values." <> name, value}
+
+        step = Map.merge(past, Map.put(encoder, "input_ids", host.([tokens])))
+        logits = run.(model, step, flag.(1))["logits"]
+        {past, length(prompt), tokens, logits[0][-1]}
+      end
+
+    capacity = 32
+    noise = &Nx.broadcast(Nx.tensor(5.0, backend: @opts[:backend]), &1)
+
+    buffers =
+      for name <- ctx.cache, into: %{} do
+        parts =
+          for {{past, length, _tokens, _logits}, i} <- Enum.with_index(rows) do
+            if name in ctx.buffers do
+              {b, h, _rows, d} = Nx.shape(past[name])
+              valid = if i == 0, do: Nx.concatenate([past[name], noise.({b, h, 3, d})], axis: 2)
+              valid = valid || past[name]
+              free = capacity - Nx.axis_size(valid, 2)
+              Nx.pad(valid, 0.0, [{0, 0, 0}, {0, 0, 0}, {0, free, 0}, {0, 0, 0}])
+            else
+              past[name]
+            end
+          end
+
+        {name, Nx.concatenate(parts, axis: 0)}
+      end
+
+    mask = &(List.duplicate(1, &1) ++ List.duplicate(0, capacity - &1) ++ [1, 1])
+
+    step =
+      Map.merge(buffers, %{
+        "input_ids" => host.(Enum.map(rows, &elem(&1, 2))),
+        "encoder_hidden_states" =>
+          Nx.concatenate(List.duplicate(encoder["encoder_hidden_states"], 2)),
+        "encoder_attention_mask" =>
+          Nx.concatenate(List.duplicate(encoder["encoder_attention_mask"], 2)),
+        "transmuter.position_offset" => host.(for {_, l, _, _} <- rows, do: [l - capacity]),
+        "transmuter.logit_index" => host.([[[1]], [[1]]]),
+        "transmuter.key_mask" => host.(for {_, l, _, _} <- rows, do: mask.(l))
+      })
+
+    logits = run.(ctx.model, step, flag.(1))["logits"]
+
+    for {{_past, _length, _tokens, alone}, i} <- Enum.with_index(rows) do
+      diff = Nx.subtract(logits[i][0], alone) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+      assert diff < 1.0e-4, "row #{i}: #{diff}"
+    end
   end
 
   # The Qwen3-MoE and Gemma 3 exports of onnxruntime-genai count the valid rows of
@@ -2040,7 +2134,10 @@ defmodule Transmuter.GenerationBitsTest do
   # offset {batch, 1}, which gives them the batch as a new axis 0, and the Unsqueeze and the
   # sinusoid after it take that axis until the sum with the embeddings. In the export, the
   # cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset is {batch, 1, 1}
-  # there. In both, the rows of the prompts join one group. A Reshape to a static shape after
+  # there. When the cast reads [n, 1] positions, the offset is {batch, 1, 1}, one axis more
+  # than the positions, so the batch is a new axis 0 for each rank. In all three, the rows of
+  # the prompts join one group, and one step of 2 tokens for 2 rows gives the logits of each
+  # row alone (see assert_step_alone/1). A Reshape to a static shape after
   # the cast stops the lift, so that decoder takes one offset for all rows, and the prompts of
   # each length run in a group of their own, the prompt of 20 tokens in parts of 16 and 4
   # tokens. Its 16 new tokens grow the buffers from 32 to 64 rows. In a batch, each row gives
@@ -2214,6 +2311,25 @@ defmodule Transmuter.GenerationBitsTest do
           end)
     }
 
+    # The cast after the Unsqueeze on axis 1, so the value that takes the offset is [n, 1].
+    column = %{
+      model
+      | nodes:
+          Enum.flat_map(nodes, fn
+            %{name: "float_positions"} ->
+              [
+                node.("Unsqueeze", ["positions", "axis_1"], ["position_column"]),
+                %{node.("Cast", ["position_column"], ["column"]) | attribute: [int.("to", 1)]}
+              ]
+
+            %{name: "column"} ->
+              []
+
+            other ->
+              [other]
+          end)
+    }
+
     # A Reshape to a static shape in place of the Unsqueeze on axis 1, which the lift of the
     # positions does not follow.
     reshaped = %{
@@ -2231,12 +2347,15 @@ defmodule Transmuter.GenerationBitsTest do
 
     per_row = ["batch_size", 1]
 
-    for {model, offset} <- [{model, per_row}, {export, per_row}, {reshaped, []}] do
+    forms = [{model, per_row}, {export, per_row}, {column, per_row}, {reshaped, []}]
+
+    for {model, offset} <- forms do
       ctx = context.(model)
       assert ctx.mode == :in_place
       assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == {:s64, offset}
       refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
       assert Generation.joins?(ctx) == (offset != [])
+      if offset != [], do: assert_step_alone(ctx.model)
 
       ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
       rows = Generation.generate(ctx, prompts, [0, 0, 0])
@@ -2247,6 +2366,44 @@ defmodule Transmuter.GenerationBitsTest do
         diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
         assert diff < 1.0e-4, "#{diff}"
       end
+    end
+  end
+
+  # One step of 2 tokens for 2 rows with 0 and 3 rows of cache in a buffer of 8 rows gives the
+  # logits of each row alone, so the offset of each row reaches only its own positions. A step
+  # whose tokens are as many as its rows shows an offset that takes the axis of the tokens.
+  defp assert_step_alone(model) do
+    host = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+    capacity = 8
+
+    inputs = fn rows ->
+      pasts = Enum.map(rows, &elem(&1, 0))
+
+      cache =
+        Nx.broadcast(Nx.tensor(0.0, backend: Nx.BinaryBackend), {length(rows), 1, capacity, 4})
+
+      %{
+        "input_ids" => host.(Enum.map(rows, &elem(&1, 1))),
+        "attention_mask" =>
+          host.(
+            for p <- pasts, do: List.duplicate(1, p + 2) ++ List.duplicate(0, capacity - p - 2)
+          ),
+        "past_key_values.0.key" => cache,
+        "past_key_values.0.value" => cache,
+        "transmuter.position_offset" => host.(for p <- pasts, do: [p - capacity]),
+        "transmuter.logit_index" => host.(for _ <- rows, do: [[1]])
+      }
+    end
+
+    run = &Transmuter.run(model, model.params, Map.take(inputs.(&1), model.inputs))["logits"]
+    rows = [{0, [3, 7]}, {3, [11, 13]}]
+    batch = run.(rows)
+
+    for {row, i} <- Enum.with_index(rows) do
+      diff =
+        Nx.subtract(batch[i], run.([row])[0]) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+
+      assert diff < 1.0e-5, "row #{i}: #{diff}"
     end
   end
 

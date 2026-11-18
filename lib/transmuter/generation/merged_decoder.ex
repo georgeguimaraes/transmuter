@@ -10,7 +10,9 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   A walk follows L forward through the branch. A value that depends on L is a shift of L, another integer, a boolean of a comparison, or the shape of a tensor whose length follows the buffer: the buffer, the attention mask, and their results through Concat, Cast, Identity and Transpose. A dimension of such a shape is a shift of L when it is the length, and no L when it is another dimension. These uses keep the decoder in `:grow`: a cast to a float of another value of L, a 2-D static table read on axis 0 with another index of L, and the other reads of static tables at a value of L that is not a shift. A static table that a shift of L indexes in another way, such as the causal table of GPT-2, counts the rows of the buffer, so the buffer and the new token must fit its axes: its smallest axis minus 1 is the largest capacity (1023 for GPT-2). A `Slice` from 0 to a shift of L with step 1 of a tensor that the graph made, whose content has no L or only comparisons of L, is a prefix: with a buffer it keeps C + n rows in place of v + n, which hold every row that a step reads, such as the causal mask of moonshine, which compares the positions of L with the key index. The rows of a prefix are rows of the buffer, the same for each row of the batch, so a prefix allows an offset for each row: the key mask hides a gap row as it hides a free row. A prefix of a static table, such as the rotary table of the merged llama2.c that its nested `If` nodes squeeze, keeps the decoder in `:grow`.
 
-  A `Range` from 0 to a shift of L, with a step without L, gives the positions of all keys of a step, as the relative positions of T5. With a buffer, its index is the row of the buffer, and the new rows come after the C rows of the buffer. So the rewrite keeps the `Range` and maps each of its values to a position through the key mask: the cumulative count of the valid rows, minus 1, over the union of the rows of the step, and the offset after the last key. A row that has ended has a prefix of the valid rows of the active rows, so the union is the mask of the active rows, and a valid row gets its position and a new row v + i. The `Range` keeps its start, limit and step, so its output keeps its length. The walk follows these positions through moves, arithmetic and comparisons with values without L, float casts and reads of static tables, such as the bucket table of T5. A use that mixes them with other values of L, such as the causal mask of moonshine, which compares the key index with the positions of L, keeps that range as an index of the buffer, and the walk runs again (at most once for each range).
+  A read whose value has no batch axis, such as the `[K]` positions of a `Range` or the `[n]` input of a float cast, takes an offset with one axis more than that value, `{batch, 1, ..., 1}`, so the batch is a new axis 0. Each later node takes that axis, until the value meets a value of the tokens of the same rank, or a value whose only uses are the masks of `AttentionCore` nodes, which have the batch on axis 0. There, a `Squeeze` removes a static first axis of size 1 of the value, as the `[1, H, n, K]` bias of T5. Unsqueeze, Squeeze, Transpose and Slice shift their axes. Elementwise ops take static values of at most the same rank, and a `Gather` of a static table at such a value gives a value with the batch. Another op, or a read from a subgraph, keeps one offset for all rows.
+
+  A `Range` from 0 to a shift of L, with a step without L, gives the positions of all keys of a step, as the relative positions of T5. With a buffer, its index is the row of the buffer, and the new rows come after the C rows of the buffer. So the rewrite keeps the `Range` and maps each of its values to a position through the key mask: the cumulative count of the valid rows, minus 1, and the offset after the last key. With an offset for each row, the count runs over the key mask of each row, so the positions have the shape `{batch, keys}`, and a gap row does not move them. With one offset for all rows, the rows of a step have no gap rows, and the count runs over the union of the rows of the step: a row that has ended has a prefix of the valid rows of the active rows, so the union is the mask of the active rows. A valid row gets its position and a new row v + i. The `Range` keeps its start, limit and step, so its output keeps its length. The walk follows these positions through moves, arithmetic and comparisons with values without L, float casts and reads of static tables, such as the bucket table of T5. A use that mixes them with other values of L, such as the causal mask of moonshine, which compares the key index with the positions of L, keeps that range as an index of the buffer, and the walk runs again (at most once for each range).
 
   A `Mul` of a shift of L by a value without L also makes positions, as the positions of M2M100 and NLLB, (cumsum(mask) + L) * mask + padding_idx. The offset goes on its shift input, so a real token gets v + cumsum and a padding token keeps padding_idx, and the walk follows the result as positions. A position is a position only in position uses: arithmetic and comparisons with values without L, float casts, and reads of static tables. A use as a size or a bound (the shape of a Reshape, Expand or Tile, a Slice start or end, a Range or ConstantOfShape input) or as an index into a tensor that is not a static table needs the index of the buffer, so it sends the range or the `Mul` back to the index space, and the walk runs again.
   """
@@ -121,7 +123,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   end
 
   # The edits of lift/4 when no read needs them.
-  @no_lift %{edits: %{}, static: %{}, rows: MapSet.new()}
+  @no_lift %{edits: %{}, static: %{}, rows: MapSet.new(), ranks: %{}}
 
   # The offset is one value for each row, of shape {batch, 1}, when the rows of a step can have
   # different valid rows: the value that takes the offset at each read has the batch on axis 0
@@ -153,7 +155,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     case reason do
       nil ->
-        {nil, ranks, lift}
+        {nil, Map.merge(ranks, lift.ranks), lift}
 
       {what, node} ->
         reason =
@@ -189,15 +191,16 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp lift(_model, _graph, _scope, []), do: @no_lift
 
   defp lift(model, graph, scope, reads) do
-    dims = position_dims(graph, scope)
+    dims = position_dims(graph, scope, model.input_types)
     sources = Enum.map(reads, &read_node/1)
+    takes = Map.new(sources, &{&1, offset_value(&1, dims)})
 
-    if Enum.all?(sources, &(&1.op_type in ["Range", "Cast", "Gather"] and dims[hd(&1.output)])) do
+    if Enum.all?(sources, &(match?([_ | _], takes[&1]) and is_list(dims[hd(&1.output)]))) do
       lifted = Map.new(sources, &{hd(&1.output), dims[hd(&1.output)]})
       tokens = token_values(graph)
       masks = mask_values(graph)
 
-      walk = %{scope: scope, tokens: tokens, masks: masks, sources: sources}
+      walk = %{scope: scope, tokens: tokens, masks: masks, sources: sources, dims: dims}
 
       graph.node
       |> Enum.reduce_while({lifted, @no_lift}, &lift_step(&1, &2, walk))
@@ -211,27 +214,51 @@ defmodule Transmuter.Generation.MergedDecoder do
                &Map.has_key?(lifted, &1)
              ),
              do: {:bail, hd(sources)},
-             else: %{acc | rows: MapSet.new(for(%{op_type: "Range"} = n <- sources, do: n))}
+             else: %{
+               acc
+               | rows: MapSet.new(for(%{op_type: "Range"} = n <- sources, do: n)),
+                 ranks: Map.new(takes, fn {source, d} -> {source, length(d) + 1} end)
+             }
       end
     else
-      {:bail, Enum.find(sources, &(not Map.has_key?(dims, hd(&1.output)))) || hd(sources)}
+      {:bail, Enum.find(sources, &(not match?([_ | _], takes[&1]))) || hd(sources)}
     end
   end
 
-  # One node of the walk of lift/4: a node without lifted inputs, or a source, stays.
-  defp lift_step(node, {lifted, acc}, walk) do
-    if node in walk.sources or not Enum.any?(node.input, &Map.has_key?(lifted, &1)) do
-      {:cont, {lifted, acc}}
-    else
-      case lift_node(node, lifted, walk) do
-        {:ok, outputs, nodes, static} ->
-          edits = Map.put(acc.edits, node, nodes)
-          acc = %{acc | edits: edits, static: Map.merge(acc.static, static)}
-          {:cont, {Map.merge(lifted, outputs), acc}}
+  # The dims of the value that takes the offset of a read: the positions of a Range (see
+  # row_positions/2), the input of a float cast or the index of a Gather. The offset takes one
+  # more axis than this value, {batch, 1, ..., 1}, so the batch is a new axis 0 for each rank.
+  defp offset_value(%{op_type: "Range", output: [out]}, dims), do: dims[out]
+  defp offset_value(%{op_type: "Cast", input: [value]}, dims), do: dims[value]
+  defp offset_value(%{op_type: "Gather", input: [_table, index]}, dims), do: dims[index]
+  defp offset_value(_read, _dims), do: nil
 
-        :bail ->
-          {:halt, {:bail, node}}
-      end
+  # One node of the walk of lift/4: a node without lifted inputs, or a source, stays. A node
+  # that reads a lifted value from a subgraph, such as the branch of an If, stops the walk.
+  defp lift_step(node, {lifted, acc}, walk) do
+    reads = Enum.filter(Transmuter.dependencies(node), &Map.has_key?(lifted, &1))
+
+    cond do
+      node in walk.sources or reads == [] ->
+        {:cont, {lifted, acc}}
+
+      reads -- node.input != [] ->
+        {:halt, {:bail, node}}
+
+      true ->
+        lift_read(node, lifted, acc, walk)
+    end
+  end
+
+  defp lift_read(node, lifted, acc, walk) do
+    case lift_node(node, lifted, walk) do
+      {:ok, outputs, nodes, static} ->
+        edits = Map.put(acc.edits, node, nodes)
+        acc = %{acc | edits: edits, static: Map.merge(acc.static, static)}
+        {:cont, {Map.merge(lifted, outputs), acc}}
+
+      :bail ->
+        {:halt, {:bail, node}}
     end
   end
 
@@ -239,7 +266,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   # and Identity.
   defp mask_values(graph) do
     uses = fn value ->
-      for node <- graph.node, {^value, i} <- Enum.with_index(node.input), do: {node, i}
+      for node <- graph.node,
+          value in Transmuter.dependencies(node),
+          do: {node, Enum.find_index(node.input, &(&1 == value))}
     end
 
     graph.node
@@ -369,7 +398,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     if d && values && not Enum.any?([starts, ends, axes | rest], &Map.has_key?(lifted, &1)) do
       shifted = Enum.map(values, &if(&1 >= 0, do: &1 + 1, else: &1))
-      name = @position_offset <> ".lift." <> node.name <> ".axes"
+      name = @position_offset <> ".lift." <> hd(node.output) <> ".axes"
       static = %{name => Nx.tensor(shifted, type: :s64, backend: Nx.BinaryBackend)}
       node = %{node | input: [data, starts, ends, name | rest]}
       dims = slice_dims(d, values)
@@ -394,7 +423,10 @@ defmodule Transmuter.Generation.MergedDecoder do
     squeeze? = match?([1 | _], d)
     rank = if squeeze?, do: length(d), else: length(d) + 1
 
-    tokens? = Enum.any?(others, &MapSet.member?(walk.tokens, &1))
+    tokens? =
+      Enum.any?(others, &MapSet.member?(walk.tokens, &1)) and
+        Enum.all?(others, &(is_list(walk.dims[&1]) and length(walk.dims[&1]) == rank))
+
     mask? = MapSet.member?(walk.masks, hd(node.output)) and rank == 4
 
     cond do
@@ -402,8 +434,8 @@ defmodule Transmuter.Generation.MergedDecoder do
         :bail
 
       squeeze? ->
-        squeezed = @position_offset <> ".lift." <> node.name <> ".squeezed"
-        axes = @position_offset <> ".lift." <> node.name <> ".axes"
+        squeezed = @position_offset <> ".lift." <> hd(node.output) <> ".squeezed"
+        axes = @position_offset <> ".lift." <> hd(node.output) <> ".axes"
 
         squeeze = %NodeProto{
           op_type: "Squeeze",
@@ -424,9 +456,14 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   # The dims of the values of positions, from the Range nodes and the static values: 1 for an
   # axis of size 1, :x for another axis. A Shape gives {:shape, dims}, which only a
-  # ConstantOfShape reads. Values from the inputs of the graph have no dims.
-  defp position_dims(graph, scope) do
-    Enum.reduce(graph.node, %{}, fn node, dims ->
+  # ConstantOfShape reads. The inputs of the graph take the dims of their declared shapes.
+  defp position_dims(graph, scope, input_types) do
+    inputs =
+      Map.new(input_types, fn {name, {_type, shape}} ->
+        {name, Enum.map(shape, &if(&1 == 1, do: 1, else: :x))}
+      end)
+
+    Enum.reduce(graph.node, inputs, fn node, dims ->
       get = fn name ->
         case dims[name] do
           nil -> static_dims(scope, name)
@@ -547,7 +584,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   # The node with new axes: a new static value for an axes input, so a constant that other
   # nodes share keeps its value, or a new attribute.
   defp with_axes(node = %{input: [data, axes]}, values) when axes != "" do
-    name = @position_offset <> ".lift." <> node.name <> ".axes"
+    name = @position_offset <> ".lift." <> hd(node.output) <> ".axes"
 
     {%{node | input: [data, name]},
      %{name => Nx.tensor(values, type: :s64, backend: Nx.BinaryBackend)}}
@@ -1516,9 +1553,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     ]
   end
 
-  # Each value of the Range is a row of the buffer and the new rows, which maps to its position
-  # through the key mask: the cumulative count of the valid rows, minus 1, over the union of
-  # the rows. A row that has ended has a prefix of the valid rows of the active rows, so the
+  # With one offset for all rows, each value of the Range is a row of the buffer and the new
+  # rows, which maps to its position through the key mask: the cumulative count of the valid
+  # rows, minus 1, over the union of the rows (see row_positions/2 for an offset for each row). A row that has ended has a prefix of the valid rows of the active rows, so the
   # union is the mask of the active rows, and a free row gets a position that the key mask
   # hides. An index after the last key continues from the last new row with the offset. The
   # Range keeps its start, limit and step, so the output keeps its length.
