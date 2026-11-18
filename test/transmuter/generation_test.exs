@@ -2126,98 +2126,180 @@ defmodule Transmuter.GenerationBitsTest do
 
   # A decoder in the form of the Apertus export: GroupQueryAttention counts its rows from the
   # length of the mask, and the positions come from the length of the past, Range(L, L + n),
-  # cast to a float for a sinusoid that the embeddings add. MergedDecoder gives the cast the
-  # position offset, so the decoder runs in :in_place. The cast of the [n] positions takes the
-  # offset {batch, 1}, which gives them the batch as a new axis 0, and the Unsqueeze and the
-  # sinusoid after it take that axis until the sum with the embeddings. In the export, the
-  # cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset is {batch, 1, 1}
-  # there. When the cast reads [n, 1] positions, the offset is {batch, 1, 1}, one axis more
-  # than the positions, so the batch is a new axis 0 for each rank. In all three, the rows of
-  # the prompts join one group, and one step of 2 tokens for 2 rows gives the logits of each
-  # row alone (see assert_step_alone/1). The prompt of 20 tokens and its 16 new tokens grow the
-  # buffers from 32 to 64 rows. A Reshape to a static shape after the cast stops the lift, so
-  # that decoder keeps a cache of exact length (:grow), and the prompts of each length run in
-  # a group of their own. In a batch, each row gives the greedy tokens of the same decoder
-  # without a cache, computed with Nx, and log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
-  # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
-  # reads a slice of the shape of the past keeps the decoder in :grow. When the positions read
-  # such a slice, the first step of :grow sees a past of 0 rows from the attention mask, not
-  # the placeholder row of the cache, and the rows give the same tokens. A Concat of the cache
-  # would read that placeholder row as a valid row, so its context raises. A decoder whose
-  # GroupQueryAttention counts its rows from the values of the mask also keeps a cache of
-  # exact length when its positions cannot take an offset for each row.
-  test "a decoder without an If takes positions from the length of its past with the offset" do
-    node = &%NodeProto{op_type: &1, name: hd(&3), input: &2, output: &3}
-    int = &%AttributeProto{name: &1, type: :INT, i: &2}
-    host = &Nx.tensor(&1, backend: Nx.BinaryBackend)
-    weight = &(Nx.iota(&1, type: :f32, backend: Nx.BinaryBackend) |> Nx.multiply(&2) |> Nx.sin())
-    past = ["past_key_values.0.key", "past_key_values.0.value"]
+  # cast to a float for a sinusoid that the embeddings add. In a batch of 3 prompts of 5, 12
+  # and 20 tokens, each row gives the greedy tokens of the same decoder without a cache,
+  # computed with Nx, and log-probabilities within 1e-4. The prompt of 20 tokens and its 16 new
+  # tokens grow the buffers from 32 to 64 rows. The forms:
+  #
+  #   * rank_1 - the cast of the [n] positions takes the offset {batch, 1}, which gives them the
+  #     batch as a new axis 0, and the Unsqueeze and the sinusoid after it take that axis until
+  #     the sum with the embeddings, so the decoder runs in :in_place.
+  #   * export - the cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset is
+  #     {batch, 1, 1}.
+  #   * column - the cast reads [n, 1] positions, so the offset is {batch, 1, 1}, one axis more
+  #     than the positions, and the batch is a new axis 0 for each rank.
+  #   * reshaped - a Reshape to a static shape after the cast stops the lift, so the decoder
+  #     keeps a cache of exact length (:grow).
+  #   * sliced - the length of the past comes from a Shape with start 2, which the rewrite does
+  #     not follow, so the decoder runs in :grow. Its first step sees a past of 0 rows from the
+  #     attention mask, not the placeholder row of the cache (see MergedDecoder.past_length/1).
+  #   * unknown - the tokens have no declared shape and another input is not a tensor, so the
+  #     positions have no dims, the lift stops at the sum with the embeddings, and the decoder
+  #     runs in :grow.
+  #   * summed_reshaped and summed_sliced - the reshaped and sliced forms with a
+  #     GroupQueryAttention that counts its rows from the values of the mask, which still run in
+  #     :grow.
+  #
+  # In :in_place, the rows of the prompts join one group, and one step of 2 tokens for 2 rows
+  # gives the logits of each row alone (see assert_step_alone/1). In :grow, the prompts of
+  # each length run in a group of their own.
+  for {form, mode} <- [
+        rank_1: :in_place,
+        export: :in_place,
+        column: :in_place,
+        reshaped: :grow,
+        sliced: :grow,
+        unknown: :grow,
+        summed_reshaped: :grow,
+        summed_sliced: :grow
+      ] do
+    test "a decoder without an If takes positions from the length of its past, #{form} form" do
+      assert_apertus_form(unquote(form), unquote(mode))
+    end
+  end
 
-    params = %{
+  # The output of the attention has the shape of its queries, so a Slice whose end comes from
+  # that shape, as the halves of the heads of Apertus, does not read the past. A node that reads
+  # a slice of the shape of the past keeps the decoder in :grow. A Concat of the cache would read
+  # the placeholder row of :grow as a valid row, so its context raises and names the node.
+  test "a decoder without an If that reads its cache keeps :grow or raises at the load" do
+    model = apertus_form(:rank_1)
+    reads = %{gnode("Shape", ["past_key_values.0.key"], ["reads"]) | attribute: [int("start", 2)]}
+    grow = %{model | nodes: model.nodes ++ [reads]}
+
+    assert capture_log([level: :debug], fn -> assert apertus_context(grow).mode == :grow end) =~
+             "because Shape reads reads the cache or its length"
+
+    sliced = apertus_form(:sliced)
+    past = "past_key_values.0.key"
+    concat = %{gnode("Concat", [past, past], ["doubled"]) | attribute: [int("axis", 2)]}
+    doubled = %{sliced | nodes: sliced.nodes ++ [concat], outputs: sliced.outputs ++ ["doubled"]}
+
+    assert_raise ArgumentError, ~r/because Concat doubled reads the values of the cache/, fn ->
+      apertus_context(doubled)
+    end
+  end
+
+  defp assert_apertus_form(form, mode) do
+    ctx = apertus_context(apertus_form(form))
+    assert ctx.mode == mode
+    refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
+    assert Generation.joins?(ctx) == (mode == :in_place)
+
+    if mode == :in_place do
+      offset = ctx.model.input_types[Generation.MergedDecoder.position_offset()]
+      assert offset == {:s64, ["batch_size", 1]}
+      assert_step_alone(ctx.model)
+    end
+
+    prompts =
+      for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
+
+    ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
+    rows = Generation.generate(ctx, prompts, [0, 0, 0])
+
+    for {row, prompt} <- Enum.zip(rows, prompts) do
+      expected = apertus_greedy(prompt)
+      assert Enum.map(row, &hd/1) == Enum.map(expected, &hd/1)
+      diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+      assert diff < 1.0e-4, "#{diff}"
+    end
+  end
+
+  defp apertus_context(model) do
+    repo = %{generation_config: %{}, config: %{"eos_token_id" => -1, "vocab_size" => 50}}
+    Generation.context(repo, model, max_new_tokens: 16, token_logprobs: true)
+  end
+
+  defp gnode(op, inputs, outputs),
+    do: %NodeProto{op_type: op, name: hd(outputs), input: inputs, output: outputs}
+
+  defp int(name, value), do: %AttributeProto{name: name, type: :INT, i: value}
+
+  defp host(value), do: Nx.tensor(value, backend: Nx.BinaryBackend)
+
+  defp apertus_params do
+    weight = &(Nx.iota(&1, type: :f32, backend: Nx.BinaryBackend) |> Nx.multiply(&2) |> Nx.sin())
+    freq = host([[1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015, 0.008]])
+
+    %{
       "embed" => weight.({50, 8}, 0.7),
       "wq" => weight.({8, 8}, 1.3),
       "wk" => weight.({8, 4}, 2.1),
       "wv" => weight.({8, 4}, 0.9),
       "wo" => weight.({8, 50}, 1.7),
-      "freq" => host.([[1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015, 0.008]])
+      "freq" => freq,
+      "freq_column" => Nx.reshape(freq, {1, 8, 1})
     }
+  end
 
-    params = Map.put(params, "freq_column", Nx.reshape(params["freq"], {1, 8, 1}))
+  defp apertus_form(:rank_1) do
+    past = ["past_key_values.0.key", "past_key_values.0.value"]
 
     attention = %{
-      node.("GroupQueryAttention", ~w(q k v) ++ past ++ ~w(seqlens_k total_length), [
+      gnode("GroupQueryAttention", ~w(q k v) ++ past ++ ~w(seqlens_k total_length), [
         "attended",
         "present.0.key",
         "present.0.value"
       ])
-      | attribute: [int.("num_heads", 2), int.("kv_num_heads", 1)]
+      | attribute: [int("num_heads", 2), int("kv_num_heads", 1)]
     }
 
     nodes = [
-      node.("Gather", ["embed", "input_ids"], ["hidden"]),
-      node.("Shape", [hd(past)], ["past_shape"]),
-      node.("Gather", ["past_shape", "two"], ["past"]),
-      node.("Shape", ["input_ids"], ["ids_shape"]),
-      node.("Gather", ["ids_shape", "one"], ["new"]),
-      node.("Gather", ["ids_shape", "zero"], ["batch"]),
-      node.("Add", ["past", "new"], ["end"]),
-      node.("Range", ["past", "end", "one"], ["positions"]),
-      %{node.("Cast", ["positions"], ["float_positions"]) | attribute: [int.("to", 1)]},
-      node.("Unsqueeze", ["float_positions", "axis_1"], ["column"]),
-      node.("Mul", ["column", "freq"], ["angles"]),
-      node.("Sin", ["angles"], ["wave"]),
-      node.("Add", ["hidden", "wave"], ["input"]),
-      node.("MatMul", ["input", "wq"], ["q"]),
-      node.("MatMul", ["input", "wk"], ["k"]),
-      node.("MatMul", ["input", "wv"], ["v"]),
-      node.("Shape", ["attention_mask"], ["mask_shape"]),
-      node.("Gather", ["mask_shape", "one"], ["total"]),
-      node.("Sub", ["total", "one"], ["last"]),
-      node.("Unsqueeze", ["last", "axis_0"], ["last_row"]),
-      node.("Unsqueeze", ["batch", "axis_0"], ["batch_shape"]),
-      node.("Expand", ["last_row", "batch_shape"], ["seqlens"]),
-      %{node.("Cast", ["seqlens"], ["seqlens_k"]) | attribute: [int.("to", 6)]},
-      %{node.("Cast", ["total"], ["total_length"]) | attribute: [int.("to", 6)]},
+      gnode("Gather", ["embed", "input_ids"], ["hidden"]),
+      gnode("Shape", [hd(past)], ["past_shape"]),
+      gnode("Gather", ["past_shape", "two"], ["past"]),
+      gnode("Shape", ["input_ids"], ["ids_shape"]),
+      gnode("Gather", ["ids_shape", "one"], ["new"]),
+      gnode("Gather", ["ids_shape", "zero"], ["batch"]),
+      gnode("Add", ["past", "new"], ["end"]),
+      gnode("Range", ["past", "end", "one"], ["positions"]),
+      %{gnode("Cast", ["positions"], ["float_positions"]) | attribute: [int("to", 1)]},
+      gnode("Unsqueeze", ["float_positions", "axis_1"], ["column"]),
+      gnode("Mul", ["column", "freq"], ["angles"]),
+      gnode("Sin", ["angles"], ["wave"]),
+      gnode("Add", ["hidden", "wave"], ["input"]),
+      gnode("MatMul", ["input", "wq"], ["q"]),
+      gnode("MatMul", ["input", "wk"], ["k"]),
+      gnode("MatMul", ["input", "wv"], ["v"]),
+      gnode("Shape", ["attention_mask"], ["mask_shape"]),
+      gnode("Gather", ["mask_shape", "one"], ["total"]),
+      gnode("Sub", ["total", "one"], ["last"]),
+      gnode("Unsqueeze", ["last", "axis_0"], ["last_row"]),
+      gnode("Unsqueeze", ["batch", "axis_0"], ["batch_shape"]),
+      gnode("Expand", ["last_row", "batch_shape"], ["seqlens"]),
+      %{gnode("Cast", ["seqlens"], ["seqlens_k"]) | attribute: [int("to", 6)]},
+      %{gnode("Cast", ["total"], ["total_length"]) | attribute: [int("to", 6)]},
       attention,
-      node.("Shape", ["attended"], ["attended_shape"]),
-      node.("Gather", ["attended_shape", "two"], ["width"]),
-      node.("Unsqueeze", ["width", "axis_0"], ["width_end"]),
-      node.("Slice", ["attended", "axis_0", "width_end", "axis_2"], ["kept"]),
-      node.("MatMul", ["kept", "wo"], ["logits"])
+      gnode("Shape", ["attended"], ["attended_shape"]),
+      gnode("Gather", ["attended_shape", "two"], ["width"]),
+      gnode("Unsqueeze", ["width", "axis_0"], ["width_end"]),
+      gnode("Slice", ["attended", "axis_0", "width_end", "axis_2"], ["kept"]),
+      gnode("MatMul", ["kept", "wo"], ["logits"])
     ]
 
     cache_type = {:f32, ["batch", 1, "past", 4]}
 
-    model = %{
+    %{
       nodes: nodes,
-      params: params,
+      params: apertus_params(),
       static: %{
-        "zero" => host.(0),
-        "one" => host.(1),
-        "two" => host.(2),
-        "axis_0" => host.([0]),
-        "axis_1" => host.([1]),
-        "axis_2" => host.([2])
+        "zero" => host(0),
+        "one" => host(1),
+        "two" => host(2),
+        "axis_0" => host([0]),
+        "axis_1" => host([1]),
+        "axis_2" => host([2])
       },
       inputs: ["input_ids", "attention_mask"] ++ past,
       input_types:
@@ -2230,15 +2312,106 @@ defmodule Transmuter.GenerationBitsTest do
       backend: nil,
       compute_type: nil
     }
+  end
 
-    # The same decoder over all tokens of a row, without a cache.
+  # The positions of the export: an Unsqueeze on axis 0 gives [1, n], an Unsqueeze on axis 1
+  # gives [1, 1, n], and a MatMul with the frequencies [1, 8, 1] gives the angles.
+  defp apertus_form(:export) do
+    rotary = [
+      gnode("Unsqueeze", ["positions", "axis_0"], ["position_ids"]),
+      gnode("Unsqueeze", ["position_ids", "axis_1"], ["position_column"]),
+      %{gnode("Cast", ["position_column"], ["float_positions"]) | attribute: [int("to", 1)]},
+      gnode("MatMul", ["freq_column", "float_positions"], ["frequencies"]),
+      %{
+        gnode("Transpose", ["frequencies"], ["angles"])
+        | attribute: [%AttributeProto{name: "perm", type: :INTS, ints: [0, 2, 1]}]
+      },
+      gnode("Sin", ["angles"], ["wave"])
+    ]
+
+    replace_nodes(apertus_form(:rank_1), fn
+      %{name: "float_positions"} -> rotary
+      %{name: name} when name in ["column", "angles", "wave"] -> []
+      other -> [other]
+    end)
+  end
+
+  # The cast after the Unsqueeze on axis 1, so the value that takes the offset is [n, 1].
+  defp apertus_form(:column) do
+    replace_nodes(apertus_form(:rank_1), fn
+      %{name: "float_positions"} ->
+        [
+          gnode("Unsqueeze", ["positions", "axis_1"], ["position_column"]),
+          %{gnode("Cast", ["position_column"], ["column"]) | attribute: [int("to", 1)]}
+        ]
+
+      %{name: "column"} ->
+        []
+
+      other ->
+        [other]
+    end)
+  end
+
+  # A Reshape to a static shape in place of the Unsqueeze on axis 1.
+  defp apertus_form(:reshaped) do
+    model =
+      replace_nodes(apertus_form(:rank_1), fn
+        %{name: "column"} -> [gnode("Reshape", ["float_positions", "column_shape"], ["column"])]
+        other -> [other]
+      end)
+
+    %{model | static: Map.put(model.static, "column_shape", host([-1, 1]))}
+  end
+
+  # The length of the past from a Shape with start 2.
+  defp apertus_form(:sliced) do
+    replace_nodes(apertus_form(:rank_1), fn
+      %{name: "past_shape"} = shape -> [%{shape | attribute: [int("start", 2)]}]
+      %{name: "past"} -> [gnode("Gather", ["past_shape", "zero"], ["past"])]
+      other -> [other]
+    end)
+  end
+
+  defp apertus_form(:unknown) do
+    model = apertus_form(:rank_1)
+    types = model.input_types |> Map.put("input_ids", {:s64, []}) |> Map.put("sequence", nil)
+    %{model | input_types: types}
+  end
+
+  # GroupQueryAttention that counts its rows from ReduceSum(attention_mask) - 1.
+  defp apertus_form(summed) when summed in [:summed_reshaped, :summed_sliced] do
+    form = if summed == :summed_reshaped, do: :reshaped, else: :sliced
+
+    replace_nodes(apertus_form(form), fn
+      %{name: "seqlens"} ->
+        [
+          %{
+            gnode("ReduceSum", ["attention_mask", "axis_1"], ["mask_rows"])
+            | attribute: [int("keepdims", 0)]
+          },
+          gnode("Sub", ["mask_rows", "one"], ["seqlens"])
+        ]
+
+      other ->
+        [other]
+    end)
+  end
+
+  defp replace_nodes(model, fun), do: %{model | nodes: Enum.flat_map(model.nodes, fun)}
+
+  # The greedy tokens and log-probabilities of 16 steps of the decoder over all tokens of a
+  # row, without a cache.
+  defp apertus_greedy(prompt) do
+    params = apertus_params()
+
     exact = fn tokens ->
       count = length(tokens)
       positions = Nx.iota({count, 1}, type: :f32, backend: Nx.BinaryBackend)
 
       input =
         Nx.add(
-          Nx.take(params["embed"], host.(tokens)),
+          Nx.take(params["embed"], host(tokens)),
           Nx.sin(Nx.multiply(positions, params["freq"]))
         )
 
@@ -2263,177 +2436,16 @@ defmodule Transmuter.GenerationBitsTest do
       Nx.dot(Nx.concatenate(heads, axis: 1), params["wo"])[-1]
     end
 
-    greedy = fn prompt ->
-      {_tokens, row} =
-        Enum.reduce(1..16, {prompt, []}, fn _step, {tokens, row} ->
-          logits = exact.(tokens)
-          token = logits |> Nx.argmax() |> Nx.to_number()
-          shifted = Nx.subtract(logits, Nx.reduce_max(logits))
-          logprob = Nx.to_number(Nx.subtract(shifted[token], Nx.log(Nx.sum(Nx.exp(shifted)))))
-          {tokens ++ [token], row ++ [[token, logprob]]}
-        end)
+    {_tokens, row} =
+      Enum.reduce(1..16, {prompt, []}, fn _step, {tokens, row} ->
+        logits = exact.(tokens)
+        token = logits |> Nx.argmax() |> Nx.to_number()
+        shifted = Nx.subtract(logits, Nx.reduce_max(logits))
+        logprob = Nx.to_number(Nx.subtract(shifted[token], Nx.log(Nx.sum(Nx.exp(shifted)))))
+        {tokens ++ [token], row ++ [[token, logprob]]}
+      end)
 
-      row
-    end
-
-    repo = %{generation_config: %{}, config: %{"eos_token_id" => -1, "vocab_size" => 50}}
-    context = &Generation.context(repo, &1, max_new_tokens: 16, token_logprobs: true)
-    start = int.("start", 2)
-
-    grow = %{
-      model
-      | nodes: nodes ++ [%{node.("Shape", [hd(past)], ["reads"]) | attribute: [start]}]
-    }
-
-    assert capture_log([level: :debug], fn -> assert context.(grow).mode == :grow end) =~
-             "because Shape reads reads the cache or its length"
-
-    # The positions of the export: an Unsqueeze on axis 0 gives [1, n], an Unsqueeze on axis 1
-    # gives [1, 1, n], and a MatMul with the frequencies [1, 8, 1] gives the angles.
-    rotary = [
-      node.("Unsqueeze", ["positions", "axis_0"], ["position_ids"]),
-      node.("Unsqueeze", ["position_ids", "axis_1"], ["position_column"]),
-      %{node.("Cast", ["position_column"], ["float_positions"]) | attribute: [int.("to", 1)]},
-      node.("MatMul", ["freq_column", "float_positions"], ["frequencies"]),
-      %{
-        node.("Transpose", ["frequencies"], ["angles"])
-        | attribute: [%AttributeProto{name: "perm", type: :INTS, ints: [0, 2, 1]}]
-      },
-      node.("Sin", ["angles"], ["wave"])
-    ]
-
-    export = %{
-      model
-      | nodes:
-          Enum.flat_map(nodes, fn
-            %{name: "float_positions"} -> rotary
-            %{name: name} when name in ["column", "angles", "wave"] -> []
-            other -> [other]
-          end)
-    }
-
-    # The cast after the Unsqueeze on axis 1, so the value that takes the offset is [n, 1].
-    column = %{
-      model
-      | nodes:
-          Enum.flat_map(nodes, fn
-            %{name: "float_positions"} ->
-              [
-                node.("Unsqueeze", ["positions", "axis_1"], ["position_column"]),
-                %{node.("Cast", ["position_column"], ["column"]) | attribute: [int.("to", 1)]}
-              ]
-
-            %{name: "column"} ->
-              []
-
-            other ->
-              [other]
-          end)
-    }
-
-    # A Reshape to a static shape in place of the Unsqueeze on axis 1, which the lift of the
-    # positions does not follow.
-    reshaped = %{
-      model
-      | nodes:
-          Enum.map(nodes, fn
-            %{name: "column"} -> node.("Reshape", ["float_positions", "column_shape"], ["column"])
-            other -> other
-          end),
-        static: Map.put(model.static, "column_shape", host.([-1, 1]))
-    }
-
-    # The length of the past from a Shape with start 2, which the rewrite does not follow, so
-    # the decoder keeps a cache of exact length (:grow). That cache starts with a placeholder
-    # row, and the length of the past comes from the attention mask (see
-    # MergedDecoder.past_length/1), so the first step sees a past of 0 rows.
-    sliced = %{
-      model
-      | nodes:
-          Enum.map(nodes, fn
-            %{name: "past_shape"} = shape -> %{shape | attribute: [int.("start", 2)]}
-            %{name: "past"} -> node.("Gather", ["past_shape", "zero"], ["past"])
-            other -> other
-          end)
-    }
-
-    # A node that reads the values of the cache, other than GroupQueryAttention, would read the
-    # placeholder row of :grow as a valid row, so the context raises and names it.
-    doubled = %{
-      sliced
-      | nodes:
-          sliced.nodes ++
-            [%{node.("Concat", [hd(past), hd(past)], ["doubled"]) | attribute: [int.("axis", 2)]}],
-        outputs: sliced.outputs ++ ["doubled"]
-    }
-
-    assert_raise ArgumentError, ~r/because Concat doubled reads the values of the cache/, fn ->
-      context.(doubled)
-    end
-
-    prompts =
-      for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
-
-    # GroupQueryAttention that counts its rows from the values of the mask. A decoder whose
-    # positions cannot take an offset for each row still keeps a cache of exact length.
-    summed = fn model ->
-      nodes =
-        Enum.flat_map(model.nodes, fn
-          %{name: "seqlens"} ->
-            [
-              %{
-                node.("ReduceSum", ["attention_mask", "axis_1"], ["mask_rows"])
-                | attribute: [int.("keepdims", 0)]
-              },
-              node.("Sub", ["mask_rows", "one"], ["seqlens"])
-            ]
-
-          other ->
-            [other]
-        end)
-
-      %{model | nodes: nodes}
-    end
-
-    # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
-    # the lift of the [n] form stops at the sum with the embeddings, without an error, and the
-    # decoder keeps a cache of exact length.
-    types = model.input_types |> Map.put("input_ids", {:s64, []}) |> Map.put("sequence", nil)
-    unknown = %{model | input_types: types}
-
-    forms = [
-      {model, :in_place},
-      {export, :in_place},
-      {column, :in_place},
-      {reshaped, :grow},
-      {sliced, :grow},
-      {unknown, :grow},
-      {summed.(reshaped), :grow},
-      {summed.(sliced), :grow}
-    ]
-
-    for {model, mode} <- forms do
-      ctx = context.(model)
-      assert ctx.mode == mode
-      refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
-      assert Generation.joins?(ctx) == (mode == :in_place)
-
-      if mode == :in_place do
-        offset = ctx.model.input_types[Generation.MergedDecoder.position_offset()]
-        assert offset == {:s64, ["batch_size", 1]}
-        assert_step_alone(ctx.model)
-      end
-
-      ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
-      rows = Generation.generate(ctx, prompts, [0, 0, 0])
-
-      for {row, prompt} <- Enum.zip(rows, prompts) do
-        expected = greedy.(prompt)
-        assert Enum.map(row, &hd/1) == Enum.map(expected, &hd/1)
-        diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
-        assert diff < 1.0e-4, "#{diff}"
-      end
-    end
+    row
   end
 
   # One step of 2 tokens for 2 rows with 0 and 3 rows of cache in a buffer of 8 rows gives the
