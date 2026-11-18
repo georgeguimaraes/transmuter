@@ -241,9 +241,7 @@ defmodule Transmuter.ContinuousBatchingTest do
           {source, [model: merged],
            ~r/cannot join a running batch .* one length of the cache: .*, because \w+ \S+ reads/},
           {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, [num_beams: 2],
-           ~r/cannot join a running batch of this model: it has num_beams 2/},
-          {{:hf, "Xenova/t5-small"}, [task: Text.TextToText, num_beams: 1],
-           ~r/cannot join a running batch .* one length of the cache: .*Range/}
+           ~r/cannot join a running batch of this model: it has num_beams 2/}
         ] do
       assert_raise ArgumentError, message, fn ->
         ContinuousBatching.start_link([source: source] ++ opts ++ @opts)
@@ -596,6 +594,38 @@ defmodule Transmuter.ContinuousBatchingTest do
     {results, steps} = step_events(server, fn -> ContinuousBatching.run(server, texts) end)
 
     assert Enum.map(results, &hd(&1.results).text) == alone
+    assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) >= 2
+  end
+
+  # The relative bias of T5 reads the positions of all keys, which take a position offset for
+  # each row. A server of 2 rows gets 4 texts at once, so the later texts join a running row,
+  # and the rows of a step have gap rows. Each text gives the translation and the
+  # log-probabilities (within 1e-4) that it gives alone. The bias has the square of the rows of
+  # the buffer for each row, so the server has a capacity of 256 rows.
+  test "requests of T5 that join a running row give the result that they give alone" do
+    source = {:hf, "Xenova/t5-small"}
+    opts = [strategy: :greedy, num_beams: 1, max_new_tokens: 32, token_logprobs: true] ++ @opts
+
+    texts = [
+      "translate English to German: The house is wonderful.",
+      "translate English to German: " <> @fox,
+      "translate English to German: My brother reads a book every evening.",
+      "translate English to French: The weather is cold today, so we stay at home."
+    ]
+
+    single = Text.text_to_text(source, opts)
+    alone = for text <- texts, do: hd(Nx.Serving.run(single, text).results)
+
+    spec = [source: source, task: Text.TextToText, slots: 2, capacity: 256] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
+
+    {results, steps} = step_events(server, fn -> ContinuousBatching.run(server, texts) end)
+
+    for {%{results: [result]}, expected} <- Enum.zip(results, alone) do
+      assert result.text == expected.text
+      assert_all_close(result.token_logprobs, expected.token_logprobs)
+    end
+
     assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) >= 2
   end
 

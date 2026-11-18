@@ -42,11 +42,12 @@ defmodule Transmuter.Generation.MergedDecoder do
          {branch, graph} <- cache_graph(model),
          {:ok, cores} <- buffer_cores(model, graph),
          {:ok, [_ | _] = reads, limit, kinds} <- past_uses(model, graph) do
-      {one_offset, ranks} = one_offset(model, graph, reads)
+      {one_offset, ranks, lift} = one_offset(model, graph, reads)
       per_row? = one_offset == nil
+      entries = Map.new(reads ++ cores, &read_entry/1)
 
       model
-      |> offset_reads(branch, graph, Map.new(reads ++ cores, &read_entry/1), per_row?, ranks)
+      |> offset_reads(branch, graph, entries, per_row?, ranks, lift)
       |> Map.put(:max_capacity, limit && limit - 1)
       |> Map.put(:per_row_offset, per_row?)
       |> Map.put(:one_length, one_offset)
@@ -119,6 +120,9 @@ defmodule Transmuter.Generation.MergedDecoder do
     end)
   end
 
+  # The edits of lift/4 when no read needs them.
+  @no_lift %{edits: %{}, static: %{}, rows: MapSet.new()}
+
   # The offset is one value for each row, of shape {batch, 1}, when the rows of a step can have
   # different valid rows: the value that takes the offset at each read has the batch on axis 0
   # (see batch_rank/3) or meets the tokens, no later Reshape or Expand has a static first
@@ -133,11 +137,12 @@ defmodule Transmuter.Generation.MergedDecoder do
       for read <- reads, rank = batch_rank(read, producers, scope), into: %{}, do: {read, rank}
 
     batch? = &(Map.has_key?(ranks, &1) or meets_tokens?(&1, graph))
+    lift = lift(model, graph, scope, Enum.reject(reads, batch?))
 
     reason =
       cond do
-        read = Enum.find(reads, &(not batch?.(&1))) ->
-          {"a read that needs one offset for all rows", read_node(read)}
+        match?({:bail, _node}, lift) ->
+          {"a read that needs one offset for all rows", elem(lift, 1)}
 
         node = batch_reshape(graph, reads, scope) ->
           {"a reshape to a batch of 1", node}
@@ -148,7 +153,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
     case reason do
       nil ->
-        {nil, ranks}
+        {nil, ranks, lift}
 
       {what, node} ->
         reason =
@@ -158,8 +163,399 @@ defmodule Transmuter.Generation.MergedDecoder do
           "generation runs one group for each prompt length of the merged decoder: #{reason}"
         )
 
-        {reason, ranks}
+        {reason, ranks, @no_lift}
     end
+  end
+
+  # The ops whose output has the shape of their broadcast inputs, and the ops of one input
+  # whose output has the shape of that input.
+  @broadcast ~w(Add Sub Mul Div Pow Mod Min Max Where Equal Less LessOrEqual Greater
+                GreaterOrEqual And Or Xor)
+  @same_dims ~w(Cast CastLike Identity Neg Abs Log Exp Sqrt Sin Cos Floor Ceil Not Sigmoid Tanh
+                Relu)
+
+  # Lifts the reads whose positions have no batch axis, such as the relative positions of T5,
+  # Range(0, L + n) of shape [K]. The offset {batch, 1} gives each such position the batch as a
+  # new axis 0, and each later node takes that axis: its axes and its perm shift by 1, and a
+  # Gather of a static table at lifted positions gives a lifted output. A lifted value meets
+  # the batch at a node whose other input is a value of the tokens, or whose output reaches
+  # only the masks of AttentionCore nodes (input 3, through Cast and Identity), which the
+  # graph broadcasts with the batch on axis 0, as the relative bias of T5 that adds to the
+  # mask of each core. When the lifted value has a static 1 on its first axis there, as the
+  # [1, H, n, K] bias of T5, a Squeeze removes that axis, so the batch takes its place.
+  # Returns the edits of the lifted nodes, the new static values and the Range reads that map
+  # the rows of the buffer for each row, or {:bail, node} for a node that the lift does not
+  # follow.
+  defp lift(_model, _graph, _scope, []), do: @no_lift
+
+  defp lift(model, graph, scope, reads) do
+    dims = position_dims(graph, scope)
+    sources = Enum.map(reads, &read_node/1)
+
+    if Enum.all?(sources, &(&1.op_type in ["Range", "Cast", "Gather"] and dims[hd(&1.output)])) do
+      lifted = Map.new(sources, &{hd(&1.output), dims[hd(&1.output)]})
+      tokens = token_values(graph)
+      masks = mask_values(graph)
+
+      walk = %{scope: scope, tokens: tokens, masks: masks, sources: sources}
+
+      graph.node
+      |> Enum.reduce_while({lifted, @no_lift}, &lift_step(&1, &2, walk))
+      |> case do
+        {:bail, node} ->
+          {:bail, node}
+
+        {lifted, acc} ->
+          if Enum.any?(
+               model.outputs ++ Enum.map(graph.output, & &1.name),
+               &Map.has_key?(lifted, &1)
+             ),
+             do: {:bail, hd(sources)},
+             else: %{acc | rows: MapSet.new(for(%{op_type: "Range"} = n <- sources, do: n))}
+      end
+    else
+      {:bail, Enum.find(sources, &(not Map.has_key?(dims, hd(&1.output)))) || hd(sources)}
+    end
+  end
+
+  # One node of the walk of lift/4: a node without lifted inputs, or a source, stays.
+  defp lift_step(node, {lifted, acc}, walk) do
+    if node in walk.sources or not Enum.any?(node.input, &Map.has_key?(lifted, &1)) do
+      {:cont, {lifted, acc}}
+    else
+      case lift_node(node, lifted, walk) do
+        {:ok, outputs, nodes, static} ->
+          edits = Map.put(acc.edits, node, nodes)
+          acc = %{acc | edits: edits, static: Map.merge(acc.static, static)}
+          {:cont, {Map.merge(lifted, outputs), acc}}
+
+        :bail ->
+          {:halt, {:bail, node}}
+      end
+    end
+  end
+
+  # The values whose only uses are the masks of AttentionCore nodes (input 3), through Cast
+  # and Identity.
+  defp mask_values(graph) do
+    uses = fn value ->
+      for node <- graph.node, {^value, i} <- Enum.with_index(node.input), do: {node, i}
+    end
+
+    graph.node
+    |> Enum.flat_map(& &1.output)
+    |> Enum.filter(&mask_value?(&1, uses))
+    |> MapSet.new()
+  end
+
+  defp mask_value?(value, uses) do
+    case uses.(value) do
+      [] ->
+        false
+
+      list ->
+        Enum.all?(list, fn
+          {%{op_type: "AttentionCore"}, 3} ->
+            true
+
+          {%{op_type: op, output: [out]}, 0} when op in ["Cast", "Identity"] ->
+            mask_value?(out, uses)
+
+          _other ->
+            false
+        end)
+    end
+  end
+
+  # The lift of one node with lifted inputs (see lift/4): the dims of its lifted outputs before
+  # the lift, its nodes after the lift and their new static values, or :bail.
+  # Only a ConstantOfShape may read the shape of a lifted value.
+  defp lift_node(node = %{op_type: op}, lifted, walk) when op != "ConstantOfShape" do
+    if Enum.any?(node.input, &match?({:shape, _dims}, lifted[&1])),
+      do: :bail,
+      else: lift_values(node, lifted, walk)
+  end
+
+  defp lift_node(node = %{op_type: "ConstantOfShape", input: [shape]}, lifted, _walk) do
+    case lifted[shape] do
+      {:shape, d} -> {:ok, %{hd(node.output) => d}, [node], %{}}
+      _other -> :bail
+    end
+  end
+
+  defp lift_values(node = %{op_type: op}, lifted, _walk) when op in @same_dims do
+    if hd(node.input) in Map.keys(lifted) and length(Map.keys(Map.take(lifted, node.input))) == 1,
+      do: {:ok, %{hd(node.output) => lifted[hd(node.input)]}, [node], %{}},
+      else: :bail
+  end
+
+  defp lift_values(node = %{op_type: op}, lifted, walk) when op in @broadcast do
+    lifted_dims = for name <- node.input, d = lifted[name], uniq: true, do: d
+    ranks = lifted_dims |> Enum.map(&length/1) |> Enum.uniq()
+    others = Enum.reject(node.input, &(Map.has_key?(lifted, &1) or &1 == ""))
+    static? = &(&1 in walk.scope.static)
+
+    cond do
+      length(ranks) != 1 ->
+        :bail
+
+      Enum.all?(others, static?) ->
+        [rank] = ranks
+        partner = Enum.map(others, &static_dims(walk.scope, &1))
+
+        if Enum.all?(partner, &(&1 != nil and length(&1) <= rank)),
+          do: {:ok, %{hd(node.output) => broadcast_dims(lifted_dims ++ partner)}, [node], %{}},
+          else: :bail
+
+      length(Enum.uniq(Enum.filter(node.input, &Map.has_key?(lifted, &1)))) == 1 ->
+        join(node, lifted, others, walk)
+
+      true ->
+        :bail
+    end
+  end
+
+  defp lift_values(node = %{op_type: op}, lifted, walk) when op in ["Unsqueeze", "Squeeze"] do
+    [data | rest] = node.input
+    d = lifted[data]
+    axes = axes_of(node, walk.scope)
+
+    if d == nil or axes == nil or Enum.any?(rest, &Map.has_key?(lifted, &1)) do
+      :bail
+    else
+      dims = if op == "Unsqueeze", do: unsqueeze_dims(d, axes), else: squeeze_dims(d, axes)
+      {node, static} = with_axes(node, Enum.map(axes, &if(&1 >= 0, do: &1 + 1, else: &1)))
+      {:ok, %{hd(node.output) => dims}, [node], static}
+    end
+  end
+
+  defp lift_values(node = %{op_type: "Transpose", input: [data]}, lifted, _walk) do
+    perm = Enum.find_value(node.attribute, &(&1.name == "perm" && &1.ints))
+    d = lifted[data]
+
+    if perm && length(perm) == length(d) do
+      attribute = %AttributeProto{
+        name: "perm",
+        type: :INTS,
+        ints: [0 | Enum.map(perm, &(&1 + 1))]
+      }
+
+      node = %{node | attribute: [attribute | Enum.reject(node.attribute, &(&1.name == "perm"))]}
+      {:ok, %{hd(node.output) => Enum.map(perm, &Enum.at(d, &1))}, [node], %{}}
+    else
+      :bail
+    end
+  end
+
+  defp lift_values(node = %{op_type: "Gather", input: [table, index]}, lifted, walk) do
+    axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
+
+    with true <- axis == 0 and table in walk.scope.static and not Map.has_key?(lifted, table),
+         d when d != nil <- lifted[index],
+         [_rows | tail] <- static_dims(walk.scope, table) do
+      {:ok, %{hd(node.output) => d ++ tail}, [node], %{}}
+    else
+      _other -> :bail
+    end
+  end
+
+  defp lift_values(
+         node = %{op_type: "Slice", input: [data, starts, ends, axes | rest]},
+         lifted,
+         walk
+       ) do
+    d = lifted[data]
+    values = static_list(walk.scope, axes, node)
+
+    if d && values && not Enum.any?([starts, ends, axes | rest], &Map.has_key?(lifted, &1)) do
+      shifted = Enum.map(values, &if(&1 >= 0, do: &1 + 1, else: &1))
+      name = @position_offset <> ".lift." <> node.name <> ".axes"
+      static = %{name => Nx.tensor(shifted, type: :s64, backend: Nx.BinaryBackend)}
+      node = %{node | input: [data, starts, ends, name | rest]}
+      dims = slice_dims(d, values)
+      {:ok, %{hd(node.output) => dims}, [node], static}
+    else
+      :bail
+    end
+  end
+
+  # The shape of a lifted value is lifted, and only a ConstantOfShape may read it.
+  defp lift_values(node = %{op_type: "Shape", input: [data]}, lifted, _walk),
+    do: {:ok, %{hd(node.output) => {:shape, lifted[data]}}, [node], %{}}
+
+  defp lift_values(_node, _lifted, _walk), do: :bail
+
+  # The node where a lifted value meets a value with the batch on axis 0: a value of the tokens,
+  # or a node whose output reaches only the masks of the cores. With a static 1 on the first
+  # axis of the lifted value, a Squeeze removes it there.
+  defp join(node, lifted, others, walk) do
+    [name] = Enum.filter(node.input, &Map.has_key?(lifted, &1)) |> Enum.uniq()
+    d = lifted[name]
+    squeeze? = match?([1 | _], d)
+    rank = if squeeze?, do: length(d), else: length(d) + 1
+
+    tokens? = Enum.any?(others, &MapSet.member?(walk.tokens, &1))
+    mask? = MapSet.member?(walk.masks, hd(node.output)) and rank == 4
+
+    cond do
+      not is_list(d) or not (tokens? or mask?) ->
+        :bail
+
+      squeeze? ->
+        squeezed = @position_offset <> ".lift." <> node.name <> ".squeezed"
+        axes = @position_offset <> ".lift." <> node.name <> ".axes"
+
+        squeeze = %NodeProto{
+          op_type: "Squeeze",
+          name: squeezed,
+          input: [name, axes],
+          output: [squeezed]
+        }
+
+        renamed = rename_input(node, name, squeezed)
+
+        {:ok, %{}, [squeeze, renamed],
+         %{axes => Nx.tensor([1], type: :s64, backend: Nx.BinaryBackend)}}
+
+      true ->
+        {:ok, %{}, [node], %{}}
+    end
+  end
+
+  # The dims of the values of positions, from the Range nodes and the static values: 1 for an
+  # axis of size 1, :x for another axis. A Shape gives {:shape, dims}, which only a
+  # ConstantOfShape reads. Values from the inputs of the graph have no dims.
+  defp position_dims(graph, scope) do
+    Enum.reduce(graph.node, %{}, fn node, dims ->
+      get = fn name ->
+        case dims[name] do
+          nil -> static_dims(scope, name)
+          {:shape, _} -> nil
+          d -> d
+        end
+      end
+
+      case node_dims(node, get, dims, scope) do
+        nil -> dims
+        d -> Map.put(dims, hd(node.output), d)
+      end
+    end)
+  end
+
+  defp node_dims(%{op_type: "Range"}, _get, _dims, _scope), do: [:x]
+
+  defp node_dims(%{op_type: op, input: [input | _]}, get, _dims, _scope) when op in @same_dims,
+    do: get.(input)
+
+  defp node_dims(%{op_type: op, input: inputs}, get, _dims, _scope) when op in @broadcast do
+    all = Enum.map(Enum.reject(inputs, &(&1 == "")), get)
+    if Enum.all?(all, &(&1 != nil)), do: broadcast_dims(all)
+  end
+
+  defp node_dims(node = %{op_type: op, input: [data | _]}, get, _dims, scope)
+       when op in ["Unsqueeze", "Squeeze"] do
+    d = get.(data)
+    axes = axes_of(node, scope)
+
+    cond do
+      d == nil or axes == nil -> nil
+      op == "Unsqueeze" -> unsqueeze_dims(d, axes)
+      true -> squeeze_dims(d, axes)
+    end
+  end
+
+  defp node_dims(node = %{op_type: "Transpose", input: [data]}, get, _dims, _scope) do
+    perm = Enum.find_value(node.attribute, &(&1.name == "perm" && &1.ints))
+    d = get.(data)
+    if d && perm && length(perm) == length(d), do: Enum.map(perm, &Enum.at(d, &1))
+  end
+
+  defp node_dims(node = %{op_type: "Gather", input: [data, index]}, get, _dims, _scope) do
+    axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
+    {d, i} = {get.(data), get.(index)}
+
+    if d && i && axis >= 0 && axis < length(d),
+      do: Enum.take(d, axis) ++ i ++ Enum.drop(d, axis + 1)
+  end
+
+  defp node_dims(
+         node = %{op_type: "Slice", input: [data, _starts, _ends, axes | _]},
+         get,
+         _dims,
+         scope
+       ) do
+    d = get.(data)
+    values = d && static_list(scope, axes, node)
+    if values, do: slice_dims(d, values)
+  end
+
+  defp node_dims(%{op_type: "Shape", input: [data]}, get, _dims, _scope) do
+    if d = get.(data), do: {:shape, d}
+  end
+
+  defp node_dims(%{op_type: "ConstantOfShape", input: [shape]}, _get, dims, _scope) do
+    case dims[shape] do
+      {:shape, d} -> d
+      _other -> nil
+    end
+  end
+
+  defp node_dims(_node, _get, _dims, _scope), do: nil
+
+  defp static_dims(scope, name) do
+    case scope.values[name] do
+      nil -> nil
+      value -> value |> Nx.shape() |> Tuple.to_list() |> Enum.map(&if(&1 == 1, do: 1, else: :x))
+    end
+  end
+
+  # The dims of the broadcast of values, aligned from the last axis.
+  defp broadcast_dims(all) do
+    rank = all |> Enum.map(&length/1) |> Enum.max()
+    padded = Enum.map(all, &(List.duplicate(1, rank - length(&1)) ++ &1))
+
+    padded
+    |> Enum.zip_with(& &1)
+    |> Enum.map(&if(Enum.all?(&1, fn d -> d == 1 end), do: 1, else: :x))
+  end
+
+  defp unsqueeze_dims(d, axes) do
+    rank = length(d) + length(axes)
+
+    axes
+    |> Enum.map(&if(&1 < 0, do: &1 + rank, else: &1))
+    |> Enum.sort()
+    |> Enum.reduce(d, &List.insert_at(&2, &1, 1))
+  end
+
+  defp squeeze_dims(d, axes) do
+    axes = Enum.map(axes, &if(&1 < 0, do: &1 + length(d), else: &1))
+    for {dim, i} <- Enum.with_index(d), i not in axes, do: dim
+  end
+
+  defp slice_dims(d, axes) do
+    axes = Enum.map(axes, &if(&1 < 0, do: &1 + length(d), else: &1))
+    for {dim, i} <- Enum.with_index(d), do: if(i in axes and dim != 1, do: :x, else: dim)
+  end
+
+  # The axes of an Unsqueeze or a Squeeze, from its static input or its attribute.
+  defp axes_of(node = %{input: [_data, axes]}, scope) when axes != "",
+    do: static_list(scope, axes, node)
+
+  defp axes_of(node, _scope), do: Enum.find_value(node.attribute, &(&1.name == "axes" && &1.ints))
+
+  # The node with new axes: a new static value for an axes input, so a constant that other
+  # nodes share keeps its value, or a new attribute.
+  defp with_axes(node = %{input: [data, axes]}, values) when axes != "" do
+    name = @position_offset <> ".lift." <> node.name <> ".axes"
+
+    {%{node | input: [data, name]},
+     %{name => Nx.tensor(values, type: :s64, backend: Nx.BinaryBackend)}}
+  end
+
+  defp with_axes(node, values) do
+    attribute = %AttributeProto{name: "axes", type: :INTS, ints: values}
+    {%{node | attribute: [attribute | Enum.reject(node.attribute, &(&1.name == "axes"))]}, %{}}
   end
 
   # The rank of the value that takes the offset of a read, when its axis 0 is the batch: the
@@ -961,7 +1357,10 @@ defmodule Transmuter.Generation.MergedDecoder do
   # An offset for each row, {batch, 1}, takes the rank of the value of a read whose axis 0 is
   # the batch (see batch_rank/3): an Unsqueeze at the start of the branch gives the offset of
   # each such rank above 2, as {batch, 1, 1} for the [1, 1, n] positions of Apertus.
-  defp offset_reads(model, branch, graph, reads, per_row?, ranks) do
+  #
+  # The reads of positions without a batch axis take the edits of lift/4, and a Range read
+  # maps the rows of the buffer to positions for each row (see row_positions/2).
+  defp offset_reads(model, branch, graph, reads, per_row?, ranks, lift) do
     name = &(@position_offset <> "." <> &1)
     constant = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
     ranks = if per_row?, do: Map.filter(ranks, fn {_read, rank} -> rank > 2 end), else: %{}
@@ -987,9 +1386,16 @@ defmodule Transmuter.Generation.MergedDecoder do
         fn node ->
           added =
             case Map.fetch(reads, node) do
-              {:ok, nil} -> shift_read(node, name)
-              {:ok, input} -> offset_input(node, input, name)
-              :error -> [node]
+              {:ok, nil} ->
+                if MapSet.member?(lift.rows, node),
+                  do: row_positions(node, name),
+                  else: shift_read(node, name)
+
+              {:ok, input} ->
+                offset_input(node, input, name)
+
+              :error ->
+                Map.get(lift.edits, node, [node])
             end
 
           case Map.fetch(ranks, node) do
@@ -1014,7 +1420,8 @@ defmodule Transmuter.Generation.MergedDecoder do
         static:
           model.static
           |> Map.merge(%{name.("zero") => constant.(0), name.("one") => constant.(1)})
-          |> Map.merge(axes),
+          |> Map.merge(axes)
+          |> Map.merge(lift.static),
         inputs: model.inputs ++ added,
         input_types: Map.merge(model.input_types, Map.take(types, added))
     }
@@ -1162,6 +1569,46 @@ defmodule Transmuter.Generation.MergedDecoder do
         output: [shifted]
       },
       %{node | input: [shifted]}
+    ]
+  end
+
+  # The Range of shift_read/2 for an offset for each row, where the rows of a step have gap
+  # rows: the cumulative count of the valid rows of each row, minus 1, maps each row of the
+  # buffer and of the new rows to its position, and an index after the last key continues
+  # from the offset of the row. The positions have the batch on axis 0, {batch, keys}.
+  defp row_positions(node = %{op_type: "Range", input: [start | _]}, name) do
+    value = &name.(hd(node.output) <> "." <> &1)
+
+    step = fn op, inputs, out, attribute ->
+      %NodeProto{
+        op_type: op,
+        name: value.(out),
+        input: inputs,
+        output: [value.(out)],
+        attribute: attribute
+      }
+    end
+
+    axis = [%AttributeProto{name: "axis", type: :INT, i: 1}]
+
+    [
+      %{node | output: [value.("index")]},
+      step.("CumSum", [@key_mask, name.("one")], "count", []),
+      step.("Sub", [value.("count"), name.("one")], "map", []),
+      step.("Shape", [value.("map")], "shape", []),
+      step.("Gather", [value.("shape"), name.("one")], "keys", []),
+      step.("Sub", [value.("keys"), name.("one")], "last", []),
+      step.("Min", [value.("index"), value.("last")], "clamped", []),
+      step.("Gather", [value.("map"), value.("clamped")], "mapped", axis),
+      step.("Less", [value.("index"), value.("keys")], "inside", []),
+      step.("Add", [value.("index"), @position_offset], "after", []),
+      step.("Where", [value.("inside"), value.("mapped"), value.("after")], "positions", []),
+      %NodeProto{
+        op_type: "CastLike",
+        name: node.name,
+        input: [value.("positions"), start],
+        output: node.output
+      }
     ]
   end
 

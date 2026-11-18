@@ -523,15 +523,15 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # The position offset is one value for each row only when the value that takes it at each
-  # read has the batch on axis 0 or meets the tokens (see MergedDecoder). gpt2 reads a table at
-  # [1, n] positions, and moonshine casts [1, 1, n] positions for its rotary angles. The
-  # relative bias of T5 takes the key positions from the union of the key masks, which has no
-  # gap rows, so it keeps one offset for all rows and one group for each prompt length.
+  # The position offset is one value for each row when the value that takes it at each read
+  # has the batch on axis 0, or takes it as a new axis 0 until the batch (see MergedDecoder).
+  # gpt2 reads a table at [1, n] positions, and moonshine casts [1, 1, n] positions for its
+  # rotary angles. The relative bias of T5 reads the [K] positions of the keys, which take the
+  # batch through the bias until the mask of each attention.
   test "a merged decoder gets a position offset for each row when its reads have the batch" do
     for {source, per_row?} <- [
           {{:hf, "Xenova/gpt2", "onnx/decoder_model_merged.onnx"}, true},
-          {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, false},
+          {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, true},
           {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, true}
         ] do
       rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite(1)
@@ -2036,13 +2036,16 @@ defmodule Transmuter.GenerationBitsTest do
   # A decoder in the form of the Apertus export: GroupQueryAttention counts its rows from the
   # length of the mask, and the positions come from the length of the past, Range(L, L + n),
   # cast to a float for a sinusoid that the embeddings add. MergedDecoder gives the cast the
-  # position offset, so the decoder runs in :in_place. The cast of the [n] positions takes one
-  # offset for all rows, so the prompts of each length run in a group of their own. In the
-  # export, the cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset has
-  # one value for each row, {batch, 1, 1} there, and the rows join one group. With one offset,
-  # the prompt of 20 tokens runs in parts of 16 and 4 tokens. Its 16 new tokens grow the
-  # buffers from 32 to 64 rows. In a batch, each row gives the greedy tokens of the same
-  # decoder without a cache, computed with Nx, and log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
+  # position offset, so the decoder runs in :in_place. The cast of the [n] positions takes the
+  # offset {batch, 1}, which gives them the batch as a new axis 0, and the Unsqueeze and the
+  # sinusoid after it take that axis until the sum with the embeddings. In the export, the
+  # cast reads [1, 1, n] positions, whose axis 0 is the batch, so the offset is {batch, 1, 1}
+  # there. In both, the rows of the prompts join one group. A Reshape to a static shape after
+  # the cast stops the lift, so that decoder takes one offset for all rows, and the prompts of
+  # each length run in a group of their own, the prompt of 20 tokens in parts of 16 and 4
+  # tokens. Its 16 new tokens grow the buffers from 32 to 64 rows. In a batch, each row gives
+  # the greedy tokens of the same decoder without a cache, computed with Nx, and
+  # log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
   # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
   # reads a slice of the shape of the past keeps the decoder in :grow.
   test "a decoder without an If takes positions from the length of its past with the offset" do
@@ -2211,10 +2214,24 @@ defmodule Transmuter.GenerationBitsTest do
           end)
     }
 
+    # A Reshape to a static shape in place of the Unsqueeze on axis 1, which the lift of the
+    # positions does not follow.
+    reshaped = %{
+      model
+      | nodes:
+          Enum.map(nodes, fn
+            %{name: "column"} -> node.("Reshape", ["float_positions", "column_shape"], ["column"])
+            other -> other
+          end),
+        static: Map.put(model.static, "column_shape", host.([-1, 1]))
+    }
+
     prompts =
       for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
 
-    for {model, offset} <- [{model, []}, {export, ["batch_size", 1]}] do
+    per_row = ["batch_size", 1]
+
+    for {model, offset} <- [{model, per_row}, {export, per_row}, {reshaped, []}] do
       ctx = context.(model)
       assert ctx.mode == :in_place
       assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == {:s64, offset}
