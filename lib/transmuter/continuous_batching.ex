@@ -44,7 +44,7 @@ defmodule Transmuter.ContinuousBatching do
 
   The server takes a decoder whose rows can join a running batch, and it raises an `ArgumentError` at the start for the others:
 
-    * A decoder that grows its cache, or that takes one position offset for all rows, such as the merged decoders of llama2.c and T5, needs one length of the cache for all rows of a step.
+    * A decoder that grows its cache, such as the merged decoder of llama2.c, needs one length of the cache for all rows of a step.
     * With `num_beams` above 1, the rows of a prompt move together as beams, so a request cannot join between them.
     * A merged decoder whose cross-attention cache reads other values than the outputs of the encoder cannot compute that cache for one request (see `Transmuter.Generation.MergedDecoder.cross/1`).
 

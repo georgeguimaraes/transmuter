@@ -22,7 +22,7 @@ defmodule Transmuter.Generation do
 
   Otherwise, as with beam search, the prompts of a batch run on the branch without cache as one step for each prompt length, from the longest to the shortest, and each row takes its first token from the step of its prompt.
 
-  A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`. A decoder without an `If`, such as Apertus, whose rotary positions come from the length of its past, gets the same rewrite on its graph. Its GroupQueryAttention hides its own free rows, so it takes only the offset and runs in `:in_place`. When the valid rows have one value for each row, as in GPT-2 and Apertus, the rows of prompts of different lengths run together, and the steps of the other prompt lengths leave gap rows in each row. A group takes the next prompt length while the sum of its prompt lengths and the new tokens fits the static tables of the decoder, else the length starts a new group. When they have one value for all rows, as in T5, the prompts of each length run as one group, as in `:grow` (see "Batches").
+  A merged decoder without `position_ids` takes the length of its cache from the shape of the past, so with a buffer it sees the capacity of the buffer and not the valid rows. `Transmuter.Generation.MergedDecoder` gives the branch with cache the valid rows where the positions need them, and a mask of the free rows, so such a decoder runs in `:append`. Other merged decoders stay in `:grow`. A decoder without an `If`, such as Apertus, whose rotary positions come from the length of its past, gets the same rewrite on its graph. Its GroupQueryAttention hides its own free rows, so it takes only the offset and runs in `:in_place`. The valid rows have one value for each row, as in GPT-2, T5 and Apertus, so the rows of prompts of different lengths run together, and the steps of the other prompt lengths leave gap rows in each row. A group takes the next prompt length while the sum of its prompt lengths and the new tokens fits the static tables of the decoder, else the length starts a new group. A decoder whose positions cannot take an offset for each row stays in `:grow`.
 
   The decoder of an encoder-decoder model also takes the outputs of the encoder, such as `encoder_hidden_states`, in each step. Its branch without cache computes the cross-attention cache (`past_key_values.N.encoder.key` and `.value`) from these outputs. The branch with cache gives an empty present for this cache, so the cache keeps its value.
 
@@ -85,7 +85,7 @@ defmodule Transmuter.Generation do
 
   The buffer starts with a capacity that fits the rows of the prompt steps and 16 more rows: the smallest capacity, or above it a multiple of a step. The step is a quarter of the power of two below the rows, at least 64 rows: 64 rows up to 512, 128 rows up to 1024, 256 rows up to 2048. These rows are the longest prompt, or with a merged decoder the sum of the prompt lengths of the group. When a step does not fit, the buffers grow to the next capacity, and the steps compile for it. Each step reads the whole buffers, so the small steps keep them near the rows that the longest row needs: a row of 300 rows runs its steps at 320 rows, not at 512. The step grows with the rows, so a long answer compiles four capacities for each doubling of its rows: the first answer of 1024 tokens compiles 12 shapes in place of 6 with powers of two, about 13 s more on CUDA. A process compiles each capacity one time, so later answers do not pay it. The smallest capacity is 256 rows, so the first request compiles the steps one time for most answers, and an answer of 600 tokens to a short prompt compiles them at 256, 320, 384, 448, 512 and 640 rows. A decoder with the position offset of `Transmuter.Generation.MergedDecoder` starts at 32 rows. In `:grow`, such a decoder compiles a shape for each length of its cache, so a few compiles of capacities cost little against that, and its steps are faster with a smaller buffer, as in Whisper and in Marian with beam search. The capacity of a merged decoder stops at the rows of its static tables. In `:append`, the rows of all steps of a batch count, also after a row ends, so a batch whose longest row ends early can need more rows than its longest row, grow one step earlier, or pass the rows of the static tables.
 
-  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group. A merged decoder in `:append` with one position offset for all rows also runs a group for each prompt length (see "Merged decoders").
+  In `:grow`, the positions come from the length of the cache, which is the same for all rows. So only prompts of the same length share a cache. The prompts of each length run as one group, and the groups run one after the other. A group runs with all rows of the batch, and the rows of other lengths are padding rows of the group. So each length of the cache has one compiled shape, and a batch with prompts of three lengths runs the steps of three groups. Text-to-text, image-to-text and speech-to-text have prompts of one length, so all their rows run as one group.
 
   ## Logits
 
@@ -1226,8 +1226,8 @@ defmodule Transmuter.Generation do
   # of next/2, next to the new tokens of the other rows (see plan/1). Otherwise the prompts
   # run here, in parts that end all prompts in the same step, and the first token of each new
   # row is read (see prefill/4): a merged decoder runs a prompt on its branch without cache,
-  # which no row with a cache can share, the rows of :grow and of a scalar offset need one
-  # length of the cache, and the beams of all prompts start their search in the same step.
+  # which no row with a cache can share, the rows of :grow need one length of the cache, and
+  # the beams of all prompts start their search in the same step.
   def admit(ctx, group, requests, inputs \\ %{}) do
     # The group keeps the inputs of the prompts across steps, so they are evaluated as the
     # outputs of state_jit/2.
@@ -2938,22 +2938,12 @@ defmodule Transmuter.Generation do
       (ctx.mode == :grow or @position_offset in ctx.model.inputs)
   end
 
-  # The offset of the positions of a merged decoder in :append (see MergedDecoder): the valid
-  # rows of each row less the capacity, or one value for all rows. In a group of one prompt
-  # length, the valid rows of each row are the rows of all steps.
-  defp position_offset(ctx, state) do
-    if per_row_offset?(ctx),
-      do: for(past <- state.lengths, do: [past - state.capacity]),
-      else: state.used - state.capacity
-  end
+  # The offset of the positions of each row of a decoder with the position offset of
+  # MergedDecoder: the valid rows of the row less the capacity.
+  defp position_offset(_ctx, state), do: for(past <- state.lengths, do: [past - state.capacity])
 
-  defp per_row_offset?(ctx),
-    do: match?({_type, [_ | _]}, ctx.model.input_types[@position_offset])
-
-  # The rows of a step need one length of the cache in :grow, where the positions come from it,
-  # and with one position offset for all rows.
-  defp one_length?(ctx),
-    do: ctx.mode == :grow or match?({_type, []}, ctx.model.input_types[@position_offset])
+  # The rows of a step need one length of the cache in :grow, where the positions come from it.
+  defp one_length?(ctx), do: ctx.mode == :grow
 
   # The positions of the tokens at the indices past..past + n - 1 of each row: the given
   # positions of the prompt, and after them the index plus the delta of the row. A decoder

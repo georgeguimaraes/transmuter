@@ -529,14 +529,11 @@ defmodule Transmuter.GenerationTest do
   # rotary angles. The relative bias of T5 reads the [K] positions of the keys, which take the
   # batch through the bias until the mask of each attention.
   test "a merged decoder gets a position offset for each row when its reads have the batch" do
-    for {source, per_row?} <- [
-          {{:hf, "Xenova/gpt2", "onnx/decoder_model_merged.onnx"}, true},
-          {{:hf, "Xenova/t5-small", "onnx/decoder_model_merged.onnx"}, true},
-          {{:hf, "onnx-community/moonshine-base-ONNX", "onnx/decoder_model_merged.onnx"}, true}
-        ] do
+    for repo <- ["Xenova/gpt2", "Xenova/t5-small", "onnx-community/moonshine-base-ONNX"] do
+      source = {:hf, repo, "onnx/decoder_model_merged.onnx"}
       rewritten = source |> Transmuter.load!() |> Generation.MergedDecoder.rewrite(1)
-      assert "transmuter.position_offset" in rewritten.inputs, inspect(source)
-      assert rewritten[:per_row_offset] == per_row?, inspect(source)
+      offset = rewritten.input_types["transmuter.position_offset"]
+      assert offset == {:s64, ["batch_size", 1]}, repo
     end
   end
 
@@ -943,7 +940,7 @@ defmodule Transmuter.GenerationTest do
   end
 
   # Beam search reorders the rows of the cache at each step. The merged decoder of Marian has
-  # one position offset for all rows and starts at 32 rows in :append, so an answer of more
+  # a position offset for each row and starts at 32 rows in :append, so an answer of more
   # than 32 tokens compacts the buffers of the beams into 64 rows. Its tokens equal those of
   # the same decoder with a cache of exact length, which a Shape node of the past outside the
   # If keeps in :grow.
@@ -2137,12 +2134,11 @@ defmodule Transmuter.GenerationBitsTest do
   # there. When the cast reads [n, 1] positions, the offset is {batch, 1, 1}, one axis more
   # than the positions, so the batch is a new axis 0 for each rank. In all three, the rows of
   # the prompts join one group, and one step of 2 tokens for 2 rows gives the logits of each
-  # row alone (see assert_step_alone/1). A Reshape to a static shape after
-  # the cast stops the lift, so that decoder takes one offset for all rows, and the prompts of
-  # each length run in a group of their own, the prompt of 20 tokens in parts of 16 and 4
-  # tokens. Its 16 new tokens grow the buffers from 32 to 64 rows. In a batch, each row gives
-  # the greedy tokens of the same decoder without a cache, computed with Nx, and
-  # log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
+  # row alone (see assert_step_alone/1). The prompt of 20 tokens and its 16 new tokens grow the
+  # buffers from 32 to 64 rows. A Reshape to a static shape after the cast stops the lift, so
+  # that decoder keeps a cache of exact length (:grow), and the prompts of each length run in
+  # a group of their own. In a batch, each row gives the greedy tokens of the same decoder
+  # without a cache, computed with Nx, and log-probabilities within 1e-4. The output of the attention has the shape of its queries, so a Slice whose end comes
   # from that shape, as the halves of the heads of Apertus, does not read the past. A node that
   # reads a slice of the shape of the past keeps the decoder in :grow. When the positions read
   # such a slice, the first step of :grow sees a past of 0 rows from the attention mask, not
@@ -2376,30 +2372,32 @@ defmodule Transmuter.GenerationBitsTest do
     prompts =
       for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
 
-    per_row = ["batch_size", 1]
+    # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
+    # the lift of the [n] form stops at the sum with the embeddings, without an error, and the
+    # decoder keeps a cache of exact length.
+    types = model.input_types |> Map.put("input_ids", {:s64, []}) |> Map.put("sequence", nil)
+    unknown = %{model | input_types: types}
 
     forms = [
-      {model, :in_place, per_row},
-      {export, :in_place, per_row},
-      {column, :in_place, per_row},
-      {reshaped, :in_place, []},
-      {sliced, :grow, nil}
+      {model, :in_place},
+      {export, :in_place},
+      {column, :in_place},
+      {reshaped, :grow},
+      {sliced, :grow},
+      {unknown, :grow}
     ]
 
-    # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
-    # the lift of the [n] form stops at the sum with the embeddings, without an error.
-    types = model.input_types |> Map.put("input_ids", {:s64, []}) |> Map.put("sequence", nil)
-    unknown = context.(%{model | input_types: types}).model.input_types
-    assert unknown[Generation.MergedDecoder.position_offset()] == {:s64, []}
-
-    for {model, mode, offset} <- forms do
+    for {model, mode} <- forms do
       ctx = context.(model)
       assert ctx.mode == mode
-      offset = offset && {:s64, offset}
-      assert ctx.model.input_types[Generation.MergedDecoder.position_offset()] == offset
       refute Generation.MergedDecoder.key_mask() in ctx.model.inputs
-      assert Generation.joins?(ctx) == (offset == {:s64, per_row})
-      if offset == {:s64, per_row}, do: assert_step_alone(ctx.model)
+      assert Generation.joins?(ctx) == (mode == :in_place)
+
+      if mode == :in_place do
+        offset = ctx.model.input_types[Generation.MergedDecoder.position_offset()]
+        assert offset == {:s64, ["batch_size", 1]}
+        assert_step_alone(ctx.model)
+      end
 
       ctx = Generation.compile(ctx, 3, Transmuter.TestBackend.compiler_opts())
       rows = Generation.generate(ctx, prompts, [0, 0, 0])
