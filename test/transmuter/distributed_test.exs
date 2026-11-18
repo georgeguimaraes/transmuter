@@ -205,40 +205,80 @@ defmodule Transmuter.DistributedTest do
              catch_error(:erpc.call(peer, ContinuousBatching, :stream, [__MODULE__.Streams, 42]))
   end
 
-  # The server Full has 1 row and a queue of 1 request, and both are taken. The server Spare
-  # joins the group of the name Full, so a call of Full from each node goes to Spare.
-  test "a request goes to the next server of the name when a queue is full", %{peer: peer} do
+  # The server Busy has 1 row, which runs a long request, and 1 waiting request, so its room
+  # is -1. The server Spare joins the group of the name Busy and has a room of 1. A call of
+  # Busy from each node goes to Spare: the test node reads the rooms of both servers, and the
+  # peer gets them from rooms/1 on the test node.
+  test "a request goes to the server of the name with the most room", %{peer: peer} do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     long = [strategy: :greedy, max_new_tokens: 2000, min_new_tokens: 2000] ++ @opts
-    spec = [name: __MODULE__.Full, source: source, slots: 1, max_queue: 1] ++ long
+    spec = [name: __MODULE__.Busy, source: source, slots: 1] ++ long
+    busy = start_supervised!(Supervisor.child_spec({ContinuousBatching, spec}, id: :busy))
+
+    spawn(ContinuousBatching, :run, [__MODULE__.Busy, "Once upon a time"])
+    wait_for(fn -> map_size(:sys.get_state(busy).rows) == 1 end)
+    spawn(ContinuousBatching, :run, [__MODULE__.Busy, "Explain how a rainbow forms."])
+    wait_for(fn -> :queue.len(:sys.get_state(busy).queue) == 1 end)
+
+    spare = start_spare(peer, __MODULE__.Busy, source)
+    assert ContinuousBatching.rooms([busy, spare]) == [{busy, -1}, {spare, 1}]
+
+    alone = ContinuousBatching.run(spare, "Hello")
+    assert ContinuousBatching.run(__MODULE__.Busy, "Hello") == alone
+
+    for _call <- 1..3 do
+      assert :erpc.call(peer, ContinuousBatching, :run, [__MODULE__.Busy, "Hello"]) == alone
+    end
+  end
+
+  # The server Full has 2 free rows and a queue of 1 request. Its worker holds one request,
+  # so its room is 1, but its queue is full. A call on the test node tries Full first, because
+  # it is the server of this node and has room, gets a full queue and goes to Spare.
+  test "a request goes to the next server of the name when a queue is full", %{peer: peer} do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 8] ++ @opts
+    spec = [name: __MODULE__.Full, source: source, slots: 2, max_queue: 1] ++ opts
     full = start_supervised!(Supervisor.child_spec({ContinuousBatching, spec}, id: :full))
+    %{worker: worker} = :sys.get_state(full)
+    parent = self()
+    id = make_ref()
 
-    # The second request waits until the first runs, because the queue limit counts the
-    # requests in the worker.
+    :telemetry.attach(
+      id,
+      [:transmuter, :continuous_batching, :prepare, :start],
+      fn _event, _measurements, _metadata, _config ->
+        if self() == worker do
+          send(parent, {id, :preparing})
+          receive do: ({^id, :go} -> :ok)
+        end
+      end,
+      nil
+    )
+
     spawn(ContinuousBatching, :run, [__MODULE__.Full, "Once upon a time"])
-    wait_for(fn -> map_size(:sys.get_state(full).rows) == 1 end)
-    spawn(ContinuousBatching, :run, [__MODULE__.Full, "Explain how a rainbow forms."])
-
-    wait_for(fn ->
-      state = :sys.get_state(full)
-      :queue.len(state.queue) + map_size(state.preparing) == 1
-    end)
-
-    short = [strategy: :greedy, max_new_tokens: 8] ++ @opts
-    spec = [name: __MODULE__.Spare, source: source, slots: 1] ++ short
-    spare = start_supervised!(Supervisor.child_spec({ContinuousBatching, spec}, id: :spare))
-    :ok = :pg.join(Transmuter.PG, __MODULE__.Full, spare)
-
-    wait_for(fn ->
-      length(:erpc.call(peer, :pg, :get_members, [Transmuter.PG, __MODULE__.Full])) == 2
-    end)
+    assert_receive {^id, :preparing}, 60_000
+    spare = start_spare(peer, __MODULE__.Full, source)
+    assert ContinuousBatching.rooms([full]) == [{full, 1}]
 
     alone = ContinuousBatching.run(spare, "Hello")
     assert ContinuousBatching.run(__MODULE__.Full, "Hello") == alone
 
-    for _call <- 1..3 do
-      assert :erpc.call(peer, ContinuousBatching, :run, [__MODULE__.Full, "Hello"]) == alone
-    end
+    send(worker, {id, :go})
+    :telemetry.detach(id)
+  end
+
+  # A server of 1 row with 8 new tokens, which joins the group of `name`.
+  defp start_spare(peer, name, source) do
+    spec = [name: __MODULE__.Spare, source: source, slots: 1, max_new_tokens: 8] ++ @opts
+
+    spare =
+      start_supervised!(
+        Supervisor.child_spec({ContinuousBatching, [strategy: :greedy] ++ spec}, id: :spare)
+      )
+
+    :ok = :pg.join(Transmuter.PG, name, spare)
+    wait_for(fn -> length(:erpc.call(peer, :pg, :get_members, [Transmuter.PG, name])) == 2 end)
+    spare
   end
 
   # librispeech_long is 62.46 s, three windows of Whisper, so its request has three rows. A

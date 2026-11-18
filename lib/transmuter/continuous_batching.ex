@@ -266,16 +266,52 @@ defmodule Transmuter.ContinuousBatching do
 
   defp stream_on(pid, _server, input, opts, reason), do: remote_stream(pid, input, opts, reason)
 
-  # The servers of a call, in the order that the call tries them: the server on this node,
-  # and then the other servers of the group of the name in a random order.
+  # The servers of a call, in the order that the call tries them. The server on this node goes
+  # first while it has room. Else the servers of the group of the name go from the most room
+  # to the least, with a random order among equal rooms, and the servers whose room is not
+  # known go last in a random order (see rooms/1).
   defp servers!(server, call) do
+    local = GenServer.whereis(server)
     members = if is_atom(server), do: :pg.get_members(Transmuter.PG, server), else: []
-    order = [GenServer.whereis(server) | Enum.shuffle(members)]
+    pids = for pid <- [local | members], is_pid(pid), uniq: true, do: pid
 
-    case for(pid <- order, is_pid(pid), uniq: true, do: pid) do
-      [] -> exit({:noproc, call})
-      pids -> pids
+    case pids do
+      [] ->
+        exit({:noproc, call})
+
+      [^local | others] ->
+        if has_room?(local), do: [local | Enum.shuffle(others)], else: by_room(pids)
+
+      pids ->
+        by_room(pids)
     end
+  end
+
+  defp has_room?(pid), do: (room = room(pid)) != nil and room > 0
+
+  # The servers of this node get their room from their info, and the servers of each other
+  # node from one call of rooms/1 there. A node that does not answer in 50 ms gives no rooms.
+  defp by_room(pids) do
+    {here, there} = Enum.split_with(pids, &(node(&1) == node()))
+    nodes = there |> Enum.map(&node/1) |> Enum.uniq()
+
+    known =
+      for {:ok, rooms} <- :erpc.multicall(nodes, __MODULE__, :rooms, [there], 50),
+          pair <- rooms,
+          into: Map.new(rooms(here)),
+          do: pair
+
+    {rooms, unknown} = Enum.split_with(pids, &Map.has_key?(known, &1))
+    sorted = rooms |> Enum.shuffle() |> Enum.sort_by(&known[&1], :desc)
+    sorted ++ Enum.shuffle(unknown)
+  end
+
+  @doc false
+  # The room of each server of `pids` on this node: its free rows less its waiting requests.
+  def rooms(pids), do: for(pid <- pids, node(pid) == node(), room = room(pid), do: {pid, room})
+
+  defp room(pid) do
+    with %{load: load} <- :persistent_term.get({__MODULE__, pid}, nil), do: :atomics.get(load, 1)
   end
 
   # Calls `fun` on each server in turn until the queue of one takes the request.
@@ -500,13 +536,15 @@ defmodule Transmuter.ContinuousBatching do
       task: Map.take(state.task, [:validate, :postprocess]),
       tokenizer: state.tokenizer,
       logprobs?: ctx.token_logprobs?,
-      max_queue: state.max_queue
+      max_queue: state.max_queue,
+      load: :atomics.new(1, signed: true)
     }
 
     :persistent_term.put({__MODULE__, self()}, info)
     if state.name, do: :pg.join(Transmuter.PG, state.name, self())
 
-    Map.merge(state, %{
+    state
+    |> Map.merge(%{
       ctx: ctx,
       worker: worker,
       group: nil,
@@ -514,13 +552,36 @@ defmodule Transmuter.ContinuousBatching do
       preparing: %{},
       queue: :queue.new(),
       callers: %{},
-      stepping?: false
+      stepping?: false,
+      load: info.load
     })
+    |> publish()
   end
 
-  # The requests go to the worker, which sends each one back with its inputs.
+  # Each callback ends here, so the room of the server always follows its state: its free
+  # rows less the rows of its waiting requests and its requests in the worker.
+  defp publish(state) do
+    waiting = state.queue |> :queue.to_list() |> Enum.map(&length(&1.rows)) |> Enum.sum()
+    room = state.slots - map_size(state.rows) - waiting - map_size(state.preparing)
+    :atomics.put(state.load, 1, room)
+    state
+  end
+
+  defp published({:reply, reply, state}), do: {:reply, reply, publish(state)}
+  defp published({:noreply, state}), do: {:noreply, publish(state)}
+  defp published(stop = {:stop, _reason, _state}), do: stop
+
   @impl true
-  def handle_call({:enqueue, requests}, {pid, _tag}, state) do
+  def handle_call(message, from, state), do: message |> on_call(from, state) |> published()
+
+  @impl true
+  def handle_cast(message, state), do: message |> on_cast(state) |> published()
+
+  @impl true
+  def handle_info(message, state), do: message |> on_info(state) |> published()
+
+  # The requests go to the worker, which sends each one back with its inputs.
+  defp on_call({:enqueue, requests}, {pid, _tag}, state) do
     if :queue.len(state.queue) + map_size(state.preparing) + length(requests) > state.max_queue do
       {:reply, {:error, :queue_full}, state}
     else
@@ -533,11 +594,9 @@ defmodule Transmuter.ContinuousBatching do
     end
   end
 
-  @impl true
-  def handle_cast({:cancel, refs}, state), do: {:noreply, drop(state, &(&1.ref in refs))}
+  defp on_cast({:cancel, refs}, state), do: {:noreply, drop(state, &(&1.ref in refs))}
 
-  @impl true
-  def handle_info(:step, state) do
+  defp on_info(:step, state) do
     state = %{state | stepping?: false}
     state = if active?(state) or :queue.is_empty(state.queue), do: state, else: open(state)
     state = if state.group, do: forget_callers(step(state)), else: state
@@ -548,7 +607,7 @@ defmodule Transmuter.ContinuousBatching do
   end
 
   # A request that the caller cancelled in the worker has no entry.
-  def handle_info({:prepared, ref, reply}, state) do
+  defp on_info({:prepared, ref, reply}, state) do
     case {Map.pop(state.preparing, ref), reply} do
       {{nil, _preparing}, _reply} ->
         {:noreply, state}
@@ -564,11 +623,11 @@ defmodule Transmuter.ContinuousBatching do
     end
   end
 
-  def handle_info({:DOWN, _monitor, :process, pid, _reason}, state) do
+  defp on_info({:DOWN, _monitor, :process, pid, _reason}, state) do
     {:noreply, drop(%{state | callers: Map.delete(state.callers, pid)}, &(&1.pid == pid))}
   end
 
-  def handle_info({:EXIT, worker, reason}, state = %{worker: worker}),
+  defp on_info({:EXIT, worker, reason}, state = %{worker: worker}),
     do: {:stop, reason, state}
 
   @impl true
