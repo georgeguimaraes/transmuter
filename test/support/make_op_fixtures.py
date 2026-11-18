@@ -35,6 +35,18 @@ def rng_for(name):
     return np.random.default_rng(zlib.crc32(name.encode()))
 
 
+# The past of GroupQueryAttention with zeros after the valid rows of each sequence, which are
+# seqlens + 1 - S. ONNX Runtime gives zeros in these rows of the present, and Transmuter keeps
+# the past there (see write_cache/4 in Transmuter.Ops.Transformer). No query reads them.
+def gqa_valid(inputs, s=1):
+    for name in ("pk", "pv"):
+        past = inputs[name].copy()
+        for row, length in enumerate(inputs["seqlens"]):
+            past[row, :, int(length) + 1 - s:, :] = 0
+        inputs[name] = past
+    return inputs
+
+
 def tensor_type(a):
     return TensorProto.STRING if a.dtype.kind in "OUS" else helper.np_dtype_to_tensor_dtype(a.dtype)
 
@@ -235,8 +247,8 @@ gqa_sin = np.sin(np.arange(32)[:, None] * np.arange(G // 2)[None] * 0.1).astype(
 case("GroupQueryAttention_batch_rotary_interleaved",
      [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total", "cos", "sin"], ["y", "present_k", "present_v"], domain=MS,
            num_heads=4, kv_num_heads=2, do_rotary=1, rotary_interleaved=1)],
-     {"q": f32(B, 1, 4 * G), "k": f32(B, 1, 2 * G), "v": f32(B, 1, 2 * G), "pk": f32(B, 2, 6, G), "pv": f32(B, 2, 6, G),
-      "seqlens": np.array([6, 4], dtype=np.int32), "total": np.array(7, dtype=np.int32)},
+     gqa_valid({"q": f32(B, 1, 4 * G), "k": f32(B, 1, 2 * G), "v": f32(B, 1, 2 * G), "pk": f32(B, 2, 6, G), "pv": f32(B, 2, 6, G),
+                "seqlens": np.array([6, 4], dtype=np.int32), "total": np.array(7, dtype=np.int32)}),
      {"cos": gqa_cos, "sin": gqa_sin}, ms=True, static=("total",))
 
 # ---------- vision, diffusion and misc ----------
@@ -1519,8 +1531,8 @@ hf = lambda *shape: r.standard_normal(shape).astype(np.float16)
 case("GroupQueryAttention_f16",
      [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
            num_heads=4, kv_num_heads=2)],
-     {"q": hf(2, 1, 4 * G), "k": hf(2, 1, 2 * G), "v": hf(2, 1, 2 * G), "pk": hf(2, 2, 6, G), "pv": hf(2, 2, 6, G),
-      "seqlens": np.array([6, 3], np.int32), "total": np.array(7, np.int32)}, ms=True, static=("total",), extra=HALF)
+     gqa_valid({"q": hf(2, 1, 4 * G), "k": hf(2, 1, 2 * G), "v": hf(2, 1, 2 * G), "pk": hf(2, 2, 6, G), "pv": hf(2, 2, 6, G),
+                "seqlens": np.array([6, 3], np.int32), "total": np.array(7, np.int32)}), ms=True, static=("total",), extra=HALF)
 # The attention core of an f16 export, which Transmuter.Fusion turns into AttentionCore.
 case("AttentionCore_f16",
      [node("MatMul", ["q", "kt"], ["qk"]), node("Mul", ["qk", "scale"], ["scaled"]), node("Add", ["scaled", "mask"], ["masked"]),
@@ -1533,12 +1545,13 @@ case("SkipSimplifiedLayerNormalization_f16", [node("SkipSimplifiedLayerNormaliza
 # ---------- KV cache writes ----------
 
 # GQA with a static cache: the past is as long as the total length. Each row writes its new
-# keys and values at its own offset, seqlens + 1 - S, and the rows after them are zero.
+# keys and values at its own offset, seqlens + 1 - S. The past rows after the valid rows are
+# zero (see gqa_valid).
 r = rng_for("KV cache writes")
-gqa_static = lambda b, S, seqlens: (
+gqa_static = lambda b, S, seqlens: gqa_valid(
     {"q": r.standard_normal((b, S, 4 * G)).astype(np.float32), "k": r.standard_normal((b, S, 2 * G)).astype(np.float32),
      "v": r.standard_normal((b, S, 2 * G)).astype(np.float32), "pk": r.standard_normal((b, 2, 8, G)).astype(np.float32),
-     "pv": r.standard_normal((b, 2, 8, G)).astype(np.float32), "seqlens": np.array(seqlens, np.int32), "total": np.array(8, np.int32)})
+     "pv": r.standard_normal((b, 2, 8, G)).astype(np.float32), "seqlens": np.array(seqlens, np.int32), "total": np.array(8, np.int32)}, S)
 gqa_node = lambda: [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
                          num_heads=4, kv_num_heads=2)]
 case("GroupQueryAttention_static_cache_decode", gqa_node(), gqa_static(2, 1, [6, 3]), ms=True, static=("total",))
@@ -1561,8 +1574,8 @@ case("MultiHeadAttention_unidirectional_past",
 case("GroupQueryAttention_local_window",
      [node("GroupQueryAttention", ["q", "k", "v", "pk", "pv", "seqlens", "total"], ["y", "present_k", "present_v"], domain=MS,
            num_heads=4, kv_num_heads=2, local_window_size=3)],
-     {"q": cf(2, 1, 4 * G), "k": cf(2, 1, 2 * G), "v": cf(2, 1, 2 * G), "pk": cf(2, 2, 7, G), "pv": cf(2, 2, 7, G),
-      "seqlens": np.array([7, 4], np.int32), "total": np.array(8, np.int32)}, ms=True, static=("total",))
+     gqa_valid({"q": cf(2, 1, 4 * G), "k": cf(2, 1, 2 * G), "v": cf(2, 1, 2 * G), "pk": cf(2, 2, 7, G), "pv": cf(2, 2, 7, G),
+                "seqlens": np.array([7, 4], np.int32), "total": np.array(8, np.int32)}), ms=True, static=("total",))
 # One new token after the past, as in decode, where the causal mask hides no key.
 case("MultiHeadAttention_unidirectional_decode",
      [node("MultiHeadAttention", ["q", "k", "v", "", "", "", "pk", "pv"], ["y", "present_k", "present_v"], domain=MS, num_heads=H, unidirectional=1)],

@@ -579,26 +579,21 @@ defmodule Transmuter.Ops.Transformer do
   end
 
   # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at the offset of each
-  # sequence. Row j of a sequence keeps the past before the offset, takes the new row
-  # j - offset, and is zero after the new rows, as in ONNX Runtime. One select writes all
-  # sequences. A negative offset writes at 0, as the first prompt of ONNX Runtime does.
-  # Generation gives buffers with room for the new rows, so none falls after the buffer.
+  # sequence: row offset + j takes the new row j, and the other rows keep the past. One
+  # scatter writes all sequences, and it reads and writes only the new rows. ONNX Runtime
+  # gives zeros after the new rows, which no query reads, because each key after the newest
+  # row of its sequence is hidden. A negative offset writes at 0, as the first prompt of ONNX
+  # Runtime does. Generation gives buffers with room for the new rows, so none falls after
+  # the buffer.
   defp write_cache(past, new, offsets, capacity) do
     {b, heads, past_len, head_size} = shape_of(past)
     s = Nx.axis_size(new, 2)
-    shape = {b, heads, capacity, head_size}
     zero = Nx.tensor(0, type: Nx.type(new))
-
-    position =
-      Nx.subtract(
-        Nx.iota({1, 1, capacity, 1}, axis: 2),
-        Nx.reshape(Nx.max(offsets, 0), {b, 1, 1, 1})
-      )
 
     past =
       cond do
         empty?(past) ->
-          Nx.broadcast(zero, shape)
+          Nx.broadcast(zero, {b, heads, capacity, head_size})
 
         past_len < capacity ->
           Nx.pad(past, zero, [{0, 0, 0}, {0, 0, 0}, {0, capacity - past_len, 0}, {0, 0, 0}])
@@ -607,14 +602,20 @@ defmodule Transmuter.Ops.Transformer do
           past
       end
 
-    # A step of one token broadcasts its row, a longer step gathers row j - offset.
-    rows =
-      if s == 1,
-        do: Nx.broadcast(new, shape),
-        else: Nx.take_along_axis(new, Nx.broadcast(Nx.clip(position, 0, s - 1), shape), axis: 2)
+    # Row j of the step goes to row max(offset, 0) + j of its sequence. The scatter writes only
+    # these rows, so with a donated buffer the step does not read or write the other rows.
+    # The indices name the leading axes (sequence, head, row), so each update is one row of
+    # head_size values. Indices on the axes [0, 2] alone would give fewer updates, but the hex
+    # release of EMLX 0.5.0 raises for indexed_put on axes that are not contiguous. EMLX
+    # c10b272 (#145) fixes it, so this form can go after a release of EMLX with that commit.
+    shape = {b, heads, s}
+    starts = offsets |> Nx.max(0) |> Nx.as_type(:s64) |> Nx.reshape({b, 1, 1})
+    rows = Nx.add(starts, Nx.iota(shape, type: :s64, axis: 2))
+    leading = [Nx.iota(shape, type: :s64, axis: 0), Nx.iota(shape, type: :s64, axis: 1), rows]
+    indices = leading |> Nx.stack(axis: -1) |> Nx.reshape({b * heads * s, 3})
+    updates = new |> Nx.as_type(Nx.type(past)) |> Nx.reshape({b * heads * s, head_size})
 
-    written = Nx.select(Nx.broadcast(Nx.less(position, s), shape), rows, zero)
-    Nx.select(Nx.broadcast(Nx.less(position, 0), shape), past, written)
+    Nx.indexed_put(past, indices, updates)
   end
 
   defp split_packed_qkv(qkv, nil, nil, heads, kv_heads) do

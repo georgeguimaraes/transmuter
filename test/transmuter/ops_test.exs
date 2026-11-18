@@ -18,6 +18,59 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # GroupQueryAttention writes only the new rows of each sequence, and the rows of the past
+  # after the valid rows keep their values (see write_cache/4 in Transmuter.Ops.Transformer).
+  # No query reads them, so values of 1.0e4 there give the output and the valid rows of the
+  # present that zeros give. A change that starts to read these rows fails here.
+  test "GroupQueryAttention does not read the past rows after the valid rows" do
+    for name <- [
+          "GroupQueryAttention_static_cache_decode",
+          "GroupQueryAttention_static_cache_prefill"
+        ] do
+      dir = Path.join(@fixtures, name)
+      meta = dir |> Path.join("meta.json") |> File.read!() |> JSON.decode!()
+
+      model =
+        Transmuter.load!(Path.join(dir, meta["onnx_path"]), backend: @backend, compute_type: :f32)
+
+      specs = Map.new(meta["inputs"], &{&1["name"], &1})
+      static = %{"total" => read(dir, specs["total"], Nx.BinaryBackend)}
+
+      inputs =
+        Map.new(Map.delete(specs, "total"), fn {name, spec} ->
+          {name, read(dir, spec, Nx.BinaryBackend)}
+        end)
+
+      s = Nx.axis_size(inputs["q"], 1)
+      valid = for length <- Nx.to_flat_list(inputs["seqlens"]), do: length + 1 - s
+
+      garbage = fn past ->
+        {b, heads, rows, head} = Nx.shape(past)
+        row = Nx.iota({1, 1, rows, 1}, axis: 2)
+        after_valid = Nx.greater_equal(row, Nx.reshape(Nx.tensor(valid), {b, 1, 1, 1}))
+        Nx.select(Nx.broadcast(after_valid, {b, heads, rows, head}), 1.0e4, past)
+      end
+
+      run = fn inputs ->
+        inputs = Map.new(inputs, fn {name, t} -> {name, Nx.backend_transfer(t, @backend)} end)
+        compiled = Transmuter.compile(model, inputs, [static_inputs: static] ++ @compiler)
+
+        Map.new(compiled.(inputs), fn {name, t} ->
+          {name, Nx.backend_transfer(t, Nx.BinaryBackend)}
+        end)
+      end
+
+      clean = run.(inputs)
+      dirty = run.(%{inputs | "pk" => garbage.(inputs["pk"]), "pv" => garbage.(inputs["pv"])})
+      assert_same("#{name} y", dirty["y"], clean["y"], 1.0e-6)
+
+      for name <- ["present_k", "present_v"], {length, row} <- Enum.with_index(valid) do
+        rows = &Nx.slice_along_axis(&1[name][row], 0, length + s, axis: 1)
+        assert_same("#{name} of row #{row}", rows.(dirty), rows.(clean), 0.0)
+      end
+    end
+  end
+
   # A packed MatMulNBits weight holds its scales and zero points. Transmuter.EMLX.move gives
   # the node the packed weight as "B:packed", blanks its scales and zero points, and drops B,
   # the scales (a param) and the zero points (a static value) when no other node reads them.
