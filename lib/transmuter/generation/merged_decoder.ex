@@ -4,7 +4,7 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   Such a decoder takes the length L of its cache from the shape of the past. With a buffer of C rows, L is C, which is right for the shapes and the causal masks: the keys are the buffer and the new rows, and query i of a step sees the keys up to C + i. Only the positions need the valid rows v. The rewrite changes only the branch with cache of the `If` on `use_cache_branch`, because the branches of the exports have nodes with the same names. A decoder without an `If` gets the rewrite on its graph when a node other than GroupQueryAttention reads the past, as the rotary positions of Apertus. GroupQueryAttention writes its new rows into the buffer and hides its free rows, so it needs no key mask, and no other node may read its present. The rewrite adds two inputs:
 
-    * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when the value that takes the offset at every read has the batch on axis 0, or a read has positions that meet the tokens of each row, which have the batch first (the table reads of Marian, Whisper, TrOCR and Florence-2, whose output adds to the token embeddings, and the `Mul` of M2M100 and NLLB by the padding mask), and no later `Reshape` or `Expand` has a static first dimension of 1. A value has the batch on axis 0 when it is the index of a `Gather` or the input of a float cast with a leading axis of size 1: an `Unsqueeze` on axis 0 or a `Reshape` to a shape that starts with 1 or -1, then `Unsqueeze` on other axes, `Cast` and `Identity`. The offset then takes the rank of that value, as `{batch, 1, 1}` for the `[1, 1, n]` positions of the rotary angles of Apertus, so it gives the batch to axis 0 and keeps the other axes. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
+    * `transmuter.position_offset`, v - C. Each position read, a `Gather` on axis 0 or a `Slice` on axis 0 with step 1 of a 2-D static table whose index is a shift of L (L plus values without L), gets it added to its index. Each cast of a shift of L to a float, such as the position of a rotary angle, gets it added to its integer input, so the float values see v and not C. The integer uses of L keep C, because they index the buffer. The offset has one value for each row, of shape `{batch, 1}`, when the value that takes the offset at every read has the batch on axis 0, or a read has positions that meet the tokens of each row, which have the batch first (the table reads of Marian, Whisper, TrOCR and Florence-2, whose output adds to the token embeddings, and the `Mul` of M2M100 and NLLB by the padding mask), and no later `Reshape` or `Expand` has a static first dimension of 1. A value has the batch on axis 0 when it is the index of a `Gather` or the input of a float cast, reads no input of the graph, and has a first axis of static size 1: an `Unsqueeze` on axis 0 or a `Reshape` to a shape that starts with 1 or -1, then the ops that keep axis 0. A forward walk from the `Range` nodes and the static values gives these sizes. The offset then takes the rank of that value, as `{batch, 1, 1}` for the `[1, 1, n]` positions of the rotary angles of Apertus, so it gives the batch to axis 0 and keeps the other axes. Then the rows of a step can have different valid rows and gap rows, so Generation decodes the rows of prompts of different lengths together. Otherwise the offset is one scalar for all rows, which keeps the shape of each value that it is added to, and Generation runs the rows of each prompt length as a group of their own, without gap rows, so that buffer row j holds position j. `:per_row_offset` in the returned model tells which.
 
     * `transmuter.key_mask`, the attention mask of `:append`, 1 for the valid rows and the new rows and 0 for the gap rows and the free rows. Each `AttentionCore` whose keys read a buffer gets it as input 8, so the free rows get no weight, also when the decoder takes no attention mask, as in Whisper. The key mask is an input only when a node reads it. The rows of a buffer may reach only the keys and the values of these cores, the present cache and Concat, Reshape, Transpose (with the batch first), Unsqueeze, Squeeze, Identity and Cast. Another reader, such as an attention that `Transmuter.Fusion` did not replace, keeps the decoder in `:grow`.
 
@@ -122,24 +122,21 @@ defmodule Transmuter.Generation.MergedDecoder do
     end)
   end
 
-  # The edits of lift/4 when no read needs them.
+  # The edits of lift/5 when no read needs them.
   @no_lift %{edits: %{}, static: %{}, rows: MapSet.new(), ranks: %{}}
 
   # The offset is one value for each row, of shape {batch, 1}, when the rows of a step can have
   # different valid rows: the value that takes the offset at each read has the batch on axis 0
-  # (see batch_rank/3) or meets the tokens, no later Reshape or Expand has a static first
+  # (see batch_ranks/4) or meets the tokens, no later Reshape or Expand has a static first
   # dimension of 1. Otherwise it is one value for all rows, and Generation runs one group for
   # each prompt length. Returns nil for an offset for each row, else the reason for one offset,
   # and the rank of the value at each read whose axis 0 is the batch.
   defp one_offset(model, graph, reads) do
     scope = static_scope(model, graph)
-    producers = for node <- graph.node, output <- node.output, into: %{}, do: {output, node}
-
-    ranks =
-      for read <- reads, rank = batch_rank(read, producers, scope), into: %{}, do: {read, rank}
-
+    positions = position_dims(graph, scope, model.input_types)
+    ranks = batch_ranks(reads, positions)
     batch? = &(Map.has_key?(ranks, &1) or meets_tokens?(&1, graph))
-    lift = lift(model, graph, scope, Enum.reject(reads, batch?))
+    lift = lift(model, graph, scope, positions, Enum.reject(reads, batch?))
 
     reason =
       cond do
@@ -188,10 +185,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   # Returns the edits of the lifted nodes, the new static values and the Range reads that map
   # the rows of the buffer for each row, or {:bail, node} for a node that the lift does not
   # follow.
-  defp lift(_model, _graph, _scope, []), do: @no_lift
+  defp lift(_model, _graph, _scope, _positions, []), do: @no_lift
 
-  defp lift(model, graph, scope, reads) do
-    {dims, batched} = position_dims(graph, scope, model.input_types)
+  defp lift(model, graph, scope, {dims, batched}, reads) do
     sources = Enum.map(reads, &read_node/1)
 
     takes =
@@ -239,7 +235,7 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp offset_value(%{op_type: "Gather", input: [_table, index]}), do: index
   defp offset_value(_read), do: nil
 
-  # One node of the walk of lift/4: a node without lifted inputs, or a source, stays. A node
+  # One node of the walk of lift/5: a node without lifted inputs, or a source, stays. A node
   # that reads a lifted value from a subgraph, such as the branch of an If, stops the walk.
   defp lift_step(node, {lifted, acc}, walk) do
     reads = Enum.filter(Transmuter.dependencies(node), &Map.has_key?(lifted, &1))
@@ -302,7 +298,7 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
-  # The lift of one node with lifted inputs (see lift/4): the dims of its lifted outputs before
+  # The lift of one node with lifted inputs (see lift/5): the dims of its lifted outputs before
   # the lift, its nodes after the lift and their new static values, or :bail.
   # Only a ConstantOfShape may read the shape of a lifted value.
   defp lift_node(node = %{op_type: op}, lifted, walk) when op != "ConstantOfShape" do
@@ -470,6 +466,9 @@ defmodule Transmuter.Generation.MergedDecoder do
   # of its shape. A scalar of a Shape has no dims, so the positions of a Range of the length of
   # the cache have no batch.
   defp position_dims(graph, scope, input_types) do
+    producers = for node <- graph.node, output <- node.output, into: %{}, do: {output, node}
+    scope = Map.put(scope, :producers, producers)
+
     inputs =
       for {name, {_type, [_ | _] = shape}} <- input_types,
           into: %{},
@@ -554,6 +553,29 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
+  # A Reshape to a shape that starts with 1 or -1 keeps a leading axis of size 1, as the
+  # Reshape(Unsqueeze(Range), [-1, n]) positions of GPT-2. The other axes of a shape that is
+  # not static count as other sizes.
+  defp node_dims(node = %{op_type: "Reshape", input: [data, shape]}, get, _dims, scope) do
+    d = get.(data)
+    list = &static_list(scope, &1, node)
+    length = shape_length(shape, scope.producers, scope)
+
+    cond do
+      d == nil or length == nil ->
+        nil
+
+      match?([1 | _], d) and leading_one?(shape, scope.producers, list) ->
+        [1 | List.duplicate(:x, length - 1)]
+
+      values = list.(shape) ->
+        Enum.map(values, &if(&1 == 1, do: 1, else: :x))
+
+      true ->
+        List.duplicate(:x, length)
+    end
+  end
+
   defp node_dims(_node, _get, _dims, _scope), do: nil
 
   defp static_dims(scope, name) do
@@ -612,86 +634,27 @@ defmodule Transmuter.Generation.MergedDecoder do
     {%{node | attribute: [attribute | Enum.reject(node.attribute, &(&1.name == "axes"))]}, %{}}
   end
 
-  # The rank of the value that takes the offset of a read, when its axis 0 is the batch: the
-  # index of a Gather on axis 0, or the input of a float cast, with a leading axis of size 1.
-  # The offset then has that rank, {batch, 1, ..., 1}, so it gives the batch to axis 0 and
-  # keeps the other axes, as the [1, 1, n] positions of the rotary angles of Apertus.
-  defp batch_rank(node = %NodeProto{op_type: "Gather", input: [_table, index]}, producers, scope) do
-    axis = Enum.find_value(node.attribute, 0, &(&1.name == "axis" && &1.i))
-    if axis == 0, do: leading_rank(index, producers, scope)
-  end
-
-  defp batch_rank(%NodeProto{op_type: "Cast", input: [value]}, producers, scope),
-    do: leading_rank(value, producers, scope)
-
-  defp batch_rank(_read, _producers, _scope), do: nil
-
-  # The rank of a value whose axis 0 is a leading axis of size 1: an Unsqueeze on axis 0 or a
-  # Reshape to a shape whose first static value is 1 or -1, with more values after it, then
-  # Unsqueeze on other axes, Cast and Identity, which keep axis 0. nil for another value.
-  defp leading_rank(value, producers, scope) do
-    node = producers[value]
-    list = &static_list(scope, &1, node)
-
-    case node do
-      %{op_type: op, input: [input]} when op in ["Cast", "Identity"] ->
-        leading_rank(input, producers, scope)
-
-      %{op_type: "Unsqueeze", input: [input | _]} ->
-        with axes when axes != nil <- unsqueeze_axes(node, list),
-             leading? = 0 in axes,
-             rank when rank != nil <-
-               if(leading?,
-                 do: rank(input, producers, scope),
-                 else: leading_rank(input, producers, scope)
-               ),
-             do: rank + length(axes)
-
-      %{op_type: "Reshape", input: [_data, shape]} ->
-        if leading_one?(shape, producers, list), do: shape_length(shape, producers, list)
-
-      _other ->
-        nil
-    end
-  end
-
-  # The rank of a value of positions: a Range, and the Unsqueeze, Reshape, Cast and Identity
-  # of it.
-  defp rank(value, producers, scope) do
-    node = producers[value]
-    list = &static_list(scope, &1, node)
-
-    case node do
-      %{op_type: "Range"} ->
-        1
-
-      %{op_type: op, input: [input]} when op in ["Cast", "Identity"] ->
-        rank(input, producers, scope)
-
-      %{op_type: "Unsqueeze", input: [input | _]} ->
-        axes = unsqueeze_axes(node, list)
-        rank = rank(input, producers, scope)
-        if axes && rank, do: rank + length(axes)
-
-      %{op_type: "Reshape", input: [_data, shape]} ->
-        shape_length(shape, producers, list)
-
-      _other ->
-        nil
-    end
-  end
-
-  # The axes of an Unsqueeze, from its input or its attribute.
-  defp unsqueeze_axes(node, list) do
-    case node.input do
-      [_data, axes] -> list.(axes)
-      [_data] -> Enum.find_value(node.attribute, &(&1.name == "axes" && &1.ints))
-    end
+  # The rank of the value that takes the offset at each read whose value has the batch on
+  # axis 0: a value without the batch whose first axis has a static size of 1, such as the
+  # [1, 1, n] positions of the rotary angles of Apertus, an Unsqueeze on axis 0 of a Range. The
+  # offset then has that rank, {batch, 1, ..., 1}, so it gives the batch to axis 0 and keeps
+  # the other axes (see position_dims/3).
+  defp batch_ranks(reads, {dims, batched}) do
+    for read <- reads,
+        %NodeProto{op_type: op} = node <- [read],
+        op in ["Gather", "Cast"],
+        value = offset_value(node),
+        not MapSet.member?(batched, value),
+        [1 | _] = d <- [dims[value]],
+        into: %{},
+        do: {read, length(d)}
   end
 
   # The number of values of a shape: a static list, or a Concat of static lists and of
   # Unsqueezes of scalars.
-  defp shape_length(shape, producers, list) do
+  defp shape_length(shape, producers, scope) do
+    list = &static_list(scope, &1, producers[shape])
+
     case {list.(shape), producers[shape]} do
       {[_ | _] = values, _producer} ->
         length(values)
@@ -701,7 +664,7 @@ defmodule Transmuter.Generation.MergedDecoder do
           Enum.map(parts, fn part ->
             case {list.(part), producers[part]} do
               {[_ | _] = values, _} -> length(values)
-              {nil, %{op_type: "Unsqueeze"} = node} -> length(unsqueeze_axes(node, list) || [])
+              {nil, %{op_type: "Unsqueeze"} = node} -> length(axes_of(node, scope) || [])
               _other -> nil
             end
           end)
@@ -1409,10 +1372,10 @@ defmodule Transmuter.Generation.MergedDecoder do
   # a shift of L. The reads are found by value, as in cut/3.
   #
   # An offset for each row, {batch, 1}, takes the rank of the value of a read whose axis 0 is
-  # the batch (see batch_rank/3): an Unsqueeze at the start of the branch gives the offset of
+  # the batch (see batch_ranks/2): an Unsqueeze at the start of the branch gives the offset of
   # each such rank above 2, as {batch, 1, 1} for the [1, 1, n] positions of Apertus.
   #
-  # The reads of positions without a batch axis take the edits of lift/4, and a Range read
+  # The reads of positions without a batch axis take the edits of lift/5, and a Range read
   # maps the rows of the buffer to positions for each row (see row_positions/2).
   defp offset_reads(model, branch, graph, reads, per_row?, ranks, lift) do
     name = &(@position_offset <> "." <> &1)
