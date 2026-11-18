@@ -23,7 +23,7 @@ A caller node calls the models. It has Transmuter without the optional dependenc
 {:transmuter, "~> 2.0"}
 ```
 
-All nodes must have the same versions of Nx and Transmuter.
+All nodes must have the same versions of Nx and Transmuter. A caller node starts a process on the model node through a function of Transmuter, and the arguments of this function can change between versions. So a node cannot call a model on a node with another version of Transmuter. Upgrade all nodes of a cluster together, not one node at a time.
 
 ## Connect the nodes
 
