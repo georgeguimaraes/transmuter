@@ -257,6 +257,8 @@ Requests that arrive over time, at 0.8 and 1.2 times what 8 rows can give, get t
 
 The table shows 48 requests with greedy selection and up to 256 new tokens, with 8 rows on an RTX 3060 with EXLA, from `bench/continuous_batching.exs`. A warm round of the same requests at the same times comes first, so the values do not include the first compiles.
 
+All rows of a group have the KV cache of its longest row, so the device memory sets the largest `:capacity` that the server can keep. Without `:capacity`, the server takes the largest capacity up to 4096 rows that fits `:device_memory`, and it logs the capacity that it takes. EXLA 1.0 reports no memory limit, so on CUDA give `:device_memory`: the bytes that the allocator of EXLA can use, about 90% of the memory of the GPU. For Qwen3-0.6B q4 with 8 slots on an RTX 3060, `device_memory: trunc(10.6 * 2 ** 30)` gives 2048 rows. Without `:device_memory` and `:capacity`, the capacity is 4096, and with `compile_steps: true` the start fails with an `ArgumentError` that gives the bytes. See "Device memory" in `Transmuter.ContinuousBatching`.
+
 #### Beam search
 
 Set `:num_beams` to keep the best `n` sequences at each step and return the best one at the end:

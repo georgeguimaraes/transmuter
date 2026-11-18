@@ -2615,3 +2615,51 @@ defmodule Transmuter.GenerationMemoryTest do
     end
   end
 end
+
+defmodule Transmuter.GenerationCapacityTest do
+  use ExUnit.Case, async: true
+
+  alias Transmuter.Generation
+
+  # A decoder of 14 layers with f32 caches of 8 heads of 128: 8 rows hold 917,536 bytes for
+  # each position. The temporaries of the step of 512 tokens take 5 times its scores: 655,360
+  # bytes for each position with 8 query heads, 2,621,440 with 32.
+  @names for layer <- 0..13, kind <- ["key", "value"], do: "past_key_values.#{layer}.#{kind}"
+  @ctx %{
+    min_capacity: 256,
+    max_capacity: 4096,
+    cache: @names,
+    buffers: @names,
+    query_heads: 8,
+    model: %{input_types: Map.new(@names, &{&1, {:f32, ["batch", 8, "length", 128]}})},
+    widths: %{with_cache: [1, 64, 512], without_cache: [1, 2, 4, 8, 16, 32, 64, 512]}
+  }
+  @live 1_000_000_000
+
+  test "the largest capacity is the largest one whose peak fits 95% of the device memory" do
+    growth = @live + 917_536 * (1792 + 2048)
+
+    # The step at 2048 rows needs less than the growth into it, so the growth decides.
+    assert @live + (917_536 + 655_360) * 2048 < growth
+    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95) == 2048
+    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95 - 1) == 1792
+    assert Generation.largest_capacity(@ctx, 8, @live, 1.0e12) == 4096
+    assert Generation.largest_capacity(@ctx, 8, @live, nil) == 4096
+
+    message = ~r/a :capacity of 256 rows with 8 :slots needs about \d+ bytes .* :device_memory/
+
+    assert_raise ArgumentError, message, fn ->
+      Generation.largest_capacity(@ctx, 8, @live, @live + 1000)
+    end
+  end
+
+  test "the step peak decides the capacity when the query heads make its temporaries large" do
+    ctx = %{@ctx | query_heads: 32}
+    step = @live + (917_536 + 2_621_440) * 2048
+
+    # The growth into 2048 rows needs less than the step at it, so the step decides.
+    assert @live + 917_536 * (1792 + 2048) < step
+    assert Generation.largest_capacity(ctx, 8, @live, step / 0.95) == 2048
+    assert Generation.largest_capacity(ctx, 8, @live, step / 0.95 - 1) == 1792
+  end
+end

@@ -205,6 +205,7 @@ defmodule Transmuter.Generation do
       embed: opts[:embed],
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
+      query_heads: query_heads(model, repo.config),
       buffers: buffers(model),
       min_capacity: min_capacity(model),
       max_capacity: model[:max_capacity],
@@ -228,6 +229,27 @@ defmodule Transmuter.Generation do
       processors: processors(gen, opts, max_new_tokens, eos)
     }
     |> Map.merge(beam_search(gen, opts, sampling?))
+  end
+
+  # The query heads of the attention: the largest head count of the attention nodes of the
+  # graph, else the attention heads of the decoder in the config, else nil.
+  defp query_heads(model, config) do
+    attributes = %{
+      "GroupQueryAttention" => "num_heads",
+      "MultiHeadAttention" => "num_heads",
+      "Attention" => "q_num_heads"
+    }
+
+    keys = ["num_attention_heads", "decoder_attention_heads", "num_heads", "n_head"]
+    config = Map.merge(config, config["text_config"] || %{})
+
+    heads =
+      for node <- model.nodes,
+          name = attributes[node.op_type],
+          heads = name && Transmuter.Ops.attr(node, name),
+          do: heads
+
+    Enum.max(heads, fn -> Enum.find_value(keys, &config[&1]) end)
   end
 
   # The length of the past comes from the mask only in :grow (see MergedDecoder.past_length/1),
@@ -2773,6 +2795,64 @@ defmodule Transmuter.Generation do
     if to >= from,
       do: Enum.filter(steps, &(&1 > from and &1 <= to)),
       else: steps |> Enum.filter(&(&1 >= to and &1 < from)) |> Enum.reverse()
+  end
+
+  @doc false
+  # The largest capacity of capacity/2, up to ctx.max_capacity, whose peak of device memory
+  # for `rows` rows (see peak/4) stays at most 95% of `limit` bytes, with `live` bytes already
+  # in use. Without a limit, the capacity is ctx.max_capacity.
+  def largest_capacity(ctx, _rows, _live, nil), do: ctx.max_capacity
+
+  def largest_capacity(ctx, rows, live, limit) do
+    [smallest | _] = capacities = capacities(ctx, ctx.max_capacity)
+
+    case Enum.filter(capacities, &(peak(ctx, rows, live, &1) <= 0.95 * limit)) do
+      [] -> raise memory_error(ctx, rows, live, limit, smallest)
+      fits -> List.last(fits)
+    end
+  end
+
+  # The peak of device memory of a group of `rows` rows at `capacity`, with `live` bytes in
+  # use: the larger of a step at the capacity, with the temporary of the widest step, and a
+  # growth into it from the capacity before, which holds the buffers of both capacities.
+  defp peak(ctx, rows, live, capacity) do
+    # Each row and position of a buffer holds a row of each cache buffer and a token of history.
+    {position, cache_heads} =
+      ctx.buffers
+      |> Enum.filter(&(&1 in ctx.cache))
+      |> Enum.map(fn name ->
+        {type, [_batch, heads, _length, head_dim]} = ctx.model.input_types[name]
+        {_kind, bits} = Nx.Type.normalize!(type)
+        {heads * head_dim * div(bits, 8), heads}
+      end)
+      |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
+
+    # The temporaries of the widest step: 5 times its attention scores in f32, one row for each
+    # query head. For Qwen3-0.6B, XLA held up to 4.5 times the scores (at 1280 rows: two copies
+    # each of the scores, the masked scores and the softmax, and parts of the cache), 3.4 times
+    # at 2048 rows (1.7 GiB) and 1.9 times at 4096 rows (1.9 GiB). Without a count of query
+    # heads in the graph or the config, it takes 8 query heads for each head of the cache, as
+    # in Llama 3 70B. That is not a bound for multi-query attention, which has one cache head.
+    width = Enum.max(ctx.widths.with_cache ++ ctx.widths.without_cache)
+    heads = ctx.query_heads || 8 * cache_heads
+    temporary = 5 * rows * heads * width * capacity * 4
+    before = capacities(ctx, capacity - 1) |> List.last(0)
+    buffers = &(rows * position * &1)
+    live + max(buffers.(capacity) + temporary, buffers.(before) + buffers.(capacity))
+  end
+
+  @doc false
+  # The error of a server whose group of `rows` rows at `capacity` does not fit the device.
+  def memory_error(ctx, rows, live, limit, capacity) do
+    free = if limit, do: "#{limit - live} bytes", else: "an unknown number of bytes"
+    limit = if limit, do: "#{limit} bytes", else: "not known"
+
+    ArgumentError.exception(
+      "the server cannot start: a :capacity of #{capacity} rows with #{rows} :slots needs " <>
+        "about #{peak(ctx, rows, live, capacity)} bytes of device memory, and #{free} are " <>
+        "free (the :device_memory is #{limit}). Give a smaller :capacity, fewer :slots or " <>
+        "a :device_memory that the device has"
+    )
   end
 
   # The capacities of capacity/2 up to `bound`, from the smallest one.

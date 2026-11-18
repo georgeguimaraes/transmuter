@@ -34,11 +34,21 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:max_queue` - the number of requests that can wait for their rows. A request counts one time, also when its input gives more than one row. The default is 4 times `:slots`. When the queue is full, `run/3` and `stream/3` raise `Transmuter.ContinuousBatching.QueueFullError`, so the caller can rescue this case and reject the request.
 
-    * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. The default is `4096`.
+    * `:capacity` - the largest number of rows of the KV cache of a row, at most the rows of the static tables of the decoder. A request whose prompt and `:max_new_tokens` need more rows raises an `ArgumentError` in the caller. Without it, the server takes the largest capacity up to 4096 whose buffers fit the device memory (see "Device memory"), or 4096 when the device memory is not known.
+
+    * `:device_memory` - the bytes of device memory that the server can use. Without it, the server takes the limit that the backend reports, when it reports one (see "Device memory").
 
     * `:compile_steps` - when `true`, the server compiles the shape of each step that its rows can take before it starts (see "Compiles"). The default is `false`.
 
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
+
+  ## Device memory
+
+  All rows of a group have the capacity of its buffers, so one long request grows the KV cache of all `:slots` rows. Without `:capacity`, the server takes the largest capacity whose peak of device memory stays at most 95% of `:device_memory`, with the bytes that the backend has in use after the load, such as the parameters. The peak is the larger of a step at the capacity, with the scores of the attention of its widest step, and a growth into it from the capacity before, which holds the buffers of both capacities. The bytes of each row and position come from the shapes and types of the cache inputs of the decoder, so a model in f16 takes half of the bytes of the same model in f32. The server logs the capacity that it takes.
+
+  EXLA gives the limit of its allocator when `EXLA.Client.get_memory_statistics/1` has a `:limit` key, and EXLA 1.0 has none. EMLX gives no limit. Without a limit, the capacity is 4096. With `compile_steps: true`, a capacity that does not fit fails at the start with an `ArgumentError` that gives the bytes. Without it, a step fails when the group grows to it.
+
+  For example, Qwen3-0.6B q4 has f32 caches of 229,376 bytes for each row and position. With 8 slots on an RTX 3060 (12 GB, an allocator limit of about 10.6 GiB) and about 2.2 GiB of parameters, `device_memory: trunc(10.6 * 2 ** 30)` gives a capacity of 2048 rows: a growth to 2560 rows holds about 10.1 GiB.
 
   ## Scope
 
@@ -107,7 +117,12 @@ defmodule Transmuter.ContinuousBatching do
 
   use GenServer
 
+  require Logger
+
   alias Transmuter.{Generation, Serving}
+
+  @compile {:no_warn_undefined, [EXLA.Client, EMLX]}
+  @default_capacity 4096
 
   defmodule QueueFullError do
     @moduledoc """
@@ -126,8 +141,8 @@ defmodule Transmuter.ContinuousBatching do
   """
   def start_link(opts) do
     module = Keyword.get(opts, :task, Transmuter.Text.Generation)
-    server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: 4096]
-    server_opts = server_opts ++ [compile_steps: false]
+    server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: nil]
+    server_opts = server_opts ++ [device_memory: nil, compile_steps: false]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
@@ -139,7 +154,9 @@ defmodule Transmuter.ContinuousBatching do
       raise ArgumentError, "requests cannot join a running batch of this model: #{reason}"
     end
 
-    ctx = %{ctx | max_capacity: min(ctx.max_capacity || opts[:capacity], opts[:capacity])}
+    # Without :capacity, init/1 takes the capacity up to this one that fits the device memory.
+    capacity = opts[:capacity] || @default_capacity
+    ctx = %{ctx | max_capacity: min(ctx.max_capacity || capacity, capacity)}
 
     state = %{
       name: opts[:name],
@@ -149,7 +166,9 @@ defmodule Transmuter.ContinuousBatching do
       slots: opts[:slots],
       max_queue: opts[:max_queue] || 4 * opts[:slots],
       defn_options: opts[:defn_options],
-      compile_steps: opts[:compile_steps]
+      compile_steps: opts[:compile_steps],
+      fixed_capacity?: opts[:capacity] != nil,
+      device_memory: opts[:device_memory]
     }
 
     GenServer.start_link(__MODULE__, state,
@@ -515,11 +534,25 @@ defmodule Transmuter.ContinuousBatching do
       end)
 
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
+    {live, limit} = device_memory(ctx.backend)
+    limit = state.device_memory || limit
+
+    capacity =
+      if state.fixed_capacity?,
+        do: ctx.max_capacity,
+        else: Generation.largest_capacity(ctx, state.slots, live, limit)
+
+    ctx = %{ctx | max_capacity: capacity}
+
+    Logger.info(
+      "Transmuter.ContinuousBatching: a :capacity of #{capacity} rows for #{state.slots} :slots, " <>
+        "with #{live} bytes of device memory in use and a limit of #{inspect(limit)} bytes"
+    )
 
     receive do
       {^worker, :ready, example} ->
         if example do
-          Generation.compile_steps(ctx, state.slots, example.inputs)
+          compile_steps(ctx, state.slots, example.inputs, {live, limit})
           if example.features, do: Generation.compile_features(ctx, state.slots, example.features)
         end
 
@@ -529,6 +562,33 @@ defmodule Transmuter.ContinuousBatching do
         {:stop, reason}
     end
   end
+
+  # A step that does not fit the device fails in EXLA with a RuntimeError whose message has
+  # RESOURCE_EXHAUSTED or "Out of memory". No other field tells this error apart, so the match
+  # reads the text, and other errors pass.
+  defp compile_steps(ctx, slots, inputs, {live, limit}) do
+    Generation.compile_steps(ctx, slots, inputs)
+  rescue
+    error in RuntimeError ->
+      if error.message =~ ~r/RESOURCE_EXHAUSTED|Out of memory/ do
+        reraise Generation.memory_error(ctx, slots, live, limit, ctx.max_capacity), __STACKTRACE__
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  # The bytes in use on the device of `backend` and the limit of its allocator, when the backend
+  # reports one: EXLA in a :limit key of its memory statistics, for each device. EMLX reports no
+  # limit.
+  defp device_memory({EXLA.Backend, opts}) do
+    client = EXLA.Client.fetch!(opts[:client] || EXLA.Client.default_name())
+    device = opts[:device_id] || client.default_device_id
+    stats = EXLA.Client.get_memory_statistics(client)
+    {Map.get(stats.per_device, device, stats.allocated), stats[:limit][device]}
+  end
+
+  defp device_memory({EMLX.Backend, _opts}), do: {EMLX.memory_info().active_memory, nil}
+  defp device_memory(_backend), do: {0, nil}
 
   defp start(state, ctx, worker) do
     info = %{

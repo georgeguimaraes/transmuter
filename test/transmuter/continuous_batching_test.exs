@@ -464,6 +464,24 @@ defmodule Transmuter.ContinuousBatchingTest do
     assert inspect(reason) =~ "no encoder"
   end
 
+  # Without :capacity, the server takes the largest capacity whose peak fits :device_memory,
+  # and a :device_memory that no capacity fits fails the start. A :capacity that the caller
+  # gives stays, whatever the device memory.
+  test "the capacity of a server comes from its :device_memory when no :capacity is given" do
+    spec = [source: {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, slots: 2] ++ @opts
+    capacity = fn server -> :sys.get_state(server).ctx.max_capacity end
+
+    assert {:error, reason} = start_supervised({ContinuousBatching, [device_memory: 1] ++ spec})
+    assert inspect(reason) =~ "a :capacity of 256 rows with 2 :slots needs about"
+
+    server = start_supervised!({ContinuousBatching, [device_memory: 2 ** 40] ++ spec})
+    assert capacity.(server) == 4096
+    stop_supervised!(ContinuousBatching)
+
+    server = start_supervised!({ContinuousBatching, [device_memory: 1, capacity: 512] ++ spec})
+    assert capacity.(server) == 512
+  end
+
   # A server with compile_steps runs one step of each shape before it starts. Then a stream
   # starts in an idle group, where its prompt runs in one part, two requests join it with parts
   # of at most 64 tokens, and the answers of 300 tokens take the buffers from 256 to 384 rows.
