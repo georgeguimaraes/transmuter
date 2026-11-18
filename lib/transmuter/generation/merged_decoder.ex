@@ -1582,17 +1582,21 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   The nodes of the main graph run in the first step. Each of them that takes the `Shape` of a buffer (see `buffers/1`) gets a shape whose length is the length of the attention mask less the new tokens, as `:grow` gives the mask of the past and the new tokens. So each position and each mask that the graph makes from that length sees the true past. Only the nodes whose outputs reach an output of the graph count.
 
-  Raises an `ArgumentError` for a decoder that this does not cover, so that it never gives wrong tokens: a node of the main graph that reads the values of a buffer, other than GroupQueryAttention and the `If` on `use_cache_branch`, as the `Concat` attention of Gemma 4 E2B, which would read the placeholder row as a key, or a `Shape` of a buffer without an `attention_mask` input.
+  Raises an `ArgumentError` for a decoder that this does not cover, so that it never gives wrong tokens: a node of the main graph that reads the values of a cache entry, or the `Shape` of a cross-attention cache entry, other than GroupQueryAttention and the `If` on `use_cache_branch`, as the `Concat` attention of Gemma 4 E2B, which would read the placeholder row as a key, or a `Shape` of a buffer without an `attention_mask` input.
   """
   def past_length(model) do
     buffers = MapSet.new(buffers(model))
+
+    cache =
+      model.inputs |> Enum.filter(&String.starts_with?(&1, "past_key_values.")) |> MapSet.new()
+
     live = slice(model.nodes, MapSet.new(model.outputs), &Transmuter.dependencies/1)
 
     shapes =
       for node <- live,
-          Enum.any?(Transmuter.dependencies(node), &MapSet.member?(buffers, &1)),
+          Enum.any?(Transmuter.dependencies(node), &MapSet.member?(cache, &1)),
           not past_reader?(node),
-          do: length_read!(node)
+          do: length_read!(node, buffers)
 
     cond do
       shapes == [] ->
@@ -1627,9 +1631,15 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp past_reader?(%{op_type: "If", input: ["use_cache_branch" | _]}), do: true
   defp past_reader?(_node), do: false
 
-  defp length_read!(node = %{op_type: "Shape"}), do: node
+  # Only the Shape of a buffer takes the length of the mask. A cross-attention cache entry has
+  # another length, so its readers raise as the other readers of the values.
+  defp length_read!(node = %{op_type: "Shape", input: [entry]}, buffers) do
+    if MapSet.member?(buffers, entry), do: node, else: values_read!(node)
+  end
 
-  defp length_read!(node) do
+  defp length_read!(node, _buffers), do: values_read!(node)
+
+  defp values_read!(node) do
     raise ArgumentError,
           "generation cannot run this decoder with a cache of exact length (:grow), because " <>
             "#{where(node)} reads the values of the cache. That cache starts with one " <>

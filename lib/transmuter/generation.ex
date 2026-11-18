@@ -10,7 +10,7 @@ defmodule Transmuter.Generation do
 
     * `:append` - the graph declares `position_ids`, or it is a merged decoder whose positions are reads of a table at the length of the cache plus the index of the token, as in GPT-2, Whisper, Marian and TrOCR (see "Merged decoders"). The cache is a buffer whose free rows the attention mask hides. The present cache is the buffer and the new rows after it, and the new rows go into the buffer.
 
-    * `:grow` - the graph computes the positions from the length of the cache in a way that `Transmuter.Generation.MergedDecoder` does not cover, such as the rotary table of the merged llama2.c, or a node other than GroupQueryAttention reads the cache or its length, as in Gemma 4. The cache has its exact length, so each length is a new shape that compiles on its first step.
+    * `:grow` - the graph computes the positions from the length of the cache in a way that `Transmuter.Generation.MergedDecoder` does not cover, such as the rotary table of the merged llama2.c, or a node other than GroupQueryAttention reads the cache or its length, as in Gemma 4. This holds also when the GroupQueryAttention of the decoder counts the valid rows from the values of the mask. The cache has its exact length, so each length is a new shape that compiles on its first step.
 
   ## Merged decoders
 
@@ -484,6 +484,12 @@ defmodule Transmuter.Generation do
     gqa = Enum.find(model.nodes, &(&1.op_type == "GroupQueryAttention"))
 
     cond do
+      # A decoder that reads its cache or its length where MergedDecoder cannot give the
+      # offset of each row keeps a cache of exact length, whatever its GroupQueryAttention
+      # reads, so MergedDecoder.past_length/1 gives it the true past or raises.
+      model[:one_length] ->
+        :grow
+
       # A buffer as long as the mask works when GroupQueryAttention counts the valid rows
       # from the values of the mask (see count_rows/1).
       gqa && reads_values?(model, Enum.at(gqa.input, 5), "attention_mask") ->

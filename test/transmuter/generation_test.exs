@@ -2143,7 +2143,9 @@ defmodule Transmuter.GenerationBitsTest do
   # reads a slice of the shape of the past keeps the decoder in :grow. When the positions read
   # such a slice, the first step of :grow sees a past of 0 rows from the attention mask, not
   # the placeholder row of the cache, and the rows give the same tokens. A Concat of the cache
-  # would read that placeholder row as a valid row, so its context raises.
+  # would read that placeholder row as a valid row, so its context raises. A decoder whose
+  # GroupQueryAttention counts its rows from the values of the mask also keeps a cache of
+  # exact length when its positions cannot take an offset for each row.
   test "a decoder without an If takes positions from the length of its past with the offset" do
     node = &%NodeProto{op_type: &1, name: hd(&3), input: &2, output: &3}
     int = &%AttributeProto{name: &1, type: :INT, i: &2}
@@ -2372,6 +2374,27 @@ defmodule Transmuter.GenerationBitsTest do
     prompts =
       for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: rem(i * 37 * row, 50))
 
+    # GroupQueryAttention that counts its rows from the values of the mask. A decoder whose
+    # positions cannot take an offset for each row still keeps a cache of exact length.
+    summed = fn model ->
+      nodes =
+        Enum.flat_map(model.nodes, fn
+          %{name: "seqlens"} ->
+            [
+              %{
+                node.("ReduceSum", ["attention_mask", "axis_1"], ["mask_rows"])
+                | attribute: [int.("keepdims", 0)]
+              },
+              node.("Sub", ["mask_rows", "one"], ["seqlens"])
+            ]
+
+          other ->
+            [other]
+        end)
+
+      %{model | nodes: nodes}
+    end
+
     # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
     # the lift of the [n] form stops at the sum with the embeddings, without an error, and the
     # decoder keeps a cache of exact length.
@@ -2384,7 +2407,9 @@ defmodule Transmuter.GenerationBitsTest do
       {column, :in_place},
       {reshaped, :grow},
       {sliced, :grow},
-      {unknown, :grow}
+      {unknown, :grow},
+      {summed.(reshaped), :grow},
+      {summed.(sliced), :grow}
     ]
 
     for {model, mode} <- forms do
