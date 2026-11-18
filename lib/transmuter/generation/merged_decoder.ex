@@ -191,9 +191,14 @@ defmodule Transmuter.Generation.MergedDecoder do
   defp lift(_model, _graph, _scope, []), do: @no_lift
 
   defp lift(model, graph, scope, reads) do
-    dims = position_dims(graph, scope, model.input_types)
+    {dims, batched} = position_dims(graph, scope, model.input_types)
     sources = Enum.map(reads, &read_node/1)
-    takes = Map.new(sources, &{&1, offset_value(&1, dims)})
+
+    takes =
+      Map.new(sources, fn source ->
+        value = offset_value(source)
+        {source, if(value && not MapSet.member?(batched, value), do: dims[value])}
+      end)
 
     if Enum.all?(sources, &(match?([_ | _], takes[&1]) and is_list(dims[hd(&1.output)]))) do
       lifted = Map.new(sources, &{hd(&1.output), dims[hd(&1.output)]})
@@ -225,13 +230,14 @@ defmodule Transmuter.Generation.MergedDecoder do
     end
   end
 
-  # The dims of the value that takes the offset of a read: the positions of a Range (see
-  # row_positions/2), the input of a float cast or the index of a Gather. The offset takes one
-  # more axis than this value, {batch, 1, ..., 1}, so the batch is a new axis 0 for each rank.
-  defp offset_value(%{op_type: "Range", output: [out]}, dims), do: dims[out]
-  defp offset_value(%{op_type: "Cast", input: [value]}, dims), do: dims[value]
-  defp offset_value(%{op_type: "Gather", input: [_table, index]}, dims), do: dims[index]
-  defp offset_value(_read, _dims), do: nil
+  # The value that takes the offset of a read: the positions of a Range (see row_positions/2),
+  # the input of a float cast or the index of a Gather. When it has no batch axis, the offset
+  # takes one more axis than this value, {batch, 1, ..., 1}, so the batch is a new axis 0 for
+  # each rank.
+  defp offset_value(%{op_type: "Range", output: [out]}), do: out
+  defp offset_value(%{op_type: "Cast", input: [value]}), do: value
+  defp offset_value(%{op_type: "Gather", input: [_table, index]}), do: index
+  defp offset_value(_read), do: nil
 
   # One node of the walk of lift/4: a node without lifted inputs, or a source, stays. A node
   # that reads a lifted value from a subgraph, such as the branch of an If, stops the walk.
@@ -456,14 +462,20 @@ defmodule Transmuter.Generation.MergedDecoder do
 
   # The dims of the values of positions, from the Range nodes and the static values: 1 for an
   # axis of size 1, :x for another axis. A Shape gives {:shape, dims}, which only a
-  # ConstantOfShape reads. The inputs of the graph take the dims of their declared shapes.
+  # ConstantOfShape reads. The tensor inputs of the graph with a declared shape take the dims
+  # of that shape, and the other inputs have no dims.
+  #
+  # Also returns the values with the batch: the inputs of the graph and the values with dims
+  # that read them, so a Shape carries the batch of its input and a ConstantOfShape the batch
+  # of its shape. A scalar of a Shape has no dims, so the positions of a Range of the length of
+  # the cache have no batch.
   defp position_dims(graph, scope, input_types) do
     inputs =
-      Map.new(input_types, fn {name, {_type, shape}} ->
-        {name, Enum.map(shape, &if(&1 == 1, do: 1, else: :x))}
-      end)
+      for {name, {_type, [_ | _] = shape}} <- input_types,
+          into: %{},
+          do: {name, Enum.map(shape, &if(&1 == 1, do: 1, else: :x))}
 
-    Enum.reduce(graph.node, inputs, fn node, dims ->
+    Enum.reduce(graph.node, {inputs, MapSet.new(Map.keys(inputs))}, fn node, {dims, batched} ->
       get = fn name ->
         case dims[name] do
           nil -> static_dims(scope, name)
@@ -473,8 +485,13 @@ defmodule Transmuter.Generation.MergedDecoder do
       end
 
       case node_dims(node, get, dims, scope) do
-        nil -> dims
-        d -> Map.put(dims, hd(node.output), d)
+        nil ->
+          {dims, batched}
+
+        d ->
+          out = hd(node.output)
+          reads? = Enum.any?(Transmuter.dependencies(node), &MapSet.member?(batched, &1))
+          {Map.put(dims, out, d), if(reads?, do: MapSet.put(batched, out), else: batched)}
       end
     end)
   end

@@ -2349,6 +2349,12 @@ defmodule Transmuter.GenerationBitsTest do
 
     forms = [{model, per_row}, {export, per_row}, {column, per_row}, {reshaped, []}]
 
+    # The tokens without a declared shape, and an input that is not a tensor, give no dims, so
+    # the lift of the [n] form stops at the sum with the embeddings, without an error.
+    types = model.input_types |> Map.put("input_ids", {:s64, []}) |> Map.put("sequence", nil)
+    unknown = context.(%{model | input_types: types}).model.input_types
+    assert unknown[Generation.MergedDecoder.position_offset()] == {:s64, []}
+
     for {model, offset} <- forms do
       ctx = context.(model)
       assert ctx.mode == :in_place
