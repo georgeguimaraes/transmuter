@@ -394,7 +394,7 @@ defmodule Transmuter.Serving do
       items = rows |> split_like(inputs) |> Enum.map(&Enum.concat/1)
       {batches, {multi?, items}}
     end)
-    |> Nx.Serving.client_postprocessing(fn result, {multi?, items} ->
+    |> client_postprocessing(fn result, {multi?, items} ->
       {outputs, _metadata} = result
 
       results =
@@ -465,7 +465,7 @@ defmodule Transmuter.Serving do
       batch_limit!(length(inputs), 1)
       {Nx.Batch.stack(Enum.map(inputs, preprocess)), multi?}
     end)
-    |> Nx.Serving.client_postprocessing(fn {outputs, _metadata}, multi? ->
+    |> client_postprocessing(fn {outputs, _metadata}, multi? ->
       result = outputs |> Map.new(fn {name, t} -> {name, t[0]} end) |> postprocess.()
       if multi?, do: [result], else: result
     end)
@@ -486,10 +486,18 @@ defmodule Transmuter.Serving do
   # without a copy. Nx.Serving.run/2 runs init and the batches in the caller, or for a stream
   # in a process that it starts for the call, which keeps the functions only as long as it
   # needs them.
+  #
+  # The compiles of init and of a batch make scopes of Transmuter.Shared, which live as long
+  # as the process that makes them. In the caller of Nx.Serving.run/2 they belong to the call,
+  # so the call ends them: the client postprocessing ends them after the result, and a batch
+  # that raises ends them (see end_run/0). In a serving process and in its batches, the run
+  # list stays empty, and the scopes end with their process.
+  @run {__MODULE__, :run}
+
   @doc false
   @impl Nx.Serving
   def init(type, init, partitions) do
-    funs = Enum.map(partitions, init)
+    funs = run_collect(type, fn -> Enum.map(partitions, init) end)
 
     case type do
       :inline ->
@@ -505,7 +513,44 @@ defmodule Transmuter.Serving do
   @doc false
   @impl Nx.Serving
   def handle_batch(batch, partition, funs) do
-    {:execute, fn -> {Enum.at(funs.(), partition).(batch), :server_info} end, funs}
+    execute = fn ->
+      try do
+        run_collect(:inline, fn -> {Enum.at(funs.(), partition).(batch), :server_info} end)
+      catch
+        kind, reason ->
+          end_run()
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end
+
+    {:execute, execute, funs}
+  end
+
+  # Runs `fun`, and in the caller of Nx.Serving.run/2 adds the scopes that it makes to the
+  # scopes of the call.
+  defp run_collect(:process, fun), do: fun.()
+
+  defp run_collect(:inline, fun) do
+    {result, scopes} = Shared.collect(fun)
+    if scopes != [], do: Process.put(@run, scopes ++ Process.get(@run, []))
+    result
+  end
+
+  # Ends the scopes of the call of Nx.Serving.run/2 in this process.
+  defp end_run do
+    @run |> Process.delete() |> List.wrap() |> Enum.each(&Shared.erase_scope/1)
+  end
+
+  # The client postprocessing of all servings. The result of a call of Nx.Serving.run/2 ends
+  # the scopes of the call.
+  defp client_postprocessing(serving, fun) do
+    Nx.Serving.client_postprocessing(serving, fn result, info ->
+      try do
+        fun.(result, info)
+      after
+        end_run()
+      end
+    end)
   end
 
   defp zeros(shape, type),
@@ -751,11 +796,11 @@ defmodule Transmuter.Serving do
 
   defp generation_postprocessing(serving, tokenizer, postprocess, stream?, flags) do
     if stream? do
-      Nx.Serving.client_postprocessing(serving, fn stream, {false, [[run]]} ->
+      client_postprocessing(serving, fn stream, {false, [[run]]} ->
         stream_text(stream, tokenizer, run.summary, flags)
       end)
     else
-      Nx.Serving.client_postprocessing(serving, fn result, {multi?, runs} ->
+      client_postprocessing(serving, fn result, {multi?, runs} ->
         rows = rows_by_input(result)
 
         results =

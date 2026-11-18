@@ -54,8 +54,6 @@ defmodule Transmuter.GraphBreaks do
       {outputs, Enum.sort_by(segments, & &1.start)}
     after
       Shared.erase_scope(plan.scope)
-      :ets.delete(plan.table)
-      :ets.delete(plan.learned)
     end
   end
 
@@ -101,6 +99,8 @@ defmodule Transmuter.GraphBreaks do
               "the extra inputs of the tail #{inspect(names)} are names of the model"
     end
 
+    scope = Shared.scope()
+
     %{
       cache_size: cache_size,
       model: Map.delete(model, :nodes),
@@ -116,9 +116,9 @@ defmodule Transmuter.GraphBreaks do
       key: make_ref(),
       opts: opts,
       backend: Nx.Defn.to_backend(opts),
-      table: :ets.new(__MODULE__, [:public, read_concurrency: true]),
-      learned: :ets.new(__MODULE__, [:public, :bag, read_concurrency: true]),
-      scope: Shared.scope(),
+      table: Shared.table(scope, [:public, read_concurrency: true]),
+      learned: Shared.table(scope, [:public, :bag, read_concurrency: true]),
+      scope: scope,
       disk_cache: disk_cache(disk_cache, Map.merge(model, tail_key(tail))),
       random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
     }

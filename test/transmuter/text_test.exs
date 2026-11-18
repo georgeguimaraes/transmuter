@@ -47,6 +47,25 @@ defmodule Transmuter.TextTest do
     end
   end
 
+  # Each call of Nx.Serving.run/2 compiles the model in the caller, which makes a scope of
+  # Transmuter.Shared and the ETS tables of the plan. The call ends them, so runs in a
+  # long-lived process leave nothing behind.
+  test "runs of a serving leave no scope of Transmuter.Shared and no ETS table in the caller" do
+    serving = Transmuter.Text.text_embedding({:hf, "Xenova/all-MiniLM-L6-v2"}, @opts)
+    caller = self()
+
+    owned = fn ->
+      terms =
+        Enum.count(:persistent_term.get(), &match?({{Transmuter.Shared, {^caller, _}, _}, _}, &1))
+
+      {terms, Enum.count(:ets.all(), &(:ets.info(&1, :owner) == caller))}
+    end
+
+    before = owned.()
+    for _run <- 1..3, do: Nx.Serving.run(serving, "The cat sat on the mat")
+    assert owned.() == before
+  end
+
   test "an embedding truncates at max_seq_length of sentence_bert_config.json" do
     # 541 tokens. all-MiniLM-L6-v2 truncates at 256, not at 512 as its tokenizer.
     text = String.duplicate("the quick brown fox jumps over the lazy dog ", 60)
