@@ -704,12 +704,22 @@ defmodule Transmuter.Ops.Transformer do
         Nx.slice_along_axis(out, 0, Nx.axis_size(v, 3), axis: 3)
 
       _plain ->
-        [q, k, v, opts.bias]
-        |> widen(fn [q, k, v, bias] ->
-          [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
-        end)
-        |> hd()
+        plain_attention(q, k, v, opts)
     end
+  end
+
+  # An f16 cache stays f16: the dots run in f16, and the scores, the masks and the softmax in
+  # f32 (see scores/4), so the core makes no f32 copy of K and V. A bf16 cache runs in f32
+  # through widen/2, because the scores of a bf16 dot lose too much.
+  defp plain_attention(q, k = %Nx.Tensor{type: {:f, 16}}, v, opts),
+    do: attend_rows(q, k, v, opts, @scores_budget)
+
+  defp plain_attention(q, k, v, opts) do
+    [q, k, v, opts.bias]
+    |> widen(fn [q, k, v, bias] ->
+      [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
+    end)
+    |> hd()
   end
 
   defp rank4(mask),
@@ -733,9 +743,10 @@ defmodule Transmuter.Ops.Transformer do
     t = Nx.axis_size(k, 2)
     type = Nx.Type.to_floating(Nx.Type.merge(Nx.type(q), Nx.type(k)))
 
-    case chunk_rows({b, heads, s, t}, type, budget) do
+    # The scores are at least f32 (see scores/4).
+    case chunk_rows({b, heads, s, t}, Nx.Type.merge(type, {:f, 32}), budget) do
       nil ->
-        q |> scores(k, opts, 3) |> grouped_values(v)
+        q |> scores(k, opts, 3) |> grouped_values(q, k, v)
 
       {count, rows} ->
         shape = put_elem(Nx.shape(q), 3, Nx.axis_size(v, 3))
@@ -803,7 +814,7 @@ defmodule Transmuter.Ops.Transformer do
     q
     |> Nx.slice_along_axis(start, rows, axis: 2)
     |> scores(k, %{opts | causal: false}, 3)
-    |> grouped_values(v)
+    |> grouped_values(q, k, v)
   end
 
   # The rows of the queries from start, for a mask with a query axis of S rows. A mask with
@@ -858,9 +869,14 @@ defmodule Transmuter.Ops.Transformer do
   defp scores(q, k, opts, stage) do
     {s, t} = {Nx.axis_size(q, 2), Nx.axis_size(k, 2)}
 
+    # The scores are at least f32, so the softcap, the masks and the softmax of an f16 core
+    # run in f32.
+    scores = grouped_scores(q, k, opts.scale)
+    scores = Nx.as_type(scores, Nx.Type.merge(Nx.type(scores), {:f, 32}))
+
     [&softcap(&1, opts.softcap), &mask_scores(&1, opts, s, t), &softmax_last/1]
     |> Enum.take(stage)
-    |> Enum.reduce(grouped_scores(q, k, opts.scale), & &1.(&2))
+    |> Enum.reduce(scores, & &1.(&2))
   end
 
   # A float bias adds to the scores, and the hidden keys get the smallest finite value.
@@ -909,22 +925,28 @@ defmodule Transmuter.Ops.Transformer do
 
   # Query head h uses key and value head div(h, group). Folding each group of query heads
   # into the rows of one batched dot avoids copying the keys and values for every head.
+  # The scale multiplies q before the dot, as in PyTorch SDPA, so the dot of an f16 core does
+  # not pass the f16 range where only the unscaled q · k is that large.
   defp grouped_scores(q, k, scale) do
     {b, heads, s, head_size} = Nx.shape(q)
     {_b, kv_heads, t, _head_size} = Nx.shape(k)
 
     q
+    |> Nx.multiply(scale)
     |> Nx.reshape({b, kv_heads, div(heads, kv_heads) * s, head_size})
     |> Nx.dot([3], [0, 1], k, [3], [0, 1])
-    |> Nx.multiply(scale)
     |> Nx.reshape({b, heads, s, t})
   end
 
-  defp grouped_values(probs, v) do
+  # The second dot runs in the type of the output: the type of q and k with the type of V. So
+  # the f32 probabilities of an f16 core meet its f16 V in f16, and f32 queries keep f32.
+  defp grouped_values(probs, q, k, v) do
     {b, heads, s, t} = Nx.shape(probs)
     {_b, kv_heads, _t, head_size} = Nx.shape(v)
+    type = Nx.Type.merge(Nx.Type.to_floating(Nx.Type.merge(Nx.type(q), Nx.type(k))), Nx.type(v))
 
     probs
+    |> Nx.as_type(type)
     |> Nx.reshape({b, kv_heads, div(heads, kv_heads) * s, t})
     |> Nx.dot([3], [0, 1], v, [2], [0, 1])
     |> Nx.reshape({b, heads, s, head_size})

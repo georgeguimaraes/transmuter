@@ -297,6 +297,46 @@ defmodule Transmuter.OpsTest do
     assert Nx.to_number(Nx.all_close(jit.(budget), jit.(2 ** 40), atol: 1.0e-5)) == 1
   end
 
+  # An f16 cache stays f16 in the Nx core: the dots run in f16, and the scores, the masks and
+  # the softmax in f32. On the shapes of GroupQueryAttention, two query heads for each key head
+  # and a hidden mask of the valid rows of each sequence, with one and five query rows and a
+  # float bias, the f16 core gives the f32 core within 3e-3. On the shapes of Qwen3-0.6B, the
+  # f16 core gave at most 2.3e-3, and the f32 core of f16 inputs at most 1.9e-3. With q and k 60
+  # times larger and a head size of 64, the unscaled q · k passes 65504, the largest f16 value,
+  # and the scaled scores do not, so the scale must come before the dot.
+  test "the attention core of an f16 cache gives the values of the f32 core within 3e-3" do
+    key = Nx.Random.key(3)
+    {b, heads, kv_heads, t} = {2, 4, 2, 40}
+
+    for {s, head_size, size, scale} <- [{1, 16, 1, 0.25}, {5, 16, 1, 0.25}, {1, 64, 60, 6.0e-5}] do
+      {q, key} = Nx.Random.normal(key, shape: {b, heads, s, head_size})
+      {k, key} = Nx.Random.normal(key, shape: {b, kv_heads, t, head_size})
+      {v, key} = Nx.Random.normal(key, shape: {b, kv_heads, t, head_size})
+      {q, k} = {Nx.multiply(q, size), Nx.multiply(k, size)}
+      grouped = Nx.reshape(q, {b, kv_heads, div(heads, kv_heads) * s, head_size})
+      largest = Nx.dot(grouped, [3], [0, 1], k, [3], [0, 1]) |> Nx.abs() |> Nx.reduce_max()
+      assert Nx.to_number(largest) > 65_504 == size > 1
+      {bias, _key} = Nx.Random.normal(key, shape: {1, 1, s, t})
+      lengths = Nx.reshape(Nx.tensor([40, 23]), {b, 1, 1, 1})
+      hidden = Nx.greater_equal(Nx.iota({b, 1, 1, t}, axis: 3), lengths)
+      opts = %{scale: scale, softcap: 0.0, bias: bias, hidden: hidden, causal: false}
+      expected = Transformer.attend_rows(q, k, v, opts, 2 ** 40)
+
+      got =
+        Nx.Defn.jit_apply(
+          &Transformer.attend_rows(&1, &2, &3, %{opts | bias: &4, hidden: &5}, 2 ** 40),
+          Enum.map([q, k, v], &(&1 |> Nx.as_type(:f16) |> Nx.backend_transfer(@backend))) ++
+            Enum.map([Nx.as_type(bias, :f16), hidden], &Nx.backend_transfer(&1, @backend)),
+          @compiler
+        )
+
+      assert Nx.type(got) == {:f, 16}
+      got = got |> Nx.backend_transfer(Nx.BinaryBackend) |> Nx.as_type(:f32)
+      diff = Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+      assert diff < 3.0e-3, "#{s} query rows, q and k times #{size}: #{diff}"
+    end
+  end
+
   # MLX 0.32.0 has fused kernels for some head sizes. A head size of 72 pads to 80 for the
   # "full" kernel, 64 takes it as it is, and 256 with 16 queries has no fused size within
   # 1.25 times, so the Nx core runs in chunks. Each case gives the values of the Nx core.
