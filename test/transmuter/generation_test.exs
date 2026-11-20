@@ -901,9 +901,9 @@ defmodule Transmuter.GenerationTest do
   # In :append, all rows of a step write at one offset, so a group that lives on passes the
   # rows of all its steps. The fox runs 100 steps. The essay of 229 tokens ends after 30 tokens
   # at 259 rows, and its row stays ended. The third row takes a new prompt every 4 tokens, so
-  # the steps pass about 900 rows. While the essay runs, the buffers grow to 320 rows, and to
-  # 384 rows when a join step of 64 rows does not fit next to its 259 rows. When a step does
-  # not fit after it ends, the compaction moves the valid rows of each running row to the
+  # the steps pass about 900 rows. While the essay runs, the buffers grow to 320 rows. The
+  # prompts of the third row join in steps of 16 rows, which fit next to its 259 rows, so the
+  # buffers do not grow more. When a step does not fit after the essay ends, the compaction moves the valid rows of each running row to the
   # front and leaves the rows of the essay, so the buffers go back to 256 rows for the fox and
   # its 131 rows. Each request gives the tokens that it gives alone.
   @tag ci_partition: 10
@@ -949,16 +949,16 @@ defmodule Transmuter.GenerationTest do
     assert row_tokens(group, 1) == Enum.take(alone[essay], 30)
     assert length(answers) > 20
     for {prompt, tokens} <- answers, do: assert(tokens == Enum.take(alone[prompt], 4))
-    assert capacities == [256, 320, 384]
+    assert capacities == [256, 320]
     assert group.state.capacity == 256
   end
 
   # A request that joins writes its prompt parts at the write offset, so a join can pass the
-  # capacity. The first row has a prompt of 200 tokens, which runs in steps of 64, 64, 64 and 8
-  # tokens, and then 44 steps of one token, so the offset is 244 of 256 rows. The prompt of 20
-  # tokens that joins then runs in a step of 64 rows at that offset, so its admission compacts
-  # the buffers into 384 rows (244 and 64 rows, and 16 free rows), and the step does not move
-  # them again. Each row gives the tokens that it gives alone.
+  # capacity. The first row has a prompt of 200 tokens, which runs in steps of 64, 64, 64 and 16
+  # tokens (its last 8 tokens pad to 16), and then 44 steps of one token, so the offset is 252
+  # of 256 rows. The prompt of 20 tokens that joins then runs in a step of 32 rows at that
+  # offset, so its admission compacts the buffers into 320 rows (the 244 valid rows of the first
+  # row, 32 rows and 44 free rows), and the step does not move them again. Each row gives the tokens that it gives alone.
   @tag ci_partition: 10
   test "a request that joins past the capacity compacts the buffers before its prompt" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -982,18 +982,18 @@ defmodule Transmuter.GenerationTest do
       compiled_capacities(fn ->
         group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, long, 60)])
         group = Enum.reduce(1..48, group, fn _step, group -> Generation.next(ctx, group) end)
-        assert {group.state.used, group.state.capacity} == {244, 256}
+        assert {group.state.used, group.state.capacity} == {252, 256}
         assert group.state.used + length(joining) > group.state.capacity
         group = Generation.admit(ctx, group, [request.(1, joining, 10)])
-        assert group.state.capacity == 384
+        assert {group.state.used, group.state.capacity} == {244, 320}
         group = Generation.next(ctx, group)
-        assert group.state.capacity == 384
+        assert {group.state.used, group.state.capacity} == {276, 320}
         run_until(ctx, group, &Enum.all?(&1.done))
       end)
 
     assert row_tokens(group, 0) == alone.(long)
     assert row_tokens(group, 1) == Enum.take(alone.(joining), 10)
-    assert capacities == [256, 384]
+    assert capacities == [256, 320]
   end
 
   # A merged decoder with one position offset for each row (gpt2) takes requests when its
@@ -1689,16 +1689,22 @@ defmodule Transmuter.GenerationTest do
 
       group = Generation.admit(batch, Generation.open(batch, 2), [request.(0, 456)])
       group = run_until(batch, group, &(length(Enum.at(&1.ids, 0)) == 10))
-      assert Generation.rows_needed(batch, group, [request.(1, 10)]) == 529
+      # A prompt of 40 tokens joins in a step of width 64, which writes 64 rows after the 466
+      # rows of the running row.
+      assert Generation.rows_needed(batch, group, [request.(1, 40)]) == 529
       Generation.finish(group)
 
+      # A prompt of 965 tokens in an idle group runs in parts of 512, 7 x 64 and 5 tokens. The
+      # last part runs at width 16, which writes 976 rows, more than the prompt and a budget of
+      # 4 tokens.
       wide = %{batch | max_capacity: 1000}
-      assert Generation.rows_needed(wide, Generation.open(batch, 2), [request.(0, 965)]) == 1024
+      short = %{request.(0, 965) | budget: 4}
+      assert Generation.rows_needed(wide, Generation.open(batch, 2), [short]) == 976
 
       single = Generation.compile(ctx, 1, @opts[:defn_options])
       alone = single |> Generation.generate([prompt.(450)], [0]) |> hd() |> Enum.map(&hd/1)
       group = Generation.open(batch, 2)
-      assert Generation.rows_needed(batch, group, [request.(0, 450)]) == 512
+      assert Generation.rows_needed(batch, group, [request.(0, 450)]) == 481
       group = Generation.admit(batch, group, [request.(0, 450)])
       group = run_until(batch, group, &Enum.all?(&1.done))
       assert row_tokens(group, 0) == alone, inspect(mode)
