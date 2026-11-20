@@ -95,7 +95,7 @@ defmodule Transmuter.Generation do
 
   ## Decode loops
 
-  With `decode_steps: k` above 1 in the options of `context/4`, `compile/3` also compiles decode loops for `:in_place` and `:append` with greedy selection or sampling, without beams and without `:embed`. A loop runs the decoder and the selection for 2, 4 ... up to `k` steps in one call, in a while loop with a static trip count (the `:repeat` option of `Transmuter.compile/3`). So the cost of a call on the host and in the launch of the program comes once for these steps. `:grow` has no loops, because its cache grows in each step, and the carry of a while loop keeps its shape.
+  With `decode_steps: k` above 1 in the options of `context/4`, `compile/3` also compiles decode loops for `:in_place` and `:append` with greedy selection or sampling, without beams. A loop runs the decoder and the selection for 2, 4 ... up to `k` steps in one call, in a while loop with a static trip count (the `:repeat` option of `Transmuter.compile/3`). So the cost of a call on the host and in the launch of the program comes once for these steps. `:grow` has no loops, because its cache grows in each step, and the carry of a while loop keeps its shape. A decoder with `:embed` runs the nodes of the embedding model in the loop, before its own nodes.
 
   In the loop, each step makes the inputs of the next step on the device: the new token, the attention mask, the positions and the position offset come from the length of each row, and in `:append` the write offset moves by one row. A row stops at an eos token or when it has no new tokens left. A row that stopped still runs in the later steps of the call: it writes no token, and its length does not move. The call gives the selection of each step, with -1 for a row that stopped in an earlier step, and the host reads the steps in order, with the work of one step for each of them. On the EXLA host, the loops give the same tokens and log-probabilities as one step for each call. On CUDA in fp16, the loop is another compiled program, so its log-probabilities can move slightly, as with any change of the program: up to 0.013 at 256 tokens for Qwen3-0.6B. So a near tie can give another token.
 
@@ -114,7 +114,7 @@ defmodule Transmuter.Generation do
 
   alias Nx.Defn.Composite
   alias Transmuter.Generation.MergedDecoder
-  alias Transmuter.{GraphBreaks, Serving}
+  alias Transmuter.{GraphBreaks, Ops, Serving}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
   alias Transmuter.Ops.Transformer
 
@@ -851,6 +851,10 @@ defmodule Transmuter.Generation do
       ctx
       |> Map.put(:run, fn inputs, static -> runs[static].(inputs) end)
       |> Map.put(:run_steps, compile_loop(ctx, state, opts, batch_size))
+      |> Map.put(
+        :loop_model,
+        ctx.model |> loop_model(ctx.embed) |> Map.take([:inputs, :input_types])
+      )
       |> compile_embed(batch_size, defn_options)
       |> compile_cross(defn_options)
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
@@ -866,13 +870,13 @@ defmodule Transmuter.Generation do
 
   # The decode loops: for each count of loop_steps/1, that many steps of width 1 in one call,
   # with the selection of each step in the graph (see next/3). Only :in_place and :append with
-  # greedy selection or sampling, without beams and without an embedding function, have them. :grow cannot: its cache grows
+  # greedy selection or sampling, without beams, have them. :grow cannot: its cache grows
   # in each step, and the carry of a loop keeps its shape. The call returns the buffers, the
   # selection state and the selection of each step, [steps, rows, 1 or 2], with the eos token
   # of a row that ends and -1 for a row that ended before the step.
   defp compile_loop(ctx, state, opts, batch_size)
-       when ctx.decode_steps > 1 and ctx.mode in [:in_place, :append] and ctx.num_beams == 1 and
-              ctx.embed == nil do
+       when ctx.decode_steps > 1 and ctx.mode in [:in_place, :append] and ctx.num_beams == 1 do
+    ctx = %{ctx | model: loop_model(ctx.model, ctx.embed)}
     Map.new(loop_steps(ctx), &{&1, compile_loop(ctx, state, opts, batch_size, &1)})
   end
 
@@ -904,6 +908,52 @@ defmodule Transmuter.Generation do
       )
 
     fn inputs, _static -> run.(inputs) end
+  end
+
+  # The decoder of the loops. A decoder that takes inputs_embeds gets the nodes of the
+  # embedding model before its nodes, so input_ids goes to inputs_embeds in the graph. The
+  # names of the embedding model get a prefix, so they do not meet the names of the decoder.
+  # The tokens of a decode step are never image tokens with features (see embed/4), so the
+  # loop needs no merge of image features.
+  defp loop_model(model, nil), do: model
+
+  defp loop_model(model, embed = %{inputs: [input], outputs: [output]}) do
+    prefix = "transmuter.embed."
+
+    rename = fn
+      ^input -> "input_ids"
+      "" -> ""
+      name -> prefix <> name
+    end
+
+    nodes =
+      for node <- embed.nodes,
+          do: %{node | input: Enum.map(node.input, rename), output: Enum.map(node.output, rename)}
+
+    {type, _dims} = model.input_types["inputs_embeds"]
+    to = Enum.find([1, 10, 16, 11], &(Ops.dtype(&1) == type))
+
+    cast = %NodeProto{
+      op_type: "Cast",
+      name: prefix <> "cast",
+      input: [rename.(output)],
+      output: ["inputs_embeds"],
+      attribute: [%AttributeProto{name: "to", type: :INT, i: to}]
+    }
+
+    renamed = &Map.new(&1, fn {name, value} -> {rename.(name), value} end)
+
+    %{
+      model
+      | nodes: nodes ++ [cast | model.nodes],
+        params: Map.merge(model.params, renamed.(embed.params)),
+        static: Map.merge(model.static, renamed.(embed.static)),
+        inputs: ["input_ids" | model.inputs -- ["inputs_embeds"]],
+        input_types:
+          model.input_types
+          |> Map.delete("inputs_embeds")
+          |> Map.put("input_ids", embed.input_types[input])
+    }
   end
 
   # The step counts of the loops: the powers of two below decode_steps, and decode_steps.
@@ -1544,7 +1594,7 @@ defmodule Transmuter.Generation do
     {parts, _left, 1} = next_parts(ctx, group)
     counts = Enum.map(parts, &length/1)
     tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, 1 - length(&1))))
-    {inputs, static} = step_inputs(ctx, state, tokens, counts)
+    {inputs, static} = step_inputs(%{ctx | model: ctx.loop_model}, state, tokens, counts)
 
     remaining =
       Enum.zip_with([group.ids, group.budgets, group.done], fn [ids, budget, done?] ->

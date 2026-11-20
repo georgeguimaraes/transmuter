@@ -502,8 +502,11 @@ defmodule Transmuter.Audio.SpeechToText do
       timestamps = Nx.logsumexp(Nx.select(timestamp?, logprobs, min))
       text = Nx.reduce_max(Nx.select(timestamp?, min, logprobs))
 
+      # Nx.less and not Nx.logical_not, because Nx 1.0 gives a block of tensors without a
+      # parameter, such as the iota, the :root context, and a decode loop of Generation runs
+      # this function in a while loop, where :root does not merge with the loop values.
       Nx.select(
-        Nx.logical_and(Nx.greater(timestamps, text), Nx.logical_not(timestamp?)),
+        Nx.logical_and(Nx.greater(timestamps, text), Nx.less(ids, begin)),
         min,
         logits
       )

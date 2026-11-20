@@ -847,6 +847,50 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # A decoder that takes inputs_embeds runs the nodes of its embedding model in the decode
+  # loop, before its own nodes. The rows of different prompt lengths give the tokens and the
+  # log-probabilities of one step for each call.
+  needs(:exla)
+
+  test "a decode loop runs the embedding model of a decoder with :embed" do
+    source = "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"
+    repo = Transmuter.Repo.load!({:hf, source})
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    model_opts = Keyword.take(@opts, [:backend])
+    outputs = [outputs: &Generation.outputs/1]
+
+    model =
+      Transmuter.Repo.load_component!(repo, "decoder_model_merged", :fp32, outputs ++ model_opts)
+
+    embed = Transmuter.Repo.load_component!(repo, "embed_tokens", :fp32, model_opts)
+    prompts = for {n, row} <- [{5, 1}, {12, 2}, {20, 3}], do: for(i <- 1..n, do: i * 37 * row)
+
+    generate = fn steps ->
+      opts = [strategy: :greedy, max_new_tokens: 10, token_logprobs: true, decode_steps: steps]
+      ctx = Generation.context(repo, model, [embed: embed, image_token: -1] ++ opts)
+      ctx = Generation.compile(ctx, length(prompts), @opts[:defn_options])
+      Generation.generate(ctx, prompts, [0, 0, 0])
+    end
+
+    assert generate.(4) == generate.(1)
+  end
+
+  # The timestamp processor of Whisper runs in the decode loop, in a while loop of the
+  # compiled call, and gives the chunks and the log-probabilities of one step for each call.
+  needs(:exla)
+
+  test "the timestamps of Whisper in a decode loop give the chunks of one step for each call" do
+    audio = Nx.from_binary(File.read!("test/fixtures/librispeech_0.f32"), :f32)
+
+    transcribe = fn steps ->
+      opts = [timestamps: :segments, token_logprobs: true, decode_steps: steps] ++ @opts
+      serving = Audio.speech_to_text({:hf, "Xenova/whisper-tiny.en"}, opts)
+      Nx.Serving.run(serving, audio)
+    end
+
+    assert transcribe.(4) == transcribe.(1)
+  end
+
   # In :append, all rows of a step write at one offset, so a group that lives on passes the
   # rows of all its steps. The fox runs 100 steps. The essay of 229 tokens ends after 30 tokens
   # at 259 rows, and its row stays ended. The third row takes a new prompt every 4 tokens, so
