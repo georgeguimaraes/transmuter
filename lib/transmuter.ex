@@ -417,6 +417,14 @@ defmodule Transmuter do
       The term names the function in the key of the EXLA disk cache. The
       default is `nil`.
 
+    * `:repeat` (`{term, count, function, names}`) - runs the graph and the
+      `:tail` `count` times in one compiled while loop. `function` takes the
+      outputs of the tail, the inputs of the step and the index of the step, and
+      gives the inputs of the next step, with the shapes and types of the
+      inputs. The call returns the inputs in `names` after the last step. The
+      graph must have no break. The term names the loop in the key of the EXLA
+      disk cache. Generation uses it for its decode loops. The default is `nil`.
+
     * `:donate` (list of input names) - inputs whose buffers the compiled program can
       reuse for its outputs of the same shape and type (see `Nx.donatable/1`). The
       caller must not read these inputs after the call. Only a graph without breaks

@@ -13,7 +13,7 @@ defmodule Transmuter.GraphBreaks do
   With the `:tail` option of `Transmuter.compile/3`, the segment that ends the graph also runs a function on the graph outputs and on the inputs of the call: the inputs that the model declares, and the extra inputs, which it does not declare. The call then gives the outputs of that function. This segment always compiles, also when it has fewer nodes than a segment that runs eagerly.
   """
 
-  alias Nx.Defn.{Compiler, Composite}
+  alias Nx.Defn.{Compiler, Composite, Expr}
   alias Transmuter.{Ops, Shared, UnknownValueError}
 
   # A segment of fewer nodes runs eagerly, but the last segment of a plan with a tail always
@@ -86,6 +86,7 @@ defmodule Transmuter.GraphBreaks do
     {cache_size, opts} = Keyword.pop(opts, :cache_size, 8)
     {disk_cache, opts} = Keyword.pop(opts, :disk_cache)
     {tail, opts} = Keyword.pop(opts, :tail)
+    {repeat, opts} = Keyword.pop(opts, :repeat)
     {donate, opts} = Keyword.pop(opts, :donate, [])
     constant = constant(model)
     extra = if tail, do: Map.keys(inputs) -- model.inputs, else: []
@@ -107,6 +108,7 @@ defmodule Transmuter.GraphBreaks do
       source: model[:source],
       nodes: List.to_tuple(model.nodes),
       tail: tail,
+      repeat: repeat,
       donate: donate,
       extra: extra,
       last_use: last_use(model, if(tail, do: model.inputs ++ extra, else: [])),
@@ -119,7 +121,11 @@ defmodule Transmuter.GraphBreaks do
       table: Shared.table(scope, [:public, read_concurrency: true]),
       learned: Shared.table(scope, [:public, :bag, read_concurrency: true]),
       scope: scope,
-      disk_cache: disk_cache(disk_cache, Map.merge(model, tail_key(tail))),
+      disk_cache:
+        disk_cache(
+          disk_cache,
+          model |> Map.merge(tail_key(tail)) |> Map.merge(repeat_key(repeat))
+        ),
       random?: Map.get(model, :noise, true) and Transmuter.random?(model.nodes)
     }
   end
@@ -599,6 +605,9 @@ defmodule Transmuter.GraphBreaks do
   defp tail_key({key, _fun}), do: %{tail: key}
   defp tail_key(nil), do: %{}
 
+  defp repeat_key({key, count, _fun, returns}), do: %{repeat: {key, count, returns}}
+  defp repeat_key(nil), do: %{}
+
   defp hash(term) do
     hash = :crypto.hash(:sha256, :erlang.term_to_binary(term, [:deterministic]))
     Base.encode16(hash, case: :lower)
@@ -611,7 +620,39 @@ defmodule Transmuter.GraphBreaks do
   # The traced body of a segment. It records where it stopped and why, which traced values it
   # returns and which static values it folded, so the caller can resume after it.
   defp trace(key, statics, args, pos, ref) do
-    %{} = plan = Process.get({__MODULE__, key})
+    case Process.get({__MODULE__, key}) do
+      plan = %{repeat: {_key, _count, _fun, _returns}} when pos == 0 ->
+        repeat(plan, statics, args, ref)
+
+      plan ->
+        trace_segment(plan, statics, args, pos, ref)
+    end
+  end
+
+  # With :repeat, the whole graph and the tail run `count` times in a while loop. The carry
+  # is the arguments of the call, and the function of :repeat gives the arguments of the next
+  # iteration from the outputs of the tail, the arguments and the index. The call returns the
+  # arguments of :repeat returns after the last iteration. A break in the graph raises.
+  defp repeat(plan = %{repeat: {_key, count, next, returns}}, statics, args, ref) do
+    loop = fn :body, {i, carried} ->
+      env = Map.merge(statics, carried)
+      {env, stop, reason} = run_until_break(plan, env, context(plan, env), 0, ref)
+
+      if stop != :end,
+        do: raise(ArgumentError, "a repeated graph has a break at #{inspect(reason)}")
+
+      next.(final(plan, env, :end, %{}), carried, Nx.as_type(i, :s32))
+    end
+
+    carried =
+      Expr.defn_while(__ENV__.file, __ENV__.line, args, {:while, 0..(count - 1)}, loop, [])
+
+    outputs = Map.take(carried, returns)
+    Process.put(ref, {:end, nil, Map.keys(outputs), %{}})
+    Transmuter.tag_literals(outputs, Compiler.current())
+  end
+
+  defp trace_segment(plan, statics, args, pos, ref) do
     env = Map.merge(statics, decode(args))
     ctx = context(plan, env)
     {env, stop, reason} = run_until_break(plan, env, ctx, pos, ref)
