@@ -228,6 +228,35 @@ defmodule Transmuter.ContinuousBatchingTest do
   # Requests cannot join a running batch of a merged decoder that grows its cache, such as
   # the merged llama2.c, whose rows need one length of the cache, or of beam search, whose rows
   # of a prompt move together. The error names the reason, with the node that reads the cache.
+  # The two chats share a system prompt of more than 64 tokens. The first one stores the whole
+  # blocks of its prompt, and the second one reuses the first block: its prompt runs in one
+  # step of 64 tokens or fewer, against two without the store. Each chat gives the text of a
+  # server without the store, with greedy selection.
+  test "a chat reuses the stored prefix of an earlier chat with the same system prompt" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 16] ++ @opts
+
+    chats =
+      for question <- ["Where is the museum?", "When is the entry free?"] do
+        %{messages: [%{role: "system", content: @museum}, %{role: "user", content: question}]}
+      end
+
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
+    alone = for chat <- chats, do: ContinuousBatching.run(server, chat)
+    stop_supervised!(ContinuousBatching)
+
+    spec = [source: source, slots: 2, prefix_cache: 512] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
+    first = ContinuousBatching.run(server, hd(chats))
+
+    {second, steps} =
+      step_events(server, fn -> ContinuousBatching.run(server, List.last(chats)) end)
+
+    assert [first, second] == alone
+    assert [64] == for(%{admitted: 1, prefix_tokens: tokens} <- steps, do: tokens)
+    assert Enum.count(steps, &(&1.prompts > 0)) == 1
+  end
+
   test "a model whose rows cannot join a running batch raises at the start" do
     source = {:hf, "Xenova/llama2.c-stories15M"}
 

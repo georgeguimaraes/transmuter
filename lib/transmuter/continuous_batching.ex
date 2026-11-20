@@ -40,6 +40,8 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:compile_steps` - when `true`, the server compiles the shape of each step that its rows can take before it starts (see "Compiles"). The default is `false`.
 
+    * `:prefix_cache` - the rows of a store of prompt prefixes on the device (see "Prefix cache"), in slots of the rows of the widest step (512 rows). The default is `0`, no store.
+
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
   ## Device memory
@@ -102,6 +104,12 @@ defmodule Transmuter.ContinuousBatching do
 
   With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
 
+  ## Prefix cache
+
+  With `:prefix_cache`, a request reuses the keys and values of the start of its prompt when an earlier request had the same start, such as a system prompt. The server copies them from the store into the row of the request, and the steps run only the rest of the prompt, so the first token comes earlier. The rows of a prefix are whole blocks of 64 tokens, and a prefix leaves at least the last token of the prompt. After the prompt of a request ran, the server copies its whole blocks into the slot that was used the longest time ago, unless the store has them.
+
+  The key of each block is a hash of the hash of the block before it and the tokens of the block, so a block matches only after the same tokens. The server also keeps the tokens of each stored block and compares them on a hit, so a collision of hashes cannot give the keys and values of other tokens. A request with image features or encoder outputs does not use the store, because its tokens do not show them. The server raises at the start for a decoder whose rows cannot reuse a prefix (see "Prefixes" in `Transmuter.Generation`). The store is on the device before the server chooses its capacity, so the capacity counts its bytes. With greedy selection, a request gives the text that it gives without the store, as for any other order of the steps.
+
   ## Telemetry
 
   Each step emits `[:transmuter, :continuous_batching, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The `:stop` event also has `:steps`, the decode steps of the call, and `:row_steps`, the steps of the rows that had not ended before each step. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_batching, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
@@ -146,7 +154,7 @@ defmodule Transmuter.ContinuousBatching do
   def start_link(opts) do
     module = Keyword.get(opts, :task, Transmuter.Text.Generation)
     server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: nil]
-    server_opts = server_opts ++ [device_memory: nil, compile_steps: false]
+    server_opts = server_opts ++ [device_memory: nil, compile_steps: false, prefix_cache: 0]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
@@ -157,6 +165,8 @@ defmodule Transmuter.ContinuousBatching do
     if reason = Generation.cannot_join(ctx) do
       raise ArgumentError, "requests cannot join a running batch of this model: #{reason}"
     end
+
+    prefix_slots = prefix_slots!(ctx, opts[:prefix_cache])
 
     # Without :capacity, init/1 takes the capacity up to this one that fits the device memory.
     capacity = opts[:capacity] || @default_capacity
@@ -172,7 +182,8 @@ defmodule Transmuter.ContinuousBatching do
       defn_options: opts[:defn_options],
       compile_steps: opts[:compile_steps],
       fixed_capacity?: opts[:capacity] != nil,
-      device_memory: opts[:device_memory]
+      device_memory: opts[:device_memory],
+      prefix_slots: prefix_slots
     }
 
     GenServer.start_link(__MODULE__, state,
@@ -180,6 +191,28 @@ defmodule Transmuter.ContinuousBatching do
       spawn_opt: Serving.generation_flags()
     )
   end
+
+  # The slots of the store of prefixes: :prefix_cache rows in slots of the rows of the widest
+  # step. A decoder whose rows cannot reuse a prefix raises.
+  defp prefix_slots!(_ctx, 0), do: 0
+
+  defp prefix_slots!(ctx, rows) do
+    if reason = Generation.prefix_reason(ctx) do
+      raise ArgumentError, "the rows of this model cannot reuse a stored prefix: #{reason}"
+    end
+
+    length = prefix_length(ctx)
+
+    if rows < length do
+      raise ArgumentError,
+            "a :prefix_cache holds slots of #{length} rows, so it needs at least #{length} rows, got: #{rows}"
+    end
+
+    div(rows, length)
+  end
+
+  # The rows of a slot of the store: the widest step, the most tokens of a prompt in one step.
+  defp prefix_length(ctx), do: Enum.max(ctx.widths.with_cache)
 
   @doc """
   Generates the text of `input`, an input of the task or a list of them, as `Nx.Serving.batched_run/2` with a serving of the task, and returns the same result.
@@ -538,6 +571,9 @@ defmodule Transmuter.ContinuousBatching do
       end)
 
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
+
+    # The store is on the device before the choice of the capacity, so its bytes are in use.
+    prefix = prefix_cache(ctx, state.prefix_slots)
     {live, limit} = device_memory(ctx.backend)
     limit = state.device_memory || limit
 
@@ -560,10 +596,110 @@ defmodule Transmuter.ContinuousBatching do
           if example.features, do: Generation.compile_features(ctx, state.slots, example.features)
         end
 
-        {:ok, start(state, ctx, worker)}
+        {:ok, start(Map.put(state, :prefix, prefix), ctx, worker)}
 
       {:EXIT, ^worker, reason} ->
         {:stop, reason}
+    end
+  end
+
+  # The store of prefixes and its index on the host (see "Prefix cache"): for each chained hash
+  # of the blocks of a stored prompt, its slot and the tokens up to its block, and for each
+  # slot the time of its last use and its hashes.
+  defp prefix_cache(_ctx, 0), do: nil
+
+  defp prefix_cache(ctx, slots) do
+    %{
+      store: Generation.prefix_store(ctx, slots, prefix_length(ctx)),
+      length: prefix_length(ctx),
+      entries: %{},
+      slots: Map.new(0..(slots - 1), &{&1, %{used: 0, hashes: []}}),
+      clock: 0
+    }
+  end
+
+  # The chained hash of each whole block of `prompt` that fits a slot, with the tokens up to
+  # it: the hash of a block reads the hash of the block before it, so a block matches only
+  # after the same tokens.
+  defp prefix_blocks(prompt, length) do
+    block = Generation.prefix_block()
+
+    prompt
+    |> Enum.take(length)
+    |> Enum.chunk_every(block, block, :discard)
+    |> Enum.scan({"", []}, fn ids, {hash, tokens} ->
+      {:crypto.hash(:sha256, [hash, :erlang.term_to_binary(ids)]), tokens ++ ids}
+    end)
+  end
+
+  # The stored prefix of a request: its longest stored blocks that leave at least the last
+  # token of its prompt. A hit compares the tokens, so a collision of hashes gives no prefix.
+  # A request with image features or encoder outputs has no prefix, because its tokens do not
+  # show them.
+  defp with_prefix(request, prefix)
+       when prefix == nil or request.features != nil or
+              request.inputs != %{},
+       do: {request, prefix}
+
+  defp with_prefix(request, prefix) do
+    hit =
+      request.prompt
+      |> prefix_blocks(prefix.length)
+      |> Enum.filter(fn {_hash, tokens} -> length(tokens) < length(request.prompt) end)
+      |> Enum.reverse()
+      |> Enum.find_value(fn {hash, tokens} ->
+        with %{slot: slot, tokens: ^tokens} <- prefix.entries[hash], do: {slot, length(tokens)}
+      end)
+
+    case hit do
+      {slot, size} ->
+        stored = %{store: prefix.store, slot: slot, size: size}
+        {Map.put(request, :prefix, stored), touch(prefix, slot)}
+
+      nil ->
+        {request, prefix}
+    end
+  end
+
+  defp touch(prefix, slot) do
+    prefix = %{prefix | clock: prefix.clock + 1}
+    put_in(prefix.slots[slot].used, prefix.clock)
+  end
+
+  # Stores the whole blocks of the prompt of each row whose prompt ran in the last step, in the
+  # slot used the longest time ago, unless the store has them.
+  defp store_prompts(prefix, _ctx, _group, _rows) when prefix == nil, do: prefix
+
+  defp store_prompts(prefix, ctx, group, rows) do
+    for {row, request = %{store?: true}} <- rows,
+        Enum.at(group.left, row) == [],
+        reduce: prefix do
+      prefix ->
+        blocks = prefix_blocks(request.prompt, prefix.length)
+        store_blocks(prefix, ctx, group, row, blocks)
+    end
+  end
+
+  defp store_blocks(prefix, _ctx, _group, _row, []), do: prefix
+
+  defp store_blocks(prefix, ctx, group, row, blocks) do
+    {last, tokens} = List.last(blocks)
+
+    case prefix.entries[last] do
+      %{slot: slot, tokens: ^tokens} ->
+        touch(prefix, slot)
+
+      _missing ->
+        {slot, %{hashes: old}} = Enum.min_by(prefix.slots, fn {_slot, %{used: used}} -> used end)
+
+        entries =
+          Map.reject(prefix.entries, fn {hash, entry} -> hash in old and entry.slot == slot end)
+
+        store = Generation.store_prefix(ctx, group, prefix.store, row, slot, length(tokens))
+        hashes = Enum.map(blocks, &elem(&1, 0))
+        added = Map.new(blocks, fn {hash, tokens} -> {hash, %{slot: slot, tokens: tokens}} end)
+        prefix = %{prefix | store: store, entries: Map.merge(entries, added)}
+        touch(put_in(prefix.slots[slot].hashes, hashes), slot)
     end
   end
 
@@ -747,12 +883,23 @@ defmodule Transmuter.ContinuousBatching do
   defp step(state) do
     {admitted, state} = admissions(state)
 
+    {admitted, prefix} =
+      Enum.map_reduce(admitted, state.prefix, fn {row, request}, prefix ->
+        {request, prefix} = with_prefix(request, prefix)
+        store? = prefix != nil and request.features == nil and request.inputs == %{}
+        {{row, Map.put(request, :store?, store?)}, prefix}
+      end)
+
+    state = %{state | prefix: prefix}
+
     if admitted == [] and not active?(state) do
       state
     else
       metadata = %{
         running: map_size(state.rows),
         admitted: length(admitted),
+        prefix_tokens:
+          Enum.sum(for {_row, request} <- admitted, do: get_in(request, [:prefix, :size]) || 0),
         prompts: Enum.count(state.group.left, &(&1 != [])) + length(admitted),
         waiting: :queue.len(state.queue),
         slots: state.slots,
@@ -783,13 +930,19 @@ defmodule Transmuter.ContinuousBatching do
     steps = if free? and waiting?, do: 1, else: state.ctx.decode_steps
 
     group = Generation.next(state.ctx, group, steps)
-    group = Generation.shrink(state.ctx, group)
-    # The group keeps the features and the encoder outputs, so the rows do not keep them for
-    # their callers.
-    admitted =
-      Map.new(admitted, fn {row, request} -> {row, Map.drop(request, [:features, :inputs])} end)
 
-    emit(%{state | rows: Map.merge(state.rows, admitted)}, group)
+    # The group keeps the features, the encoder outputs and the prefixes, so the rows do not
+    # keep them for their callers.
+    admitted =
+      Map.new(admitted, fn {row, request} ->
+        {row, Map.drop(request, [:features, :inputs, :prefix])}
+      end)
+
+    rows = Map.merge(state.rows, admitted)
+    prefix = store_prompts(state.prefix, state.ctx, group, rows)
+    rows = Map.new(rows, fn {row, request} -> {row, stored(request, group, row)} end)
+    group = Generation.shrink(state.ctx, group)
+    emit(%{state | rows: rows, prefix: prefix}, group)
   end
 
   # The steps of the call, and the steps of the rows that had not ended before each step. A
@@ -833,9 +986,15 @@ defmodule Transmuter.ContinuousBatching do
     end
   end
 
+  # A row stores the blocks of its prompt once, after its prompt ran.
+  defp stored(request = %{store?: true}, group, row),
+    do: %{request | store?: Enum.at(group.left, row) != []}
+
+  defp stored(request, _group, _row), do: request
+
   defp request(state, row, request) do
     request
-    |> Map.take([:prompt, :seed, :features, :position, :inputs])
+    |> Map.take([:prompt, :seed, :features, :position, :inputs, :prefix])
     |> Map.merge(%{row: row, budget: state.ctx.max_new_tokens})
   end
 
