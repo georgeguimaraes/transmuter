@@ -842,7 +842,7 @@ defmodule Transmuter.GenerationTest do
       config = %{"eos_token_id" => story |> Enum.map(&hd/1) |> Enum.at(5)}
       steps = generate.(config, 1)
 
-      assert generate.(config, 4) == steps
+      assert_same_steps(generate.(config, 4), steps)
       assert Enum.any?(steps, &(length(&1) < 10))
     end
   end
@@ -872,7 +872,7 @@ defmodule Transmuter.GenerationTest do
       Generation.generate(ctx, prompts, [0, 0, 0])
     end
 
-    assert generate.(4) == generate.(1)
+    assert_same_steps(generate.(4), generate.(1))
   end
 
   # The timestamp processor of Whisper runs in the decode loop, in a while loop of the
@@ -888,7 +888,14 @@ defmodule Transmuter.GenerationTest do
       Nx.Serving.run(serving, audio)
     end
 
-    assert transcribe.(4) == transcribe.(1)
+    {logprobs, chunks} =
+      transcribe.(4).chunks |> Enum.map(&Map.pop(&1, :token_logprobs)) |> Enum.unzip()
+
+    {step_logprobs, steps} =
+      transcribe.(1).chunks |> Enum.map(&Map.pop(&1, :token_logprobs)) |> Enum.unzip()
+
+    assert chunks == steps
+    assert_close_logprobs(List.flatten(logprobs), List.flatten(step_logprobs))
   end
 
   # In :append, all rows of a step write at one offset, so a group that lives on passes the
@@ -1821,7 +1828,7 @@ defmodule Transmuter.GenerationTest do
     buffers =
       for name <- ctx.cache, into: %{} do
         parts =
-          for {{past, length, _tokens, _logits}, i} <- Enum.with_index(rows) do
+          for {{past, _length, _tokens, _logits}, i} <- Enum.with_index(rows) do
             if name in ctx.buffers do
               {b, h, _rows, d} = Nx.shape(past[name])
               valid = if i == 0, do: Nx.concatenate([past[name], noise.({b, h, 3, d})], axis: 2)
@@ -1934,6 +1941,25 @@ defmodule Transmuter.GenerationTest do
         assert diff < 1.0e-4, "#{source}: #{diff}"
       end
     end
+  end
+
+  # The rows of a decode loop against those of one step for each call: the same tokens, and
+  # log-probabilities within 1e-4. The loop is another compiled program, so on CUDA its
+  # log-probabilities move by about 1e-6. A later fork shows as a token difference.
+  defp assert_same_steps(rows, steps) do
+    assert Enum.map(rows, &Enum.map(&1, fn token -> hd(token) end)) ==
+             Enum.map(steps, &Enum.map(&1, fn token -> hd(token) end))
+
+    assert_close_logprobs(
+      Enum.flat_map(rows, &Enum.map(&1, fn [_id, logprob] -> logprob end)),
+      Enum.flat_map(steps, &Enum.map(&1, fn [_id, logprob] -> logprob end))
+    )
+  end
+
+  defp assert_close_logprobs(logprobs, expected) do
+    assert length(logprobs) == length(expected)
+    diff = logprobs |> Enum.zip_with(expected, &abs(&1 - &2)) |> Enum.max(fn -> 0.0 end)
+    assert diff < 1.0e-4, "the log-probabilities differ by #{diff}"
   end
 
   # Generates 40 tokens for each prompt, and gives the rows and the capacities of the buffers
