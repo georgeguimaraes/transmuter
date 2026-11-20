@@ -15,6 +15,7 @@ defmodule Transmuter.Ops.Signal do
     ]
 
   alias Nx.Defn.Expr
+  alias Transmuter.Ops
 
   @op_types ~w(LSTM GRU RNN STFT DFT HannWindow HammingWindow BlackmanWindow MelWeightMatrix)
 
@@ -266,7 +267,8 @@ defmodule Transmuter.Ops.Signal do
   defp while_steps(x_gates, weights, state, lengths, backward?, step) do
     seq = Nx.axis_size(x_gates, 0)
     h_shape = state |> elem(0) |> Nx.shape()
-    y = Nx.broadcast(Nx.tensor(0, type: Nx.type(x_gates)), Tuple.insert_at(h_shape, 0, seq))
+    # The steps write all rows of y (see Transmuter.Ops.loop_buffer/3).
+    y = Ops.loop_buffer(x_gates, Tuple.insert_at(h_shape, 0, seq), Nx.type(x_gates))
 
     initial = %{state: state, y: y, x: x_gates, weights: weights}
     initial = if lengths, do: Map.put(initial, :lengths, lengths), else: initial

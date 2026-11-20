@@ -14,6 +14,7 @@ defmodule Transmuter.Ops.Transformer do
   @compile {:no_warn_undefined, EMLX.Fast}
 
   alias Nx.Defn.Expr
+  alias Transmuter.Ops
   alias Transmuter.Ops.Attention
 
   import Transmuter.Ops,
@@ -795,8 +796,9 @@ defmodule Transmuter.Ops.Transformer do
         q |> scores(k, opts, 3) |> grouped_values(q, k, v)
 
       {count, rows} ->
+        # The chunks write all rows of the output (see Transmuter.Ops.loop_buffer/3).
         shape = put_elem(Nx.shape(q), 3, Nx.axis_size(v, 3))
-        out = Nx.broadcast(Nx.tensor(0, type: Nx.Type.merge(type, Nx.type(v))), shape)
+        out = Ops.loop_buffer(q, shape, Nx.Type.merge(type, Nx.type(v)))
 
         masks =
           Map.reject(%{bias: opts.bias, hidden: opts.hidden}, fn {_name, mask} -> is_nil(mask) end)

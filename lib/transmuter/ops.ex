@@ -63,6 +63,17 @@ defmodule Transmuter.Ops do
     end
   end
 
+  @doc """
+  Returns the first value of a buffer of `shape` and `type` that a while loop of an op writes in full, such as the outputs of the chunks of an attention core or of the steps of an RNN.
+
+  The first values of such a buffer do not matter. They come from one value of `source`, a tensor that the op computes, and not from a constant. XLA computes the broadcasts of a constant for all layers of a graph in one fusion at the start of the graph, so the buffers of all layers would take device memory at the same time: 2.8 GB for the attention outputs of the 28 layers of Qwen3-0.6B at 48 rows of 512 queries. A value of `source` exists only from its op on, so each buffer lives only while its op runs. The loop is an Nx while loop, so the buffer cannot come from a concatenation of the results of the iterations.
+  """
+  def loop_buffer(source, shape, type) do
+    rank = Nx.rank(source)
+    first = source |> Nx.slice(List.duplicate(0, rank), List.duplicate(1, rank)) |> Nx.reshape({})
+    Nx.broadcast(Nx.as_type(first, type), shape)
+  end
+
   # Positions of the inputs whose zero size makes the output zero size, so the operator
   # only computes the output shape. Detection models run per-class branches with no boxes.
   @empty_through %{
