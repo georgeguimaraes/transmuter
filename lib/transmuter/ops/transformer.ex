@@ -46,6 +46,10 @@ defmodule Transmuter.Ops.Transformer do
   # chunk_rows/3.
   @scores_budget 256 * 1024 * 1024
 
+  @doc false
+  # The bytes of the scores of one chunk of query rows, at most (see chunk_rows/3).
+  def scores_budget, do: @scores_budget
+
   @op_types ~w(Attention AttentionCore GroupQueryAttention MultiHeadAttention RotaryEmbedding RMSNormalization
                SimplifiedLayerNormalization SkipSimplifiedLayerNormalization SkipLayerNormalization
                EmbedLayerNormalization TensorScatter LinearAttention)

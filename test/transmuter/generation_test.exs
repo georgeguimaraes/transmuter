@@ -2622,8 +2622,10 @@ defmodule Transmuter.GenerationCapacityTest do
   alias Transmuter.Generation
 
   # A decoder of 14 layers with f32 caches of 8 heads of 128: 8 rows hold 917,536 bytes for
-  # each position. The temporaries of the step of 512 tokens take 5 times its scores: 655,360
-  # bytes for each position with 8 query heads, 2,621,440 with 32.
+  # each position. Its widest matmul gives 1024 f32 values for each token. The temporaries of
+  # the step of 512 tokens of 8 rows: two outputs of that matmul for each of its 4096 tokens,
+  # 33,554,432 bytes, and one chunk of scores in f32, at most 268,435,456 bytes, with the output
+  # of its dot, half of that: 402,653,184 bytes.
   @names for layer <- 0..13, kind <- ["key", "value"], do: "past_key_values.#{layer}.#{kind}"
   @ctx %{
     min_capacity: 256,
@@ -2631,35 +2633,58 @@ defmodule Transmuter.GenerationCapacityTest do
     cache: @names,
     buffers: @names,
     query_heads: 8,
+    matmul_bytes: 4096,
     model: %{input_types: Map.new(@names, &{&1, {:f32, ["batch", 8, "length", 128]}})},
     widths: %{with_cache: [1, 64, 512], without_cache: [1, 2, 4, 8, 16, 32, 64, 512]}
   }
   @live 1_000_000_000
+  @scores_chunk 402_653_184
 
   test "the largest capacity is the largest one whose peak fits 95% of the device memory" do
     growth = @live + 917_536 * (1792 + 2048)
 
     # The step at 2048 rows needs less than the growth into it, so the growth decides.
-    assert @live + (917_536 + 655_360) * 2048 < growth
+    assert @live + 917_536 * 2048 + 2 * 4096 * 4096 + @scores_chunk < growth
     assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95) == 2048
     assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95 - 1) == 1792
     assert Generation.largest_capacity(@ctx, 8, @live, 1.0e12) == 4096
     assert Generation.largest_capacity(@ctx, 8, @live, nil) == 4096
-
-    message = ~r/a :capacity of 256 rows with 8 :slots needs about \d+ bytes .* :device_memory/
-
-    assert_raise ArgumentError, message, fn ->
-      Generation.largest_capacity(@ctx, 8, @live, @live + 1000)
-    end
   end
 
-  test "the step peak decides the capacity when the query heads make its temporaries large" do
-    ctx = %{@ctx | query_heads: 32}
-    step = @live + (917_536 + 2_621_440) * 2048
-
-    # The growth into 2048 rows needs less than the step at it, so the step decides.
+  # The step decides when its temporaries are large: a wide matmul, or the f32 copy of a bf16
+  # cache (14 layers of bf16 caches hold 458,784 bytes for each position of 8 rows, and their
+  # f32 copy 917,504 bytes).
+  test "the step peak decides the capacity when the temporaries of the widest step are large" do
+    wide = %{@ctx | matmul_bytes: 200_000}
+    step = @live + 917_536 * 2048 + 2 * 4096 * 200_000 + @scores_chunk
     assert @live + 917_536 * (1792 + 2048) < step
-    assert Generation.largest_capacity(ctx, 8, @live, step / 0.95) == 2048
-    assert Generation.largest_capacity(ctx, 8, @live, step / 0.95 - 1) == 1792
+    assert Generation.largest_capacity(wide, 8, @live, step / 0.95) == 2048
+    assert Generation.largest_capacity(wide, 8, @live, step / 0.95 - 1) == 1792
+
+    types = Map.new(@names, &{&1, {:bf16, ["batch", 8, "length", 128]}})
+    bf16 = %{@ctx | model: %{input_types: types}}
+    step = @live + (458_784 + 917_504) * 2048 + 2 * 4096 * 4096 + @scores_chunk
+    assert @live + 458_784 * (1792 + 2048) < step
+    assert Generation.largest_capacity(bf16, 8, @live, step / 0.95) == 2048
+    assert Generation.largest_capacity(bf16, 8, @live, step / 0.95 - 1) == 1792
+  end
+
+  # The error of a capacity that does not fit gives the estimate and the budget that the
+  # choice uses, so its estimate is larger than its budget.
+  test "the error of a capacity that does not fit gives an estimate above its budget" do
+    limit = @live + 1000
+    error = catch_error(Generation.largest_capacity(@ctx, 8, @live, limit))
+
+    [estimate, live, budget] =
+      Regex.run(
+        ~r/a :capacity of 256 rows with 8 :slots needs about (\d+) bytes of device memory with the (\d+) bytes in use, and the budget is (\d+) bytes, 95% of the :device_memory of #{limit} bytes/,
+        error.message,
+        capture: :all_but_first
+      )
+      |> Enum.map(&String.to_integer/1)
+
+    assert live == @live
+    assert budget == round(0.95 * limit)
+    assert estimate > budget
   end
 end

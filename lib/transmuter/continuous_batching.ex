@@ -44,9 +44,9 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Device memory
 
-  All rows of a group have the capacity of its buffers, so one long request grows the KV cache of all `:slots` rows. Without `:capacity`, the server takes the largest capacity whose peak of device memory stays at most 95% of `:device_memory`, with the bytes that the backend has in use after the load, such as the parameters. The peak is the larger of a step at the capacity, with the scores of the attention of its widest step, and a growth into it from the capacity before, which holds the buffers of both capacities. The bytes of each row and position come from the shapes and types of the cache inputs of the decoder, so a model in f16 takes half of the bytes of the same model in f32. The server logs the capacity that it takes.
+  All rows of a group have the capacity of its buffers, so one long request grows the KV cache of all `:slots` rows. Without `:capacity`, the server takes the largest capacity whose peak of device memory stays at most 95% of `:device_memory`, with the bytes that the backend has in use after the load, such as the parameters. The peak is the larger of a step at the capacity, with the temporary buffers of its widest step, and a growth into it from the capacity before, which holds the buffers of both capacities. The temporary buffers are two outputs of the widest matmul for each token of the step, one chunk of the attention scores, and with a bf16 cache the f32 copy of the cache that the attention reads. The bytes of each row and position come from the shapes and types of the cache inputs of the decoder, so a model in f16 takes half of the bytes of the same model in f32. The server logs the capacity that it takes.
 
-  EXLA gives the limit of its allocator when `EXLA.Client.get_memory_statistics/1` has a `:limit` key, and EXLA 1.0 has none. EMLX gives no limit. Without a limit, the capacity is 4096. With `compile_steps: true`, a capacity that does not fit fails at the start with an `ArgumentError` that gives the bytes. Without it, a step fails when the group grows to it.
+  EXLA gives the limit of its allocator when `EXLA.Client.get_memory_statistics/1` has a `:limit` key, and EXLA 1.0 has none. EMLX gives no limit. Without a limit, the capacity is 4096. With `compile_steps: true`, a capacity that does not fit fails at the start with an `ArgumentError` that gives the estimate and the budget. Without it, a step fails when the group grows to it.
 
   For example, Qwen3-0.6B q4 has f32 caches of 229,376 bytes for each row and position. With 8 slots on an RTX 3060 (12 GB, an allocator limit of about 10.6 GiB) and about 2.2 GiB of parameters, `device_memory: trunc(10.6 * 2 ** 30)` gives a capacity of 2048 rows: a growth to 2560 rows holds about 10.1 GiB.
 
@@ -571,7 +571,12 @@ defmodule Transmuter.ContinuousBatching do
   rescue
     error in RuntimeError ->
       if error.message =~ ~r/RESOURCE_EXHAUSTED|Out of memory/ do
-        reraise Generation.memory_error(ctx, slots, live, limit, ctx.max_capacity), __STACKTRACE__
+        error = Generation.memory_error(ctx, slots, live, limit, ctx.max_capacity)
+
+        reraise ArgumentError,
+                "the device ran out of memory in the steps of the server, so the estimate is " <>
+                  "too low: " <> error.message,
+                __STACKTRACE__
       else
         reraise error, __STACKTRACE__
       end

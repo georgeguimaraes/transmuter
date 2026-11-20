@@ -106,6 +106,7 @@ defmodule Transmuter.Generation do
   alias Transmuter.Generation.MergedDecoder
   alias Transmuter.{GraphBreaks, Serving}
   alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Ops.Transformer
 
   require Logger
 
@@ -206,6 +207,7 @@ defmodule Transmuter.Generation do
       image_token: opts[:image_token],
       cache: Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values.")),
       query_heads: query_heads(model, repo.config),
+      matmul_bytes: matmul_bytes(model, vocab(model, repo.config)),
       buffers: buffers(model),
       min_capacity: min_capacity(model),
       max_capacity: model[:max_capacity],
@@ -250,6 +252,22 @@ defmodule Transmuter.Generation do
           do: heads
 
     Enum.max(heads, fn -> Enum.find_value(keys, &config[&1]) end)
+  end
+
+  # The bytes of one token of the widest output of a matmul of the decoder, other than the
+  # lm_head, which computes one position of each row (see "Logits"). A MatMul weight is
+  # {K, N}, and the moved weight of a MatMulNBits is {N, K}.
+  defp matmul_bytes(model, vocab) do
+    sizes =
+      for node = %{op_type: op_type} <- model.nodes,
+          op_type in ["MatMul", "MatMulNBits"],
+          weight = model.params[Enum.at(node.input, 1, "")],
+          match?(%Nx.Tensor{shape: {_, _}}, weight),
+          size = elem(weight.shape, if(op_type == "MatMul", do: 1, else: 0)),
+          size != vocab,
+          do: size * Nx.byte_size(Nx.tensor(0, type: Nx.type(weight)))
+
+    Enum.max(sizes, fn -> 0 end)
   end
 
   # The length of the past comes from the mask only in :grow (see MergedDecoder.past_length/1),
@@ -2827,31 +2845,52 @@ defmodule Transmuter.Generation do
       end)
       |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
 
-    # The temporaries of the widest step: 5 times its attention scores in f32, one row for each
-    # query head. For Qwen3-0.6B, XLA held up to 4.5 times the scores (at 1280 rows: two copies
-    # each of the scores, the masked scores and the softmax, and parts of the cache), 3.4 times
-    # at 2048 rows (1.7 GiB) and 1.9 times at 4096 rows (1.9 GiB). Without a count of query
-    # heads in the graph or the config, it takes 8 query heads for each head of the cache, as
-    # in Llama 3 70B. That is not a bound for multi-query attention, which has one cache head.
+    # The temporaries of the widest step, from the buffers that XLA gives it, which it reuses
+    # for each layer: two outputs of the widest matmul for each token, such as the merged gate
+    # and up of the MLP and its activation, and the attention scores of one chunk of query rows
+    # in f32, at most the budget of the chunks of the attention core, with the output of its
+    # first dot, at most half of that in f16. For Qwen3-0.6B fp16 on EXLA CUDA, XLA gave a temp
+    # buffer of 573 MB at 48 rows of 512 tokens, with 302 MB of gate and up and 151 MB of the
+    # activation, and of 412 MB at 8 rows and a capacity of 1024, with 268 MB of f32 scores and
+    # 134 MB of the f16 output of the dot. This estimate bounds each of 10 measured steps from 8
+    # to 48 rows and from 512 to 4096 rows of capacity. A bf16 cache also has the f32 copy of the
+    # cache of all layers that the core reads (see Transmuter.Ops.Transformer). Without a count
+    # of query heads in the graph or the config, it takes 8 query heads for each head of the
+    # cache, as in Llama 3 70B. That is not a bound for multi-query attention, which has one
+    # cache head.
     width = Enum.max(ctx.widths.with_cache ++ ctx.widths.without_cache)
     heads = ctx.query_heads || 8 * cache_heads
-    temporary = 5 * rows * heads * width * capacity * 4
+    chunk = min(rows * heads * width * capacity * 4, Transformer.scores_budget())
+    scores = div(3 * chunk, 2)
+    widened = if bf16_cache?(ctx), do: rows * capacity * 2 * (position - 4), else: 0
+    temporary = 2 * rows * width * ctx.matmul_bytes + scores + widened
     before = capacities(ctx, capacity - 1) |> List.last(0)
     buffers = &(rows * position * &1)
     live + max(buffers.(capacity) + temporary, buffers.(before) + buffers.(capacity))
   end
 
+  defp bf16_cache?(ctx) do
+    Enum.any?(ctx.buffers, fn name ->
+      {type, _dims} = ctx.model.input_types[name]
+      name in ctx.cache and Nx.Type.normalize!(type) == {:bf, 16}
+    end)
+  end
+
   @doc false
-  # The error of a server whose group of `rows` rows at `capacity` does not fit the device.
+  # The error of a server whose group of `rows` rows at `capacity` does not fit the device. The
+  # estimate and the budget are those of largest_capacity/4: the peak with the `live` bytes in
+  # use, and 95% of `limit`.
   def memory_error(ctx, rows, live, limit, capacity) do
-    free = if limit, do: "#{limit - live} bytes", else: "an unknown number of bytes"
-    limit = if limit, do: "#{limit} bytes", else: "not known"
+    budget =
+      if limit,
+        do: "#{round(0.95 * limit)} bytes, 95% of the :device_memory of #{limit} bytes",
+        else: "not known"
 
     ArgumentError.exception(
       "the server cannot start: a :capacity of #{capacity} rows with #{rows} :slots needs " <>
-        "about #{peak(ctx, rows, live, capacity)} bytes of device memory, and #{free} are " <>
-        "free (the :device_memory is #{limit}). Give a smaller :capacity, fewer :slots or " <>
-        "a :device_memory that the device has"
+        "about #{peak(ctx, rows, live, capacity)} bytes of device memory with the #{live} " <>
+        "bytes in use, and the budget is #{budget}. Give a smaller :capacity, fewer :slots " <>
+        "or a :device_memory that the device has"
     )
   end
 
