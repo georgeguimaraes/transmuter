@@ -1,8 +1,8 @@
 defmodule Transmuter.Ops.Attention do
   @moduledoc """
-  The `Nx.block/4` of the attention core: `softmax(q · k * scale + masks) · v` for q `{B, N, S, H}` and k and v `{B, N_kv, T, H}`. The inputs are q, k, v and the masks that `masks` names, in that order: `:bias` (a float mask to add, or a u8 mask with 1 for the keys to keep) and `:hidden` (a u8 mask with 1 for the hidden keys). The output is the attention, in the type of q.
+  The `Nx.block/4` of the attention core: `softmax(q · k * scale + masks) · v` for q `{B, N, S, H}` and k and v `{B, N_kv, T, H}`. The inputs are q, k, v and the masks that `masks` names, in that order: `:bias` (a float mask to add, or a u8 mask with 1 for the keys to keep), `:hidden` (a u8 mask with 1 for the hidden keys), and `:query_lengths` and `:key_lengths` (s32 `{B}`, always together: the query rows of each row, which are all S, and its live keys). The keys at or after the live keys of a row are hidden, and a causal mask is aligned to the last live key: query i sees the keys up to length - S + i. Without lengths, all T keys are live. The output is the attention, in the type of q.
 
-  The default function is the attention core of `Transmuter.Ops.Transformer`, with the kernels of `EMLX.Fast` on EMLX. Every backend and compiler runs it, except for one case: on CUDA, EXLA runs the block as the fused flash attention of cuDNN (`__cudnn$fmhaSoftmax` and `__cudnn$fmhaScaleBiasSoftmax`, as `jax._src.cudnn.fused_attention_stablehlo` lowers them) when q, k and v are f16 or bf16 of one type with a head size of at most 128 and a multiple of 8, there is no softcap and no hidden mask, a bias has the full key axis and a query axis of 1 or S, and a causal mask is aligned to the first query (S = T) or hides nothing (S = 1). The kernel accumulates in f32 and gives f16 or bf16, so its output can differ from the Nx core in f32 by one unit in the last place.
+  The default function is the attention core of `Transmuter.Ops.Transformer`, with the kernels of `EMLX.Fast` on EMLX. Every backend and compiler runs it, except for one case: on CUDA, EXLA runs the block as the fused flash attention of cuDNN (`__cudnn$fmhaSoftmax` and `__cudnn$fmhaScaleBiasSoftmax`, as `jax._src.cudnn.fused_attention_stablehlo` lowers them) when q, k and v are f16 or bf16 of one type with a head size of at most 128 and a multiple of 8, there is no softcap and no hidden mask, a bias has the full key axis and a query axis of 1 or S, and a causal mask is aligned to the first query (S = T without lengths) or hides nothing beyond the lengths (S = 1). With lengths, cuDNN takes them as its PADDING mask and reads only the live keys of each row. The kernel accumulates in f32 and gives f16 or bf16, so its output can differ from the Nx core in f32 by one unit in the last place.
 
   The cuDNN targets read an opaque string config and return a workspace after the output, so the `EXLA.CustomCall` implementation exists only when `EXLA.CustomCall.Spec` has the `:api_version` and `:extra_results` fields. With an EXLA without them, EXLA runs the default function.
   """
@@ -19,7 +19,7 @@ defmodule Transmuter.Ops.Attention do
       def call(attention, %{shape: out_shape}, [q, k, v | masks], %{platform: :cuda}) do
         {b, heads, s, _head_size} = q.shape
         t = elem(k.shape, 2)
-        bias = if attention.masks == [:bias], do: hd(masks)
+        bias = if List.first(attention.masks) == :bias, do: hd(masks)
 
         if kernel_options?(attention, s, t) and kernel_inputs?(q, k, v, out_shape) and
              kernel_bias?(bias, {b, heads, s, t}) do
@@ -31,12 +31,15 @@ defmodule Transmuter.Ops.Attention do
 
       def call(_attention, _out, _args, _client), do: :skip
 
-      # The kernel has no softcap and no mask of hidden keys, and its causal mask is aligned
-      # to the first query.
+      # The kernel has no softcap and no mask of hidden keys. Its causal mask is aligned to
+      # the first query, which is the alignment of the core when S = T and all keys are live.
+      # With one query, the causal mask hides nothing beyond the lengths.
       defp kernel_options?(attention, s, t),
         do:
-          attention.softcap == 0 and attention.masks in [[], [:bias]] and
-            (not attention.causal or s == t or s == 1)
+          attention.softcap == 0 and :hidden not in attention.masks and
+            (not attention.causal or s == 1 or (s == t and not lengths?(attention)))
+
+      defp lengths?(attention), do: :key_lengths in attention.masks
 
       # f16 or bf16 of one type, a head size of at most 128 and a multiple of 8, and key and
       # value heads that group the query heads.
@@ -57,30 +60,37 @@ defmodule Transmuter.Ops.Attention do
 
       defp kernel_bias?(_bias, _scores), do: false
 
+      # The operands are q, k, v, the bias and the query and key lengths, as the block
+      # inputs give them.
       defp spec(attention, q, bias, {b, heads, s, t}) do
         layout = "dense<[3, 2, 1, 0]> : tensor<4xindex>"
-        operands = if bias, do: 4, else: 3
+        tensors = if bias, do: 4, else: 3
+        lengths = if lengths?(attention), do: 2, else: 0
+
+        layouts =
+          List.duplicate(layout, tensors) ++ List.duplicate("dense<0> : tensor<1xindex>", lengths)
 
         %Spec{
           call_target_name:
             if(bias, do: "__cudnn$fmhaScaleBiasSoftmax", else: "__cudnn$fmhaSoftmax"),
           api_version: 2,
-          backend_config: JSON.encode!(config(attention, q.type, {b, heads, s, t})),
+          attributes: JSON.encode!(config(attention, q.type, {b, heads, s, t})),
           mlir_attributes: [
-            {"operand_layouts",
-             "[" <> Enum.map_join(1..operands, ", ", fn _ -> layout end) <> "]"},
+            {"operand_layouts", "[" <> Enum.join(layouts, ", ") <> "]"},
             {"result_layouts", "[#{layout}, dense<0> : tensor<1xindex>]"}
           ],
           # cuDNN takes the workspace that XLA allocates as the last result. XLA gives it
           # the size of the cuDNN graph, and an empty workspace must stay empty.
           extra_results: [{{:u, 8}, {0}}],
-          operand_element_types: List.duplicate(q.type, operands)
+          operand_element_types:
+            List.duplicate(q.type, tensors) ++ List.duplicate({:s, 32}, lengths)
         }
       end
 
       # The GpuBackendConfig of jax._src.cudnn.fused_attention_stablehlo for the BNTH
       # layout, in inference. The causal mask of cuDNN is aligned to the first query, which
-      # is the alignment of the attention core when S = T. When S = 1 it hides nothing.
+      # is the alignment of the attention core when S = T. When S = 1 it hides nothing. The
+      # lengths give the PADDING mask, as dot_product_attention with key_value_seq_lengths.
       defp config(attention, type, {b, heads, s, t}) do
         dims = fn lc, rc ->
           %{
@@ -93,7 +103,6 @@ defmodule Transmuter.Ops.Attention do
 
         %{
           operation_queue_id: "0",
-          wait_on_operation_queues: [],
           cudnn_fmha_backend_config: %{
             algorithm: %{
               algo_id: "0",
@@ -111,7 +120,7 @@ defmodule Transmuter.Ops.Attention do
               is_dynamic_dimension: [false, false, false, false]
             },
             is_flash_attention: true,
-            mask_type: if(attention.causal and s == t and s > 1, do: "CAUSAL", else: "NO_MASK"),
+            mask_type: mask_type(attention, s, t),
             bmm1_dot_dimension_numbers: dims.(3, 3),
             bmm2_dot_dimension_numbers: dims.(3, 2),
             dropout_rate: 0.0,
@@ -121,6 +130,14 @@ defmodule Transmuter.Ops.Attention do
             is_paged_attention: false
           }
         }
+      end
+
+      defp mask_type(attention, s, t) do
+        cond do
+          lengths?(attention) -> "PADDING"
+          attention.causal and s == t and s > 1 -> "CAUSAL"
+          true -> "NO_MASK"
+        end
       end
     end
   end

@@ -137,7 +137,10 @@ defmodule Transmuter.Ops.Transformer do
     present_k = write_cache(past_k, k, offsets, capacity)
     present_v = write_cache(past_v, v, offsets, capacity)
 
-    # The query at row i of a sequence has the position offset + i.
+    # Each sequence has seqlens_k + 1 live keys, and the query at row i has the position
+    # offset + i, so the causal mask aligned to the live keys hides the rows after it and the
+    # free rows of the buffer.
+    lengths = Nx.add(offsets, s)
     offsets = Nx.reshape(offsets, {b, 1, 1, 1})
     window = attr(node, "local_window_size", -1)
 
@@ -146,12 +149,10 @@ defmodule Transmuter.Ops.Transformer do
       softcap: attr(node, "softcap", 0.0),
       bias: attention_bias,
       hidden:
-        any_hidden([
-          causal_hidden(s, capacity, offsets),
-          window > 0 &&
-            Nx.less_equal(key_positions(capacity), Nx.add(query_positions(s, offsets), -window))
-        ]),
-      causal: false
+        window > 0 &&
+          Nx.less_equal(key_positions(capacity), Nx.add(query_positions(s, offsets), -window)),
+      causal: true,
+      lengths: lengths
     }
 
     out = q |> attend(present_k, present_v, opts) |> from_heads()
@@ -651,6 +652,9 @@ defmodule Transmuter.Ops.Transformer do
   #   * :hidden - nil, or a u8 mask with 1 for the hidden keys.
   #   * :causal - whether query i sees only the keys up to T - S + i. ONNX Runtime aligns the
   #     causal mask to the last query, so past keys stay visible.
+  #   * :lengths - optional, nil or the s32 {B} live keys of each row. The keys at or after
+  #     them are hidden, and the causal mask is aligned to them: query i sees the keys up to
+  #     length - S + i. Without lengths, all T keys are live.
   #
   # The masks broadcast to {B, N, S, T}. The core is the Nx.block of Transmuter.Ops.Attention
   # on every backend, so a compiler can run it as one kernel. Its default function is
@@ -659,7 +663,19 @@ defmodule Transmuter.Ops.Transformer do
   def attend(q, k, v, opts) do
     # Leading axes of 1 keep the values of a mask that broadcasts to {B, N, S, T}.
     bias = opts.bias && Nx.reshape(opts.bias, rank4(opts.bias))
-    masks = for {name, mask} <- [bias: bias, hidden: opts.hidden], mask, do: {name, mask}
+    {b, _heads, s, _head_size} = Nx.shape(q)
+    lengths = opts[:lengths] && opts.lengths |> Nx.as_type(:s32) |> Nx.reshape({b})
+    query_lengths = lengths && Nx.broadcast(Nx.tensor(s, type: :s32), {b})
+
+    masks =
+      for {name, mask} <- [
+            bias: bias,
+            hidden: opts.hidden,
+            query_lengths: query_lengths,
+            key_lengths: lengths
+          ],
+          mask,
+          do: {name, mask}
 
     attention =
       struct!(
@@ -675,6 +691,8 @@ defmodule Transmuter.Ops.Transformer do
   defp attention_fun(3), do: &attention(&1, [&2, &3, &4])
   defp attention_fun(4), do: &attention(&1, [&2, &3, &4, &5])
   defp attention_fun(5), do: &attention(&1, [&2, &3, &4, &5, &6])
+  defp attention_fun(6), do: &attention(&1, [&2, &3, &4, &5, &6, &7])
+  defp attention_fun(7), do: &attention(&1, [&2, &3, &4, &5, &6, &7, &8])
 
   # The default function of the attention block. On EMLX without softcap, one kernel of MLX
   # computes it when it takes the shapes, or when the head size padded with zeros takes it
@@ -686,8 +704,9 @@ defmodule Transmuter.Ops.Transformer do
     opts =
       attention
       |> Map.take([:scale, :softcap, :causal])
-      |> Map.merge(%{bias: nil, hidden: nil})
+      |> Map.merge(%{bias: nil, hidden: nil, query_lengths: nil, key_lengths: nil})
       |> Map.merge(Map.new(Enum.zip(attention.masks, masks)))
+      |> live_keys(Nx.axis_size(q, 2), Nx.axis_size(k, 2))
 
     type = Nx.type(q)
 
@@ -720,6 +739,33 @@ defmodule Transmuter.Ops.Transformer do
       [attend_rows(q, k, v, %{opts | bias: bias}, @scores_budget)]
     end)
     |> hd()
+  end
+
+  # The lengths as a mask of hidden keys. The last live query of a row sees its last live
+  # key: with a causal mask, query i sees the keys up to key length - query length + i, and
+  # without one, every query sees the keys before the key length. The mask reads both lengths,
+  # so the default function reads every input of the block. EMLX 0.5 gives the inputs to the
+  # parameters that the default function reads, in order, so an input that it does not read
+  # shifts the inputs after it.
+  defp live_keys(opts, s, t) do
+    {query_lengths, opts} = Map.pop(opts, :query_lengths)
+    {key_lengths, opts} = Map.pop(opts, :key_lengths)
+
+    if key_lengths do
+      [query_lengths, key_lengths] =
+        Enum.map([query_lengths, key_lengths], &Nx.reshape(&1, {:auto, 1, 1, 1}))
+
+      offset = Nx.subtract(key_lengths, query_lengths)
+
+      past =
+        if opts.causal,
+          do: causal_hidden(s, t, offset),
+          else: causal_hidden(1, t, Nx.add(offset, Nx.subtract(query_lengths, 1)))
+
+      %{opts | hidden: any_hidden([opts.hidden, past]), causal: false}
+    else
+      opts
+    end
   end
 
   defp rank4(mask),
