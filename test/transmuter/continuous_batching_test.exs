@@ -165,7 +165,7 @@ defmodule Transmuter.ContinuousBatchingTest do
 
         full = fn ->
           assert_raise ContinuousBatching.QueueFullError, ~r/holds 1 requests/, fn ->
-            ContinuousBatching.run(server, "Explain how a rainbow forms.", 60_000)
+            ContinuousBatching.run(server, "Explain how a rainbow forms.", timeout: 60_000)
           end
         end
 
@@ -652,6 +652,30 @@ defmodule Transmuter.ContinuousBatchingTest do
     assert Enum.count(steps, &(&1.admitted > 0 and &1.running > 0)) >= 2
   end
 
+  # Marian has forced_eos_token_id, so the eos token is the last token of the budget of a row.
+  # A request with :max_new_tokens of 8 runs next to a request with the 64 tokens of the
+  # server, and each one gives the translation of a serving with its own max_new_tokens.
+  test "a request of Marian with its own :max_new_tokens gives the text of a serving with it" do
+    source = {:hf, "Xenova/opus-mt-en-de"}
+    opts = [strategy: :greedy, num_beams: 1] ++ @opts
+
+    translate =
+      &hd(Nx.Serving.run(Text.text_to_text(source, opts ++ [max_new_tokens: &1]), &2).results).text
+
+    spec = [source: source, task: Text.TextToText, slots: 2, max_new_tokens: 64] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
+
+    long = Task.async(fn -> ContinuousBatching.run(server, @museum) end)
+    short = ContinuousBatching.run(server, @fox, max_new_tokens: 8)
+
+    assert hd(short.results).text == translate.(8, @fox)
+    assert hd(Task.await(long, :infinity).results).text == translate.(64, @museum)
+
+    assert_raise ArgumentError, ~r/from 1 to 64/, fn ->
+      ContinuousBatching.run(server, @fox, max_new_tokens: 65)
+    end
+  end
+
   # The relative bias of T5 reads the positions of all keys, which take a position offset for
   # each row. A server of 2 rows gets 4 texts at once, so the later texts join a running row,
   # and the rows of a step have gap rows. Each text gives the translation and the
@@ -922,7 +946,7 @@ defmodule Transmuter.ContinuousBatchingTest do
 
         {results, steps} =
           step_events(server, fn ->
-            ContinuousBatching.run(server, [@long_speech, @speech], 120_000)
+            ContinuousBatching.run(server, [@long_speech, @speech], timeout: 120_000)
           end)
 
         for {%{chunks: [got]}, %{chunks: [expected]}} <- Enum.zip(results, alone) do

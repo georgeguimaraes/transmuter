@@ -32,7 +32,7 @@ defmodule Transmuter.Generation do
 
   ## Lengths
 
-  The processors count the tokens of each row as Python transformers counts the columns of `input_ids`: the prompt and the new tokens. The prompt of a decoder-only model is the text, and the prompt of the decoder of an encoder-decoder model starts with `decoder_start_token_id`. Each row has its own length, and the rows of a batch are not padded. Transmuter limits the new tokens with `max_new_tokens`, so the `max_length` of a row in Python is the length of its prompt plus `max_new_tokens`. Thus:
+  The processors count the tokens of each row as Python transformers counts the columns of `input_ids`: the prompt and the new tokens. The prompt of a decoder-only model is the text, and the prompt of the decoder of an encoder-decoder model starts with `decoder_start_token_id`. Each row has its own length, and the rows of a batch are not padded. Transmuter limits the new tokens of each row with its budget, `max_new_tokens` or the `:max_new_tokens` of its request in `Transmuter.ContinuousBatching`, so the `max_length` of a row in Python is the length of its prompt plus its budget. Thus:
 
     * `no_repeat_ngram_size` - the n-grams of the prompt and the new tokens can occur only once.
     * `min_length` - the eos tokens are removed while the prompt and the new tokens are fewer than `min_length`.
@@ -149,6 +149,7 @@ defmodule Transmuter.Generation do
   @history "transmuter.select.history"
   @count "transmuter.select.count"
   @prompt_count "transmuter.select.prompt_count"
+  @budget "transmuter.select.budget"
   @keys "transmuter.select.keys"
   @scores "transmuter.select.scores"
   @tokens "transmuter.select.tokens"
@@ -249,7 +250,7 @@ defmodule Transmuter.Generation do
       masks: masks(gen),
       eos: eos,
       bos: gen["bos_token_id"] || repo.config["bos_token_id"],
-      processors: processors(gen, opts, max_new_tokens, eos)
+      processors: processors(gen, opts, eos)
     }
     |> Map.merge(beam_search(gen, opts, sampling?))
   end
@@ -424,7 +425,7 @@ defmodule Transmuter.Generation do
 
   # The processors in the order of _get_logits_processor of Python transformers. An option
   # replaces the value of generation_config.json.
-  defp processors(gen, opts, max_new_tokens, eos) do
+  defp processors(gen, opts, eos) do
     setting = &(opts[&1] || gen[Atom.to_string(&1)])
     ngram_size = setting.(:no_repeat_ngram_size) || 0
     forced_bos = setting.(:forced_bos_token_id)
@@ -445,9 +446,10 @@ defmodule Transmuter.Generation do
       :bad_words,
       min_length? && eos != [] && min_length(min_length, eos),
       forced_bos != nil && forced(&Nx.equal(&1.count, 1), [forced_bos]),
-      # The row has max_length - 1 tokens, where max_length is the prompt and max_new_tokens.
+      # The row has max_length - 1 tokens, where max_length is the prompt and the budget of
+      # new tokens of the row.
       forced_eos != nil &&
-        forced(&Nx.equal(generated(&1), max_new_tokens - 1), List.wrap(forced_eos)),
+        forced(&Nx.equal(generated(&1), Nx.subtract(&1.budget, 1)), List.wrap(forced_eos)),
       :suppress_tokens,
       begin_suppress != [] && begin_suppress(begin_suppress, forced_bos != nil)
     ]
@@ -1141,7 +1143,7 @@ defmodule Transmuter.Generation do
       new = Nx.equal(Nx.iota({rows, vocab}, axis: 1), Nx.new_axis(extra[@tokens], 1))
       seen = seen |> Nx.logical_or(new) |> Nx.as_type(Nx.type(seen))
       row = append_token(extra[@history], extra[@count], extra[@tokens])
-      row = Map.put(row, :prompt, extra[@prompt_count])
+      row = Map.merge(row, %{prompt: extra[@prompt_count], budget: extra[@budget]})
 
       # The last real token of each row is offset positions before the last position of the
       # step, and the logits keep the last positions of the step.
@@ -1211,7 +1213,8 @@ defmodule Transmuter.Generation do
         seen: none({rows, ctx.vocab}),
         history: zeros.(:s32, {rows, capacity}),
         count: zeros.(:s32, {rows}),
-        prompt_count: zeros.(:s32, {rows})
+        prompt_count: zeros.(:s32, {rows}),
+        budget: zeros.(:s32, {rows})
       },
       masks: token_masks(ctx),
       keys: zeros.(:u32, {rows, 2}),
@@ -1247,6 +1250,7 @@ defmodule Transmuter.Generation do
       @history => group.state.history,
       @count => group.state.count,
       @prompt_count => group.state.prompt_count,
+      @budget => group.state.budget,
       @keys => group.keys,
       @tokens => Nx.tensor(tokens, type: :s32, backend: Nx.BinaryBackend)
     }
@@ -1470,7 +1474,8 @@ defmodule Transmuter.Generation do
       | seen: Nx.backend_transfer(none({rows, ctx.vocab}), ctx.backend),
         history: zeros.(:s32, {rows, state.capacity}),
         count: zeros.(:s32, {rows}),
-        prompt_count: zeros.(:s32, {rows})
+        prompt_count: zeros.(:s32, {rows}),
+        budget: zeros.(:s32, {rows})
     }
 
     # The rows of the slot of image features of each row: the power of two of the largest
@@ -2213,7 +2218,7 @@ defmodule Transmuter.Generation do
   end
 
   # Writes the device state of the rows of `requests`: the seen tokens and the tokens of its
-  # prompt, its count and prompt count, and the key of its seed.
+  # prompt, its count and prompt count, its budget of new tokens, and the key of its seed.
   defp admit_rows(ctx, group, requests) do
     capacity = group.state.capacity
     prompt_ids = for {request, i} <- Enum.with_index(requests), id <- request.prompt, do: [i, id]
@@ -2226,12 +2231,13 @@ defmodule Transmuter.Generation do
         host.(Enum.map(requests, &(&1.prompt ++ List.duplicate(0, capacity - length(&1.prompt))))),
       count: host.(counts),
       prompt_count: host.(counts),
+      budget: host.(Enum.map(requests, & &1.budget)),
       keys: requests |> Enum.map(&Nx.Random.key(&1.seed)) |> Nx.stack()
     }
 
     old =
       group.state
-      |> Map.take([:seen, :history, :count, :prompt_count])
+      |> Map.take([:seen, :history, :count, :prompt_count, :budget])
       |> Map.put(:keys, group.keys)
 
     written = ctx.admit_rows.(old, host.(Enum.map(requests, & &1.row)), values)
@@ -2461,7 +2467,7 @@ defmodule Transmuter.Generation do
   # and selection state, its masks and its keys.
   def finish(group = %{state: state}) do
     own = [state.selected, state.seen, state.history, state.count, state.prompt_count]
-    own = [group.keys | own] ++ Map.values(state.cache)
+    own = [group.keys, state.budget | own] ++ Map.values(state.cache)
     release(own ++ Map.values(group.masks), [])
     group
   end
@@ -2701,7 +2707,8 @@ defmodule Transmuter.Generation do
         @seen => state.seen,
         @history => state.history,
         @count => state.count,
-        @prompt_count => state.prompt_count
+        @prompt_count => state.prompt_count,
+        @budget => state.budget
       }
 
       written = state.cache |> Map.take(state.written) |> Map.merge(rows)
@@ -2716,6 +2723,7 @@ defmodule Transmuter.Generation do
           history: moved[@history],
           count: moved[@count],
           prompt_count: moved[@prompt_count],
+          budget: moved[@budget],
           cursors: take.(state.cursors),
           positions: take.(state.positions),
           lengths: take.(state.lengths),
@@ -2972,7 +2980,8 @@ defmodule Transmuter.Generation do
       seen: nil,
       history: nil,
       count: nil,
-      prompt_count: nil
+      prompt_count: nil,
+      budget: nil
     }
   end
 

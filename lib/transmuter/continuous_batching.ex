@@ -217,23 +217,32 @@ defmodule Transmuter.ContinuousBatching do
   @doc """
   Generates the text of `input`, an input of the task or a list of them, as `Nx.Serving.batched_run/2` with a serving of the task, and returns the same result.
 
-  Raises `QueueFullError` when no queue of a server of the name can take the inputs (see "Distribution"). After `timeout` milliseconds, the rows of the inputs end and the caller exits.
+  Raises `QueueFullError` when no queue of a server of the name can take the inputs (see "Distribution").
+
+  ## Options
+
+    * `:timeout` - after this number of milliseconds, the rows of the inputs end and the caller exits. The default is `:infinity`.
+
+    * `:max_new_tokens` - the most new tokens of each row of the inputs, from 1 to the `:max_new_tokens` of the server. The default is the `:max_new_tokens` of the server. A row ends at its own budget, and its processors, such as `forced_eos_token_id`, use it as `max_new_tokens`.
   """
-  def run(server, input, timeout \\ :infinity) do
-    call = {__MODULE__, :run, [server, input, timeout]}
-    server |> servers!(call) |> with_room(&run_on(&1, server, input, timeout, call))
+  def run(server, input, opts \\ []) do
+    opts = Keyword.validate!(opts, timeout: :infinity, max_new_tokens: nil)
+    call = {__MODULE__, :run, [server, input, opts]}
+    server |> servers!(call) |> with_room(&run_on(&1, server, input, opts, call))
   end
 
-  defp run_on(pid, server, input, timeout, call) when node(pid) == node(),
-    do: run(info!(pid, call), server, input, timeout, call)
+  defp run_on(pid, server, input, opts, call) when node(pid) == node(),
+    do: run(info!(pid, call), server, input, opts, call)
 
-  defp run_on(pid, _server, input, timeout, call), do: remote_run(pid, input, timeout, call)
+  defp run_on(pid, _server, input, opts, call), do: remote_run(pid, input, opts, call)
 
-  defp run(info, server, input, timeout, call) do
+  defp run(info, server, input, opts, call) do
+    timeout = opts[:timeout]
     deadline = if timeout == :infinity, do: :infinity, else: now() + timeout
+    budget = budget!(info, opts)
     {inputs, multi?} = Serving.validate!(input, info.task.validate)
     refs = for input <- inputs, do: {make_ref(), input}
-    monitor = enqueue!(info, refs, false, server, deadline, call)
+    monitor = enqueue!(info, refs, {false, budget}, server, deadline, call)
 
     # The rows of an input end in any order, and :postprocess takes them in the order of
     # their runs.
@@ -252,16 +261,17 @@ defmodule Transmuter.ContinuousBatching do
   @doc """
   Returns a stream of the text of `input`, as a serving of the task with `stream: true`. Consume the stream in the process that called this function.
 
-  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. An input that gives more than one row raises an `ArgumentError`. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream. Raises `QueueFullError` when no queue of a server of the name can take the input.
+  The function returns when the worker has prepared the request (see "Encoders and images"), and it raises the exception of the worker on the request. An input that gives more than one row raises an `ArgumentError`. `stream_done: true` adds `{:done, %{token_summary: summary}}` at the end of the stream, and `:max_new_tokens` is as in `run/3`. Raises `QueueFullError` when no queue of a server of the name can take the input.
   """
   def stream(server, input, opts \\ []) do
-    opts = Keyword.validate!(opts, stream_done: false)
+    opts = Keyword.validate!(opts, stream_done: false, max_new_tokens: nil)
     reason = {__MODULE__, :stream, [server, input, opts]}
     server |> servers!(reason) |> with_room(&stream_on(&1, server, input, opts, reason))
   end
 
   defp stream_on(pid, server, input, opts, reason) when node(pid) == node() do
     info = info!(pid, reason)
+    budget = budget!(info, opts)
 
     input =
       case Serving.validate!(input, info.task.validate) do
@@ -270,7 +280,7 @@ defmodule Transmuter.ContinuousBatching do
       end
 
     ref = make_ref()
-    monitor = enqueue!(info, [{ref, input}], true, server, :infinity, reason)
+    monitor = enqueue!(info, [{ref, input}], {true, budget}, server, :infinity, reason)
 
     run =
       case await(info, monitor, {ref, :run}, :infinity, [{ref, input}], reason) do
@@ -389,8 +399,8 @@ defmodule Transmuter.ContinuousBatching do
   # process of a distributed call of Nx.Serving does. The caller only monitors the proxy, so
   # it gets each end of the proxy as an exit of a local call. The timeout goes as a duration,
   # because monotonic time is local to each node.
-  defp remote_run(pid, input, timeout, call) do
-    {_proxy, ref, monitor} = proxy(pid, :run, [input, timeout])
+  defp remote_run(pid, input, opts, call) do
+    {_proxy, ref, monitor} = proxy(pid, :run, [input, opts])
 
     receive do
       {:DOWN, ^monitor, :process, _proxy, {^ref, {:ok, result}}} -> result
@@ -476,7 +486,7 @@ defmodule Transmuter.ContinuousBatching do
     :exit, {reason, {__MODULE__, _fun, _args}} -> reason
   end
 
-  defp local_call(_proxy, _ref, :run, [pid, input, timeout]), do: {:ok, run(pid, input, timeout)}
+  defp local_call(_proxy, _ref, :run, [pid, input, opts]), do: {:ok, run(pid, input, opts)}
 
   defp local_call(proxy, ref, :stream, [pid, input, opts]) do
     chunks = stream(pid, input, opts)
@@ -487,10 +497,12 @@ defmodule Transmuter.ContinuousBatching do
 
   # The server reads its mailbox between two steps, so the reply waits for the step that runs,
   # up to the deadline of the caller.
-  defp enqueue!(info, refs, stream?, server, deadline, call) do
+  defp enqueue!(info, refs, {stream?, budget}, server, deadline, call) do
     monitor = Process.monitor(info.pid)
 
-    requests = for {ref, input} <- refs, do: %{ref: ref, input: input, stream?: stream?}
+    requests =
+      for {ref, input} <- refs,
+          do: %{ref: ref, input: input, stream?: stream?, max_new_tokens: budget}
 
     reply =
       try do
@@ -534,6 +546,19 @@ defmodule Transmuter.ContinuousBatching do
         GenServer.cast(info.pid, {:cancel, Enum.map(refs, &elem(&1, 0))})
         Process.demonitor(monitor, [:flush])
         exit({:timeout, call})
+    end
+  end
+
+  # The budget of new tokens of each row of a call, at most that of the server, which sizes
+  # its cache and its steps.
+  defp budget!(info, opts) do
+    case opts[:max_new_tokens] || info.max_new_tokens do
+      budget when is_integer(budget) and budget in 1..info.max_new_tokens//1 ->
+        budget
+
+      budget ->
+        raise ArgumentError,
+              "expected :max_new_tokens to be an integer from 1 to #{info.max_new_tokens}, the :max_new_tokens of the server, got: #{inspect(budget)}"
     end
   end
 
@@ -741,6 +766,7 @@ defmodule Transmuter.ContinuousBatching do
       task: Map.take(state.task, [:validate, :postprocess]),
       tokenizer: state.tokenizer,
       logprobs?: ctx.token_logprobs?,
+      max_new_tokens: ctx.max_new_tokens,
       max_queue: state.max_queue,
       load: :atomics.new(1, signed: true)
     }
@@ -915,7 +941,7 @@ defmodule Transmuter.ContinuousBatching do
   end
 
   defp step(state, admitted) do
-    requests = for {row, request} <- admitted, do: request(state, row, request)
+    requests = for {row, request} <- admitted, do: request(row, request)
 
     group =
       if requests == [],
@@ -969,7 +995,7 @@ defmodule Transmuter.ContinuousBatching do
         next = waiting |> Map.delete(:rows) |> Map.merge(fields) |> Map.put(:index, index)
         queue = if rows == [], do: rest, else: :queue.in_r(%{waiting | rows: rows}, rest)
         candidates = [{row, next} | admitted]
-        requests = for {row, waiting} <- candidates, do: request(state, row, waiting)
+        requests = for {row, waiting} <- candidates, do: request(row, waiting)
 
         cond do
           Generation.rows_needed(state.ctx, state.group, requests) <= state.ctx.max_capacity ->
@@ -992,14 +1018,14 @@ defmodule Transmuter.ContinuousBatching do
 
   defp stored(request, _group, _row), do: request
 
-  defp request(state, row, request) do
+  defp request(row, request) do
     request
     |> Map.take([:prompt, :seed, :features, :position, :inputs, :prefix])
-    |> Map.merge(%{row: row, budget: state.ctx.max_new_tokens})
+    |> Map.merge(%{row: row, budget: request.max_new_tokens})
   end
 
   defp too_long(state, request) do
-    "a prompt of #{length(request.prompt)} tokens and max_new_tokens of #{state.ctx.max_new_tokens} need more than the #{state.ctx.max_capacity} rows of the cache of the server"
+    "a prompt of #{length(request.prompt)} tokens and max_new_tokens of #{request.max_new_tokens} need more than the #{state.ctx.max_capacity} rows of the cache of the server"
   end
 
   # Sends the new token of each row to its stream, and the tokens of each row that ends to

@@ -297,8 +297,11 @@ defmodule Transmuter.DistributedTest do
 
     wait_for(fn -> member?(peer, Transmuter.PG, __MODULE__.Speech) end)
 
-    local = ContinuousBatching.run(__MODULE__.Speech, audio, 120_000)
-    remote = :erpc.call(peer, ContinuousBatching, :run, [__MODULE__.Speech, audio, 120_000])
+    local = ContinuousBatching.run(__MODULE__.Speech, audio, timeout: 120_000)
+
+    remote =
+      :erpc.call(peer, ContinuousBatching, :run, [__MODULE__.Speech, audio, [timeout: 120_000]])
+
     assert remote == local
 
     assert {:exception, %ArgumentError{message: message}, _stacktrace} =
