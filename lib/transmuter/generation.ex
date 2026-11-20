@@ -983,14 +983,15 @@ defmodule Transmuter.Generation do
   defp loop_carry(ctx, state, counts, remaining, k) do
     rows = length(counts)
     width = if ctx.token_logprobs?, do: 2, else: 1
-    s32 = &Nx.tensor(&1, type: :s32, backend: Nx.BinaryBackend)
+    s32 = &host_tensor(runs(&1), :s32)
+    none = Nx.tensor(-1, type: :s32, backend: Nx.BinaryBackend)
 
     %{
       @lengths => s32.(state.lengths),
       @active => s32.(counts),
       @remaining => s32.(remaining),
       @delta => s32.(Enum.map(state.positions, &elem(&1, 1))),
-      @out => Nx.broadcast(s32.(-1), {k, rows, width})
+      @out => Nx.broadcast(none, {k, rows, width})
     }
   end
 
@@ -1244,7 +1245,7 @@ defmodule Transmuter.Generation do
 
     other =
       if ctx.num_beams > 1,
-        do: %{@scores => Nx.tensor(group.scores, type: :f32, backend: Nx.BinaryBackend)},
+        do: %{@scores => host_tensor(runs(group.scores), :f32)},
         else: %{}
 
     tokens = Enum.map(group.new, &(&1 || -1))
@@ -1256,7 +1257,7 @@ defmodule Transmuter.Generation do
       @prompt_count => group.state.prompt_count,
       @budget => group.state.budget,
       @keys => group.keys,
-      @tokens => Nx.tensor(tokens, type: :s32, backend: Nx.BinaryBackend)
+      @tokens => host_tensor(runs(tokens), :s32)
     }
     |> Map.merge(masks)
     |> Map.merge(other)
@@ -1622,7 +1623,7 @@ defmodule Transmuter.Generation do
         if done?, do: 0, else: budget - length(ids)
       end)
 
-    offsets = Nx.tensor(List.duplicate(0, length(counts)), type: :s32, backend: Nx.BinaryBackend)
+    offsets = host_tensor([{0, length(counts)}], :s32)
     release(List.wrap(state.selected), [])
 
     inputs =
@@ -3007,7 +3008,7 @@ defmodule Transmuter.Generation do
         do: List.duplicate(0, length(counts)),
         else: Enum.map(counts, &(n - &1))
 
-    offsets = Nx.tensor(offsets, type: :s32, backend: Nx.BinaryBackend)
+    offsets = host_tensor(runs(offsets), :s32)
 
     # The selection of the last step is read, or is that of an earlier part of the prompt,
     # so nothing reads it now.
@@ -3468,16 +3469,46 @@ defmodule Transmuter.Generation do
 
   defp add_rows(ranges, at, n), do: [{at, n} | ranges]
 
-  # The mask of the buffer of a row: ones at its valid rows, and zeros at its gap rows and
-  # the free rows.
-  defp valid_mask(ranges, capacity) do
-    {mask, first} =
-      Enum.reduce(ranges, {[], capacity}, fn {start, count}, {mask, stop} ->
-        {List.duplicate(1, count) ++ List.duplicate(0, stop - start - count) ++ mask, start}
+  # The mask of the buffer of a row, as runs (see host_tensor/2): ones at its valid rows, and
+  # zeros at its gap rows and the free rows.
+  defp valid_runs(ranges, capacity) do
+    {runs, first} =
+      Enum.reduce(ranges, {[], capacity}, fn {start, count}, {runs, stop} ->
+        {[{1, count}, {0, stop - start - count} | runs], start}
       end)
 
-    List.duplicate(0, first) ++ mask
+    [{0, first} | runs]
   end
+
+  # A host tensor of `type` from nested lists whose innermost lists are runs {value, count}.
+  # Each run is one binary copy, so a mask of the capacity of a row costs two copies and not
+  # one conversion for each element, as Nx.tensor/2 of a list does.
+  defp host_tensor(nested, type) do
+    {shape, data} = encode_runs(nested, Nx.Type.normalize!(type))
+
+    data
+    |> IO.iodata_to_binary()
+    |> Nx.from_binary(type, backend: Nx.BinaryBackend)
+    |> Nx.reshape(shape)
+  end
+
+  defp encode_runs(runs = [{_value, _count} | _], type) do
+    data = for {value, count} <- runs, do: :binary.copy(scalar_binary(value, type), count)
+    {{runs |> Enum.map(&elem(&1, 1)) |> Enum.sum()}, data}
+  end
+
+  defp encode_runs(lists, type) do
+    parts = Enum.map(lists, &encode_runs(&1, type))
+    {inner, _data} = hd(parts)
+    {Tuple.insert_at(inner, 0, length(lists)), Enum.map(parts, &elem(&1, 1))}
+  end
+
+  defp scalar_binary(value, type),
+    do: Nx.to_binary(Nx.tensor(value, type: type, backend: Nx.BinaryBackend))
+
+  # The runs of one value each of nested lists of numbers, for host_tensor/2.
+  defp runs(values = [value | _]) when is_number(value), do: Enum.map(values, &{&1, 1})
+  defp runs(lists), do: Enum.map(lists, &runs/1)
 
   defp step_inputs(ctx, state, tokens, counts) do
     n = length(hd(tokens))
@@ -3491,27 +3522,20 @@ defmodule Transmuter.Generation do
     masks =
       for {past, valid} <- Enum.zip(state.lengths, state.valid) do
         case ctx.mode do
-          :in_place ->
-            List.duplicate(1, past + n) ++ List.duplicate(0, state.capacity - past - n)
-
-          :append when cached? ->
-            valid_mask(valid, state.capacity) ++ List.duplicate(1, n)
-
-          :append ->
-            List.duplicate(1, n)
-
-          :grow ->
-            List.duplicate(1, past + n)
+          :in_place -> [{1, past + n}, {0, state.capacity - past - n}]
+          :append when cached? -> valid_runs(valid, state.capacity) ++ [{1, n}]
+          :append -> [{1, n}]
+          :grow -> [{1, past + n}]
         end
       end
 
     values = %{
-      "input_ids" => tokens,
+      "input_ids" => runs(tokens),
       "attention_mask" => masks,
-      "position_ids" => positions(ctx, state, n),
-      @position_offset => position_offset(ctx, state),
+      "position_ids" => runs(positions(ctx, state, n)),
+      @position_offset => runs(position_offset(ctx, state)),
       @key_mask => masks,
-      @logit_index => for(count <- counts, do: [[max(count - 1, 0)]])
+      @logit_index => runs(for count <- counts, do: [[max(count - 1, 0)]])
     }
 
     inputs =
@@ -3519,7 +3543,7 @@ defmodule Transmuter.Generation do
           name in ctx.model.inputs,
           into: Map.merge(state.cache, state.inputs) do
         {type, _dims} = ctx.model.input_types[name]
-        {name, Nx.tensor(value, type: type, backend: Nx.BinaryBackend)}
+        {name, host_tensor(value, type)}
       end
 
     # An export that declares num_logits_to_keep keeps all positions (0). With @logit_index,
