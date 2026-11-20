@@ -108,9 +108,17 @@ MyChat
 
 A process on the model node runs the request, and the caller gets the result, the exceptions and the exits of a local call. A stream gets each chunk of text as a message. Consume the stream in the process that called `stream/3`. When the caller exits, or stops the stream before its end, the server frees the row of the request.
 
-Several model nodes can start a server with the same name. A call tries the server on its own node first, and then the other servers in a random order. It goes to the first server whose queue takes it, and it raises `Transmuter.ContinuousBatching.QueueFullError` when no queue takes it.
+Several model nodes can start a server with the same name. A call tries the server on its own node first while it has room. Else it tries the servers from the most room to the least: the free rows of a server less its waiting requests. A server on another node gives its room through one call to its node, and a node that does not answer in 50 ms goes last. A call goes to the first server whose queue takes it, and it raises `Transmuter.ContinuousBatching.QueueFullError` when no queue takes it.
 
 The call copies the tensors of the input to `Nx.BinaryBackend` with `Transmuter.to_host/1`.
+
+## The cost of a remote call
+
+A remote call starts a process on the model node, and the messages of the call go through Erlang distribution. On a LAN with a round trip of about 2.8 ms, against the same call on the model node:
+
+- The first chunk of a ContinuousBatching stream comes about 12 ms later (80.25 ms against 68.53 ms, the median of 8 streams of fp16 Qwen3-0.6B on an RTX 3060).
+- Each later chunk comes about 0.25 ms later (8.55 ms against 8.30 ms between two chunks).
+- A short call of an embedding serving takes about 4.6 ms more (6.82 ms against 2.25 ms, all-MiniLM-L6-v2).
 
 ## Inputs
 
