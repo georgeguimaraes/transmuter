@@ -111,7 +111,7 @@ defmodule Transmuter.Generation do
 
   ## Prefixes
 
-  A request of `admit/4` can reuse the keys and values of a prefix of its prompt from a store of `prefix_store/3`, such as the system prompt of a chat. The key of a token depends only on the tokens before it and on its position, and in `:in_place` a row writes its cache from its first row, so the rows of a prefix hold the same keys and values in each row. The request gives `%{store: store, slot: slot, size: size}` in `:prefix`: its row starts with the first `size` rows of the slot, and the steps run only the rest of its prompt. `store_prefix/6` copies the first rows of a row into a slot after its prompt ran. A prefix has whole blocks of `prefix_block/0` tokens and leaves at least the last token of the prompt, which gives the logits. `prefix_reason/1` tells why a decoder cannot reuse prefixes: a cache that is not in `:in_place`, rows that cannot join a group, inputs of the steps other than the tokens, or a state that is not a cache of keys and values.
+  A request of `admit/4` can reuse the keys and values of a prefix of its prompt from a store of `prefix_store/3`, such as the system prompt of a chat. The key of a token depends only on the tokens before it and on its position, not on the row or the column of the buffer that holds it, so the rows of a prefix hold the same keys and values in each row. The request gives `%{store: store, slot: slot, size: size}` in `:prefix`: its row starts with the first `size` rows of the slot, from its first row in `:in_place`, and in `:append` at the write offset of the group, which then moves after them as after a prompt part. The steps run only the rest of its prompt. `store_prefix/6` copies the first valid rows of a row into a slot after its prompt ran. A prefix has whole blocks of `prefix_block/0` tokens and leaves at least the last token of the prompt, which gives the logits. `prefix_reason/1` tells why a decoder cannot reuse prefixes: rows that cannot join a group, a merged decoder, inputs of the steps other than the tokens, or a state that is not a cache of keys and values.
   """
 
   @compile {:no_warn_undefined, Transmuter.EMLX}
@@ -1531,11 +1531,12 @@ defmodule Transmuter.Generation do
 
       # The tokens of each prompt go into the rows of its tokens now, and its keys and values
       # in the steps of its parts, after the rows of a stored prefix (see "Prefixes"). The
-      # buffers make room for both before the writes (see fit_next/2).
+      # buffers make room for the parts before the writes (see fit_next/2).
       group =
-        ctx
-        |> fit_next(%{(group |> reset_rows(requests) |> prefix_rows(requests)) | left: left})
+        group
+        |> reset_rows(requests)
         |> copy_prefixes(ctx, requests)
+        |> then(&fit_next(ctx, %{&1 | left: left}))
         |> then(&admit_rows(ctx, &1, requests))
 
       # The rows of a merged decoder keep their own inputs: the inputs of the prompts, one row
@@ -1674,11 +1675,20 @@ defmodule Transmuter.Generation do
     state = Enum.filter(others, &String.starts_with?(&1, "past"))
 
     cond do
-      reason = cannot_join(ctx) -> reason
-      ctx.mode != :in_place -> "its cache is in #{inspect(ctx.mode)}, not in :in_place"
-      ctx.given != [] -> "its steps read inputs other than the tokens: #{inspect(ctx.given)}"
-      state != [] -> "it keeps a state that is not a cache of keys and values: #{inspect(state)}"
-      true -> nil
+      reason = cannot_join(ctx) ->
+        reason
+
+      merged?(ctx) ->
+        "a merged decoder runs the first part of a prompt on its branch without cache"
+
+      ctx.given != [] ->
+        "its steps read inputs other than the tokens: #{inspect(ctx.given)}"
+
+      state != [] ->
+        "it keeps a state that is not a cache of keys and values: #{inspect(state)}"
+
+      true ->
+        nil
     end
   end
 
@@ -1699,7 +1709,15 @@ defmodule Transmuter.Generation do
   # `slot` of the store, and returns the store.
   def store_prefix(ctx, group, store, row, slot, size) do
     buffers = Map.take(group.state.cache, Map.keys(store))
-    written = ctx.prefix_out.(store, buffers, prefix_indices(row, slot, size))
+
+    # The first `size` valid rows of the row, which are not consecutive in :append.
+    columns =
+      group.state.valid
+      |> Enum.at(row)
+      |> Enum.flat_map(fn {start, count} -> Enum.to_list(start..(start + count - 1)//1) end)
+      |> Enum.take(size)
+
+    written = ctx.prefix_out.(store, buffers, prefix_indices(row, slot, columns))
     release(Map.values(store), Map.values(written))
     written
   end
@@ -2117,60 +2135,55 @@ defmodule Transmuter.Generation do
     end)
   end
 
-  # The rows of a request with a stored prefix start with the rows of the prefix.
-  defp prefix_rows(group, requests) do
-    Enum.reduce(requests, group, fn request, group = %{state: state} ->
-      size = prefix_size(request)
-
-      state = %{
-        state
-        | lengths: List.replace_at(state.lengths, request.row, size),
-          valid:
-            List.replace_at(state.valid, request.row, if(size > 0, do: [{0, size}], else: [])),
-          used: max(state.used, size)
-      }
-
-      %{group | state: state}
-    end)
-  end
-
   defp prefix_size(request), do: get_in(request, [:prefix, :size]) || 0
 
-  # Writes the keys and values of the stored prefix of each request into the first rows of its
-  # row, after fit_next/2 made room for them.
+  # Writes the keys and values of the stored prefix of each request into its row, and the row
+  # starts with them: from its first row in :in_place, and in :append at the write offset of the
+  # group, which then moves after them, as after a prompt part. The buffers first make room for
+  # them (see fit/3), so a growth or a compaction does not move rows that hold no values yet.
   defp copy_prefixes(group, ctx, requests) do
     for request = %{prefix: %{store: store, slot: slot, size: size}} <- requests,
         reduce: group do
       group ->
-        buffers = Map.take(group.state.cache, Map.keys(store))
-        written = ctx.prefix_in.(buffers, store, prefix_indices(request.row, slot, size))
+        group = %{state: state} = fit(ctx, group, size)
+        column = if ctx.mode == :append, do: state.used, else: 0
+        buffers = Map.take(state.cache, Map.keys(store))
+        columns = Enum.to_list(column..(column + size - 1))
+        written = ctx.prefix_in.(buffers, store, prefix_indices(request.row, slot, columns))
         release(Map.values(buffers), Map.values(written))
-        put_in(group.state.cache, Map.merge(group.state.cache, written))
+
+        state = %{
+          state
+          | cache: Map.merge(state.cache, written),
+            lengths: List.replace_at(state.lengths, request.row, size),
+            valid: List.replace_at(state.valid, request.row, [{column, size}]),
+            used: max(state.used, column + size)
+        }
+
+        %{group | state: state}
     end
   end
 
-  # The row, the slot and the number of rows of a copy of a prefix. The number of rows is the
-  # size of a tensor, so each size compiles once.
-  defp prefix_indices(row, slot, size) do
-    %{
-      row: Nx.tensor(row, type: :s32, backend: Nx.BinaryBackend),
-      slot: Nx.tensor(slot, type: :s32, backend: Nx.BinaryBackend),
-      size: Nx.iota({size}, type: :s32, backend: Nx.BinaryBackend)
-    }
+  # The row, the slot and the columns of the buffer of a copy of a prefix. The number of
+  # columns is the size of a tensor, so each size compiles once.
+  defp prefix_indices(row, slot, columns) do
+    host = &Nx.tensor(&1, type: :s32, backend: Nx.BinaryBackend)
+    %{row: host.(row), slot: host.(slot), columns: host.(columns)}
   end
 
-  defp prefix_in(buffers, store, %{row: row, slot: slot, size: size}) do
+  # The prefix goes into consecutive columns of the row from the first one of `columns`.
+  defp prefix_in(buffers, store, %{row: row, slot: slot, columns: columns}) do
     Map.new(buffers, fn {name, buffer} ->
       {_batch, heads, _length, dim} = Nx.shape(buffer)
-      part = Nx.slice(store[name], [slot, 0, 0, 0], [1, heads, Nx.axis_size(size, 0), dim])
-      {name, Nx.put_slice(buffer, [row, 0, 0, 0], part)}
+      part = Nx.slice(store[name], [slot, 0, 0, 0], [1, heads, Nx.axis_size(columns, 0), dim])
+      {name, Nx.put_slice(buffer, [row, 0, columns[0], 0], part)}
     end)
   end
 
-  defp prefix_out(store, buffers, %{row: row, slot: slot, size: size}) do
+  # The values of `columns` of the row, in their order, go into the first rows of the slot.
+  defp prefix_out(store, buffers, %{row: row, slot: slot, columns: columns}) do
     Map.new(store, fn {name, slots} ->
-      {_slots, heads, _length, dim} = Nx.shape(slots)
-      part = Nx.slice(buffers[name], [row, 0, 0, 0], [1, heads, Nx.axis_size(size, 0), dim])
+      part = buffers[name] |> Nx.slice_along_axis(row, 1, axis: 0) |> Nx.take(columns, axis: 2)
       {name, Nx.put_slice(slots, [slot, 0, 0, 0], part)}
     end)
   end
