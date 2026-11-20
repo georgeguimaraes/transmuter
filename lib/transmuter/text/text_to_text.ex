@@ -34,6 +34,7 @@ defmodule Transmuter.Text.TextToText do
              :source_language_token,
              :target_language_token,
              token_logprobs: false,
+             decode_steps: 1,
              defn_options: []
            ] ++ Hub.options()
 

@@ -92,6 +92,10 @@ defmodule Transmuter.ContinuousBatching do
 
   The group keeps the features of the image tokens that its rows have not run, and the features of a request join them. Then the prompt of the request runs in parts of at most 64 tokens, next to the new tokens of the running rows (see "The KV cache").
 
+  ## Decode loops
+
+  With `decode_steps: k` above 1, a step runs a decode loop of up to `k` steps in one call (see "Decode loops" in `Transmuter.Generation`) when no request can join in that call: no row is free, or no request waits or prepares. Otherwise it runs one step, so a waiting request joins as soon as a row is free. A loop ends at the latest when a running row reaches its budget, so the row is free after the call. With `compile_steps: true`, the server also compiles each loop at each capacity. On CUDA, Qwen3-0.6B fp16 at 20 requests/s gives 767 tokens/s with 8 slots and 1782 tokens/s with 48 slots at `1`, and 1000 and 2076 tokens/s at `8`.
+
   ## Compiles
 
   A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of three widths, 1, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most three shapes for each capacity, 47 for a capacity of 4096 rows. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
@@ -100,7 +104,7 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Telemetry
 
-  Each step emits `[:transmuter, :continuous_batching, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_batching, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
+  Each step emits `[:transmuter, :continuous_batching, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The `:stop` event also has `:steps`, the decode steps of the call, and `:row_steps`, the steps of the rows that had not ended before each step. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_batching, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
 
   ## Distribution
 
@@ -757,7 +761,8 @@ defmodule Transmuter.ContinuousBatching do
       }
 
       :telemetry.span([:transmuter, :continuous_batching, :step], metadata, fn ->
-        {step(state, admitted), metadata}
+        state = step(state, admitted)
+        {state, Map.merge(metadata, loop_metadata(state.group.steps, metadata.running))}
       end)
     end
   end
@@ -770,7 +775,14 @@ defmodule Transmuter.ContinuousBatching do
         do: state.group,
         else: Generation.admit(state.ctx, state.group, requests)
 
-    group = Generation.next(state.ctx, group)
+    # A loop of steps when no request can join in this call: no row is free, or no request
+    # waits or prepares. Generation caps the loop at the tokens that the running rows have
+    # left, so a row that reaches its budget frees its row at the end of the call.
+    free? = Enum.any?(group.done)
+    waiting? = not :queue.is_empty(state.queue) or state.preparing != %{}
+    steps = if free? and waiting?, do: 1, else: state.ctx.decode_steps
+
+    group = Generation.next(state.ctx, group, steps)
     group = Generation.shrink(state.ctx, group)
     # The group keeps the features and the encoder outputs, so the rows do not keep them for
     # their callers.
@@ -778,6 +790,13 @@ defmodule Transmuter.ContinuousBatching do
       Map.new(admitted, fn {row, request} -> {row, Map.drop(request, [:features, :inputs])} end)
 
     emit(%{state | rows: Map.merge(state.rows, admitted)}, group)
+  end
+
+  # The steps of the call, and the steps of the rows that had not ended before each step. A
+  # row that ends in a step of the decode loop runs the later steps of the call without a token.
+  defp loop_metadata(views, running) do
+    before = Enum.map(Enum.drop(views, -1), fn view -> Enum.count(view.done, &(not &1)) end)
+    %{steps: length(views), row_steps: running + Enum.sum(before)}
   end
 
   defp admissions(state) do
@@ -828,31 +847,33 @@ defmodule Transmuter.ContinuousBatching do
   # its caller. A row with a part of its prompt left has no token yet. A row that ends is free
   # for the next step.
   defp emit(state, group) do
-    rows =
-      Enum.reduce(state.rows, state.rows, fn {row, request}, rows ->
-        token = Enum.at(group.new, row)
-        done? = Enum.at(group.done, row)
-
-        cond do
-          token == nil and not done? ->
-            :ok
-
-          request.stream? ->
-            logprob = if token, do: List.first(hd(Enum.at(group.logprobs, row)))
-            send(request.pid, {request.ref, {:token, token || -1, logprob, done?}})
-
-          done? ->
-            tokens = Generation.row_tokens(group, row)
-            send(request.pid, {request.ref, {:done, {request.index, tokens}}})
-
-          true ->
-            :ok
-        end
-
-        if done?, do: Map.delete(rows, row), else: rows
-      end)
-
+    rows = Enum.reduce(group.steps, state.rows, &emit_step(&2, Map.merge(group, &1)))
     %{state | group: group, rows: rows}
+  end
+
+  defp emit_step(rows, group) do
+    Enum.reduce(rows, rows, fn {row, request}, rows ->
+      token = Enum.at(group.new, row)
+      done? = Enum.at(group.done, row)
+
+      cond do
+        token == nil and not done? ->
+          :ok
+
+        request.stream? ->
+          logprob = if token, do: List.first(hd(Enum.at(group.logprobs, row)))
+          send(request.pid, {request.ref, {:token, token || -1, logprob, done?}})
+
+        done? ->
+          tokens = Generation.row_tokens(group, row)
+          send(request.pid, {request.ref, {:done, {request.index, tokens}}})
+
+        true ->
+          :ok
+      end
+
+      if done?, do: Map.delete(rows, row), else: rows
+    end)
   end
 
   # Ends the rows and removes the waiting requests that `drop?` selects.

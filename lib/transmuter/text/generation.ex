@@ -30,6 +30,7 @@ defmodule Transmuter.Text.Generation do
              :seed,
              :template_options,
              token_logprobs: false,
+             decode_steps: 1,
              defn_options: []
            ] ++ Hub.options()
 

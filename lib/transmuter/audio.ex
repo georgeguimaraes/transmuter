@@ -173,6 +173,8 @@ defmodule Transmuter.Audio do
 
   ## Options
 
+    * `:decode_steps` - as in `Transmuter.Text.generation/2`.
+
     * `:seed` - the seed of the inputs without a seed. The default is a random seed for each input.
 
     * `:speaker_embedding` - the speaker embedding of the inputs without one, a tensor `{512}` for SpeechT5. VITS takes no speaker embedding.

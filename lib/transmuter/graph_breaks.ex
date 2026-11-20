@@ -69,7 +69,7 @@ defmodule Transmuter.GraphBreaks do
   # already cached here, with eviction and erasure when the owner exits, so EXLA must not keep
   # a second copy. Other compilers, such as EMLX, reject the :cache option.
   defp options(model, opts) do
-    compiler = opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
+    compiler = compiler(opts)
 
     opts =
       if compiler == EXLA,
@@ -78,6 +78,11 @@ defmodule Transmuter.GraphBreaks do
 
     {opts, %{source: model[:source], compiler: compiler}}
   end
+
+  @doc false
+  # The compiler of `opts`, else the default compiler of Nx.Defn, else the evaluator.
+  def compiler(opts),
+    do: opts[:compiler] || Nx.Defn.default_options()[:compiler] || Nx.Defn.Evaluator
 
   # The plan keeps the nodes once, as a tuple. A copy of a closure, such as in a new process
   # or in :persistent_term, copies each reference to a term again. So the closure of a call

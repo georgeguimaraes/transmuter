@@ -220,6 +220,8 @@ defmodule Transmuter.Text do
 
     * `:token_logprobs` - `true` adds `:token_logprobs` to each result: the log-probability of each new token, without the eos token, so the list has `output` values of the token summary. The log-probability is that of the distribution that the step selects from: after the processors, the temperature, top-k and top-p, and for beam search the step of the beam of the token. These are the values of `compute_transition_scores` of Python transformers with `normalize_logits=True` (see `Transmuter.Generation.generate/5`). Python also gives a value for the step of the eos token, which the text does not have. A stream gives the values in its done event, so with `:stream` the option needs `stream_done: true`. Without the option, generation does not compute the values. The default is `false`.
 
+    * `:decode_steps` - the most decode steps in one compiled call (see "Decode loops" in `Transmuter.Generation`). Each call has a cost on the host and in the launch of the program, about 3.3 ms on CUDA for Qwen3-0.6B, so more steps in one call give more tokens per second. On CUDA, Qwen3-0.6B fp16 gives 122 tokens/s for one stream at `1` and 163 tokens/s at `8`. Only `:in_place` and `:append` caches with greedy selection or sampling use the loops. On CUDA in fp16, the log-probabilities can move slightly, so a near tie can give another token. The loops need a compiler that compiles a while loop of the whole model, such as EXLA. The default is `1`.
+
     * `:compile` - `:batch_size`, the number of inputs that generate together. The default is `1`. The serving does not use `:sequence_length`, because it does not pad or truncate the prompt.
 
     * `:stream` - `true` makes the serving return a stream of text chunks. The default is `false`. With `:stream`, the input must be one input, not a list.
@@ -283,7 +285,7 @@ defmodule Transmuter.Text do
 
     * `:max_new_tokens` - the maximum number of new tokens. The default is that of the `text2text-generation` pipeline of transformers (see `Transmuter.Generation.max_new_tokens/3`): 256 for T5, and `max_length` minus 1 for the start token when the configuration gives a `max_length` other than 20, such as 511 for Marian.
 
-    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id`, `:forced_eos_token_id`, `:seed`, `:token_logprobs`, `:stream` and `:stream_done` - as in `generation/2`. The prompt of the decoder is `decoder_start_token_id`, so `:min_length` counts it, and the forced bos token is the first new token.
+    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:no_repeat_ngram_size`, `:min_length`, `:min_new_tokens`, `:forced_bos_token_id`, `:forced_eos_token_id`, `:seed`, `:token_logprobs`, `:decode_steps`, `:stream` and `:stream_done` - as in `generation/2`. The prompt of the decoder is `decoder_start_token_id`, so `:min_length` counts it, and the forced bos token is the first new token.
 
   The other options are those of the module documentation, but `:model` does not apply.
   """

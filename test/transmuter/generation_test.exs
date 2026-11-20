@@ -1,6 +1,8 @@
 defmodule Transmuter.GenerationTest do
   use ExUnit.Case, async: true
 
+  import Transmuter.TestBackend, only: [needs: 1]
+
   # Beam search. The references come from the generate function of Python transformers with
   # num_beams, see the beam search section of test/support/pipeline_references.py. Each case
   # gives another text than greedy selection, or another text than another row of its table.
@@ -800,6 +802,48 @@ defmodule Transmuter.GenerationTest do
       assert row_tokens(group, 0) == alone.(fox, 7)
       assert story_tokens == Enum.take(alone.(story, 11), 4)
       assert row_tokens(group, 1) == alone.(rainbow, 13)
+    end
+  end
+
+  # A decode loop runs up to 4 steps in one call, and stops each row in the graph at an eos
+  # token or at its budget. The rows get their first tokens in calls of 1, 2 and 4 steps, one
+  # row stops at an eos token inside a call, and 10 new tokens are not a multiple of 4. The
+  # loops give the tokens and the log-probabilities of one step for each call, in both cache
+  # modes of buffers, with greedy selection and with sampling. EMLX 0.5 cannot compile the
+  # loops.
+  needs(:exla)
+  @tag ci_partition: 10
+  test "decode loops give the tokens and log-probabilities of one step for each call" do
+    sources = [
+      {{:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}, :append},
+      {{:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}, :in_place}
+    ]
+
+    for {source, mode} <- sources,
+        opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts,
+        {repo, model, tokenizer} = Transmuter.Serving.load!(source, opts, :fp32),
+        strategy <- [:greedy, :sampling] do
+      prompts =
+        for text <- [@fox, "Once upon a time", "Explain how a rainbow forms."] do
+          {:ok, encoding} = Tokenizers.Tokenizer.encode(tokenizer.native, text)
+          Transmuter.Tokenizer.ids(tokenizer, encoding)
+        end
+
+      generate = fn config, steps ->
+        repo = %{repo | generation_config: config}
+        opts = [strategy: strategy, max_new_tokens: 10, token_logprobs: true]
+        ctx = Generation.context(repo, model, [decode_steps: steps] ++ opts)
+        assert ctx.mode == mode
+        ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+        Generation.generate(ctx, prompts, [7, 11, 13])
+      end
+
+      [_fox, story, _rainbow] = generate.(%{}, 1)
+      config = %{"eos_token_id" => story |> Enum.map(&hd/1) |> Enum.at(5)}
+      steps = generate.(config, 1)
+
+      assert generate.(config, 4) == steps
+      assert Enum.any?(steps, &(length(&1) < 10))
     end
   end
 

@@ -93,6 +93,16 @@ defmodule Transmuter.Generation do
 
   When requests can join a group with other rows (`:in_place` and `:append` with greedy selection or sampling, and for a merged decoder an offset for each row and, with a cross-attention cache, a cross function), a prompt runs in the steps of the other rows. This is also the path of `generate/5` and of the servings of these decoders. Each step takes a part of each prompt from its front, and the new token of each other row, which takes the logits at its own position. A step has one of three widths: 1 for new tokens, 64 and 512 for prompt parts, and a shorter part pads to the width of its step. A part takes the largest width that the longest prompt left fills and that the largest capacity holds after the longest row that has not ended, at least 64, and at most 64 when another row takes a new token. A row can end early, at an eos token or a cancel, and then a step can be wider than the steps that the admission of a request planned. A step of 64 tokens always fits the rows that the admission counted, and a wider step fits the room that is left. So the other rows wait at most one step of 64 tokens for a token, and a group has at most three step shapes for each capacity, whatever the timing of the requests (see `Transmuter.ContinuousBatching`). A prompt of 37 tokens runs in one step, and a prompt of 4000 tokens in an idle group in seven steps of 512 tokens and seven of at most 64. Against parts of each power of two, the time to the first token of one prompt alone is 0.80x for 100 tokens, 1.09x for 874 tokens and 1.18x for 4000 tokens on the GPU of a Mac, and 0.56x, 0.94x and 1.20x on CUDA, for SmolLM2-135M. In `:append`, all rows of a step write its width, so a join step of 64 tokens needs 64 free rows after the write offset, and a group can grow its buffers one capacity step earlier than with parts of each power of two. The other decoders run all prompts in parts that end all prompts in the same step, with no other rows (see "Merged decoders" and beam search).
 
+  ## Decode loops
+
+  With `decode_steps: k` above 1 in the options of `context/4`, `compile/3` also compiles decode loops for `:in_place` and `:append` with greedy selection or sampling, without beams and without `:embed`. A loop runs the decoder and the selection for 2, 4 ... up to `k` steps in one call, in a while loop with a static trip count (the `:repeat` option of `Transmuter.compile/3`). So the cost of a call on the host and in the launch of the program comes once for these steps. `:grow` has no loops, because its cache grows in each step, and the carry of a while loop keeps its shape.
+
+  In the loop, each step makes the inputs of the next step on the device: the new token, the attention mask, the positions and the position offset come from the length of each row, and in `:append` the write offset moves by one row. A row stops at an eos token or when it has no new tokens left. A row that stopped still runs in the later steps of the call: it writes no token, and its length does not move. The call gives the selection of each step, with -1 for a row that stopped in an earlier step, and the host reads the steps in order, with the work of one step for each of them. On the EXLA host, the loops give the same tokens and log-probabilities as one step for each call. On CUDA in fp16, the loop is another compiled program, so its log-probabilities can move slightly, as with any change of the program: up to 0.013 at 256 tokens for Qwen3-0.6B. So a near tie can give another token.
+
+  `next/3` runs a loop only in a step where each running row takes its new token, with no part of a prompt left. It takes the largest loop of at most `k` steps, at most the new tokens that each running row has left, and at most the tokens of the newest row. So a row that reaches its budget frees its row at the end of the call, and a new row gets its first tokens in calls of 1, 2, 4 ... steps. A text stream gives a chunk only at the end of a word, so the first chunk of a stream does not wait for a long loop. A row that stops at an eos token runs the rest of the call.
+
+  EMLX 0.5 cannot compile the loop of a model, so `compile/3` raises for `:decode_steps` above 1 with `compiler: EMLX`.
+
   ## Device memory
 
   A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. The embeddings of a step are freed after its call, and when a group ends, generation frees its cache and the rest of its state. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
@@ -143,6 +153,12 @@ defmodule Transmuter.Generation do
   @next_history "transmuter.select.next_history"
   @next_count "transmuter.select.next_count"
   @write_at "transmuter.cache.write_at"
+  # The carry of the decode loop (see compile_loop/4).
+  @lengths "transmuter.loop.lengths"
+  @active "transmuter.loop.active"
+  @remaining "transmuter.loop.remaining"
+  @delta "transmuter.loop.delta"
+  @out "transmuter.loop.out"
 
   @no_vocab "generation needs the vocabulary size: the logits output of the graph has no number in its last dimension, and the configuration has no vocab_size"
 
@@ -220,6 +236,7 @@ defmodule Transmuter.Generation do
       max_new_tokens: max_new_tokens,
       sampling?: sampling?,
       token_logprobs?: Keyword.get(opts, :token_logprobs, false),
+      decode_steps: Keyword.get(opts, :decode_steps, 1),
       temperature: opts[:temperature] || gen["temperature"] || 1.0,
       top_k: opts[:top_k] || gen["top_k"] || 50,
       top_p: opts[:top_p] || gen["top_p"] || 1.0,
@@ -774,6 +791,12 @@ defmodule Transmuter.Generation do
   """
   def compile(ctx, batch_size, defn_options) do
     unless ctx.vocab, do: raise(ArgumentError, @no_vocab)
+
+    if ctx.decode_steps > 1 and GraphBreaks.compiler(defn_options) == EMLX do
+      raise ArgumentError,
+            ":decode_steps above 1 needs a compiler that compiles a while loop of the model, such as EXLA, and EMLX 0.5 cannot"
+    end
+
     ctx = Map.put(ctx, :backend, Nx.Defn.to_backend(defn_options))
 
     batch_size = batch_size * ctx.num_beams
@@ -827,6 +850,7 @@ defmodule Transmuter.Generation do
     ctx =
       ctx
       |> Map.put(:run, fn inputs, static -> runs[static].(inputs) end)
+      |> Map.put(:run_steps, compile_loop(ctx, state, opts, batch_size))
       |> compile_embed(batch_size, defn_options)
       |> compile_cross(defn_options)
       |> Map.put(:model, Map.take(ctx.model, [:inputs, :input_types]))
@@ -838,6 +862,161 @@ defmodule Transmuter.Generation do
     |> Map.put(:admit_rows, state_jit(&write_admitted/3, defn_options))
     |> Map.put(:write_row, state_jit(&write_row/3, defn_options))
     |> Map.put(:widen, state_jit(&widen_rows/2, defn_options))
+  end
+
+  # The decode loops: for each count of loop_steps/1, that many steps of width 1 in one call,
+  # with the selection of each step in the graph (see next/3). Only :in_place and :append with
+  # greedy selection or sampling, without beams and without an embedding function, have them. :grow cannot: its cache grows
+  # in each step, and the carry of a loop keeps its shape. The call returns the buffers, the
+  # selection state and the selection of each step, [steps, rows, 1 or 2], with the eos token
+  # of a row that ends and -1 for a row that ended before the step.
+  defp compile_loop(ctx, state, opts, batch_size)
+       when ctx.decode_steps > 1 and ctx.mode in [:in_place, :append] and ctx.num_beams == 1 and
+              ctx.embed == nil do
+    Map.new(loop_steps(ctx), &{&1, compile_loop(ctx, state, opts, batch_size, &1)})
+  end
+
+  defp compile_loop(_ctx, _state, _opts, _batch_size), do: nil
+
+  defp compile_loop(ctx, state, opts, batch_size, k) do
+    tokens = List.duplicate([0], batch_size)
+    counts = List.duplicate(1, batch_size)
+    state = %{state | lengths: List.duplicate(1, batch_size)}
+    {inputs, static} = step_inputs(ctx, state, tokens, counts)
+    names = ctx.model.inputs -- Map.keys(Map.merge(inputs, static))
+    selection = selection_template(ctx, batch_size, state.capacity)
+    carry = loop_carry(ctx, state, counts, List.duplicate(0, batch_size), k)
+    returns = ctx.buffers ++ [@seen, @history, @count, @out]
+
+    run =
+      Transmuter.compile(
+        ctx.model,
+        ctx.model
+        |> templates(names, batch_size)
+        |> Map.merge(inputs)
+        |> Map.merge(selection)
+        |> Map.merge(carry),
+        [
+          static_inputs: static,
+          repeat: {{:decode, ctx.eos}, k, loop_next(ctx), returns},
+          donate: ctx.buffers
+        ] ++ opts
+      )
+
+    fn inputs, _static -> run.(inputs) end
+  end
+
+  # The step counts of the loops: the powers of two below decode_steps, and decode_steps.
+  defp loop_steps(%{decode_steps: k}),
+    do: Enum.uniq(for(e <- 1..trunc(:math.log2(k))//1, 2 ** e < k, do: 2 ** e) ++ [k])
+
+  # The write offset of :append, which the tail reads (see tail/1).
+  defp write_at(%{mode: :append}, state),
+    do: %{@write_at => Nx.tensor(state.used, type: :s32, backend: Nx.BinaryBackend)}
+
+  defp write_at(_ctx, _state), do: %{}
+
+  # The carry of the loop for a step of `counts` tokens: the lengths, the rows with a token,
+  # the new tokens that each row has left, the deltas of the positions and the tokens out.
+  defp loop_carry(ctx, state, counts, remaining, k) do
+    rows = length(counts)
+    width = if ctx.token_logprobs?, do: 2, else: 1
+    s32 = &Nx.tensor(&1, type: :s32, backend: Nx.BinaryBackend)
+
+    %{
+      @lengths => s32.(state.lengths),
+      @active => s32.(counts),
+      @remaining => s32.(remaining),
+      @delta => s32.(Enum.map(state.positions, &elem(&1, 1))),
+      @out => Nx.broadcast(s32.(-1), {k, rows, width})
+    }
+  end
+
+  # The inputs of the next step of the loop, from the outputs of the tail of step `i` and the
+  # inputs of step `i`. A row stops at an eos token or when it has no new tokens left. A row
+  # that stopped still runs, without a token: it writes nothing in its tokens, and its length
+  # does not move.
+  defp loop_next(ctx) do
+    eos = ctx.eos
+    {mode, buffers} = {ctx.mode, ctx.buffers}
+
+    fn outputs, c, i ->
+      selected = outputs[@selected]
+      token = selected |> Nx.slice_along_axis(0, 1, axis: 1) |> Nx.squeeze(axes: [1])
+      eos? = Enum.reduce(eos, Nx.equal(token, -2), &Nx.logical_or(&2, Nx.equal(token, &1)))
+      running = Nx.not_equal(c[@active], 0)
+      emitted = Nx.logical_and(running, Nx.logical_not(eos?))
+      out = Nx.select(Nx.broadcast(Nx.new_axis(running, 1), Nx.shape(selected)), selected, -1)
+      remaining = Nx.subtract(c[@remaining], Nx.as_type(emitted, :s32))
+      lengths = Nx.add(c[@lengths], c[@active])
+      active = Nx.logical_and(emitted, Nx.greater(remaining, 0))
+      new_token = Nx.select(emitted, token, 0)
+      capacity = Nx.axis_size(c[@history], 1)
+      mask = next_mask(mode, c, lengths, running)
+      positions = Nx.add(lengths, c[@delta])
+
+      values = %{
+        "input_ids" => Nx.new_axis(new_token, 1),
+        "attention_mask" => mask,
+        @key_mask => mask,
+        "position_ids" => positions,
+        @position_offset => Nx.new_axis(Nx.subtract(lengths, capacity), 1),
+        @tokens => Nx.select(emitted, token, -1),
+        @seen => outputs[@next_seen],
+        @history => outputs[@next_history],
+        @count => outputs[@next_count],
+        @lengths => lengths,
+        @active => Nx.as_type(active, :s32),
+        @remaining => remaining,
+        @out => Nx.put_slice(c[@out], [i, 0, 0], Nx.new_axis(out, 0)),
+        @write_at => Nx.add(c[@write_at] || 0, 1)
+      }
+
+      present =
+        for "past_key_values." <> rest = name <- buffers,
+            Map.has_key?(outputs, "present." <> rest),
+            into: %{},
+            do: {name, outputs["present." <> rest]}
+
+      updates =
+        for {name, value} <- Map.merge(values, present), Map.has_key?(c, name), into: %{} do
+          template = c[name]
+          value = Nx.as_type(value, Nx.type(template))
+          {name, Nx.broadcast(value, Nx.shape(template), axes: broadcast_axes(value, template))}
+        end
+
+      Map.merge(c, updates)
+    end
+  end
+
+  # The mask of the next step. In :in_place, each row sees its rows and the new one. In :append,
+  # the column of the write offset becomes valid for the rows that had a token, and the new
+  # token has the last column.
+  defp next_mask(:in_place, c, lengths, _running) do
+    {rows, capacity} = Nx.shape(c[@history])
+    Nx.less(Nx.iota({rows, capacity}, axis: 1), Nx.new_axis(Nx.add(lengths, 1), 1))
+  end
+
+  defp next_mask(:append, c, _lengths, running) do
+    mask = c[@key_mask] || c["attention_mask"]
+    {rows, columns} = Nx.shape(mask)
+    past = Nx.slice_along_axis(mask, 0, columns - 1, axis: 1)
+    written = Nx.equal(Nx.iota({rows, columns - 1}, axis: 1), c[@write_at])
+    past = Nx.logical_or(Nx.not_equal(past, 0), Nx.logical_and(written, Nx.new_axis(running, 1)))
+    Nx.concatenate([past, Nx.broadcast(Nx.tensor(1, type: :u8), {rows, 1})], axis: 1)
+  end
+
+  # The axes of `template` that the axes of `value` take: the last ones, so [rows] goes to
+  # [rows, 1] at axis 0 and to [3, rows, 1] at axis 1.
+  defp broadcast_axes(value, template) do
+    rank = Nx.rank(template)
+
+    case Nx.rank(value) do
+      ^rank -> Enum.to_list(0..(rank - 1)//1)
+      1 when rank == 2 -> [0]
+      1 when rank == 3 -> [1]
+      2 when rank == 3 -> [1, 2]
+    end
   end
 
   # The jit function of `fun`, whose outputs become the state of a group, such as a row that a
@@ -1256,7 +1435,8 @@ defmodule Transmuter.Generation do
       new: List.duplicate(nil, rows),
       done: List.duplicate(true, rows),
       budgets: List.duplicate(0, rows),
-      scores: nil
+      scores: nil,
+      steps: []
     }
   end
 
@@ -1306,7 +1486,12 @@ defmodule Transmuter.Generation do
           true -> {put_in(group.state.encoder_capacity, encoder_rows(%{inputs: inputs})), inputs}
         end
 
-      %{group | state: %{group.state | inputs: inputs, features: features, cursors: cursors}}
+      group = %{
+        group
+        | state: %{group.state | inputs: inputs, features: features, cursors: cursors}
+      }
+
+      %{group | steps: [view(group)]}
     else
       ctx |> prefill(group, requests, inputs) |> then(&select(ctx, &1))
     end
@@ -1314,7 +1499,102 @@ defmodule Transmuter.Generation do
 
   @doc false
   # Runs the step of the new token of each row that has not ended, and reads its next token.
-  def next(ctx, group), do: select(ctx, advance(ctx, group))
+  #
+  # With `steps` above 1, a group where each row that runs takes its new token runs a decode
+  # loop of compile_loop/4: the largest count of loop_steps/1 up to `steps`, up to the new
+  # tokens that each running row has left, and up to the tokens of the newest row. So no row
+  # reaches its budget before the last step of the call, and its row of the group is free at
+  # the end of that step.
+  def next(ctx, group, steps \\ 1) do
+    case loop_count(ctx, group, steps) do
+      nil -> select(ctx, advance(ctx, group))
+      k -> next_steps(ctx, group, k)
+    end
+  end
+
+  defp loop_count(%{run_steps: loops}, group, steps) when steps > 1 and loops != nil do
+    running =
+      for {ids, budget, false} <- Enum.zip([group.ids, group.budgets, group.done]),
+          do: {ids, budget}
+
+    left = for {ids, budget} <- running, do: budget - length(ids)
+    # The loop is at most as long as the tokens of the newest row, so the first tokens of a row
+    # come in calls of 1, 2, 4 ... steps. A text stream gives a chunk only at the end of a
+    # word, so the first chunk does not wait for a long loop.
+    newest = for {ids, _budget} <- running, do: length(ids)
+    limit = Enum.min([steps | left] ++ newest)
+
+    if decoding?(group),
+      do: loops |> Map.keys() |> Enum.filter(&(&1 <= limit)) |> Enum.max(fn -> nil end)
+  end
+
+  defp loop_count(_ctx, _group, _steps), do: nil
+
+  # A group where each row that runs takes its new token, with no part of a prompt left.
+  defp decoding?(group) do
+    Enum.all?(group.left, &(&1 == [])) and
+      Enum.any?(Enum.zip(group.new, group.done), &match?({token, false} when token != nil, &1))
+  end
+
+  # The decode loop of compile_loop/4 in one call. The host then reads the tokens of each
+  # step and does the work of step/5 and select/2 for each step in order.
+  defp next_steps(ctx, group, k) do
+    group = fit(ctx, drop_ended(group), k)
+    state = group.state
+    {parts, _left, 1} = next_parts(ctx, group)
+    counts = Enum.map(parts, &length/1)
+    tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, 1 - length(&1))))
+    {inputs, static} = step_inputs(ctx, state, tokens, counts)
+
+    remaining =
+      Enum.zip_with([group.ids, group.budgets, group.done], fn [ids, budget, done?] ->
+        if done?, do: 0, else: budget - length(ids)
+      end)
+
+    offsets = Nx.tensor(List.duplicate(0, length(counts)), type: :s32, backend: Nx.BinaryBackend)
+    release(List.wrap(state.selected), [])
+
+    inputs =
+      inputs
+      |> Map.merge(selection(ctx, group))
+      |> Map.put(@offset, offsets)
+      |> Map.merge(loop_carry(ctx, state, counts, remaining, k))
+      |> Map.merge(write_at(ctx, state))
+
+    outputs = ctx.run_steps[k].(inputs, static)
+    release([state.seen, state.history, state.count], [])
+    present = Map.take(outputs, ctx.buffers)
+    release(Map.values(Map.take(state.cache, Map.keys(present))), Map.values(present))
+
+    state = %{
+      state
+      | cache: Map.merge(state.cache, present),
+        written: Map.keys(present),
+        selected: outputs[@out],
+        seen: outputs[@seen],
+        history: outputs[@history],
+        count: outputs[@count]
+    }
+
+    {views, group} =
+      outputs[@out]
+      |> Nx.to_list()
+      |> Enum.map_reduce(%{group | state: state}, fn selected, group = %{state: state} ->
+        counts = Enum.zip_with(group.new, group.done, &if(&1 != nil and not &2, do: 1, else: 0))
+
+        state = %{
+          state
+          | lengths: Enum.zip_with(state.lengths, counts, &+/2),
+            used: state.used + 1,
+            valid: Enum.zip_with(state.valid, counts, &add_rows(&1, state.used, &2))
+        }
+
+        group = select_rows(ctx, %{group | state: state}, selected)
+        {view(group), group}
+      end)
+
+    %{group | steps: views}
+  end
 
   @doc false
   # Whether requests can join a group with other rows, see cannot_join/1.
@@ -1393,6 +1673,8 @@ defmodule Transmuter.Generation do
       finish(admit(ctx, cancel(group, 0), [request.(0, to)]))
     end
 
+    compile_loops(ctx, rows, capacities, request.(0, hd(encoders)))
+
     for encoder <- encoders, encoder != nil, rows > 1 do
       group = admit(ctx, open(ctx, rows, hd(capacities)), [request.(0, encoder)])
       finish(admit(ctx, cached_rows(group, 1), [request.(1, encoder)]))
@@ -1432,6 +1714,16 @@ defmodule Transmuter.Generation do
 
     length(shapes)
   end
+
+  # Runs each decode loop of compile_loop/4 at each capacity, with `request` in row 0.
+  defp compile_loops(%{run_steps: loops} = ctx, rows, capacities, request) when loops != nil do
+    for capacity <- capacities, k <- Map.keys(loops) do
+      group = next(ctx, admit(ctx, open(ctx, rows, capacity), [%{request | budget: k + 1}]))
+      finish(next_steps(ctx, group, k))
+    end
+  end
+
+  defp compile_loops(_ctx, _rows, _capacities, _request), do: []
 
   # The capacity and the width of each first step of a new group of a merged decoder, on its
   # branch without cache: for each prompt length up to the largest capacity, the width of the
@@ -1979,7 +2271,10 @@ defmodule Transmuter.Generation do
   # The selection of each step, until each row has ended.
   defp decode(ctx, group, notify) do
     notify.(group)
-    if Enum.all?(group.done), do: finish(group), else: decode(ctx, next(ctx, group), notify)
+
+    if Enum.all?(group.done),
+      do: finish(group),
+      else: decode(ctx, next(ctx, group, ctx.decode_steps), notify)
   end
 
   @doc false
@@ -1993,9 +2288,11 @@ defmodule Transmuter.Generation do
   end
 
   # A row with a part of its prompt left gets no token, and has not ended.
-  defp select(ctx, group) do
+  defp select(ctx, group), do: select_rows(ctx, group, Nx.to_list(group.state.selected))
+
+  defp select_rows(ctx, group, selected) do
     {new, logprobs} =
-      [Nx.to_list(group.state.selected), group.done, group.left]
+      [selected, group.done, group.left]
       |> Enum.zip_with(fn [[token | logprob], done?, left] ->
         if done? or left != [] or token in ctx.eos,
           do: {nil, nil},
@@ -2011,14 +2308,20 @@ defmodule Transmuter.Generation do
         left == [] and (token == nil or length(ids) == budget)
       end)
 
-    %{
+    group = %{
       group
       | new: new,
         done: done,
         ids: ids,
         logprobs: push(group.logprobs, new, logprobs)
     }
+
+    %{group | steps: [view(group)]}
   end
+
+  # The new tokens of a step, the rows that ended, and the log-probabilities of each row after
+  # it. next/3 gives one for each step, and the stream of each row reads them in order.
+  defp view(group), do: Map.take(group, [:new, :done, :logprobs])
 
   # Beam search as _beam_search of Python transformers 4.57. The rows of prompt `i` are
   # `i * num_beams` to `i * num_beams + num_beams - 1`, and the inputs, the image features and
@@ -2267,6 +2570,11 @@ defmodule Transmuter.Generation do
   defp notify(nil, _group, _logprobs?), do: :ok
 
   defp notify(on_token, group, logprobs?) do
+    for view <- group.steps, do: notify_step(on_token, Map.merge(group, view), logprobs?)
+    :ok
+  end
+
+  defp notify_step(on_token, group, logprobs?) do
     {tokens, finished} =
       Enum.zip_with([group.prompts, group.new, group.done], fn
         [[], _token, _done?] -> {-1, 0}
@@ -2516,15 +2824,7 @@ defmodule Transmuter.Generation do
 
     # In :append, the new rows of all rows go into the buffer after the rows of the earlier
     # steps.
-    selection =
-      if ctx.mode == :append,
-        do:
-          Map.put(
-            selection,
-            @write_at,
-            Nx.tensor(state.used, type: :s32, backend: Nx.BinaryBackend)
-          ),
-        else: selection
+    selection = Map.merge(selection, write_at(ctx, state))
 
     outputs = ctx.run.(Map.merge(inputs, selection), static)
 

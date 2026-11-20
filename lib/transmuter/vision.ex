@@ -296,7 +296,7 @@ defmodule Transmuter.Vision do
 
     * `:task` - with Florence-2, the task of the inputs that do not give one. The default is `"<CAPTION>"`.
 
-    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:token_logprobs`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`. With Florence-2, `:token_logprobs` gives a value for each new token, also for the tokens of the locations.
+    * `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:token_logprobs`, `:decode_steps`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`. With Florence-2, `:token_logprobs` gives a value for each new token, also for the tokens of the locations.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 
@@ -342,7 +342,7 @@ defmodule Transmuter.Vision do
 
     * `:compile` - `:batch_size`, the number of chats that generate together. The default is `1`. Chats go into one batch when the number of their tiles (SmolVLM), patches (Qwen2-VL, Qwen2.5-VL and Qwen3-VL), blocks (Ministral 3) or images (Gemma 3 and LLaVA) rounds up to the same power of two. A chat can have up to 65536 tiles, patches or blocks. An image of SmolVLM gives up to 17 tiles, an image of Qwen2-VL, Qwen2.5-VL or Qwen3-VL gives up to `max_pixels / patch_size^2` patches, an image of Ministral 3 gives up to 3025 blocks, and an image of Gemma 3 or LLaVA gives one row. A row of Gemma 3 has the 3x896x896 pixel values of an image in f32, 9.6 MB, and the rows of zeros that fill a chat to its batch key have the same size: a chat with 5 images has 3 such rows. The rows of zeros stay on the host: the vision encoder runs each tile of SmolVLM and each other image in a call of its own.
 
-    * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:token_logprobs`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
+    * `:max_new_tokens`, `:strategy`, `:num_beams`, `:length_penalty`, `:early_stopping`, `:temperature`, `:top_k`, `:top_p`, `:repetition_penalty`, `:seed`, `:template_options`, `:token_logprobs`, `:decode_steps`, `:stream` and `:stream_done` - as in `Transmuter.Text.generation/2`.
 
     * `:tokenizer` - a tokenizer from `Transmuter.Tokenizer.load!/2`, to use in place of the tokenizer of the repository.
 

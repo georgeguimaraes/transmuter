@@ -29,6 +29,7 @@ defmodule Transmuter.Vision.ImageToText do
              :task,
              :seed,
              token_logprobs: false,
+             decode_steps: 1,
              defn_options: []
            ] ++ Hub.options()
 

@@ -52,6 +52,7 @@ defmodule Transmuter.Audio.SpeechToText do
              :timestamps,
              task: :transcribe,
              token_logprobs: false,
+             decode_steps: 1,
              compile: [],
              defn_options: []
            ] ++ Hub.options()
