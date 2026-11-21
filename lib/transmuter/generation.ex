@@ -2043,13 +2043,18 @@ defmodule Transmuter.Generation do
   # each width of that step, and their moves into a group at each capacity, and with
   # `prefixes?` the copies and the steps of stored prefixes.
   defp compile_alone(ctx, rows, capacities, prefixes?) do
-    for capacity <- capacities, count <- alone_counts(ctx, rows), size <- alone_sizes() do
-      requests =
-        for row <- 0..(count - 1),
-            do: %{row: row, prompt: List.duplicate(0, size), seed: 0, budget: 2}
+    items =
+      for capacity <- capacities, count <- alone_counts(ctx, rows), size <- alone_sizes() do
+        fn ctx ->
+          requests =
+            for row <- 0..(count - 1),
+                do: %{row: row, prompt: List.duplicate(0, size), seed: 0, budget: 2}
 
-      finish(admit(ctx, open(ctx, rows, capacity), requests))
-    end
+          finish(admit(ctx, open(ctx, rows, capacity), requests))
+        end
+      end
+
+    run_items(ctx, :run, items)
 
     if prefixes?, do: compile_prefixes(ctx, rows, capacities)
   end
@@ -2083,11 +2088,16 @@ defmodule Transmuter.Generation do
           uniq: true,
           do: {count, width, capacity, size}
 
-    for capacity <- capacities,
-        {count, width, _small, size} <- Enum.uniq_by(shapes, &Tuple.delete_at(&1, 3)) do
-      requests = for row <- 0..(count - 1), do: prefixed_request(row, store, size, width)
-      finish(admit(ctx, open(ctx, rows, capacity), requests))
-    end
+    items =
+      for capacity <- capacities,
+          {count, width, _small, size} <- Enum.uniq_by(shapes, &Tuple.delete_at(&1, 3)) do
+        fn ctx ->
+          requests = for row <- 0..(count - 1), do: prefixed_request(row, store, size, width)
+          finish(admit(ctx, open(ctx, rows, capacity), requests))
+        end
+      end
+
+    run_items(ctx, :run, items)
 
     release(Map.values(store), [])
   end
