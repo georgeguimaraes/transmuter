@@ -576,6 +576,36 @@ defmodule Transmuter.ContinuousBatchingTest do
     refute_received {^id, [_ | _]}
     assert steps |> Enum.map(& &1.capacity) |> Enum.max() == 384
     assert Enum.any?(steps, &(&1.admitted > 0 and &1.running > 0))
+    stop_supervised!(ContinuousBatching)
+
+    # With a store of prefixes and :alone_prompts, the second chat reuses the first block of the
+    # system prompt of the first one, and the rest of its prompt runs in a step of its own row
+    # after that prefix. compile_steps compiles the copies of the prefix and that step too.
+    chats =
+      for question <- ["Where is the museum?", "When is the entry free?"] do
+        %{messages: [%{role: "system", content: @museum}, %{role: "user", content: question}]}
+      end
+
+    opts = [strategy: :greedy, max_new_tokens: 16] ++ @opts
+    spec = [source: source, slots: 2, capacity: 512, compile_steps: true, prefix_cache: 512]
+    spec = [alone_prompts: true] ++ spec
+    server = start_supervised!({ContinuousBatching, spec ++ opts})
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :segment, :compile, :stop],
+      fn _event, _measurements, metadata, _config ->
+        if self() == server, do: send(parent, {id, metadata.shapes})
+      end,
+      nil
+    )
+
+    {_results, steps} =
+      step_events(server, fn -> for chat <- chats, do: ContinuousBatching.run(server, chat) end)
+
+    :telemetry.detach(id)
+    refute_received {^id, [_ | _]}
+    assert [64] == for(%{admitted: 1, prefix_tokens: tokens} <- steps, tokens > 0, do: tokens)
   end
 
   # A merged decoder runs the first step of a group on its branch without cache, and

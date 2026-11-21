@@ -44,6 +44,8 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:capacity_costs` - fixed costs for the shrink of the buffers: `%{slope: ms, per_row: ms}`, the time that one row of capacity adds to a decode step and the time of a move for each row that it copies. The default is `nil`: the server measures them (see `Transmuter.ContinuousBatching.Costs`).
 
+    * `:alone_prompts` - when `true`, the prompts of the new requests of an admission run in a step of their own rows, and not in steps of all rows, for a decoder in `:in_place` (see "Batches" in `Transmuter.Generation`). On a mix of ShareGPT prompts with 16 rows of Qwen3-0.6B fp16 on CUDA, it gave 34% more output tokens per second. With `compile_steps: true`, it adds the shapes of those steps: for 48 rows, the start took 490 s against 290 s. The default is `false`.
+
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
   ## Device memory
@@ -102,9 +104,9 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Compiles
 
-  A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of five widths, 1, 16, 32, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most five shapes for each capacity, 81 for a capacity of 4096 rows. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
+  A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of five widths, 1, 16, 32, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most five shapes for each capacity, 81 for a capacity of 4096 rows. With `:alone_prompts`, a decoder in `:in_place`, whose prompts of up to 511 tokens run in steps of the new rows alone, has the widths 1, 64 and 512, and the steps of its new rows have one shape for each count of 1, 4 and 16 rows below the slots and each width of 16, 64, 256 and 512 tokens. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
 
-  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. These times are from widths 1, 64 and 512. The widths 16 and 32 add two shapes for each capacity: for Qwen3-0.6B fp16 with 48 rows and a capacity of 512 rows on CUDA, the start takes 189 s against 112 s with the three widths. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
+  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With `:prefix_cache`, the server also compiles the copies of each size of a stored prefix into the buffers and into the store, and the steps of new prompts alone after a prefix. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. These times are from widths 1, 64 and 512. The widths 16 and 32 add two shapes for each capacity: for Qwen3-0.6B fp16 with 48 rows and a capacity of 512 rows on CUDA, the start takes 189 s against 112 s with the three widths. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
 
   ## Prefix cache
 
@@ -157,8 +159,11 @@ defmodule Transmuter.ContinuousBatching do
   def start_link(opts) do
     module = Keyword.get(opts, :task, Transmuter.Text.Generation)
     server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: nil]
-    server_opts = server_opts ++ [device_memory: nil, compile_steps: false, prefix_cache: 0]
-    server_opts = server_opts ++ [capacity_costs: nil]
+
+    server_opts =
+      server_opts ++
+        [device_memory: nil, compile_steps: false, prefix_cache: 0, alone_prompts: false] ++
+        [capacity_costs: nil]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
@@ -622,7 +627,8 @@ defmodule Transmuter.ContinuousBatching do
     receive do
       {^worker, :ready, example} ->
         if example do
-          compile_steps(ctx, state.slots, example.inputs, {live, limit})
+          prefixes = state.prefix_slots > 0
+          compile_steps(ctx, state.slots, example.inputs, prefixes, {live, limit})
           if example.features, do: Generation.compile_features(ctx, state.slots, example.features)
         end
 
@@ -736,8 +742,8 @@ defmodule Transmuter.ContinuousBatching do
   # A step that does not fit the device fails in EXLA with a RuntimeError whose message has
   # RESOURCE_EXHAUSTED or "Out of memory". No other field tells this error apart, so the match
   # reads the text, and other errors pass.
-  defp compile_steps(ctx, slots, inputs, {live, limit}) do
-    Generation.compile_steps(ctx, slots, inputs)
+  defp compile_steps(ctx, slots, inputs, prefixes, {live, limit}) do
+    Generation.compile_steps(ctx, slots, inputs, prefixes: prefixes)
   rescue
     error in RuntimeError ->
       if error.message =~ ~r/RESOURCE_EXHAUSTED|Out of memory/ do
@@ -972,20 +978,6 @@ defmodule Transmuter.ContinuousBatching do
   defp step(state, admitted) do
     requests = for {row, request} <- admitted, do: request(row, request)
 
-    group =
-      if requests == [],
-        do: state.group,
-        else: Generation.admit(state.ctx, state.group, requests)
-
-    # A loop of steps when no request can join in this call: no row is free, or no request
-    # waits or prepares. Generation caps the loop at the tokens that the running rows have
-    # left, so a row that reaches its budget frees its row at the end of the call.
-    free? = Enum.any?(group.done)
-    waiting? = not :queue.is_empty(state.queue) or state.preparing != %{}
-    steps = if free? and waiting?, do: 1, else: state.ctx.decode_steps
-
-    group = Generation.next(state.ctx, group, steps)
-
     # The group keeps the features, the encoder outputs and the prefixes, so the rows do not
     # keep them for their callers.
     admitted =
@@ -993,11 +985,41 @@ defmodule Transmuter.ContinuousBatching do
         {row, Map.drop(request, [:features, :inputs, :prefix])}
       end)
 
-    rows = Map.merge(state.rows, admitted)
-    prefix = store_prompts(state.prefix, state.ctx, group, rows)
-    rows = Map.new(rows, fn {row, request} -> {row, stored(request, group, row)} end)
-    group = Generation.shrink(state.ctx, group, &Costs.pays?(state.costs, &1, &2, &3, &4))
-    emit(%{state | rows: rows, prefix: prefix}, group)
+    state = %{state | rows: Map.merge(state.rows, admitted)}
+
+    # An admission can give the first token of a prompt that runs in a step of its own rows
+    # (see Transmuter.Generation.admit/4).
+    state =
+      if requests == [] do
+        state
+      else
+        group = Generation.admit(state.ctx, state.group, requests)
+        state |> store(group) |> emit(group)
+      end
+
+    # The rows of an admission can all end with their first token.
+    if Enum.all?(state.group.done), do: state, else: next(state)
+  end
+
+  # A loop of steps when no request can join in this call: no row is free, or no request
+  # waits or prepares. Generation caps the loop at the tokens that the running rows have
+  # left, so a row that reaches its budget frees its row at the end of the call.
+  defp next(state) do
+    free? = Enum.any?(state.group.done)
+    waiting? = not :queue.is_empty(state.queue) or state.preparing != %{}
+    steps = if free? and waiting?, do: 1, else: state.ctx.decode_steps
+
+    group = Generation.next(state.ctx, state.group, steps)
+    state = store(state, group)
+    emit(state, Generation.shrink(state.ctx, group, &Costs.pays?(state.costs, &1, &2, &3, &4)))
+  end
+
+  # Stores the prompts that ran (see "Prefix cache"), before a shrink can move their rows and
+  # before a row that ends frees its row.
+  defp store(state, group) do
+    prefix = store_prompts(state.prefix, state.ctx, group, state.rows)
+    rows = Map.new(state.rows, fn {row, request} -> {row, stored(request, group, row)} end)
+    %{state | rows: rows, prefix: prefix}
   end
 
   # The steps of the call, and the steps of the rows that had not ended before each step. A

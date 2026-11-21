@@ -805,6 +805,78 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # With alone_prompts: true in :in_place, the new prompts of an admission run in one step of
+  # their own rows when they are fewer than the rows of the group. A group of 8 rows with a row that runs takes 3 prompts of
+  # 5, 23 and 70 tokens, which run together in a small group of 4 rows at width 256, padded at
+  # the end. Then 2 prompts start with the 64 tokens of a stored prefix and have 9 and 40 more
+  # tokens: the prefix is the past of their small group, which runs only the rest. Each row
+  # gives the tokens and the log-probabilities of its prompt alone, with greedy selection and
+  # with sampling.
+  @tag ci_partition: 10
+  test "new prompts of different lengths and stored prefixes run alone and give the tokens of each prompt" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
+    prefix = prompt.(64, 9)
+    [running | others] = for {n, k} <- [{30, 1}, {5, 2}, {23, 3}, {70, 4}], do: prompt.(n, k)
+    prefixed = for {n, k} <- [{9, 5}, {40, 6}], do: prefix ++ prompt.(n, k)
+
+    for strategy <- [:greedy, :sampling] do
+      ctx =
+        Generation.context(repo, model,
+          strategy: strategy,
+          max_new_tokens: 12,
+          token_logprobs: true,
+          alone_prompts: true
+        )
+
+      assert ctx.mode == :in_place
+      single = Generation.compile(ctx, 1, @opts[:defn_options])
+      alone = &(single |> Generation.generate([&1], [&2]) |> hd())
+      ctx = Generation.compile(ctx, 8, @opts[:defn_options])
+      request = &%{row: &1, prompt: &2, seed: &1 + 3, budget: 12}
+
+      group = Generation.admit(ctx, Generation.open(ctx, 8), [request.(0, running)])
+      group = Generation.next(ctx, group)
+      store = Generation.prefix_store(ctx, 1, 512)
+
+      group =
+        Generation.admit(
+          ctx,
+          group,
+          for({p, row} <- Enum.zip(others, 1..3), do: request.(row, p))
+        )
+
+      assert Enum.map(1..3, &length(Enum.at(group.ids, &1))) == [1, 1, 1]
+
+      first = Generation.admit(ctx, Generation.open(ctx, 8), [request.(7, prefix ++ [100])])
+      store = Generation.store_prefix(ctx, first, store, 7, 0, 64)
+      Generation.finish(first)
+
+      with_prefix =
+        for {p, row} <- Enum.zip(prefixed, 4..5),
+            do: Map.put(request.(row, p), :prefix, %{store: store, slot: 0, size: 64})
+
+      group = Generation.admit(ctx, group, with_prefix)
+      assert Enum.map(4..5, &length(Enum.at(group.ids, &1))) == [1, 1]
+      group = run_until(ctx, group, &Enum.all?(&1.done))
+
+      for {p, row} <- Enum.zip([running | others] ++ prefixed, 0..5) do
+        expected = alone.(p, row + 3)
+        got = Generation.row_tokens(group, row)
+        assert Enum.map(got, &hd/1) == Enum.map(expected, &hd/1), inspect({strategy, row})
+
+        for {[_id, a], [_id2, b]} <- Enum.zip(got, expected),
+            do: assert_in_delta(a, b, 1.0e-4, inspect({strategy, row}))
+      end
+
+      Generation.finish(group)
+      Generation.release(Map.values(store), [])
+    end
+  end
+
   # A decode loop runs up to 4 steps in one call, and stops each row in the graph at an eos
   # token or at its budget. The rows get their first tokens in calls of 1, 2 and 4 steps, one
   # row stops at an eos token inside a call, and 10 new tokens are not a multiple of 4. The
