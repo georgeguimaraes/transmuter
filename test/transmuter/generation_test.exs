@@ -1466,10 +1466,10 @@ defmodule Transmuter.GenerationTest do
   # A row that runs its prompt in parts counts the tokens of its prompt that are left. Row 0
   # (1200 tokens of prompt) ends 2 steps after a prompt of 1000 tokens joins, which writes 64
   # tokens in each of these steps. The first of these steps compacts the buffers into 1536 rows
-  # (row 0 at 1202 rows, a step of 64 rows and 16 free rows). After row 0 ends, shrink/2 keeps
-  # the 1536 rows, because the joining row needs 1000 rows. If it counted only the 128 rows
-  # written, it would compact into 256 rows and grow again in the next steps. Each row gives
-  # the tokens that it gives alone.
+  # (row 0 at 1202 rows, a step of 64 rows and 16 free rows). After row 0 ends, shrink/2 moves
+  # them to 1280 rows, the capacity of the 1000 rows that the joining row needs and 64 rows. If
+  # it counted only the 128 rows written, it would compact into 256 rows and grow again in the
+  # next steps. Each row gives the tokens that it gives alone.
   @tag ci_partition: 10
   test "a row with a part of its prompt left keeps the buffers that its prompt needs" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -1493,7 +1493,7 @@ defmodule Transmuter.GenerationTest do
     group = Generation.admit(ctx, group, [request.(1, joining, 8)])
     group = group |> step.() |> step.()
     assert {Enum.at(group.done, 0), length(Enum.at(group.left, 1))} == {true, 1000 - 128}
-    assert group.state.capacity == 1536
+    assert group.state.capacity == 1280
 
     group = run_until(ctx, group, &Enum.all?(&1.done))
     assert row_tokens(group, 0) == Enum.take(alone.(long), 4)

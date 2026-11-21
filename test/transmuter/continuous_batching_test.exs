@@ -332,13 +332,22 @@ defmodule Transmuter.ContinuousBatchingTest do
     assert Enum.count(steps, &(&1.admitted == 1 and &1.running == 1)) == 11
   end
 
-  # A long request in :append, the fox 16 times, makes the buffers grow past 512 rows. Two
-  # short requests arrive after its first chunk and run in the other row. When the long
-  # request ends, the longest running row and 16 rows fit in half of the buffers, so the step
-  # compacts them into 256 rows, and the steps of the short requests after it run at 256 rows.
-  # Each request gives the text that it gives alone.
-  test "a server in :append shrinks its buffers after a long request ends" do
-    source = {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+  # A long request, the fox 16 times, makes the buffers grow past 512 rows. Two short requests
+  # arrive after its first chunk and run in the other row. When the long request ends, the
+  # longest running row and 64 rows fit in 256 rows, so the step moves the buffers to 256 rows
+  # (a compaction in :append, a shrink in :in_place), and the steps of the short requests after
+  # it run at 256 rows. Each request gives the text that it gives alone, in :in_place
+  # (HuggingFaceTB) and in :append (onnx-community, with position_ids).
+  test "a server shrinks its buffers after a long request ends" do
+    for source <- [
+          {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"},
+          {:hf, "onnx-community/SmolLM2-135M-Instruct-ONNX"}
+        ] do
+      shrinks_after_long_request(source)
+    end
+  end
+
+  defp shrinks_after_long_request(source) do
     opts = [strategy: :greedy, max_new_tokens: 30] ++ @opts
     long = String.duplicate(@fox <> " ", 16)
     shorts = ["Once upon a time", "Explain how a rainbow forms."]
@@ -367,10 +376,11 @@ defmodule Transmuter.ContinuousBatchingTest do
       end)
 
     [%{results: [%{text: text}]} | rest] = alone
-    assert {long_text, others} == {text, rest}
+    assert {long_text, others} == {text, rest}, inspect(source)
     capacities = Enum.map(steps, & &1.capacity)
     assert Enum.max(capacities) > 512
     assert List.last(capacities) == 256
+    stop_supervised!(ContinuousBatching)
   end
 
   # A server of 3 rows runs a chat without images. A chat with text before its image joins, and
@@ -570,10 +580,9 @@ defmodule Transmuter.ContinuousBatchingTest do
   # the buffers of gpt2 from 32 to 64 rows. The waiting prompt has 17 to 32 tokens, so its step
   # starts at 32 rows (the capacity of a step event is the one before the step). The server
   # opens a new group when no row runs, which resets every group, also the buffers of :in_place
-  # and the encoder capacity of the rows. In :append, Generation.shrink/2 also takes the buffers
-  # of a group whose rows all ended back to 32 rows, so for gpt2 a group keeps 64 rows only
-  # without both. Such a group would run the step at 64 rows, a shape that compile_steps does
-  # not compile. No step of the server compiles.
+  # and the encoder capacity of the rows. Without it, the group would keep 64 rows, because
+  # Generation.shrink/2 leaves room for a step of 64 tokens, and it would run the step at 64
+  # rows, a shape that compile_steps does not compile. No step of the server compiles.
   test "a request that waits for the last running row of a merged decoder compiles nothing" do
     source = {:hf, "Xenova/gpt2"}
     waiting = "The old lighthouse stood at the end of the pier, and every night its lamp turned"
@@ -606,10 +615,9 @@ defmodule Transmuter.ContinuousBatchingTest do
     assert [%{capacity: 32}, %{capacity: 32}] = Enum.filter(steps, &(&1.admitted > 0))
   end
 
-  # Generation.shrink/2 does not move the buffers of :in_place, so only the new group that the
-  # server opens when no row runs takes them back to their start capacity. In a server of 1 row
-  # of SmolLM2, the answer of 300 tokens takes the buffers from 256 rows past 256, and the
-  # second request, which waits for it, starts in a new group at 256 rows.
+  # The new group that the server opens when no row runs starts at the start capacity. In a
+  # server of 1 row of SmolLM2, the answer of 300 tokens takes the buffers from 256 rows past
+  # 256, and the second request, which waits for it, starts in a new group at 256 rows.
   test "a request that waits for the last running row of :in_place starts at the start capacity" do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 300, min_new_tokens: 300] ++ @opts

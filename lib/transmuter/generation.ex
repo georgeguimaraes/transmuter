@@ -1826,13 +1826,12 @@ defmodule Transmuter.Generation do
       finish(admit(ctx, open(ctx, rows, capacity), requests))
     end
 
-    # A growth to each next capacity, and in :append a shrink to each capacity before and a
-    # compaction at each capacity (see resize_buffers/4 and compact/3).
+    # A growth to each next capacity and a shrink to each capacity before (see resize_buffers/4),
+    # and in :append a compaction at each capacity (see compact/3).
     moves =
-      for [capacity, next] <- Enum.chunk_every(capacities, 2, 1, :discard), do: {capacity, next}
-
-    moves =
-      if ctx.mode == :append, do: moves ++ Enum.map(moves, fn {a, b} -> {b, a} end), else: moves
+      for [capacity, next] <- Enum.chunk_every(capacities, 2, 1, :discard),
+          move <- [{capacity, next}, {next, capacity}],
+          do: move
 
     for {from, to} <- moves do
       group = open(ctx, rows, from)
@@ -3142,11 +3141,16 @@ defmodule Transmuter.Generation do
   defp fit(ctx, group = %{state: state}, n) when is_integer(n) do
     rows = buffer_rows(ctx, group)
 
-    cond do
-      rows_for(rows, rows.written, n) <= state.capacity -> group
-      ctx.mode == :append -> compact(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
-      true -> grow(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
-    end
+    if rows_for(rows, rows.written, n) <= state.capacity,
+      do: group,
+      else: move(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
+  end
+
+  # Gives the buffers `capacity`: a compaction in :append, else a growth or a shrink.
+  defp move(ctx, group, capacity) do
+    if ctx.mode == :append,
+      do: compact(ctx, group, capacity),
+      else: grow(ctx, group, capacity)
   end
 
   # The rows of a group that size its buffers: `written`, the rows that the buffers hold (the
@@ -3236,14 +3240,16 @@ defmodule Transmuter.Generation do
   end
 
   @doc false
-  # Compacts the buffers of :append when the longest row that runs, with the prompt that it has
-  # left, and @capacity_margin rows fit in half of them, as after a long row ends in a server.
-  # The buffers of the other modes stay.
-  def shrink(ctx, group = %{state: state}) do
-    if ctx.mode == :append and
-         capacity(ctx, running_rows(group) + @capacity_margin) <= div(state.capacity, 2),
-       do: compact(ctx, group, moved_capacity(ctx, buffer_rows(ctx, group), 0)),
-       else: group
+  # Moves the buffers to the capacity of the longest row that runs, with the prompt that it has
+  # left, and @join_tokens rows, when that capacity is smaller, as after a long row ends in a
+  # server. So the steps run at the capacity of the rows that run, not of the longest row since
+  # the group opened. The @join_tokens rows hold a step of a joining prompt, so the next step
+  # does not grow the buffers again. In :in_place, the rows that ended lose their valid rows
+  # first (see drop_ended/1), so the move keeps only the rows that run.
+  def shrink(ctx, group) do
+    group = if ctx.mode == :in_place, do: drop_ended(group), else: group
+    capacity = capacity(ctx, running_rows(group) + @join_tokens)
+    if capacity < group.state.capacity, do: move(ctx, group, capacity), else: group
   end
 
   # The rows of the longest row that has not ended, with the tokens of its prompt that are left
