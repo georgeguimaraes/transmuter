@@ -88,7 +88,7 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Encoders and images
 
-  A request with images needs the features of its images before it joins, and for Qwen2-VL, Qwen2.5-VL and Qwen3-VL the 3-D positions of its prompt. A worker process of the server prepares one request at a time, in the order of the requests, and then puts the request in the queue. It runs the processor on the images and the tokenizer on the chat, and then the vision encoder on the images. So the steps of the running rows do not wait for the encoder, the caller does no work on the device, and the device memory of this work is that of one request. The processor and the encoder compile one time, in the worker. A request waits in the worker for the requests before it, also a request without images. The queue limit counts the requests in the worker. An error of the processor or of the encoder goes to the caller of the request (see "Failures").
+  A request with images needs the features of its images before it joins, and for Qwen2-VL, Qwen2.5-VL and Qwen3-VL the 3-D positions of its prompt. A worker process of the server prepares one request at a time, in the order of the requests, and then puts the request in the queue. The processor of the images and the tokenizer of the chat run in a task as soon as a request comes, for up to one request for each scheduler at a time, and the worker then runs the vision encoder on the images. So the steps of the running rows do not wait for the encoder, the caller does no work on the device, and the encoder holds the device memory of one request. The processor of the next requests runs while the worker encodes: for SmolVLM-256M on an RTX 3060, the processor takes about 165 ms for each image and the q4 encoder about 476 ms. The fp16 encoder, with `variant: %{"vision_encoder" => :fp16}`, is about 1.8 times faster on CUDA than the q4 default. The processor and the encoder compile one time, in the worker. A request waits in the worker for the requests before it, also a request without images. The queue limit counts the requests in the worker. An error of the processor or of the encoder goes to the caller of the request (see "Failures").
 
   The encoder and the steps run on the same device. On CUDA, EXLA runs the calls of the two processes side by side: for SmolVLM-256M on an RTX 3060, a decode step takes about 7 ms alone and at most about 16 ms while the worker encodes. On EMLX, both processes use the one GPU stream of EMLX, so a step waits for the encoder call that runs. So the worker runs the encoder in calls of one tile or one image, and on EMLX each call ends before the next starts. While a request with images is prepared, the time between two tokens of a running row can reach one encoder call. For SmolVLM-256M on the GPU of a Mac, a decode step takes about 7 ms alone and about 70 ms while the worker encodes in calls of one tile, against 863 ms with one call for the 13 tiles of an image, and the encoder takes about 1 s for each image. An encoder that takes the patches of an image in one call, such as that of Qwen2-VL, keeps the device for one image.
 
@@ -1129,32 +1129,73 @@ defmodule Transmuter.ContinuousBatching do
   # The worker runs :preprocess of the task on the input of each request alone, and :prepare
   # on the tensors on the host and the prompt of each run. It sends the server the fields of
   # each row for Generation and the runs without their tensors, or the exception.
-  defp prepare_requests(task, server) do
+  #
+  # :preprocess runs on the host, such as the processor of the images and the tokenizer, so
+  # it runs in a task as soon as the request comes, for up to one request for each scheduler
+  # at a time. The worker runs :prepare, such as the vision encoder, on one request at a time
+  # in the order of the requests, while the tasks preprocess the next requests.
+  defp prepare_requests({preprocess, prepare}, server) do
+    prepare_requests(preprocess, prepare, server, :queue.new(), :queue.new())
+  end
+
+  defp prepare_requests(preprocess, prepare, server, waiting, running) do
+    waiting = receive_requests(waiting, :queue.is_empty(waiting) and :queue.is_empty(running))
+    {waiting, running} = start_preprocess(preprocess, waiting, running)
+    {{:value, {request, task}}, running} = :queue.out(running)
+    runs = Task.await(task, :infinity)
+    metadata = %{wait: System.monotonic_time() - request.enqueued}
+
+    reply =
+      :telemetry.span([:transmuter, :continuous_batching, :prepare], metadata, fn ->
+        {prepare_runs(prepare, runs), metadata}
+      end)
+
+    send(server, {:prepared, request.ref, reply})
+    # The device tensors of the request, such as the tiles of its images, die here,
+    # and only a garbage collection frees them on EMLX. The worker makes little other
+    # garbage, so without it they stay for many requests.
+    :erlang.garbage_collect()
+    prepare_requests(preprocess, prepare, server, waiting, running)
+  end
+
+  # The requests in the mailbox, after a wait for one when the worker has nothing to do.
+  defp receive_requests(waiting, block?) do
+    timeout = if block?, do: :infinity, else: 0
+
     receive do
-      {:prepare, request} ->
-        metadata = %{wait: System.monotonic_time() - request.enqueued}
-
-        reply =
-          :telemetry.span([:transmuter, :continuous_batching, :prepare], metadata, fn ->
-            {prepare_request(task, request), metadata}
-          end)
-
-        send(server, {:prepared, request.ref, reply})
-        # The device tensors of the request, such as the tiles of its images, die here,
-        # and only a garbage collection frees them on EMLX. The worker makes little other
-        # garbage, so without it they stay for many requests.
-        :erlang.garbage_collect()
-        prepare_requests(task, server)
+      {:prepare, request} -> receive_requests(:queue.in(request, waiting), false)
+    after
+      timeout -> waiting
     end
   end
 
-  defp prepare_request({preprocess, prepare}, request) do
-    runs = Enum.to_list(preprocess.(request.input))
+  defp start_preprocess(preprocess, waiting, running) do
+    with true <- :queue.len(running) < System.schedulers_online(),
+         {{:value, request}, waiting} <- :queue.out(waiting) do
+      task = Task.async(fn -> preprocess_input(preprocess, request.input) end)
+      start_preprocess(preprocess, waiting, :queue.in({request, task}, running))
+    else
+      _full_or_empty -> {waiting, running}
+    end
+  end
+
+  defp prepare_request({preprocess, prepare}, request),
+    do: prepare_runs(prepare, preprocess_input(preprocess, request.input))
+
+  defp preprocess_input(preprocess, input) do
+    {:ok, Enum.to_list(preprocess.(input))}
+  rescue
+    exception -> {:error, exception}
+  end
+
+  defp prepare_runs(prepare, {:ok, runs}) do
     rows = Enum.map(runs, &prepare_row(prepare, &1))
     {:ok, rows, Enum.map(runs, &Map.delete(&1, :tensors))}
   rescue
     exception -> {:error, exception}
   end
+
+  defp prepare_runs(_prepare, error), do: error
 
   defp prepare_row(prepare, run) do
     tensors = Map.new(run.tensors, fn {name, tensor} -> {name, Nx.new_axis(tensor, 0)} end)

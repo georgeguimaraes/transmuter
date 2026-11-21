@@ -1,7 +1,8 @@
 defmodule Transmuter.ContinuousBatchingTest.FailingTask do
   @moduledoc false
   # The text generation task, whose :prepare raises on the prompt "boom", as an out-of-memory
-  # error of the device in the vision encoder would.
+  # error of the device in the vision encoder would, and whose :preprocess raises on the
+  # input "crash", as a processor would on a bad image.
 
   alias Transmuter.Text.Generation
   alias Transmuter.Tokenizer
@@ -21,7 +22,12 @@ defmodule Transmuter.ContinuousBatchingTest.FailingTask do
       end
     end
 
-    {ctx, tokenizer, %{task | prepare: prepare}}
+    preprocess = fn
+      %{text: "crash"} -> raise "bad image"
+      input -> task.preprocess.(input)
+    end
+
+    {ctx, tokenizer, %{task | prepare: prepare, preprocess: preprocess}}
   end
 end
 
@@ -436,7 +442,9 @@ defmodule Transmuter.ContinuousBatchingTest do
 
   # The worker raises on the request "boom" while a stream runs, as an out-of-memory error of
   # the vision encoder would. The caller of that request gets the exception, and the stream
-  # and a later request give the text that they give alone.
+  # and a later request give the text that they give alone. The preprocess of "crash" raises
+  # in its task while another request is in the worker. Only the caller of "crash" gets the
+  # exception, and the other request gives its text alone.
   test "an exception of the worker goes to the caller of its request, and the server continues" do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 24] ++ @opts
@@ -463,6 +471,12 @@ defmodule Transmuter.ContinuousBatchingTest do
     end
 
     assert ContinuousBatching.run(server, "Once upon a time") == Enum.at(alone, 1)
+
+    crash = Task.async(fn -> catch_error(ContinuousBatching.run(server, "crash")) end)
+    story = Task.async(fn -> ContinuousBatching.run(server, "Once upon a time") end)
+    assert %RuntimeError{message: "bad image"} = Task.await(crash, :infinity)
+    assert Task.await(story, :infinity) == Enum.at(alone, 1)
+
     [%{results: [%{text: text}]} | _rest] = alone
     assert Task.await(streamer, :infinity) == text
   end
