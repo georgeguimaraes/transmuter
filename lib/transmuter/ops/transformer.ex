@@ -145,22 +145,26 @@ defmodule Transmuter.Ops.Transformer do
     # Each sequence has seqlens_k + 1 live keys, which the lengths give, and the query at row
     # i has the position offset + i. A query does not see the keys after its position or, with
     # a local window, the keys window or more before it. These keys get the lowest bias, so the
-    # masks of the core are one float bias and the lengths, for all query rows alike.
+    # masks of the core are one float bias and the lengths, for all query rows alike. The bias
+    # needs only the keys that the lengths do not hide: the keys after the position of a query
+    # and before the lengths, at most s - 1 of them, and the keys of the window. So with one
+    # query row and no window, there is no bias.
     lengths = Nx.add(offsets, s)
     positions = query_positions(s, Nx.reshape(offsets, {b, 1, 1, 1}))
     keys = key_positions(capacity)
     window = attr(node, "local_window_size", -1)
+    after_query = s - 1
 
     hidden =
       any_hidden([
-        Nx.greater(keys, positions),
+        after_query > 0 && Nx.greater(keys, positions),
         window > 0 && Nx.less_equal(keys, Nx.add(positions, -window))
       ])
 
     opts = %{
       scale: scale(node, q),
       softcap: attr(node, "softcap", 0.0),
-      bias: any_bias([attention_bias, Nx.select(hidden, lowest(Nx.type(q)), 0)]),
+      bias: any_bias([attention_bias, hidden && Nx.select(hidden, lowest(Nx.type(q)), 0)]),
       hidden: nil,
       causal: false,
       lengths: lengths

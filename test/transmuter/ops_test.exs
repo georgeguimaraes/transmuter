@@ -339,8 +339,9 @@ defmodule Transmuter.OpsTest do
 
   # GroupQueryAttention gives its causal mask inside the live keys of each row as a float bias,
   # so a prompt of any width runs on one bias and the key lengths (on CUDA, the fused attention
-  # of cuDNN). Prompts of 16, 64 and 512 tokens after pasts of mixed lengths give the attention
-  # of an explicit mask in f32 within the tolerance of an f16 core.
+  # of cuDNN). One new token has no bias, because the lengths hide the keys after it. One token
+  # and prompts of 16, 64 and 512 tokens after pasts of mixed lengths give the attention of an
+  # explicit mask in f32 within the tolerance of an f16 core.
   test "GroupQueryAttention prompts after pasts of mixed lengths give the attention of an explicit mask" do
     {heads, kv_heads, head_size, capacity} = {4, 2, 64, 640}
     int = &%Transmuter.Onnx.AttributeProto{name: &1, type: :INT, i: &2}
@@ -353,7 +354,7 @@ defmodule Transmuter.OpsTest do
       attribute: [int.("num_heads", heads), int.("kv_num_heads", kv_heads)]
     }
 
-    for s <- [16, 64, 512] do
+    for s <- [1, 16, 64, 512] do
       lengths = Enum.map([0, 61, 128], &(&1 + s))
       b = length(lengths)
       key = Nx.Random.key(s)
