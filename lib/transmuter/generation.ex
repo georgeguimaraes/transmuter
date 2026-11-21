@@ -107,7 +107,7 @@ defmodule Transmuter.Generation do
 
   A step makes large device tensors that die at the next step: the selection of the step, the present cache, and in `:append` the old buffers. The garbage collector of the BEAM does not see the size of a device buffer, so it frees them late, and a request of 24 tokens from a prompt with an image kept 13 GB of dead buffers on the EXLA CPU. So each step frees the tensors that it owns with `Nx.backend_deallocate/1`: the selection of the last step after it is read, the present after it is in the cache, and the old buffers of the cache and of the reorder of beam search. A compiler with donation, such as EXLA, writes the present of `:in_place` and `:append` into the buffers of the step before, and the free of a donated buffer does nothing. A present that shares a buffer with a kept tensor stays, as when a merged decoder gives a past back. The embeddings of a step are freed after its call, and when a group ends, generation frees its cache and the rest of its state. Generation never frees the tensors of the caller, such as the outputs of an encoder or the image features.
 
-  A backend that frees a released buffer only when the BEAM collects its tensor, such as EMLX 0.5 (see elixir-nx/emlx#159), still keeps the dead caches of the steps until a collection. A loop with little host garbage collects rarely, so these caches pile up. So the generation process collects its garbage after it releases 256 MB of device buffers. A small cache then rarely costs a collection, and a large one gets one before its dead copies take much memory.
+  A backend that frees a released buffer only when the BEAM collects its tensor, such as EMLX 0.5 (see elixir-nx/emlx#159), still keeps the dead caches of the steps until a collection. A loop with little host garbage collects rarely, so these caches pile up. So the generation process collects its garbage after its releases free 256 MB of device buffers. A small cache then rarely costs a collection, and a large one gets one before its dead copies take much memory. A buffer that a call took by donation is not freed again, so the donated cache of each EXLA step costs no collection.
 
   ## Prefixes
 
@@ -3103,17 +3103,18 @@ defmodule Transmuter.Generation do
   @doc false
   # Frees the device buffers of `dead`, tensors that generation made and that nothing reads
   # after this point. A buffer that a tensor of `kept` shares stays, because a merged
-  # decoder can give a past back as its present. Host tensors need no release.
+  # decoder can give a past back as its present. Host tensors need no release. Only the
+  # buffers that the backend frees count for collect/1: a buffer that a call took by
+  # donation is already gone, and its backend gives :already_deallocated.
   def release(dead, kept) do
     shared = for %{data: data} <- kept, do: data
 
     freed =
       for tensor = %{data: data} <- dead,
           not is_struct(data, Nx.BinaryBackend),
-          data not in shared do
-        Nx.backend_deallocate(tensor)
-        Nx.byte_size(tensor)
-      end
+          data not in shared,
+          Nx.backend_deallocate(tensor) == :ok,
+          do: Nx.byte_size(tensor)
 
     collect(Enum.sum(freed))
   end
