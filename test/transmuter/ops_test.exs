@@ -337,6 +337,102 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # GroupQueryAttention gives its causal mask inside the live keys of each row as a float bias,
+  # so a prompt of any width runs on one bias and the key lengths (on CUDA, the fused attention
+  # of cuDNN). Prompts of 16, 64 and 512 tokens after pasts of mixed lengths give the attention
+  # of an explicit mask in f32 within the tolerance of an f16 core.
+  test "GroupQueryAttention prompts after pasts of mixed lengths give the attention of an explicit mask" do
+    {heads, kv_heads, head_size, capacity} = {4, 2, 64, 640}
+    int = &%Transmuter.Onnx.AttributeProto{name: &1, type: :INT, i: &2}
+
+    node = %Transmuter.Onnx.NodeProto{
+      op_type: "GroupQueryAttention",
+      domain: "com.microsoft",
+      input: ~w(q k v past_k past_v seqlens_k total),
+      output: ~w(y present_k present_v),
+      attribute: [int.("num_heads", heads), int.("kv_num_heads", kv_heads)]
+    }
+
+    for s <- [16, 64, 512] do
+      lengths = Enum.map([0, 61, 128], &(&1 + s))
+      b = length(lengths)
+      key = Nx.Random.key(s)
+      {q, key} = Nx.Random.normal(key, shape: {b, s, heads * head_size}, type: :f16)
+      {k, key} = Nx.Random.normal(key, shape: {b, s, kv_heads * head_size}, type: :f16)
+      {v, key} = Nx.Random.normal(key, shape: {b, s, kv_heads * head_size}, type: :f16)
+      {past_k, key} = Nx.Random.normal(key, shape: {b, kv_heads, capacity, head_size}, type: :f16)
+
+      {past_v, _key} =
+        Nx.Random.normal(key, shape: {b, kv_heads, capacity, head_size}, type: :f16)
+
+      seqlens_k = Nx.tensor(Enum.map(lengths, &(&1 - 1)), type: :s32)
+      total = Nx.tensor(capacity, type: :s32, backend: Nx.BinaryBackend)
+
+      {y, present_k, present_v} =
+        Nx.Defn.jit_apply(
+          &List.to_tuple(Transformer.apply(node, [&1, &2, &3, &4, &5, &6, total], 21)),
+          Enum.map([q, k, v, past_k, past_v, seqlens_k], &Nx.backend_transfer(&1, @backend)),
+          @compiler
+        )
+
+      # Query i of a row sees the keys up to length - s + i, its position.
+      expected =
+        Nx.Defn.jit_apply(
+          fn q, present_k, present_v ->
+            q =
+              q
+              |> Nx.reshape({b, s, kv_heads, 2, head_size})
+              |> Nx.transpose(axes: [0, 2, 3, 1, 4])
+
+            q = q |> Nx.reshape({b, kv_heads, 2 * s, head_size}) |> Nx.as_type(:f32)
+            scores = Nx.dot(q, [3], [0, 1], Nx.as_type(present_k, :f32), [3], [0, 1])
+
+            scores =
+              scores
+              |> Nx.divide(:math.sqrt(head_size))
+              |> Nx.reshape({b, kv_heads, 2, s, capacity})
+
+            position =
+              Nx.add(
+                Nx.reshape(Nx.tensor(lengths), {b, 1, 1, 1, 1}),
+                Nx.iota({1, 1, 1, s, 1}, axis: 3) |> Nx.subtract(s)
+              )
+
+            visible = Nx.less_equal(Nx.iota({1, 1, 1, 1, capacity}, axis: 4), position)
+
+            scores =
+              Nx.select(
+                Nx.broadcast(visible, Nx.shape(scores)),
+                scores,
+                Nx.Constants.min_finite(:f32)
+              )
+
+            probs = Nx.exp(Nx.subtract(scores, Nx.reduce_max(scores, axes: [4], keep_axes: true)))
+            probs = Nx.divide(probs, Nx.sum(probs, axes: [4], keep_axes: true))
+            probs = Nx.reshape(probs, {b, kv_heads, 2 * s, capacity})
+            out = Nx.dot(probs, [3], [0, 1], Nx.as_type(present_v, :f32), [2], [0, 1])
+
+            out
+            |> Nx.reshape({b, kv_heads, 2, s, head_size})
+            |> Nx.transpose(axes: [0, 3, 1, 2, 4])
+          end,
+          [Nx.backend_transfer(q, @backend), present_k, present_v],
+          @compiler
+        )
+
+      diff =
+        y
+        |> Nx.as_type(:f32)
+        |> Nx.reshape({b, s, kv_heads, 2, head_size})
+        |> Nx.subtract(expected)
+        |> Nx.abs()
+        |> Nx.reduce_max()
+        |> Nx.to_number()
+
+      assert diff < 3.0e-3, "#{s} query rows: #{diff}"
+    end
+  end
+
   # MLX 0.32.0 has fused kernels for some head sizes. A head size of 72 pads to 80 for the
   # "full" kernel, 64 takes it as it is, and 256 with 16 queries has no fused size within
   # 1.25 times, so the Nx core runs in chunks. Each case gives the values of the Nx core.

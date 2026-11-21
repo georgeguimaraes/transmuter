@@ -142,21 +142,27 @@ defmodule Transmuter.Ops.Transformer do
     present_k = write_cache(past_k, k, offsets, capacity)
     present_v = write_cache(past_v, v, offsets, capacity)
 
-    # Each sequence has seqlens_k + 1 live keys, and the query at row i has the position
-    # offset + i, so the causal mask aligned to the live keys hides the rows after it and the
-    # free rows of the buffer.
+    # Each sequence has seqlens_k + 1 live keys, which the lengths give, and the query at row
+    # i has the position offset + i. A query does not see the keys after its position or, with
+    # a local window, the keys window or more before it. These keys get the lowest bias, so the
+    # masks of the core are one float bias and the lengths, for all query rows alike.
     lengths = Nx.add(offsets, s)
-    offsets = Nx.reshape(offsets, {b, 1, 1, 1})
+    positions = query_positions(s, Nx.reshape(offsets, {b, 1, 1, 1}))
+    keys = key_positions(capacity)
     window = attr(node, "local_window_size", -1)
+
+    hidden =
+      any_hidden([
+        Nx.greater(keys, positions),
+        window > 0 && Nx.less_equal(keys, Nx.add(positions, -window))
+      ])
 
     opts = %{
       scale: scale(node, q),
       softcap: attr(node, "softcap", 0.0),
-      bias: attention_bias,
-      hidden:
-        window > 0 &&
-          Nx.less_equal(key_positions(capacity), Nx.add(query_positions(s, offsets), -window)),
-      causal: true,
+      bias: any_bias([attention_bias, Nx.select(hidden, lowest(Nx.type(q)), 0)]),
+      hidden: nil,
+      causal: false,
       lengths: lengths
     }
 
@@ -658,8 +664,7 @@ defmodule Transmuter.Ops.Transformer do
   #   * :causal - whether query i sees only the keys up to T - S + i. ONNX Runtime aligns the
   #     causal mask to the last query, so past keys stay visible.
   #   * :lengths - optional, nil or the s32 {B} live keys of each row. The keys at or after
-  #     them are hidden, and the causal mask is aligned to them: query i sees the keys up to
-  #     length - S + i. Without lengths, all T keys are live.
+  #     them are hidden. Without lengths, all T keys are live.
   #
   # The masks broadcast to {B, N, S, T}. The core is the Nx.block of Transmuter.Ops.Attention
   # on every backend, so a compiler can run it as one kernel. Its default function is
@@ -711,7 +716,7 @@ defmodule Transmuter.Ops.Transformer do
       |> Map.take([:scale, :softcap, :causal])
       |> Map.merge(%{bias: nil, hidden: nil, query_lengths: nil, key_lengths: nil})
       |> Map.merge(Map.new(Enum.zip(attention.masks, masks)))
-      |> live_keys(Nx.axis_size(q, 2), Nx.axis_size(k, 2))
+      |> live_keys(Nx.axis_size(k, 2))
 
     type = Nx.type(q)
 
@@ -746,13 +751,12 @@ defmodule Transmuter.Ops.Transformer do
     |> hd()
   end
 
-  # The lengths as a mask of hidden keys. The last live query of a row sees its last live
-  # key: with a causal mask, query i sees the keys up to key length - query length + i, and
-  # without one, every query sees the keys before the key length. The mask reads both lengths,
-  # so the default function reads every input of the block. EMLX 0.5 gives the inputs to the
+  # The lengths as a mask of hidden keys: every query of a row sees the keys before its key
+  # length, key length - query length + (query length - 1). The mask reads both lengths, so the
+  # default function reads every input of the block. EMLX 0.5 gives the inputs to the
   # parameters that the default function reads, in order, so an input that it does not read
   # shifts the inputs after it.
-  defp live_keys(opts, s, t) do
+  defp live_keys(opts, t) do
     {query_lengths, opts} = Map.pop(opts, :query_lengths)
     {key_lengths, opts} = Map.pop(opts, :key_lengths)
 
@@ -761,13 +765,8 @@ defmodule Transmuter.Ops.Transformer do
         Enum.map([query_lengths, key_lengths], &Nx.reshape(&1, {:auto, 1, 1, 1}))
 
       offset = Nx.subtract(key_lengths, query_lengths)
-
-      past =
-        if opts.causal,
-          do: causal_hidden(s, t, offset),
-          else: causal_hidden(1, t, Nx.add(offset, Nx.subtract(query_lengths, 1)))
-
-      %{opts | hidden: any_hidden([opts.hidden, past]), causal: false}
+      past = causal_hidden(1, t, Nx.add(offset, Nx.subtract(query_lengths, 1)))
+      %{opts | hidden: any_hidden([opts.hidden, past])}
     else
       opts
     end
@@ -899,12 +898,7 @@ defmodule Transmuter.Ops.Transformer do
     {s, t} = {Nx.axis_size(q, 2), Nx.axis_size(k, 2)}
     type = Nx.type(q)
     {bias, hidden} = masks(opts, s, t)
-
-    lowest =
-      Nx.tensor(Nx.to_number(Nx.Constants.min_finite(type, backend: Nx.BinaryBackend)) / 2,
-        type: type
-      )
-
+    lowest = lowest(type)
     bias = bias && bias |> Nx.as_type(type) |> Nx.max(lowest)
     shape = broadcast_shape([{1, 1, 1, t} | for(m <- [bias, hidden], m, do: Nx.shape(m))])
 
@@ -966,6 +960,14 @@ defmodule Transmuter.Ops.Transformer do
       [] -> nil
       masks -> Enum.reduce(masks, &Nx.logical_or/2)
     end
+  end
+
+  # Half the smallest finite value of type: a bias that gives a key no weight, and that a sum
+  # of two such biases or the exp2 of the MLX kernel (see fused_attention/4) keeps finite.
+  defp lowest(type) do
+    Nx.tensor(Nx.to_number(Nx.Constants.min_finite(type, backend: Nx.BinaryBackend)) / 2,
+      type: type
+    )
   end
 
   defp any_bias(masks) do
