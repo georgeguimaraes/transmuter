@@ -878,6 +878,7 @@ defmodule Transmuter.Generation do
     ctx =
       ctx
       |> Map.put(:run, fn inputs, static -> runs[static].(inputs) end)
+      |> Map.put(:compile_concurrency, compile_concurrency(defn_options))
       |> Map.put(:run_steps, compile_loop(ctx, state, opts, batch_size))
       |> Map.put(
         :loop_model,
@@ -1972,12 +1973,17 @@ defmodule Transmuter.Generation do
           encoder <- encoders,
           do: {capacity, size, past, encoder}
 
-    for {capacity, size, past, encoder} <- shapes do
-      request = %{row: 0, prompt: List.duplicate(0, size), seed: 0, budget: 1}
-      request = Map.put(request, :inputs, encoder_inputs(ctx, inputs, encoder))
-      group = admit_joining(ctx, open(ctx, rows, capacity), [request], %{})
-      finish(next(ctx, cached_rows(group, past)))
-    end
+    step_items =
+      for {capacity, size, past, encoder} <- shapes do
+        fn ctx ->
+          request = %{row: 0, prompt: List.duplicate(0, size), seed: 0, budget: 1}
+          request = Map.put(request, :inputs, encoder_inputs(ctx, inputs, encoder))
+          group = admit_joining(ctx, open(ctx, rows, capacity), [request], %{})
+          finish(next(ctx, cached_rows(group, past)))
+        end
+      end
+
+    run_items(ctx, :run, step_items)
 
     compile_alone(ctx, rows, capacities, opts[:prefixes])
 
@@ -1992,7 +1998,7 @@ defmodule Transmuter.Generation do
       finish(admit(ctx, cancel(group, 0), [request.(0, to)]))
     end
 
-    compile_loops(ctx, rows, capacities, request.(0, hd(encoders)))
+    run_items(ctx, :run_steps, loop_items(ctx, rows, capacities, request.(0, hd(encoders))))
 
     for encoder <- encoders, encoder != nil, rows > 1 do
       group = admit(ctx, open(ctx, rows, hd(capacities)), [request.(0, encoder)])
@@ -2109,15 +2115,98 @@ defmodule Transmuter.Generation do
   defp alone_sizes,
     do: Enum.zip_with([1 | @alone_widths], @alone_widths, fn below, _width -> below end)
 
-  # Runs each decode loop of compile_loop/4 at each capacity, with `request` in row 0.
-  defp compile_loops(%{run_steps: loops} = ctx, rows, capacities, request) when loops != nil do
+  # Each decode loop of compile_loop/4 at each capacity, with `request` in row 0.
+  defp loop_items(%{run_steps: loops}, rows, capacities, request) when loops != nil do
     for capacity <- capacities, k <- Map.keys(loops) do
-      group = next(ctx, admit(ctx, open(ctx, rows, capacity), [%{request | budget: k + 1}]))
-      finish(next_steps(ctx, group, k))
+      fn ctx ->
+        group = next(ctx, admit(ctx, open(ctx, rows, capacity), [%{request | budget: k + 1}]))
+        finish(next_steps(ctx, group, k))
+      end
     end
   end
 
-  defp compile_loops(_ctx, _rows, _capacities, _request), do: []
+  defp loop_items(_ctx, _rows, _capacities, _request), do: []
+
+  # Runs `items`, functions of the context that each run a call of ctx.run or of a loop of
+  # ctx.run_steps (`field`), and compiles those calls first in parallel tasks. A first pass
+  # runs each item up to its call, keeps the templates of the inputs of the call and stops
+  # there, so nothing runs on the model. The tasks then call the compiled functions with the
+  # templates, which only compiles them (see Transmuter.GraphBreaks), at most
+  # ctx.compile_concurrency at a time and without device memory. The items then run, and
+  # their calls find the compiled segments.
+  defp run_items(ctx, field, items) do
+    if ctx.compile_concurrency > 1 and items != [] do
+      calls = record_calls(ctx, field, items)
+
+      calls
+      |> Task.async_stream(
+        fn {key, inputs, static} -> call_of(ctx, field, key).(inputs, static) end,
+        max_concurrency: ctx.compile_concurrency,
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Stream.run()
+    end
+
+    Enum.each(items, & &1.(ctx))
+  end
+
+  defp record_calls(ctx, field, items) do
+    ref = make_ref()
+
+    record = fn key ->
+      fn inputs, static ->
+        inputs = Map.new(inputs, fn {name, value} -> {name, template(value)} end)
+        send(self(), {ref, {key, inputs, static}})
+        throw(ref)
+      end
+    end
+
+    recording =
+      case field do
+        :run -> %{ctx | run: record.(:run)}
+        :run_steps -> %{ctx | run_steps: Map.new(ctx.run_steps, fn {k, _} -> {k, record.(k)} end)}
+      end
+
+    for item <- items do
+      try do
+        item.(recording)
+      catch
+        ^ref -> :ok
+      end
+
+      # The buffers of the group of the item die at its stop.
+      :erlang.garbage_collect()
+    end
+
+    receive_calls(ref, [])
+    |> Enum.uniq_by(fn {key, inputs, static} ->
+      {key, Map.new(inputs, fn {n, t} -> {n, shape_of(t)} end), static}
+    end)
+  end
+
+  defp receive_calls(ref, calls) do
+    receive do
+      {^ref, call} -> receive_calls(ref, [call | calls])
+    after
+      0 -> Enum.reverse(calls)
+    end
+  end
+
+  defp call_of(ctx, :run, :run), do: ctx.run
+  defp call_of(ctx, :run_steps, k), do: ctx.run_steps[k]
+
+  defp template(tensor = %Nx.Tensor{}), do: Nx.to_template(tensor)
+  defp template(other), do: other
+
+  defp shape_of(tensor = %Nx.Tensor{}), do: {Nx.shape(tensor), Nx.type(tensor)}
+  defp shape_of(other), do: other
+
+  # The compiles of compile_steps/3 that can run at the same time: one for each scheduler, and
+  # one with EMLX, whose compile cache belongs to the first process that compiles.
+  defp compile_concurrency(defn_options) do
+    if GraphBreaks.compiler(defn_options) == EMLX, do: 1, else: System.schedulers_online()
+  end
 
   # The capacity and the width of each first step of a new group of a merged decoder, on its
   # branch without cache: for each prompt length up to the largest capacity, the width of the

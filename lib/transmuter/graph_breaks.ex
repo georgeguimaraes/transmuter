@@ -190,7 +190,13 @@ defmodule Transmuter.GraphBreaks do
   # The other arguments are params, and the plan keeps them. An input without device data,
   # such as an empty value, is a static value of the segment, so only the inputs that are
   # arguments go into the call.
+  # A call whose inputs hold templates (see Nx.template/2) only compiles the segment for their
+  # shapes, so callers can compile many shapes at the same time without device memory.
   defp run_fast(plan, entry, %{names: names}, inputs) do
+    if templates?(inputs), do: %{}, else: run_compiled_fast(plan, entry, names, inputs)
+  end
+
+  defp run_compiled_fast(plan, entry, names, inputs) do
     with_graph(plan, fn ->
       params = Enum.map(entry.params, &Map.fetch!(plan.model.params, &1))
       %{values: values} = call_compiled(entry, params, inputs |> Map.take(names) |> encode())
@@ -235,7 +241,15 @@ defmodule Transmuter.GraphBreaks do
   defp arg_name({:sequence, name, _others}), do: name
   defp arg_name(name), do: name
 
+  # A graph with breaks runs its break nodes on values, so a call with templates compiles nothing.
   defp general(plan, inputs, static_inputs) do
+    if templates?(inputs), do: %{}, else: run_general(plan, inputs, static_inputs)
+  end
+
+  defp templates?(inputs),
+    do: Enum.any?(Map.values(inputs), &match?(%Nx.Tensor{data: %Nx.TemplateBackend{}}, &1))
+
+  defp run_general(plan, inputs, static_inputs) do
     with_graph(plan, fn ->
       Transmuter.with_fold_memo(fn ->
         state = run(plan, initial(plan, inputs, static_inputs), 0)
