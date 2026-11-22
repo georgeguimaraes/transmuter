@@ -1502,7 +1502,8 @@ defmodule Transmuter.Generation do
       done: List.duplicate(true, rows),
       budgets: List.duplicate(0, rows),
       scores: nil,
-      steps: []
+      steps: [],
+      moves: []
     }
   end
 
@@ -3146,11 +3147,22 @@ defmodule Transmuter.Generation do
       else: move(ctx, group, fit_capacity(ctx, state.capacity, rows, n))
   end
 
-  # Gives the buffers `capacity`: a compaction in :append, else a growth or a shrink.
+  # Gives the buffers `capacity`: a compaction in :append, else a growth or a shrink. The group
+  # keeps the time of each move and the rows of the capacities that it copies, for the costs of
+  # ContinuousBatching, which clears them. A read of one token waits for the copy to end.
   defp move(ctx, group, capacity) do
-    if ctx.mode == :append,
-      do: compact(ctx, group, capacity),
-      else: grow(ctx, group, capacity)
+    from = group.state.capacity
+    start = System.monotonic_time()
+
+    group =
+      if ctx.mode == :append,
+        do: compact(ctx, group, capacity),
+        else: grow(ctx, group, capacity)
+
+    Nx.to_binary(group.state.history, limit: 1)
+    ms = System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond) / 1000
+    rows = max(Enum.sum(capacity_path(ctx, from, capacity)), capacity)
+    %{group | moves: [%{from: from, to: capacity, rows: rows, ms: ms} | group.moves]}
   end
 
   # The rows of a group that size its buffers: `written`, the rows that the buffers hold (the
@@ -3241,15 +3253,35 @@ defmodule Transmuter.Generation do
 
   @doc false
   # Moves the buffers to the capacity of the longest row that runs, with the prompt that it has
-  # left, and @join_tokens rows, when that capacity is smaller, as after a long row ends in a
-  # server. So the steps run at the capacity of the rows that run, not of the longest row since
-  # the group opened. The @join_tokens rows hold a step of a joining prompt, so the next step
-  # does not grow the buffers again. In :in_place, the rows that ended lose their valid rows
-  # first (see drop_ended/1), so the move keeps only the rows that run.
-  def shrink(ctx, group) do
+  # left, and @join_tokens rows, when that capacity is smaller and `pays?` says that the move
+  # pays, as after a long row ends in a server. So the steps run at the capacity of the rows
+  # that run, not of the longest row since the group opened. The @join_tokens rows hold a step
+  # of a joining prompt, so the next step does not grow the buffers again. `pays?` gets the
+  # capacity, the target, the steps that the group can run at the target (see steps_below/2)
+  # and the capacities of the path of the move. In :in_place, the rows that ended lose their
+  # valid rows first (see drop_ended/1), so the move keeps only the rows that run.
+  def shrink(ctx, group, pays?) do
     group = if ctx.mode == :in_place, do: drop_ended(group), else: group
-    capacity = capacity(ctx, running_rows(group) + @join_tokens)
-    if capacity < group.state.capacity, do: move(ctx, group, capacity), else: group
+    from = group.state.capacity
+    to = capacity(ctx, running_rows(group) + @join_tokens)
+
+    if to < from and pays?.(from, to, steps_below(group, to), capacity_path(ctx, from, to)),
+      do: move(ctx, group, to),
+      else: group
+  end
+
+  # The steps that the rows that run can take at `capacity` rows before one of them needs more:
+  # a row grows by one row in each step until its budget ends. When no row needs more, the steps
+  # until the last row ends.
+  defp steps_below(group, capacity) do
+    rows =
+      for {rows, left, done?, budget, ids} <-
+            Enum.zip([group.state.lengths, group.left, group.done, group.budgets, group.ids]),
+          not done?,
+          do: {rows + length(left), budget - length(ids)}
+
+    passing = for {rows, remaining} <- rows, rows + remaining > capacity, do: capacity - rows
+    Enum.min(passing, fn -> Enum.max(Enum.map(rows, &elem(&1, 1)), fn -> 0 end) end)
   end
 
   # The rows of the longest row that has not ended, with the tokens of its prompt that are left

@@ -55,6 +55,10 @@ defmodule Transmuter.ContinuousBatchingTest do
   alias Transmuter.{Audio, ContinuousBatching, Text, Vision}
   alias Transmuter.ContinuousBatchingTest.{BrokenTask, FailingTask}
 
+  # Costs of a capacity that each shrink pays for, so the servers of the shrink tests do not
+  # wait for measured costs.
+  @shrink_costs %{slope: 1.0, per_row: 0.0}
+
   @fox "A fox lived near a wide river at the edge of an old forest. Every morning she walked along the bank and watched the water. One day she saw"
 
   @museum "The museum opens at nine in the morning, and the guides explain the history of each painting to the visitors. Many visitors stay until the evening, because the collection is very large and the rooms are quiet. On Sundays, the entry is free for children and students, so the halls are often full."
@@ -353,7 +357,8 @@ defmodule Transmuter.ContinuousBatchingTest do
     shorts = ["Once upon a time", "Explain how a rainbow forms."]
     single = Text.generation(source, opts)
     alone = for input <- [long | shorts], do: Nx.Serving.run(single, input)
-    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
+    spec = [source: source, slots: 2, capacity_costs: @shrink_costs] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
 
     {{long_text, others}, steps} =
       step_events(server, fn ->
@@ -581,7 +586,7 @@ defmodule Transmuter.ContinuousBatchingTest do
   # starts at 32 rows (the capacity of a step event is the one before the step). The server
   # opens a new group when no row runs, which resets every group, also the buffers of :in_place
   # and the encoder capacity of the rows. Without it, the group would keep 64 rows, because
-  # Generation.shrink/2 leaves room for a step of 64 tokens, and it would run the step at 64
+  # Generation.shrink/3 leaves room for a step of 64 tokens, and it would run the step at 64
   # rows, a shape that compile_steps does not compile. No step of the server compiles.
   test "a request that waits for the last running row of a merged decoder compiles nothing" do
     source = {:hf, "Xenova/gpt2"}
@@ -924,7 +929,8 @@ defmodule Transmuter.ContinuousBatchingTest do
     opts = opts ++ @opts
     single = Text.generation(source, opts)
     alone = for input <- [long, joining], do: Nx.Serving.run(single, input)
-    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
+    spec = [source: source, slots: 2, capacity_costs: @shrink_costs] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
 
     {results, steps} =
       step_events(server, fn -> results_after_first_chunk(server, long, joining) end)

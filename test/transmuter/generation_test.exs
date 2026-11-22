@@ -1486,7 +1486,9 @@ defmodule Transmuter.GenerationTest do
     alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
     ctx = Generation.compile(ctx, 2, @opts[:defn_options])
     request = &%{row: &1, prompt: &2, seed: 0, budget: &3}
-    step = &Generation.shrink(ctx, Generation.next(ctx, &1))
+
+    step =
+      &Generation.shrink(ctx, Generation.next(ctx, &1), fn _from, _to, _steps, _path -> true end)
 
     group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, long, 4)])
     group = run_until(ctx, group, &(length(Enum.at(&1.ids, 0)) == 2))

@@ -42,6 +42,8 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:prefix_cache` - the rows of a store of prompt prefixes on the device (see "Prefix cache"), in slots of the rows of the widest step (512 rows). The default is `0`, no store.
 
+    * `:capacity_costs` - fixed costs for the shrink of the buffers: `%{slope: ms, per_row: ms}`, the time that one row of capacity adds to a decode step and the time of a move for each row that it copies. The default is `nil`: the server measures them (see `Transmuter.ContinuousBatching.Costs`).
+
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
   ## Device memory
@@ -131,6 +133,7 @@ defmodule Transmuter.ContinuousBatching do
 
   require Logger
 
+  alias Transmuter.ContinuousBatching.Costs
   alias Transmuter.{Generation, Serving}
 
   @compile {:no_warn_undefined, [EXLA.Client, EMLX]}
@@ -155,6 +158,7 @@ defmodule Transmuter.ContinuousBatching do
     module = Keyword.get(opts, :task, Transmuter.Text.Generation)
     server_opts = [:name, :task, :source, slots: 8, max_queue: nil, capacity: nil]
     server_opts = server_opts ++ [device_memory: nil, compile_steps: false, prefix_cache: 0]
+    server_opts = server_opts ++ [capacity_costs: nil]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()
@@ -182,6 +186,7 @@ defmodule Transmuter.ContinuousBatching do
       defn_options: opts[:defn_options],
       compile_steps: opts[:compile_steps],
       fixed_capacity?: opts[:capacity] != nil,
+      costs: Costs.new(opts[:capacity_costs]),
       device_memory: opts[:device_memory],
       prefix_slots: prefix_slots
     }
@@ -933,11 +938,35 @@ defmodule Transmuter.ContinuousBatching do
         encoder_capacity: state.group.state.encoder_capacity
       }
 
+      live_keys =
+        Enum.sum(
+          Enum.zip_with(state.group.state.lengths, state.group.done, &if(&2, do: 0, else: &1))
+        )
+
       :telemetry.span([:transmuter, :continuous_batching, :step], metadata, fn ->
+        start = System.monotonic_time()
         state = step(state, admitted)
+
+        ms =
+          System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond) / 1000
+
+        state = costs(state, metadata, live_keys, ms)
         {state, Map.merge(metadata, loop_metadata(state.group.steps, metadata.running))}
       end)
     end
+  end
+
+  # The costs of the call: its moves, and the call itself when it only decodes. A call with a
+  # prompt part or a move does not show the time of a decode step.
+  defp costs(state = %{group: group}, metadata, live_keys, ms) do
+    costs = Enum.reduce(group.moves, state.costs, &Costs.moved(&2, &1.rows, &1.ms))
+
+    costs =
+      if metadata.prompts == 0 and group.moves == [],
+        do: Costs.sample(costs, metadata.capacity, length(group.steps), live_keys, ms),
+        else: costs
+
+    %{state | costs: costs, group: %{group | moves: []}}
   end
 
   defp step(state, admitted) do
@@ -967,7 +996,7 @@ defmodule Transmuter.ContinuousBatching do
     rows = Map.merge(state.rows, admitted)
     prefix = store_prompts(state.prefix, state.ctx, group, rows)
     rows = Map.new(rows, fn {row, request} -> {row, stored(request, group, row)} end)
-    group = Generation.shrink(state.ctx, group)
+    group = Generation.shrink(state.ctx, group, &Costs.pays?(state.costs, &1, &2, &3, &4))
     emit(%{state | rows: rows, prefix: prefix}, group)
   end
 
