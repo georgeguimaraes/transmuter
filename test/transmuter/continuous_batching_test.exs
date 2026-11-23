@@ -578,9 +578,9 @@ defmodule Transmuter.ContinuousBatchingTest do
     assert Enum.any?(steps, &(&1.admitted > 0 and &1.running > 0))
     stop_supervised!(ContinuousBatching)
 
-    # With a store of prefixes and :alone_prompts, the second chat reuses the first block of the
-    # system prompt of the first one, and the rest of its prompt runs in a step of its own row
-    # after that prefix. compile_steps compiles the copies of the prefix and that step too.
+    # With a store of prefixes, the second chat reuses the first block of the system prompt of
+    # the first one, and the rest of its prompt runs in a step of its own row after that prefix.
+    # compile_steps compiles the copies of the prefix and that step too.
     chats =
       for question <- ["Where is the museum?", "When is the entry free?"] do
         %{messages: [%{role: "system", content: @museum}, %{role: "user", content: question}]}
@@ -588,7 +588,6 @@ defmodule Transmuter.ContinuousBatchingTest do
 
     opts = [strategy: :greedy, max_new_tokens: 16] ++ @opts
     spec = [source: source, slots: 2, capacity: 512, compile_steps: true, prefix_cache: 512]
-    spec = [alone_prompts: true] ++ spec
     server = start_supervised!({ContinuousBatching, spec ++ opts})
 
     :telemetry.attach(
