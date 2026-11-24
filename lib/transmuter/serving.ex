@@ -362,22 +362,24 @@ defmodule Transmuter.Serving do
           end)
 
         fn batch ->
-          run = runs[batch.key]
-          size = batch.size
-          batch = Nx.Batch.pad(batch, batch_size - size)
-          inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+          batch_span(model[:source], batch, batch_size, fn ->
+            run = runs[batch.key]
+            size = batch.size
+            batch = Nx.Batch.pad(batch, batch_size - size)
+            inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
 
-          inputs
-          |> run.(size)
-          |> fun.(inputs)
-          |> Nx.backend_transfer(Nx.BinaryBackend)
+            inputs
+            |> run.(size)
+            |> fun.(inputs)
+            |> Nx.backend_transfer(Nx.BinaryBackend)
+          end)
         end
       end,
       opts[:defn_options]
     )
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: Map.keys(templates))
-    |> Nx.Serving.client_preprocessing(fn input ->
+    |> client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
       if shapes[:one_batch], do: batch_limit!(length(inputs), batch_size)
       {groups, rows} = preprocess.(Enum.concat(inputs))
@@ -394,7 +396,7 @@ defmodule Transmuter.Serving do
       items = rows |> split_like(inputs) |> Enum.map(&Enum.concat/1)
       {batches, {multi?, items}}
     end)
-    |> client_postprocessing(fn result, {multi?, items} ->
+    |> client_postprocessing(model[:source], fn result, {multi?, items}, stop ->
       {outputs, _metadata} = result
 
       results =
@@ -403,6 +405,7 @@ defmodule Transmuter.Serving do
         |> split_like(items)
         |> Enum.zip_with(items, postprocess)
 
+      stop.(false, %{inputs: length(items)})
       if multi?, do: results, else: hd(results)
     end)
   end
@@ -433,6 +436,8 @@ defmodule Transmuter.Serving do
 
   `task` is a map:
 
+    * `:source` - optional, the source of the model, for the metadata of the events of the serving.
+
     * `:validate` takes one input and returns `{:ok, input}` or `{:error, message}`.
 
     * `:preprocess` takes a valid input and returns a map of `Nx.BinaryBackend` tensors without a batch axis.
@@ -452,21 +457,24 @@ defmodule Transmuter.Serving do
         run = init.(Keyword.delete(defn_options, :batch_keys))
 
         fn batch ->
-          Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-          |> run.()
-          |> Nx.backend_transfer(Nx.BinaryBackend)
+          batch_span(task[:source], batch, 1, fn ->
+            Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+            |> run.()
+            |> Nx.backend_transfer(Nx.BinaryBackend)
+          end)
         end
       end,
       opts[:defn_options]
     )
     |> Nx.Serving.batch_size(1)
-    |> Nx.Serving.client_preprocessing(fn input ->
+    |> client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
       batch_limit!(length(inputs), 1)
       {Nx.Batch.stack(Enum.map(inputs, preprocess)), multi?}
     end)
-    |> client_postprocessing(fn {outputs, _metadata}, multi? ->
+    |> client_postprocessing(task[:source], fn {outputs, _metadata}, multi?, stop ->
       result = outputs |> Map.new(fn {name, t} -> {name, t[0]} end) |> postprocess.()
+      stop.(false, %{inputs: 1})
       if multi?, do: [result], else: result
     end)
   end
@@ -541,16 +549,50 @@ defmodule Transmuter.Serving do
     @run |> Process.delete() |> List.wrap() |> Enum.each(&Shared.erase_scope/1)
   end
 
+  # The client preprocessing of all servings. It keeps the start of the call in the info.
+  defp client_preprocessing(serving, fun) do
+    Nx.Serving.client_preprocessing(serving, fn input ->
+      start = System.monotonic_time()
+      {batches, info} = fun.(input)
+      {batches, {start, info}}
+    end)
+  end
+
   # The client postprocessing of all servings. The result of a call of Nx.Serving.run/2 ends
-  # the scopes of the call.
-  defp client_postprocessing(serving, fun) do
-    Nx.Serving.client_postprocessing(serving, fn result, info ->
+  # the scopes of the call. `fun` gets a function that emits the request event with its
+  # measurements, which a stream calls when it ends.
+  defp client_postprocessing(serving, source, fun) do
+    Nx.Serving.client_postprocessing(serving, fn result, {start, info} ->
       try do
-        fun.(result, info)
+        fun.(result, info, &request_stop(source, start, &1, &2))
       after
         end_run()
       end
     end)
+  end
+
+  # The batch event: the rows of the batch, and the batch size of the compiled model.
+  defp batch_span(source, batch, batch_size, fun) do
+    metadata = %{source: source, batch_key: batch.key}
+
+    :telemetry.span([:transmuter, :serving, :batch], metadata, fn ->
+      {fun.(), %{batch_size: batch.size, padded_size: batch_size}, metadata}
+    end)
+  end
+
+  # `:first_token_at` of a stream becomes the time from the start of the call to its first token.
+  defp request_stop(source, start, stream?, measurements) do
+    now = System.monotonic_time()
+
+    measurements =
+      case Map.pop(measurements, :first_token_at) do
+        {nil, measurements} -> measurements
+        {first, measurements} -> Map.put(measurements, :time_to_first_token, first - start)
+      end
+
+    measurements = Map.merge(%{duration: now - start, monotonic_time: now}, measurements)
+    metadata = %{source: source, stream: stream?}
+    :telemetry.execute([:transmuter, :serving, :request, :stop], measurements, metadata)
   end
 
   defp zeros(shape, type),
@@ -627,28 +669,34 @@ defmodule Transmuter.Serving do
           flags = for {flag, value} <- generation_flags(), do: {flag, Process.flag(flag, value)}
 
           try do
-            inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
-            {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
+            batch_span(ctx.model[:source], batch, batch_size, fn ->
+              inputs = Nx.Defn.jit_apply(& &1, [batch], compiler: Nx.Defn.Evaluator)
+              {rows, tensors} = Map.split(inputs, ["prompt", "length", "seed", "input"])
 
-            # Padding rows have no prompt.
-            padding = batch_size - batch.size
+              # Padding rows have no prompt.
+              padding = batch_size - batch.size
 
-            prompts =
-              Enum.zip_with(Nx.to_list(rows["prompt"]), Nx.to_list(rows["length"]), &Enum.take/2)
+              prompts =
+                Enum.zip_with(
+                  Nx.to_list(rows["prompt"]),
+                  Nx.to_list(rows["length"]),
+                  &Enum.take/2
+                )
 
-            prompts = prompts ++ List.duplicate([], padding)
-            seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
-            generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
-            generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
-            lengths = Enum.map(generated, &length/1)
-            row_width = row_width!(width, lengths)
-            ids = for ids <- generated, do: ids ++ List.duplicate(0, row_width - length(ids))
+              prompts = prompts ++ List.duplicate([], padding)
+              seeds = Nx.to_list(rows["seed"]) ++ List.duplicate(0, padding)
+              generate = &Generation.generate(ctx, &2, seeds, &1, hooks[:token])
+              generated = tensors |> run.(prompts, generate) |> Enum.map(&integers/1)
+              lengths = Enum.map(generated, &length/1)
+              row_width = row_width!(width, lengths)
+              ids = for ids <- generated, do: ids ++ List.duplicate(0, row_width - length(ids))
 
-            %{
-              ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
-              length: Nx.tensor(lengths, backend: Nx.BinaryBackend),
-              input: pad_rows(rows["input"], padding, Nx.BinaryBackend)
-            }
+              %{
+                ids: Nx.tensor(ids, type: :s64, backend: Nx.BinaryBackend),
+                length: Nx.tensor(lengths, backend: Nx.BinaryBackend),
+                input: pad_rows(rows["input"], padding, Nx.BinaryBackend)
+              }
+            end)
           after
             Enum.each(flags, fn {flag, value} -> Process.flag(flag, value) end)
           end
@@ -659,7 +707,7 @@ defmodule Transmuter.Serving do
     |> Nx.Serving.batch_size(batch_size)
     |> Nx.Serving.process_options(batch_keys: keys)
     |> generation_mode(stream?, width)
-    |> Nx.Serving.client_preprocessing(fn input ->
+    |> client_preprocessing(fn input ->
       {inputs, multi?} = validate!(input, validate)
 
       if stream? and multi? do
@@ -684,8 +732,8 @@ defmodule Transmuter.Serving do
       {if(stream?, do: one_batch!(batches), else: batches), {multi?, runs}}
     end)
     |> generation_postprocessing(
-      tokenizer,
-      postprocess,
+      ctx.model[:source],
+      {tokenizer, postprocess},
       stream?,
       {opts[:stream_done], ctx.token_logprobs?}
     )
@@ -794,19 +842,23 @@ defmodule Transmuter.Serving do
   defp integer(value) when is_integer(value), do: value
   defp integer(value), do: Generation.to_bits(value)
 
-  defp generation_postprocessing(serving, tokenizer, postprocess, stream?, flags) do
+  defp generation_postprocessing(serving, source, {tokenizer, postprocess}, stream?, flags) do
     if stream? do
-      client_postprocessing(serving, fn stream, {false, [[run]]} ->
-        stream_text(stream, tokenizer, run.summary, flags)
+      client_postprocessing(serving, source, fn stream, {false, [[run]]}, stop ->
+        stream_text(stream, tokenizer, run.summary, flags, &stop.(true, &1))
       end)
     else
-      client_postprocessing(serving, fn result, {multi?, runs} ->
+      client_postprocessing(serving, source, fn result, {multi?, runs}, stop ->
         rows = rows_by_input(result)
 
         results =
           for {runs, input} <- Enum.with_index(runs),
               do: postprocess.(Map.get(rows, input, []), runs)
 
+        tokens =
+          for {_input, rows} <- rows, row <- rows, reduce: 0, do: (sum -> sum + length(row))
+
+        stop.(false, %{inputs: length(runs), output_tokens: tokens})
         if multi?, do: results, else: hd(results)
       end)
     end
@@ -831,37 +883,46 @@ defmodule Transmuter.Serving do
   # part of a character, and a tokenizer can add or remove the space before a word from
   # the tokens around it. A newline or a CJK character ends a chunk at once, and the
   # pending tokens start again after a newline.
-  def stream_text(stream, tokenizer, summary, {done?, logprobs?}) do
-    state = %{ids: [], logprobs: [], count: 0, sent: 0, finished?: false}
+  # `finish` gets the output tokens and the monotonic time of the first token when the stream
+  # ends or halts.
+  def stream_text(stream, tokenizer, summary, {done?, logprobs?}, finish \\ fn _ -> :ok end) do
+    state = %{ids: [], logprobs: [], count: 0, sent: 0, finished?: false, first: nil}
     logprob = if logprobs?, do: &[Nx.to_number(&1.logprob[0])], else: fn _event -> [] end
 
-    Stream.transform(stream, state, fn
-      _event, state = %{finished?: true} ->
-        {:halt, state}
+    Stream.transform(
+      stream,
+      fn -> state end,
+      fn
+        _event, state = %{finished?: true} ->
+          {:halt, state}
 
-      {:batch, _outputs, _metadata}, state ->
-        {:halt, state}
+        {:batch, _outputs, _metadata}, state ->
+          {:halt, state}
 
-      {:token, event = %{token: token, finished?: finished?}}, state ->
-        token = Nx.to_number(token[0])
-        finished? = Nx.to_number(finished?[0]) == 1
+        {:token, event = %{token: token, finished?: finished?}}, state ->
+          token = Nx.to_number(token[0])
+          finished? = Nx.to_number(finished?[0]) == 1
 
-        state =
-          if token < 0 do
-            state
-          else
-            logprobs = logprob.(event) ++ state.logprobs
-            %{state | ids: state.ids ++ [token], logprobs: logprobs, count: state.count + 1}
-          end
+          state =
+            if token < 0 do
+              state
+            else
+              logprobs = logprob.(event) ++ state.logprobs
+              first = state.first || System.monotonic_time()
+              count = state.count + 1
+              %{state | ids: state.ids ++ [token], logprobs: logprobs, count: count, first: first}
+            end
 
-        text = tokenizer |> Tokenizer.decode(state.ids) |> binary_slice(state.sent..-1//1)
-        {chunk, state} = chunk(text, finished?, state)
+          text = tokenizer |> Tokenizer.decode(state.ids) |> binary_slice(state.sent..-1//1)
+          {chunk, state} = chunk(text, finished?, state)
 
-        done =
-          if finished? and done?, do: [{:done, done(summary, state, logprobs?)}], else: []
+          done =
+            if finished? and done?, do: [{:done, done(summary, state, logprobs?)}], else: []
 
-        {Enum.reject([chunk], &(&1 == "")) ++ done, %{state | finished?: finished?}}
-    end)
+          {Enum.reject([chunk], &(&1 == "")) ++ done, %{state | finished?: finished?}}
+      end,
+      fn state -> finish.(%{output_tokens: state.count, first_token_at: state.first}) end
+    )
   end
 
   defp done(summary, state, logprobs?) do

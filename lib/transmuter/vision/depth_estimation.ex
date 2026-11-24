@@ -49,6 +49,7 @@ defmodule Transmuter.Vision.DepthEstimation do
     end
 
     task = %{
+      source: source,
       validate: &Featurizer.tensor/1,
       preprocess: preprocess,
       init: init,

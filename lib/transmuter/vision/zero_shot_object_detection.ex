@@ -125,6 +125,7 @@ defmodule Transmuter.Vision.ZeroShotObjectDetection do
 
     Serving.each(
       %{
+        source: model[:source],
         validate: &Featurizer.tensor/1,
         preprocess: preprocess,
         init: init,

@@ -54,6 +54,7 @@ defmodule Transmuter.Vision.ImageToImage do
     end
 
     task = %{
+      source: source,
       validate: &Featurizer.tensor/1,
       preprocess: preprocess,
       init: init,

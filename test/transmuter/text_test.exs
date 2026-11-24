@@ -482,17 +482,49 @@ defmodule Transmuter.TextTest do
     %{results: [%{text: text, token_summary: summary}]} =
       Nx.Serving.run(Transmuter.Text.generation(repo, opts), chat)
 
-    events =
-      repo
-      |> Transmuter.Text.generation([stream: true, stream_done: true] ++ opts)
-      |> Nx.Serving.run(chat)
-      |> Enum.to_list()
+    serving = Transmuter.Text.generation(repo, [stream: true, stream_done: true] ++ opts)
+
+    {events, [request]} =
+      request_events(fn -> serving |> Nx.Serving.run(chat) |> Enum.to_list() end)
 
     {chunks, [{:done, %{token_summary: streamed_summary}}]} = Enum.split(events, -1)
     assert text =~ "景谊"
     assert Enum.join(chunks) == text
     refute Enum.any?(chunks, &String.contains?(&1, "�"))
     assert streamed_summary == summary
+
+    # The request event of the stream comes when the stream ends, with its tokens.
+    {:hf, name} = repo
+    assert {measurements, %{stream: true, source: {:hf, ^name, _file}}} = request
+    assert measurements.output_tokens == summary.output
+    assert measurements.time_to_first_token in 1..measurements.duration
+  end
+
+  # The [:transmuter, :serving, :request, :stop] events of this process while `fun` runs.
+  defp request_events(fun) do
+    parent = self()
+    id = make_ref()
+
+    :telemetry.attach(
+      id,
+      [:transmuter, :serving, :request, :stop],
+      fn _event, measurements, metadata, _config ->
+        if self() == parent, do: send(parent, {id, {measurements, metadata}})
+      end,
+      nil
+    )
+
+    result = fun.()
+    :telemetry.detach(id)
+    {result, receive_all(id)}
+  end
+
+  defp receive_all(id) do
+    receive do
+      {^id, event} -> [event | receive_all(id)]
+    after
+      0 -> []
+    end
   end
 
   @tag ci_partition: 14
@@ -830,16 +862,49 @@ defmodule Transmuter.TextServingTest do
     start_supervised!({Nx.Serving, serving: serving, name: name, batch_timeout: 20})
 
     texts = for i <- 1..8, do: String.duplicate("word #{i} ", i * 4)
+    id = make_ref()
+    events = [[:transmuter, :serving, :batch, :stop], [:transmuter, :serving, :request, :stop]]
+
+    :telemetry.attach_many(
+      id,
+      events,
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {id, event, measurements, metadata})
+      end,
+      nil
+    )
 
     batched =
       texts
       |> Task.async_stream(&Nx.Serving.batched_run(name, &1))
       |> Enum.map(fn {:ok, %{embedding: embedding}} -> embedding end)
 
+    :telemetry.detach(id)
     assert compiles() == 2
+
+    # The batches hold the 8 rows of the 8 requests, and the batch size of the model is 4.
+    source = {:hf, "Xenova/all-MiniLM-L6-v2", "onnx/model.onnx"}
+    received = received(id)
+    batches = for {[_, _, :batch, _], m, %{source: ^source}} <- received, do: m
+
+    requests =
+      for {[_, _, :request, _], m, %{source: ^source, stream: false}} <- received, do: m
+
+    assert Enum.sum(Enum.map(batches, & &1.batch_size)) == 8
+    assert Enum.all?(batches, &(&1.padded_size == 4 and &1.batch_size in 1..4))
+    assert length(requests) == 8
+    assert Enum.all?(requests, &(&1.inputs == 1 and &1.duration > 0))
 
     for {text, embedding} <- Enum.zip(texts, batched) do
       assert_all_close(embedding, Nx.Serving.run(serving, text).embedding)
+    end
+  end
+
+  defp received(id) do
+    receive do
+      {^id, event, measurements, metadata} -> [{event, measurements, metadata} | received(id)]
+    after
+      0 -> []
     end
   end
 

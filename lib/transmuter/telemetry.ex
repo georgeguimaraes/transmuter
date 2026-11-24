@@ -146,6 +146,27 @@ defmodule Transmuter.Telemetry do
 
   `:wait` and `:queue_wait` are the time from the start of the request to the start of its preparation, so the time that the request waited for the requests before it in the worker.
 
+  ### Serving events
+
+  The `Nx.Serving` of a task, such as `Transmuter.Text.text_embedding/2`, emits these events. `:source` in the metadata is the source of the model of the task.
+
+    * `[:transmuter, :serving, :batch, :start]` - a batch of the serving starts to run.
+      * Metadata: `%{source: term, batch_key: term}`
+
+    * `[:transmuter, :serving, :batch, :stop]` - the batch is done, and its outputs are on the host.
+      * Measurements: `%{duration: integer, monotonic_time: integer, batch_size: integer, padded_size: integer}`
+      * Metadata: `%{source: term, batch_key: term}`
+
+    * `[:transmuter, :serving, :request, :stop]` - a call of `Nx.Serving.run/2` or `Nx.Serving.batched_run/2` returns its result. For a serving with `stream: true`, the event comes when the stream ends or halts.
+      * Measurements: `%{duration: integer, monotonic_time: integer, inputs: integer, output_tokens: integer, time_to_first_token: integer}`
+      * Metadata: `%{source: term, stream: boolean}`
+
+  `:batch_size` is the number of rows of the batch, and `:padded_size` the batch size of the compiled model, so `:batch_size` divided by `:padded_size` shows how full the batches are. `:batch_key` is the key of the batch, such as the sequence length. The batch function copies its outputs to the host, so the duration of a batch includes the time on the device.
+
+  The duration of a request is the time from the start of the client preprocessing to the result, with the wait for a batch. `:inputs` is the number of inputs of the call. A generation serving adds `:output_tokens`, the tokens of all rows of the call. A stream has `:output_tokens` and `:time_to_first_token`, and no `:inputs`.
+
+  `Nx.Serving` emits its own events too: `[:nx, :serving, :execute, :*]`, `[:nx, :serving, :preprocessing, :*]` and `[:nx, :serving, :postprocessing, :*]`. Their `:module` is `Transmuter.Serving` for all tasks, and the metadata of the preprocessing events holds the input of the call, such as the text of a user. Do not log that metadata.
+
   ### Graph break events
 
   A compiled function keeps a cache of compiled segments. The cache key is the position where the segment starts, the shapes and types of the segment arguments, and the values of the static values that the segment reads, such as static inputs. Each position keeps the `:cache_size` most recently used segments.

@@ -77,6 +77,7 @@ defmodule Transmuter.Audio.TextToSpeech do
     postprocess = fn %{"audio" => audio} -> %{audio: audio, sampling_rate: rate} end
 
     task = %{
+      source: source,
       validate: &validate(&1, opts, speaker),
       preprocess: preprocess,
       init: init,

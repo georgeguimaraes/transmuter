@@ -89,6 +89,7 @@ defmodule Transmuter.Vision.MaskGeneration do
 
     Serving.each(
       %{
+        source: source,
         validate: &validate(&1, boxes?),
         preprocess: preprocess,
         init: init,
