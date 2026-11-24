@@ -1,0 +1,157 @@
+[
+ {
+  "repo": "onnx-community/Kokoro-82M-v1.0-ONNX",
+  "check": "Speech for inputs of up to 505 phonemes. With the `atan2` fix of the example, the spectrum matches PyTorch"
+ },
+ {
+  "repo": "onnx-community/grounding-dino-tiny-ONNX",
+  "check": "The same labels and number of detections on `test/fixtures/cats.png`, with scores within 0.001"
+ },
+ {
+  "model": "[MMS-TTS English](https://huggingface.co/Xenova/mms-tts-eng)",
+  "task": "text-to-speech",
+  "check": "With the random values of ONNX Runtime, the same audio length and a waveform within 6e-5. Without noise, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4"
+ },
+ {
+  "model": "[SpeechT5](https://huggingface.co/Xenova/speecht5_tts)",
+  "task": "text-to-speech",
+  "check": "With a decoder dropout that keeps all values, `text_to_speech` gives the audio length of PyTorch and a waveform within 1e-4"
+ },
+ {
+  "model": "[SAM 2.1 tiny](https://huggingface.co/onnx-community/sam2.1-hiera-tiny-ONNX)",
+  "task": "mask-generation",
+  "check": "The same masks (IoU 1.0) for 1 point, 3 points, a box, and a box with a point"
+ },
+ {
+  "repo": "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX",
+  "check": "`generation` gives the 16 greedy tokens of ONNX Runtime on the q4 export for a chat"
+ },
+ {
+  "repo": "google/bigbird-roberta-base",
+  "check": "`fill_mask` gives the top 5 tokens of ONNX Runtime, with scores within 1e-5, for 9 and 1809 tokens.",
+  "name": "BigBird RoBERTa base",
+  "note": "The text of 1809 tokens needs `compile: [sequence_length: 2048]`, because the default lengths stop at 512. The export has full attention. Above 704 tokens, Python uses block sparse attention and gives other tokens"
+ },
+ {
+  "repo": "onnx-community/sam3-tracker-ONNX",
+  "check": "`mask_generation` gives the masks of ONNX Runtime with the processor of Python transformers 5, for 1 point, 3 points, a box, and a box with a point"
+ },
+ {
+  "model": "[Moonshine base](https://huggingface.co/onnx-community/moonshine-base-ONNX)",
+  "task": "automatic-speech-recognition",
+  "check": "The same tokens for 2 s, 6 s and 15 s of speech"
+ },
+ {
+  "model": "[Parakeet TDT 110M](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000) (sherpa-onnx export)",
+  "task": "automatic-speech-recognition",
+  "check": "The same transcripts for 2 s, 6 s and 15 s of speech, with the encoder, the LSTM decoder and the joiner in Transmuter"
+ },
+ {
+  "model": "[wav2vec2 base 960h](https://huggingface.co/Xenova/wav2vec2-base-960h)",
+  "task": "automatic-speech-recognition",
+  "check": "The same CTC transcripts for 2 s, 6 s and 15 s of speech"
+ },
+ {
+  "model": "[Piper en_US lessac medium](https://huggingface.co/rhasspy/piper-voices)",
+  "task": "text-to-speech",
+  "check": "The same audio length and a waveform within 1.3e-5, with the noise scales at 0"
+ },
+ {
+  "model": "[Florence-2 base](https://huggingface.co/onnx-community/Florence-2-base-ft)",
+  "task": "image-text-to-text",
+  "check": "`image_to_text` gives the tokens of the beam search of Python transformers on the image features of the export, for 6 tasks. The vision encoder of the export differs from PyTorch, see [The Florence-2 vision encoder](#the-florence-2-vision-encoder)"
+ },
+ {
+  "model": "[SmolVLM 256M](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct)",
+  "task": "image-text-to-text",
+  "check": "The same 100 tokens for an image with 13 tiles"
+ },
+ {
+  "repo": "onnx-community/embeddinggemma-300m-ONNX",
+  "check": "`text_embedding` within 9.3e-7 of ONNX Runtime for 9 and 543 tokens. The export attends to all tokens, but the model has a sliding window of 512 tokens. So a text of more than 512 tokens differs from sentence-transformers (cosine 0.983 at 543 tokens), and a short text differs by up to 5.6e-4"
+ },
+ {
+  "model": "[Qwen2-VL 2B](https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct)",
+  "task": "image-text-to-text",
+  "check": "With the vision features of ONNX Runtime, the q4 decoder gives the same 60 tokens for two images of different sizes.",
+  "name": "Qwen2-VL 2B",
+  "note": "The fp32 vision encoder is within 2e-5. With the fp32 vision encoder, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a chat without images"
+ },
+ {
+  "model": "[Qwen2.5-VL 3B](https://huggingface.co/onnx-community/Qwen2.5-VL-3B-Instruct-ONNX)",
+  "task": "image-text-to-text",
+  "check": "The processor gives the patches, the prompt and the 3-D positions of `Qwen2VLImageProcessor` and `Qwen2_5_VLProcessor` for a wide and a tall image.",
+  "name": "Qwen2.5-VL 3B",
+  "note": "The fp32 vision encoder, with the window attention of the export, is within 2.7e-3 of ONNX Runtime on the features of an image of 396 patches, where the largest feature is 51.8 and EMLX and EXLA differ from each other by 9.1e-4. With the fp32 vision encoder, the q4 embeddings and `repetition_penalty: 1.0` (`generation_config.json` sets 1.05), `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a chat without images, and the first 9 tokens for a chat with both images, whose 10th token is a near tie in ONNX Runtime (a margin of 0.028 in the logits). The vision encoder of the export attends across the images of one call in its layers with full attention, so each image runs alone, as in PyTorch"
+ },
+ {
+  "repo": "onnx-community/Qwen3-VL-2B-Instruct-ONNX",
+  "check": "The processor gives the patches of `Qwen2VLImageProcessorFast` within 1e-4 on 6 values and on the mean absolute value.",
+  "name": "Qwen3-VL 2B",
+  "note": "Two of the values change with the weights of Pillow. It also gives the prompt and the 3-D positions of transformers. With the fp32 vision encoder and the q4 embeddings, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image, a chat with both images and a chat without images. The export has no deepstack features, so the text can differ from the PyTorch model"
+ },
+ {
+  "repo": "mistralai/Ministral-3-3B-Instruct-2512-ONNX",
+  "check": "The processor gives the pixel values and the prompt of `PixtralImageProcessorFast` and `PixtralProcessor` for 3 image sizes.",
+  "name": "Ministral 3 3B",
+  "note": "With the q4 files, `image_text_to_text` gives the greedy text of ONNX Runtime for a chat with an image and a text chat. The q4 vision encoder at 1540x1540 (12100 patches) is within 3.9e-5 of ONNX Runtime. Its coverage case takes 27 s with EMLX on the GPU of an Apple M2 Pro, with the load and the compilation"
+ },
+ {
+  "repo": "onnx-community/gemma-3-4b-it-ONNX",
+  "check": "The processor gives the pixel values and the prompt of `Gemma3ImageProcessor` and `Gemma3Processor` for a wide image, a tall image and two images.",
+  "name": "Gemma 3 4B",
+  "note": "With the default q4 and 8-bit files, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a text chat, alone and in a batch. The q4 vision encoder at 896x896 is within 3.8e-4 (largest value 31.3) and the q4 decoder within 9.5e-3 on the logits (largest value 28.2). The decoder of the export attends causally over the image tokens, so the text can differ from the PyTorch model, which attends in both directions inside an image"
+ },
+ {
+  "model": "[LLaVA-Interleave 0.5B](https://huggingface.co/llava-hf/llava-interleave-qwen-0.5b-hf)",
+  "task": "image-text-to-text",
+  "check": "The processor gives the pixel values and the prompt of `SiglipImageProcessor` and `LlavaProcessor` for a wide and a tall image, and those of `CLIPImageProcessor` for the tiny export.",
+  "name": "LLaVA-Interleave 0.5B",
+  "note": "With the default q4 and 8-bit files, `image_text_to_text` gives the greedy text of ONNX Runtime, up to 24 tokens, for a wide image, a tall image and a text chat, alone and in a batch"
+ },
+ {
+  "model": "[InsightFace buffalo_l](https://huggingface.co/WePrompt/buffalo_l)",
+  "task": "face-recognition",
+  "check": "SCRFD detection within 2.7e-5, and ArcFace embeddings with a cosine similarity of 1.0 to ONNX Runtime"
+ },
+ {
+  "model": "[RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR v4)",
+  "task": "image-to-text",
+  "check": "The same text for three lines of rendered text, after detection, cropping and recognition"
+ },
+ {
+  "model": "[Real-ESRGAN x4](https://huggingface.co/imgdesignart/realesrgan-x4-onnx)",
+  "task": "image-to-image",
+  "check": "The upscaled image within 1.3e-5"
+ },
+ {
+  "model": "[SD-Turbo](https://huggingface.co/Heliosoph/sd-turbo-onnx)",
+  "task": "text-to-image",
+  "check": "The UNet within 2e-6 and the text encoder within 7.6e-5, then 4-step images"
+ },
+ {
+  "model": "[Chronos-Bolt tiny](https://huggingface.co/bakshinghampalace/chronos-bolt-tiny-onnx)",
+  "task": "time-series-forecasting",
+  "check": "The quantile forecasts within 1.2e-6"
+ },
+ {
+  "model": "Qwen3-0.6B FP8, exported with FLOAT8E4M3FN weights",
+  "task": "text-generation",
+  "check": "The same 30 tokens, with logits within 4.5e-5"
+ },
+ {
+  "model": "Qwen3-0.6B with YaRN rope scaling, exported",
+  "task": "text-generation",
+  "check": "The same 30 tokens, compiled and without compilation"
+ },
+ {
+  "model": "FaceNet (InceptionResnetV1), exported",
+  "task": "face-recognition",
+  "check": "Embeddings within 1e-7"
+ },
+ {
+  "model": "ControlNet scribble and the SD 1.5 UNet with ControlNet inputs, exported",
+  "task": "text-to-image",
+  "check": "ControlNet residuals within 3.8e-5, then a scribble-to-image run"
+ }
+]

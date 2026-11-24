@@ -1,0 +1,1419 @@
+[
+ {
+  "repo": "answerdotai/answerai-colbert-small-v1",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "33.2M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Carve/LaMa-ONNX",
+  "task": "inpainting",
+  "exported": false,
+  "parameters": "51M",
+  "files": [
+   "lama_fp32"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "facebook/contriever",
+  "task": "feature-extraction",
+  "exported": true,
+  "parameters": "109M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "google/bigbird-roberta-base",
+  "task": "fill-mask",
+  "exported": true,
+  "parameters": "166M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "135M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_q4",
+   "model_q4f16",
+   "model_quantized"
+  ],
+  "result": "model, model_q4 match. model_fp16, model_q4f16, model_quantized within noise"
+ },
+ {
+  "repo": "HuggingFaceTB/SmolLM2-360M-Instruct",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "362M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "HuggingFaceTB/SmolLM3-3B-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "3.08B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "jinaai/jina-embeddings-v2-small-en",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "32.4M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "microsoft/markuplm-base",
+  "task": "feature-extraction",
+  "exported": true,
+  "parameters": "133M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "microsoft/mdeberta-v3-base",
+  "task": "fill-mask",
+  "exported": true,
+  "parameters": "472M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "mistralai/Ministral-3-3B-Instruct-2512-ONNX",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "4.29B",
+  "files": [
+   "decoder_model_merged_q4",
+   "embed_tokens_q4",
+   "vision_encoder_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "nomic-ai/nomic-embed-text-v1.5",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "137M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Apertus-v1.1-0.5B-Instruct-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "573M",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Baguettotron-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "321M",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.79B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/depth-anything-v2-base",
+  "task": "depth-estimation",
+  "exported": false,
+  "parameters": "97.2M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/depth-anything-v2-small",
+  "task": "depth-estimation",
+  "exported": false,
+  "parameters": "24.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/distilbert-multilingual-toxicity-classifier-ONNX",
+  "task": "text-classification",
+  "exported": false,
+  "parameters": "135M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/embeddinggemma-300m-ONNX",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "309M",
+  "files": [
+   "model",
+   "model_no_gather_q4",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Falcon3-1B-Instruct",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.67B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/gemma-3-1b-it-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.32B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/gemma-3-270m-it-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "453M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "model, model_q4, model_quantized match. model_fp16 within noise"
+ },
+ {
+  "repo": "onnx-community/gemma-3-4b-it-ONNX",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "4.3B",
+  "files": [
+   "decoder_model_merged_q4",
+   "embed_tokens_quantized",
+   "vision_encoder_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/gemma-4-E2B-it-ONNX",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "5.64B",
+  "files": [
+   "audio_encoder_q4",
+   "decoder_model_merged_q4",
+   "embed_tokens_q4",
+   "vision_encoder"
+  ],
+  "result": "audio_encoder_q4, embed_tokens_q4, vision_encoder match. decoder_model_merged_q4 differ",
+  "difference": "the-gemma-4-e2b-decoder"
+ },
+ {
+  "repo": "onnx-community/gliner_small-v2.1",
+  "task": "token-classification",
+  "exported": false,
+  "parameters": "153M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/granite-4.0-h-1b-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.97B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/granite-4.0-h-350m-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "490M",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/granite-timeseries-patchtsmixer",
+  "task": "time-series-forecasting",
+  "exported": false,
+  "parameters": "196K",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/granite-timeseries-patchtst",
+  "task": "time-series-forecasting",
+  "exported": false,
+  "parameters": "616K",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/grounding-dino-tiny-ONNX",
+  "task": "zero-shot-object-detection",
+  "exported": false,
+  "parameters": "179M",
+  "files": [
+   "model"
+  ],
+  "result": "differs",
+  "difference": "grounding-dino"
+ },
+ {
+  "repo": "onnx-community/Kokoro-82M-v1.0-ONNX",
+  "task": "text-to-speech",
+  "exported": false,
+  "parameters": "81.2M",
+  "files": [
+   "model"
+  ],
+  "result": "differs",
+  "difference": "kokoro"
+ },
+ {
+  "repo": "onnx-community/LFM2-350M-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "430M",
+  "files": [
+   "model",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/LFM2-8B-A1B-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "4.85B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Llama-3.2-1B-Instruct-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.24B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/manga-ocr-base-ONNX",
+  "task": "image-to-text",
+  "exported": false,
+  "parameters": "115M",
+  "files": [
+   "decoder_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/MobileLLM-R1-950M-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "952M",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/ModernBERT-base-nli-ONNX",
+  "task": "text-classification",
+  "exported": false,
+  "parameters": "150M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/ormbg-ONNX",
+  "task": "image-segmentation",
+  "exported": false,
+  "parameters": "44M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/paraphrase-multilingual-MiniLM-L12-v2-ONNX",
+  "task": "sentence-similarity",
+  "exported": false,
+  "parameters": "118M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Phi-3.5-mini-instruct-onnx-web",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "3.83B",
+  "files": [
+   "model_q4f16"
+  ],
+  "result": "within noise"
+ },
+ {
+  "repo": "onnx-community/Phi-4-mini-instruct-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "4.46B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Qwen2.5-0.5B-Instruct",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "498M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Qwen3-0.6B-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "601M",
+  "files": [
+   "model",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "model, model_q4 match. model_quantized within noise"
+ },
+ {
+  "repo": "onnx-community/Qwen3-1.7B-ONNX",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.73B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "600M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/Qwen3-VL-2B-Instruct-ONNX",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "2.37B",
+  "files": [
+   "decoder_model_merged_q4",
+   "embed_tokens_q4",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/rfdetr_nano-ONNX",
+  "task": "object-detection",
+  "exported": false,
+  "parameters": "26.9M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/roberta-base-squad2-ONNX",
+  "task": "question-answering",
+  "exported": false,
+  "parameters": "124M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/ruri-v3-30m-ONNX",
+  "task": "sentence-similarity",
+  "exported": false,
+  "parameters": "36.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/sam3-tracker-ONNX",
+  "task": "mask-generation",
+  "exported": false,
+  "parameters": "473M",
+  "files": [
+   "prompt_encoder_mask_decoder",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/siglip2-base-patch16-224-ONNX",
+  "task": "zero-shot-image-classification",
+  "exported": false,
+  "parameters": "375M",
+  "files": [
+   "model",
+   "text_model",
+   "vision_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/silero-vad",
+  "task": "voice-activity-detection",
+  "exported": false,
+  "parameters": "545K",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/smart-turn-v3-ONNX",
+  "task": "voice-activity-detection",
+  "exported": false,
+  "parameters": "8M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/stable-diffusion-v1-5-ONNX",
+  "task": "text-to-image",
+  "exported": false,
+  "parameters": "1.07B",
+  "files": [
+   "text_encoder/model",
+   "unet/model",
+   "vae_decoder/model",
+   "vae_encoder/model"
+  ],
+  "result": "text_encoder/model, unet/model, vae_decoder/model match. vae_encoder/model random"
+ },
+ {
+  "repo": "onnx-community/Text-Summarizer-t5-small-ONNX",
+  "task": "summarization",
+  "exported": false,
+  "parameters": "93.4M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/text_summarization-ONNX",
+  "task": "summarization",
+  "exported": false,
+  "parameters": "77M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/timesformer-base-finetuned-k400",
+  "task": "video-classification",
+  "exported": false,
+  "parameters": "122M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/USER2-small-ONNX",
+  "task": "sentence-similarity",
+  "exported": false,
+  "parameters": "34.4M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/vit-base-violence-detection-ONNX",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "85.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/vitpose-base-simple",
+  "task": "keypoint-detection",
+  "exported": false,
+  "parameters": "85.9M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/wav2vec2-base-Speech_Emotion_Recognition-ONNX",
+  "task": "audio-classification",
+  "exported": false,
+  "parameters": "94.6M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-community/whisper-base",
+  "task": "automatic-speech-recognition",
+  "exported": false,
+  "parameters": "72.6M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-internal-testing/tiny-random-ApertusForCausalLM",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "4.21M",
+  "files": [
+   "model",
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "16.9M",
+  "files": [
+   "decoder_model_merged",
+   "embed_tokens",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "onnx-internal-testing/tiny-random-Qwen3MoeForCausalLM",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "11.3M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "SamLowe/roberta-base-go_emotions",
+  "task": "text-classification",
+  "exported": true,
+  "parameters": "125M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "tiny random Falcon",
+  "task": "text-generation",
+  "exported": true,
+  "parameters": "4.18M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "tiny random GPT-J",
+  "task": "text-generation",
+  "exported": true,
+  "parameters": "131K",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/all-MiniLM-L6-v2",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "22.6M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_int8",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/all-mpnet-base-v2",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "109M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/ast-finetuned-audioset-10-10-0.4593",
+  "task": "audio-classification",
+  "exported": false,
+  "parameters": "86.6M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/bert-base-multilingual-cased",
+  "task": "fill-mask",
+  "exported": false,
+  "parameters": "178M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/bert-base-multilingual-cased-ner-hrl",
+  "task": "token-classification",
+  "exported": false,
+  "parameters": "177M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/bert-base-NER",
+  "task": "token-classification",
+  "exported": false,
+  "parameters": "108M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/bert-base-uncased",
+  "task": "fill-mask",
+  "exported": false,
+  "parameters": "110M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "model, model_fp16, model_q4 match. model_quantized within noise"
+ },
+ {
+  "repo": "Xenova/bge-base-en-v1.5",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "109M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/bge-small-en-v1.5",
+  "task": "feature-extraction",
+  "exported": false,
+  "parameters": "33.2M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/chinese-clip-vit-base-patch16",
+  "task": "zero-shot-image-classification",
+  "exported": false,
+  "parameters": "188M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/depth-anything-small-hf",
+  "task": "depth-estimation",
+  "exported": false,
+  "parameters": "24.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/detr-resnet-50",
+  "task": "object-detection",
+  "exported": false,
+  "parameters": "41.7M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "model, model_q4 match. model_fp16, model_quantized within noise"
+ },
+ {
+  "repo": "Xenova/dino-vits16",
+  "task": "image-feature-extraction",
+  "exported": false,
+  "parameters": "21.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/dinov2-small",
+  "task": "image-feature-extraction",
+  "exported": false,
+  "parameters": "22.1M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/distilbert-base-cased-distilled-squad",
+  "task": "question-answering",
+  "exported": false,
+  "parameters": "65.2M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/distilbert-base-multilingual-cased-ner-hrl",
+  "task": "token-classification",
+  "exported": false,
+  "parameters": "135M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased",
+  "task": "fill-mask",
+  "exported": false,
+  "parameters": "67M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased-distilled-squad",
+  "task": "question-answering",
+  "exported": false,
+  "parameters": "66.4M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/distilbert-base-uncased-mnli",
+  "task": "zero-shot-classification",
+  "exported": false,
+  "parameters": "67M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/facial_emotions_image_detection",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "85.8M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/falcon-rw-1b",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.31B",
+  "files": [
+   "decoder_model_merged_quantized"
+  ],
+  "result": "matches ONNX Runtime on arm64, differs on x86",
+  "difference": "the-int8-export-of-falcon-rw-1b"
+ },
+ {
+  "repo": "Xenova/gpt2",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "127M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/llama2.c-stories15M",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "30.4M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/m2m100_418M",
+  "task": "translation",
+  "exported": false,
+  "parameters": "617M",
+  "files": [
+   "decoder_model_merged",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/mobilebert-uncased-mnli",
+  "task": "zero-shot-classification",
+  "exported": false,
+  "parameters": "24.6M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/mobileclip_s0",
+  "task": "zero-shot-image-classification",
+  "exported": false,
+  "parameters": "53.8M",
+  "files": [
+   "text_model",
+   "vision_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/mobileclip_s2",
+  "task": "zero-shot-image-classification",
+  "exported": false,
+  "parameters": "99.1M",
+  "files": [
+   "text_model",
+   "vision_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/modnet",
+  "task": "image-segmentation",
+  "exported": false,
+  "parameters": "6.46M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/ms-marco-MiniLM-L-6-v2",
+  "task": "text-classification",
+  "exported": false,
+  "parameters": "22.7M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/nli-deberta-v3-xsmall",
+  "task": "zero-shot-classification",
+  "exported": false,
+  "parameters": "70.8M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/nllb-200-distilled-600M",
+  "task": "translation",
+  "exported": false,
+  "parameters": "1.06B",
+  "files": [
+   "decoder_model_merged_q4",
+   "encoder_model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/opus-mt-en-ROMANCE",
+  "task": "translation",
+  "exported": false,
+  "parameters": "111M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/owlv2-base-patch16-ensemble",
+  "task": "zero-shot-object-detection",
+  "exported": false,
+  "parameters": "153M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/owlvit-base-patch32",
+  "task": "zero-shot-object-detection",
+  "exported": false,
+  "parameters": "153M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/sam-vit-base",
+  "task": "mask-generation",
+  "exported": false,
+  "parameters": "187M",
+  "files": [
+   "model",
+   "prompt_encoder_mask_decoder",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/segformer-b0-finetuned-ade-512-512",
+  "task": "image-segmentation",
+  "exported": false,
+  "parameters": "3.75M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/siglip-base-patch16-224",
+  "task": "zero-shot-image-classification",
+  "exported": false,
+  "parameters": "203M",
+  "files": [
+   "model",
+   "text_model",
+   "vision_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/slimsam-50-uniform",
+  "task": "mask-generation",
+  "exported": false,
+  "parameters": "28M",
+  "files": [
+   "prompt_encoder_mask_decoder",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/slimsam-77-uniform",
+  "task": "mask-generation",
+  "exported": false,
+  "parameters": "9.73M",
+  "files": [
+   "prompt_encoder_mask_decoder",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/slovak-gpt-j-405M",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "414M",
+  "files": [
+   "decoder_model_merged_quantized"
+  ],
+  "result": "differs: x86 saturation and a rounding tie",
+  "difference": "the-int8-export-of-slovak-gpt-j-405m"
+ },
+ {
+  "repo": "Xenova/swin-tiny-patch4-window7-224",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "28.6M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/swin2SR-classical-sr-x2-64",
+  "task": "image-to-image",
+  "exported": false,
+  "parameters": "12.1M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/swin2SR-lightweight-x2-64",
+  "task": "image-to-image",
+  "exported": false,
+  "parameters": "1.03M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+  "task": "image-to-image",
+  "exported": false,
+  "parameters": "12.1M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/tiny-random-Florence2ForConditionalGeneration",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "5.16M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "embed_tokens",
+   "encoder_model",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/tiny-random-GemmaForCausalLM",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "2.05M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/tiny-random-LlavaForConditionalGeneration",
+  "task": "image-text-to-text",
+  "exported": false,
+  "parameters": "9.44M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "embed_tokens",
+   "vision_encoder"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/tiny-random-Phi3ForCausalLM",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "2.07M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/tiny-random-RoFormerForMultipleChoice",
+  "task": "multiple-choice",
+  "exported": false,
+  "parameters": "1.64M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/TinyLlama-1.1B-Chat-v1.0",
+  "task": "text-generation",
+  "exported": false,
+  "parameters": "1.1B",
+  "files": [
+   "model_q4"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/trocr-small-handwritten",
+  "task": "image-to-text",
+  "exported": false,
+  "parameters": "61.4M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "Xenova/vit-base-patch16-224",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "86.7M",
+  "files": [
+   "model",
+   "model_fp16",
+   "model_q4",
+   "model_quantized"
+  ],
+  "result": "model, model_fp16, model_q4 match. model_quantized within noise"
+ },
+ {
+  "repo": "Xenova/whisper-tiny.en",
+  "task": "automatic-speech-recognition",
+  "exported": false,
+  "parameters": "46M",
+  "files": [
+   "decoder_model",
+   "decoder_model_merged",
+   "decoder_with_past_model",
+   "encoder_model",
+   "decoder_model_merged_fp16",
+   "decoder_model_merged_q4",
+   "decoder_model_merged_quantized",
+   "encoder_model_fp16",
+   "encoder_model_q4",
+   "encoder_model_quantized"
+  ],
+  "result": "decoder_model, decoder_model_merged, decoder_with_past_model, encoder_model, decoder_model_merged_q4, encoder_model_q4 match. decoder_model_merged_fp16, decoder_model_merged_quantized, encoder_model_fp16, encoder_model_quantized within noise"
+ },
+ {
+  "repo": "Xenova/yolos-tiny",
+  "task": "object-detection",
+  "exported": false,
+  "parameters": "6.49M",
+  "files": [
+   "model"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/bvlcalexnet-12-int8",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "61M",
+  "files": [
+   "bvlcalexnet-12-int8"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/densenet-12",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "8.15M",
+  "files": [
+   "densenet-12"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/emotion-ferplus-8",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "8.76M",
+  "files": [
+   "emotion-ferplus-8"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/FasterRCNN-10",
+  "task": "object-detection",
+  "exported": false,
+  "parameters": "41.8M",
+  "files": [
+   "FasterRCNN-10"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/FasterRCNN-12",
+  "task": "object-detection",
+  "exported": false,
+  "parameters": "44.1M",
+  "files": [
+   "FasterRCNN-12"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/googlenet-12",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "7M",
+  "files": [
+   "googlenet-12"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/inception-v1-12",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "7M",
+  "files": [
+   "inception-v1-12"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/MaskRCNN-12",
+  "task": "image-segmentation",
+  "exported": false,
+  "parameters": "44.4M",
+  "files": [
+   "MaskRCNN-12"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/vgg16-12-int8",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "138M",
+  "files": [
+   "vgg16-12-int8"
+  ],
+  "result": "matches"
+ },
+ {
+  "repo": "zoo/zfnet512-12-int8",
+  "task": "image-classification",
+  "exported": false,
+  "parameters": "87.3M",
+  "files": [
+   "zfnet512-12-int8"
+  ],
+  "result": "matches"
+ }
+]

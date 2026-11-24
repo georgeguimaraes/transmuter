@@ -1,4 +1,10 @@
-"""Print a Markdown table of the tested models. Usage: list_models.py cases_dir [cases_dir ...]"""
+"""Print the tables of the tested models for the README. Usage: list_models.py [cases_dir ...]
+
+tested_models.json keeps one entry for each model that a coverage run compared with ONNX Runtime.
+The models of the given case dirs get new entries, and the entries of the other models stay.
+end_to_end.json keeps the checks that ran a model from input to final result. A check with a
+"repo" goes in the row of that tested model. A "difference" or a "note" links to its README heading.
+"""
 import json, math, os, re, sys
 from collections import defaultdict
 
@@ -57,7 +63,7 @@ def human(n):
 
 
 RANDOM_OPS = {"RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike", "Bernoulli", "Multinomial"}
-LABELS = {"match": "match", "noise": "within noise", "random": "random", "timeout": "times out", "differs": "differ, see below"}
+LABELS = {"match": "match", "noise": "within noise", "random": "random", "timeout": "times out", "differs": "differ"}
 
 
 def outcome(meta, result):
@@ -75,9 +81,52 @@ def result(cases):
     if all(o == "match" for _, o in outcomes):
         return "matches"
     if len(outcomes) == 1:
-        return {"match": "matches", "differs": "differs, see below"}.get(outcomes[0][1], LABELS[outcomes[0][1]])
+        return {"match": "matches", "differs": "differs"}.get(outcomes[0][1], LABELS[outcomes[0][1]])
     groups = [(", ".join(f for f, o in outcomes if o == key), label) for key, label in LABELS.items()]
-    return "; ".join(f"{files} {label}" for files, label in groups if files)
+    return ". ".join(f"{files} {label}" for files, label in groups if files)
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTED = os.path.join(HERE, "tested_models.json")
+END_TO_END = os.path.join(HERE, "end_to_end.json")
+
+AREAS = [
+    ("Language models", ["text-generation"]),
+    ("Text encoders", ["feature-extraction", "sentence-similarity", "fill-mask", "text-classification",
+                       "token-classification", "question-answering", "zero-shot-classification", "multiple-choice"]),
+    ("Translation and summarization", ["translation", "summarization"]),
+    ("Speech and audio", ["automatic-speech-recognition", "text-to-speech", "audio-classification", "voice-activity-detection"]),
+    ("Vision", ["image-classification", "image-feature-extraction", "face-recognition", "object-detection", "image-segmentation",
+                "mask-generation", "depth-estimation", "keypoint-detection", "image-to-image", "inpainting"]),
+    ("Vision-language models", ["image-text-to-text", "image-to-text", "zero-shot-image-classification", "zero-shot-object-detection"]),
+    ("Image generation", ["text-to-image"]),
+    ("Time series", ["time-series-forecasting"]),
+    ("Video", ["video-classification"]),
+]
+TASK_ORDER = {task: (area, i) for area, tasks in AREAS for i, task in enumerate(tasks)}
+
+
+def entry(name, repo):
+    cases = list(repo["files"].values())
+    per_component = defaultdict(int)
+    for meta, _status in cases:
+        c = component(meta["file"])
+        per_component[c] = max(per_component[c], parameters(meta["onnx_path"]))
+    files = [stem(m["file"]) for m, _ in cases]
+    return {"repo": name, "task": repo["task"], "exported": bool(repo["exported"]),
+            "parameters": human(sum(per_component.values())), "files": files, "result": result(cases)}
+
+
+def link(entry):
+    name = entry["repo"]
+    if name.startswith("zoo/"):
+        return f"{name.removeprefix('zoo/')} (ONNX Model Zoo)"
+    text = f"[{name}](https://huggingface.co/{name})" if "/" in name else name
+    return text + (" (exported with Optimum)" if entry["exported"] else "")
+
+
+def anchor(heading):
+    return re.sub(r"[^a-z0-9 _-]", "", heading.lower()).replace(" ", "-")
 
 
 repos = {}
@@ -92,18 +141,52 @@ for cases_dir in sys.argv[1:]:
             repo = repos.setdefault(meta["repo"], {"task": meta["task"], "exported": meta.get("exported"), "files": {}})
             repo["files"][meta["file"]] = (meta, run)
 
-print("| Model | Task | Parameters | Files | Compared with ONNX Runtime |")
-print("|---|---|---|---|---|")
-for name, repo in sorted(repos.items(), key=lambda r: (r[1]["task"], r[0].lower())):
-    cases = list(repo["files"].values())
-    per_component = defaultdict(int)
-    for meta, _status in cases:
-        c = component(meta["file"])
-        per_component[c] = max(per_component[c], parameters(meta["onnx_path"]))
-    files = ", ".join(stem(m["file"]) for m, _ in cases)
-    if name.startswith("zoo/"):
-        link = f"{name.removeprefix('zoo/')} (ONNX Model Zoo)"
-    else:
-        link = f"[{name}](https://huggingface.co/{name})" if "/" in name else name
-        link += " (exported with Optimum)" if repo["exported"] else ""
-    print(f"| {link} | {repo['task']} | {human(sum(per_component.values()))} | {files} | {result(cases)} |")
+tested = {e["repo"]: e for e in json.load(open(TESTED))}
+for name, repo in repos.items():
+    old = tested.get(name, {})
+    tested[name] = entry(name, repo) | ({"difference": old["difference"]} if "difference" in old else {})
+if repos:
+    with open(TESTED, "w") as f:
+        json.dump(sorted(tested.values(), key=lambda e: e["repo"].lower()), f, indent=1)
+        f.write("\n")
+
+rows = {name: {"model": link(e), "task": e["task"], "parameters": e["parameters"], "files": ", ".join(e["files"]),
+               "tensors": e["result"] + (f", see [Known differences](#{e['difference']})" if "difference" in e else ""),
+               "end_to_end": ""} for name, e in tested.items()}
+notes = []
+for check in json.load(open(END_TO_END)):
+    row = rows[check["repo"]] if "repo" in check else rows.setdefault(check["model"], {
+        "model": check["model"], "task": check["task"], "parameters": "", "files": "", "tensors": ""})
+    row["end_to_end"] = check["check"]
+    if "note" in check:
+        row["end_to_end"] += f" See [{check['name']}](#{anchor(check['name'])})."
+        notes.append(check)
+
+print("### Tested models")
+print()
+print('"Within noise" means a precision variant that differs from ONNX Runtime by its rounding noise. '
+      '"Random" means a model that samples random values. "End to end" means a run from input to final result '
+      "that agrees with ONNX Runtime.")
+area_rows = defaultdict(list)
+for row in rows.values():
+    area, order = TASK_ORDER[row["task"]]
+    area_rows[area].append((order, row["model"].lstrip("[").lower(), row))
+for area, _tasks in AREAS:
+    group = sorted(area_rows[area], key=lambda r: r[:2])
+    print()
+    print("<details>")
+    print(f"<summary>{area}: {len(group)} model{'s' if len(group) != 1 else ''}</summary>")
+    print()
+    print("| Model | Task | Parameters | Files | Tensors against ONNX Runtime | End to end |")
+    print("|---|---|---|---|---|---|")
+    for _order, _name, r in group:
+        print(f"| {r['model']} | {r['task']} | {r['parameters']} | {r['files']} | {r['tensors']} | {r['end_to_end']} |")
+    print()
+    print("</details>")
+print()
+print("### End-to-end notes")
+for check in notes:
+    print()
+    print(f"#### {check['name']}")
+    print()
+    print(f"{check['check']} {check['note']}")
