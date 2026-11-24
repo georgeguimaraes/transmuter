@@ -91,11 +91,11 @@ defmodule Transmuter.Generation do
 
   Generation reads the logits of one position of each row, at its last token. `context/4` puts a GatherND before the lm_head, the MatMul or MatMulNBits that gives `logits`: it takes the hidden state of one position of each row, from the input `transmuter.logit_index`. So the rows of a step can end their tokens at different positions, and the lm_head computes one position for each row. A decoder that declares `num_logits_to_keep`, such as Gemma 3, gets the static input 0, all positions, and the same gather. Between the lm_head and `logits`, the graph can have only operators that act on each position alone (Cast, Identity, Tanh, and Add, Sub, Mul or Div with one input that is not static) and `If` nodes, such as the `use_cache_branch` of a merged decoder. Each branch of an `If` gets its own gather before its lm_head, so the `If` gives the same shape from each branch. Each value on the way to `logits` has no other use. At another operator, such as a Reshape or the dynamic quantization of an lm_head, the graph stays as it is, the decoder computes the logits of all positions, and the selection reads the position of each row. `Transmuter.load!/2` does not change the graph.
 
-  When requests can join a group with other rows (`:in_place` and `:append` with greedy selection or sampling, and for a merged decoder an offset for each row and, with a cross-attention cache, a cross function), a prompt runs in the steps of the other rows. This is also the path of `generate/5` and of the servings of these decoders. Each step takes a part of each prompt from its front, and the new token of each other row, which takes the logits at its own position. A step has one of five widths: 1 for new tokens, 16, 32, 64 and 512 for prompt parts, and a shorter part pads to the smallest width that holds the longest part of the step. A decoder whose short prompts run in steps of their own rows (see below) has no widths 16 and 32, because its prompts join the steps of the group only when they are long or when all new rows run together. Each step runs all rows of the group at its width, so its time grows with the width: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), a step takes 13 ms at width 1, 49 ms at 16, 88 ms at 32 and 165 ms at 64. A part takes the largest width that the longest prompt left fills and that the largest capacity holds after the longest row that has not ended, at least 64, and at most 64 when another row takes a new token. A row can end early, at an eos token or a cancel, and then a step can be wider than the steps that the admission of a request planned. A step of 64 tokens always fits the rows that the admission counted, and a wider step fits the room that is left. So the other rows wait at most one step of 64 tokens for a token, and a group has at most five step shapes for each capacity, whatever the timing of the requests (see `Transmuter.ContinuousBatching`). A prompt of 37 tokens runs in one step, and a prompt of 4000 tokens in an idle group in seven steps of 512 tokens and seven of at most 64. Against parts of each power of two, the time to the first token of one prompt alone is 0.80x for 100 tokens, 1.09x for 874 tokens and 1.18x for 4000 tokens on the GPU of a Mac, and 0.56x, 0.94x and 1.20x on CUDA, for SmolLM2-135M. In `:append`, all rows of a step write its width, so a join step of 64 tokens needs 64 free rows after the write offset, and a group can grow its buffers one capacity step earlier than with parts of each power of two. The other decoders run all prompts in parts that end all prompts in the same step, with no other rows (see "Merged decoders" and beam search).
+  When requests can join a group with other rows (`:in_place` and `:append` with greedy selection or sampling, and for a merged decoder an offset for each row and, with a cross-attention cache, a cross function), a prompt runs in the steps of the other rows. This is also the path of `generate/5` and of the servings of these decoders. Each step takes a part of each prompt from its front, and the new token of each other row, which takes the logits at its own position. A step has one of five widths: 1 for new tokens, 16, 32, 64 and 512 for prompt parts, and a shorter part pads to the smallest width that holds the longest part of the step. A decoder with ragged steps (see below) has no widths 16 and 32, because its prompts join the steps of the group only when no row takes a new token. Each step runs all rows of the group at its width, so its time grows with the width: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), a step takes 13 ms at width 1, 49 ms at 16, 88 ms at 32 and 165 ms at 64. A part takes the largest width that the longest prompt left fills and that the largest capacity holds after the longest row that has not ended, at least 64, and at most 64 when another row takes a new token. A row can end early, at an eos token or a cancel, and then a step can be wider than the steps that the admission of a request planned. A step of 64 tokens always fits the rows that the admission counted, and a wider step fits the room that is left. So the other rows wait at most one step of 64 tokens for a token, and a group has at most five step shapes for each capacity, whatever the timing of the requests (see `Transmuter.ContinuousBatching`). A prompt of 37 tokens runs in one step, and a prompt of 4000 tokens in an idle group in seven steps of 512 tokens and seven of at most 64. Against parts of each power of two, the time to the first token of one prompt alone is 0.80x for 100 tokens, 1.09x for 874 tokens and 1.18x for 4000 tokens on the GPU of a Mac, and 0.56x, 0.94x and 1.20x on CUDA, for SmolLM2-135M. In `:append`, all rows of a step write its width, so a join step of 64 tokens needs 64 free rows after the write offset, and a group can grow its buffers one capacity step earlier than with parts of each power of two. The other decoders run all prompts in parts that end all prompts in the same step, with no other rows (see "Merged decoders" and beam search).
 
-  A step of a group runs all its rows at its width, also the rows that only take a new token, so a step of a short prompt in a group of many rows costs the width for each row: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), 49 ms at width 16 against 13 ms at width 1. So in `:in_place`, unless `alone_prompts: false`, when the new requests of an admission are fewer than the rows of the group in a power of 4, each prompt of at most 511 tokens runs whole in one step of the new rows alone. That step runs in a group of a power of 4 of rows, with the stored prefix of each row as its past (see "Prefixes"), at the smallest width of 16, 64, 256 and 512 tokens that holds the rest of each prompt and its first token. Its first token is read, and the cache, the selection state and the tokens of each row move into its row of the group, which starts at the first row of the buffers. The other rows take their next token in the next step of the group. On a mix of 512 ShareGPT prompts of 20 to 512 tokens with 16 rows of Qwen3-0.6B fp16 on CUDA, the prompt steps took 22 s against 58 s as joins, and the time for each output token was 15.7 ms against 20.6 ms (p50). A longer prompt, the prompts of `:append`, whose rows share one write offset, and the prompts of a merged decoder whose rows keep their own encoder outputs run in the steps of the group as above.
+  A step of a group runs all its rows at its width, also the rows that only take a new token, so a step of a short prompt in a group of many rows costs the width for each row: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), 49 ms at width 16 against 13 ms at width 1. Ragged steps remove this cost.
 
-  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: a value with the batch of the buffers, such as one of the attention mask, may reach only the past, the lengths and the attention bias of GroupQueryAttention. A bias that mixes the rows and the tokens, such as the key-padding bias of Gemma 3, is taken for each token from its own row. The position offset of `Transmuter.Generation.MergedDecoder`, as in Apertus, has a value for each token of a ragged step when its reads line up with the tokens. Qwen3, SmolLM2, SmolVLM, Gemma 3 and Apertus pass this check.
+  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: a value with the batch of the buffers, such as one of the attention mask, may reach only the past, the lengths and the attention bias of GroupQueryAttention. A bias that mixes the rows and the tokens, such as the key-padding bias of Gemma 3, is taken for each token from its own row. The position offset of `Transmuter.Generation.MergedDecoder`, as in Apertus, has a value for each token of a ragged step when its reads line up with the tokens. Qwen3, SmolLM2, SmolVLM, Gemma 3 and Apertus pass this check, and so does each decoder in `:in_place` of the coverage tables of the README. Other decoders, and the decoders with `ragged_prompts: false`, run the prompts of new rows in joins. On a mix of 512 ShareGPT prompts with Qwen3-0.6B fp16 on CUDA (RTX 3060) and 8 decode steps for each call, ragged steps gave 18%, 26% and 36% more output tokens per second than the steps of new rows alone, with 16, 32 and 48 rows and the cuDNN attention, and 10% and 14% with 16 and 32 rows on plain EXLA.
 
   ## Decode loops
 
@@ -146,9 +146,6 @@ defmodule Transmuter.Generation do
   # group. Each step runs all rows of the group at its width, so its time grows with the
   # width: a short prompt runs in a step of about its own length, not of @join_tokens. See
   # step_width/1.
-  # The widths of the step of the prompts of new rows alone, see admit_alone/3: powers of 4 from
-  # 16, then 512, so a prompt pads to at most 4 times its tokens and few shapes compile.
-  @alone_widths [16, 64, 256, 512]
 
   @step_widths [1] ++
                  for(exponent <- 4..trunc(:math.log2(@join_tokens)), do: 2 ** exponent) ++ [512]
@@ -258,7 +255,6 @@ defmodule Transmuter.Generation do
       max_new_tokens: max_new_tokens,
       sampling?: sampling?,
       token_logprobs?: Keyword.get(opts, :token_logprobs, false),
-      alone_prompts: Keyword.get(opts, :alone_prompts, true),
       decode_steps: Keyword.get(opts, :decode_steps, 1),
       temperature: opts[:temperature] || gen["temperature"] || 1.0,
       top_k: opts[:top_k] || gen["top_k"] || 50,
@@ -323,12 +319,11 @@ defmodule Transmuter.Generation do
   defp widths(%{causal: false}), do: [1]
   defp widths(_model), do: @step_widths
 
-  # The widths of the steps of a group whose new prompts run in steps of their own rows (see
-  # admit_alone/3): a prompt joins the steps of the group only when it is longer than those
-  # steps take, or when all new rows run together, so its parts need no width below
+  # The widths of the steps of a group with ragged steps (see chunk_steps/1): a prompt joins the
+  # steps of the group only when no row takes a new token, so its parts need no width below
   # @join_tokens. The steps of the group then have fewer shapes to compile.
   defp join_widths(ctx, widths) do
-    if prompt_path(ctx) in [:ragged, :alone],
+    if prompt_path(ctx) == :ragged,
       do: Enum.reject(widths, &(&1 > 1 and &1 < @join_tokens)),
       else: widths
   end
@@ -1104,7 +1099,6 @@ defmodule Transmuter.Generation do
     |> Map.put(:reorder, state_jit(&reorder_rows/2, defn_options))
     |> Map.put(:admit_rows, state_jit(&write_admitted/3, defn_options))
     |> Map.put(:write_row, state_jit(&write_row/3, defn_options))
-    |> Map.put(:take_row, state_jit(&take_row/2, defn_options))
     |> Map.put(:widen, state_jit(&widen_rows/2, defn_options))
     |> Map.put(:prefix_in, state_jit(&prefix_in/3, defn_options))
     |> Map.put(:prefix_out, state_jit(&prefix_out/3, defn_options))
@@ -1748,11 +1742,10 @@ defmodule Transmuter.Generation do
   # number of rows is an encoder capacity avoid a copy to the host (see pad_rows/2).
   #
   # When requests can join a group with other rows (joins?/1), the prompts run in the steps
-  # of next/2, next to the new tokens of the other rows (see plan/1). In :in_place, unless
-  # `alone_prompts: false`, a prompt of fewer than 512 tokens runs here instead, in a step of the new rows
-  # alone, when they are fewer than the rows of the group (see admit_alone/3). Otherwise the
-  # prompts run here, in parts that end all prompts in the same step, and the first token of each
-  # new row is read (see prefill/4): a merged decoder runs a prompt on its branch without cache,
+  # of next/2, next to the new tokens of the other rows (see plan/4), and the admission gives
+  # no new token. Otherwise the prompts run here, in parts that end all prompts in the same
+  # step, and the first token of each new row is read (see prefill/4): a merged decoder runs a
+  # prompt on its branch without cache,
   # which no row with a cache can share, the rows of :grow need one length of the cache, and
   # the beams of all prompts start their search in the same step.
   def admit(ctx, group, requests, inputs \\ %{}) do
@@ -1767,16 +1760,8 @@ defmodule Transmuter.Generation do
     end
 
     if joins?(ctx) do
-      {alone, requests} = Enum.split_with(requests, &(inputs == %{} and alone?(ctx, &1)))
-
-      {alone, requests} =
-        if alone != [] and power_of_four(length(alone)) < length(group.done) and
-             alone_shape(ctx, padded(alone)),
-           do: {alone, requests},
-           else: {[], alone ++ requests}
-
-      group = ctx |> admit_alone(group, alone) |> then(&admit_joining(ctx, &1, requests, inputs))
-      %{group | steps: [admitted_view(group, alone)]}
+      group = admit_joining(ctx, group, requests, inputs)
+      %{group | steps: [%{view(group) | new: List.duplicate(nil, length(group.new))}]}
     else
       ctx |> prefill(group, requests, inputs) |> then(&select(ctx, &1))
     end
@@ -1815,22 +1800,10 @@ defmodule Transmuter.Generation do
     %{group | state: %{group.state | inputs: inputs, features: features, cursors: cursors}}
   end
 
-  # A request runs its whole prompt in a step of the new rows alone when its prompt and its first
-  # token fit the widest of @alone_widths, and its group runs new prompts alone (see
-  # runs_alone?/1).
-  defp alone?(ctx, request),
-    do: length(request.prompt) < List.last(@alone_widths) and prompt_path(ctx) == :alone
-
   # How the prompts of new requests run while other rows of the group take new tokens: in the
-  # ragged steps of the group (:ragged, see chunk_steps/1), in a step of the new rows alone
-  # (:alone, see admit_alone/3), or as parts in the steps of all rows (:join, see plan/4).
-  defp prompt_path(ctx) do
-    cond do
-      @chunk_row in ctx.model.inputs -> :ragged
-      runs_alone?(ctx) -> :alone
-      true -> :join
-    end
-  end
+  # ragged steps of the group (:ragged, see chunk_steps/1), or as parts in the steps of all rows
+  # (:join, see plan/4).
+  defp prompt_path(ctx), do: if(@chunk_row in ctx.model.inputs, do: :ragged, else: :join)
 
   # Unless `ragged_prompts: false`, a group in :in_place whose rows join runs the prompts of
   # new rows in ragged steps, when its graph allows them (see chunk_steps/1).
@@ -1841,145 +1814,6 @@ defmodule Transmuter.Generation do
   end
 
   defp ragged(ctx, false), do: ctx
-
-  # The groups that run new prompts in steps of their own rows: unless `alone_prompts: false`,
-  # rows that join, in :in_place, and that keep no encoder outputs of their own. The layout of the
-  # cache decides the mode. In :in_place, each row starts at the first row of the buffers, so a
-  # row of the small group moves into its row with no offset. In :append, all rows write at one shared write offset, so
-  # a moved row is a block of the capacity of the small group at that offset, and it must fit
-  # next to the valid rows of every row. A prompt of a few hundred tokens then needs, for
-  # example, 632 rows for a decoder whose static tables hold 512.
-  defp runs_alone?(ctx) do
-    Map.get(ctx, :alone_prompts, true) and joins?(ctx) and ctx.mode == :in_place and
-      not rows_keep_inputs?(ctx)
-  end
-
-  # The prompts of `requests` run in one step of a group of their own rows: a power of 4 of
-  # rows, with the stored prefix of each row as its past (see "Prefixes"), so the step runs the
-  # rest of each prompt. The step costs the tokens of the new rows, and not its width for each
-  # row of `group`. The rows after the requests repeat the last request, so the admission writes
-  # all rows of the small group. Then the rows of the requests move into their rows of `group`
-  # (see move_rows/4), each with the first token of its prompt.
-  defp admit_alone(_ctx, group, []), do: group
-
-  defp admit_alone(ctx, group, requests) do
-    rows = Enum.with_index(padded(requests), &%{&1 | row: &2})
-    count = length(rows)
-    {width, capacity} = alone_shape(ctx, rows)
-    small = admit_small(ctx, count, capacity, width, rows)
-    state = step(ctx, small.state, small.left, selection(ctx, small), width)
-
-    small =
-      select(ctx, %{small | left: List.duplicate([], count), state: %{state | features: nil}})
-
-    group = move_rows(ctx, group, small, requests)
-    finish(small)
-    group
-  end
-
-  # The requests of a small group: `requests`, then the last one again up to a power of 4.
-  defp padded(requests) do
-    count = power_of_four(length(requests))
-    requests ++ List.duplicate(List.last(requests), count - length(requests))
-  end
-
-  # The width of the step of the prompts of `requests` alone, the smallest of @alone_widths that
-  # holds the rest of each prompt after its prefix and its first token, and the capacity of the
-  # small group, the smallest of @alone_widths that also holds the longest prefix before that
-  # step, up to the largest capacity of the decoder. Nil when no width holds them.
-  defp alone_shape(ctx, requests) do
-    sizes = Enum.map(requests, &prefix_size/1)
-    rest = requests |> Enum.zip_with(sizes, &(length(&1.prompt) - &2)) |> Enum.max()
-    widths = Enum.filter(@alone_widths, &(&1 <= (ctx.max_capacity || &1)))
-
-    with width when width != nil <- width_for(rest + 1, widths),
-         capacity when capacity != nil <- width_for(Enum.max(sizes) + width, widths),
-         do: {width, capacity}
-  end
-
-  # A group of `rows` rows whose buffers have `capacity` rows, which admits `requests` for one
-  # step of `width` tokens. Its admission makes room for that step and no other (see
-  # fit_next/2), so its buffers keep that capacity.
-  defp admit_small(ctx, rows, capacity, width, requests) do
-    ctx = %{ctx | min_capacity: capacity, max_capacity: capacity}
-    ctx = %{ctx | widths: %{with_cache: [width], without_cache: [width]}}
-    admit(ctx, open(ctx, rows, capacity), requests)
-  end
-
-  # Moves the rows of `small` that ran the prompts of `requests` (row i for request i) into
-  # their rows of `group`: the cache, the selection state and the key of each row, and on the
-  # host its tokens, length, valid rows and positions. Each row starts at the first row of the
-  # buffers, so the buffers of `group` first grow when they do not hold each prompt and its
-  # first token.
-  defp move_rows(ctx, group, small, requests) do
-    group = reset_rows(group, requests)
-    room = Enum.max(Enum.take(small.state.lengths, length(requests))) + 1
-
-    group =
-      if group.state.capacity < room,
-        do: grow(ctx, group, fitting(ctx, room, 0)),
-        else: group
-
-    names = [:seen, :history, :count, :prompt_count, :budget]
-
-    own =
-      Map.take(group.state, names) |> Map.put(:keys, group.keys) |> Map.merge(group.state.cache)
-
-    values =
-      Map.take(small.state, names) |> Map.put(:keys, small.keys) |> Map.merge(small.state.cache)
-
-    # One row in each write, so the writes compile for each capacity of `small` and of `group`,
-    # and not for each count of rows.
-    written =
-      requests
-      |> Enum.with_index()
-      |> Enum.reduce(own, fn {request, i}, own ->
-        row = ctx.take_row.(values, Nx.tensor(i, type: :s32, backend: Nx.BinaryBackend))
-        target = Nx.tensor(request.row, backend: Nx.BinaryBackend)
-        written = ctx.write_row.(Nx.donatable(own), target, row)
-        release(Map.values(own) ++ Map.values(row), Map.values(written))
-        written
-      end)
-
-    {keys, written} = Map.pop!(written, :keys)
-    {cache, written} = Map.split(written, Map.keys(group.state.cache))
-    state = %{Map.merge(group.state, written) | cache: cache}
-
-    requests
-    |> Enum.with_index()
-    |> Enum.reduce(%{group | keys: keys, state: state}, fn {request, i}, group ->
-      put_row(group, request.row, small, i)
-    end)
-  end
-
-  # Row `row` of `group` takes the host state of row `i` of `small`.
-  defp put_row(group, row, small, i) do
-    take = &Enum.at(&1, i)
-
-    %{
-      group
-      | ids: List.replace_at(group.ids, row, take.(small.ids)),
-        logprobs: List.replace_at(group.logprobs, row, take.(small.logprobs)),
-        new: List.replace_at(group.new, row, take.(small.new)),
-        done: List.replace_at(group.done, row, take.(small.done)),
-        left: List.replace_at(group.left, row, []),
-        state: %{
-          group.state
-          | lengths: List.replace_at(group.state.lengths, row, take.(small.state.lengths)),
-            valid: List.replace_at(group.state.valid, row, take.(small.state.valid)),
-            positions: List.replace_at(group.state.positions, row, take.(small.state.positions)),
-            cursors: List.replace_at(group.state.cursors, row, {0, 0})
-        }
-    }
-  end
-
-  # The view of the steps of an admission: the first tokens of the rows of `requests`, whose
-  # prompts ran in admit_alone/3. The other rows have no new token in it.
-  defp admitted_view(group, requests) do
-    rows = MapSet.new(requests, & &1.row)
-    new = for {token, row} <- Enum.with_index(group.new), do: if(row in rows, do: token)
-    %{view(group) | new: new}
-  end
 
   @doc false
   # Runs the step of the new token of each row that has not ended, and reads its next token.
@@ -2184,8 +2018,7 @@ defmodule Transmuter.Generation do
   # and shapes, and the steps also run at each encoder capacity of encoder_capacities/2, with
   # the cross function, the writes of a row and each move between neighbour encoder capacities.
   # With `prefixes: true`, it also compiles the copies of each size of a stored prefix into the
-  # buffers and into the store at each capacity, and the steps of new prompts alone after a
-  # prefix (see "Prefixes").
+  # buffers and into the store at each capacity (see "Prefixes").
   # A shape that it misses compiles on its first step, so that step is slower and gives the
   # same result. Returns the number of step shapes.
   def compile_steps(ctx, rows, inputs \\ %{}, opts \\ []) do
@@ -2222,7 +2055,7 @@ defmodule Transmuter.Generation do
     run_items(ctx, :run, step_items)
     run_items(ctx, :run, chunk_items(ctx, rows, capacities))
 
-    compile_alone(ctx, rows, capacities, opts[:prefixes])
+    if opts[:prefixes], do: compile_prefixes(ctx, rows, capacities)
 
     # A later request with more rows of the encoder, which grows the encoder capacity to the
     # next one, and a request that joins a row that runs, which runs the cross function and
@@ -2287,30 +2120,8 @@ defmodule Transmuter.Generation do
     end
   end
 
-  # The prompts that run in a step of their own rows (see admit_alone/3): each count of rows and
-  # each width of that step, and their moves into a group at each capacity, and with
-  # `prefixes?` the copies and the steps of stored prefixes.
-  defp compile_alone(ctx, rows, capacities, prefixes?) do
-    items =
-      for capacity <- capacities, count <- alone_counts(ctx, rows), size <- alone_sizes() do
-        fn ctx ->
-          requests =
-            for row <- 0..(count - 1),
-                do: %{row: row, prompt: List.duplicate(0, size), seed: 0, budget: 2}
-
-          finish(admit(ctx, open(ctx, rows, capacity), requests))
-        end
-      end
-
-    run_items(ctx, :run, items)
-
-    if prefixes?, do: compile_prefixes(ctx, rows, capacities)
-  end
-
   # The copies of each size of a stored prefix into the buffers and into the store at each
-  # capacity, and each step of new prompts alone after prefixes: for each count of rows and
-  # each width of that step, each capacity of the small group above the width that a size of
-  # prefix gives (see alone_shape/2).
+  # capacity. The steps after a prefix have the shapes of the other steps.
   defp compile_prefixes(ctx, rows, capacities) do
     store = prefix_store(ctx, 1, Enum.max(ctx.widths.with_cache))
 
@@ -2326,52 +2137,8 @@ defmodule Transmuter.Generation do
       finish(group)
     end
 
-    shapes =
-      for count <- alone_counts(ctx, rows),
-          width <- @alone_widths,
-          size <- sizes,
-          requests = for(row <- 0..(count - 1), do: prefixed_request(row, store, size, width)),
-          {^width, capacity} <- [alone_shape(ctx, requests)],
-          capacity > width,
-          uniq: true,
-          do: {count, width, capacity, size}
-
-    items =
-      for capacity <- capacities,
-          {count, width, _small, size} <- Enum.uniq_by(shapes, &Tuple.delete_at(&1, 3)) do
-        fn ctx ->
-          requests = for row <- 0..(count - 1), do: prefixed_request(row, store, size, width)
-          finish(admit(ctx, open(ctx, rows, capacity), requests))
-        end
-      end
-
-    run_items(ctx, :run, items)
-
     release(Map.values(store), [])
   end
-
-  # A request whose prompt has a stored prefix of `size` tokens and the shortest rest of a step
-  # of `width` tokens (see alone_sizes/0).
-  defp prefixed_request(row, store, size, width) do
-    rest = Enum.at(alone_sizes(), Enum.find_index(@alone_widths, &(&1 == width)))
-    prompt = List.duplicate(0, size + rest)
-    %{row: row, prompt: prompt, seed: 0, budget: 2, prefix: %{store: store, slot: 0, size: size}}
-  end
-
-  # The counts of rows of a step of new prompts alone, the powers of 4 below the rows of a group
-  # (see admit/4).
-  defp alone_counts(ctx, rows) do
-    if prompt_path(ctx) == :alone,
-      do: Stream.iterate(1, &(&1 * 4)) |> Enum.take_while(&(&1 < rows)),
-      else: []
-  end
-
-  # The shortest prompt of each width of a step of new prompts alone (see alone_shape/2): the
-  # width below it, or 1. A move of its row needs the fewest rows of the group, so its writes
-  # compile at each capacity that a longer prompt of that width can meet, where the end of the
-  # rows of the small group is cut.
-  defp alone_sizes,
-    do: Enum.zip_with([1 | @alone_widths], @alone_widths, fn below, _width -> below end)
 
   # Each decode loop of compile_loop/4 at each capacity, with `request` in row 0.
   defp loop_items(%{run_steps: loops}, rows, capacities, request) when loops != nil do
@@ -2506,8 +2273,7 @@ defmodule Transmuter.Generation do
   # Compiles the image features of a group of `rows` rows for the type and the width of
   # `features`, the features of one prompt: the slots, a write of the features of each power
   # of two of rows up to a slot, and the merge of embed/4 at each width of step_width/1. See
-  # join_features/3. The small groups of the prompts that run alone (see admit_alone/3) have
-  # their own slots of the width of their step, so their writes and merges compile too.
+  # join_features/3.
   def compile_features(ctx, rows, features) do
     widths = ctx.widths.with_cache ++ if(merged?(ctx), do: ctx.widths.without_cache, else: [])
     chunks = if prompt_path(ctx) == :ragged, do: @chunk_widths, else: []
@@ -2517,13 +2283,6 @@ defmodule Transmuter.Generation do
         for(width <- chunks, do: {1, rows + width})
 
     compile_slots(ctx, rows, power_of_two(ctx.max_capacity), shapes, features)
-
-    for count <- alone_counts(ctx, rows),
-        width <- @alone_widths,
-        width <= ctx.max_capacity,
-        do: compile_slots(ctx, count, width, [{count, width}], features)
-
-    :ok
   end
 
   # The slots of `rows` rows of `slot` rows, a write of each power of two of rows up to a slot,
@@ -2591,9 +2350,6 @@ defmodule Transmuter.Generation do
 
   # The smallest power of two at or above `count`.
   defp power_of_two(count), do: 2 ** length(Integer.digits(max(count, 1) - 1, 2))
-
-  # The smallest power of 4 at or above `count`.
-  defp power_of_four(count), do: Enum.find(Stream.iterate(1, &(&1 * 4)), &(&1 >= count))
 
   defp empty_slots(ctx, rows, slot, [%{features: first} | _writes]) do
     zero = Nx.tensor(0, type: Nx.type(first), backend: ctx.backend)
@@ -2904,10 +2660,6 @@ defmodule Transmuter.Generation do
     %{group | keys: keys, state: Map.merge(group.state, written)}
   end
 
-  # The row `index` of each tensor, with its axis of rows.
-  defp take_row(tensors, index),
-    do: Map.new(tensors, fn {name, t} -> {name, Nx.take(t, Nx.reshape(index, {1}), axis: 0)} end)
-
   # The rows in `index` get the rows of `values`.
   defp write_admitted(tensors, index, values) do
     Map.new(tensors, fn {name, tensor} ->
@@ -2919,8 +2671,7 @@ defmodule Transmuter.Generation do
   # The row `row` of each tensor gets the row of `values`, from the start of the row. A value can
   # be shorter than the row on the axes after the first, and zeros fill the rest of the row. A
   # longer value loses its end, which holds no rows of a request. A request writes its encoder
-  # outputs and cross-attention cache (see write_request/4), and a prompt that runs in its own
-  # step moves its row into its group (see move_rows/4).
+  # outputs and cross-attention cache (see write_request/4).
   defp write_row(tensors, row, values) do
     Map.new(tensors, fn {name, tensor} ->
       value = Nx.as_type(values[name], Nx.type(tensor))

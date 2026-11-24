@@ -44,9 +44,7 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:capacity_costs` - fixed costs for the shrink of the buffers: `%{slope: ms, per_row: ms}`, the time that one row of capacity adds to a decode step and the time of a move for each row that it copies. The default is `nil`: the server measures them (see `Transmuter.ContinuousBatching.Costs`).
 
-    * `:ragged_prompts` - when `true`, the prompts of new requests run in the steps of the rows that run, in chunks of at most 256 tokens, for a decoder in `:in_place` whose graph allows it (see "Batches" in `Transmuter.Generation`). It takes the place of `:alone_prompts` for that decoder. The default is `true`.
-
-    * `:alone_prompts` - when `true`, the prompts of the new requests of an admission run in a step of their own rows, and not in steps of all rows, for a decoder in `:in_place` (see "Batches" in `Transmuter.Generation`). On a mix of ShareGPT prompts with 16 rows of Qwen3-0.6B fp16 on CUDA, it gave 23% more output tokens per second with 8 decode steps for each call, and 34% with one. An admission of several requests then delays the running rows longer, up to 146 ms against 79 ms, while the 99th percentile of the gaps between chunks goes from 113 to 68 ms. The default is `true`.
+    * `:ragged_prompts` - when `true`, the prompts of new requests run in the steps of the rows that run, in chunks of at most 256 tokens, for a decoder in `:in_place` whose graph allows it (see "Batches" in `Transmuter.Generation`). Otherwise they run in steps of all rows. The default is `true`.
 
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
 
@@ -106,9 +104,9 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Compiles
 
-  A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of five widths, 1, 16, 32, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most five shapes for each capacity, 81 for a capacity of 4096 rows. A decoder in `:in_place`, whose prompts of up to 511 tokens run in steps of the new rows alone, has the widths 1, 64 and 512, and the steps of its new rows have one shape for each count of 1, 4 and 16 rows below the slots and each width of 16, 64, 256 and 512 tokens. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
+  A step compiles the decoder for its shape the first time that the server meets it: the width of the step and the capacity of the buffers. A step has one of five widths, 1, 16, 32, 64 and 512 tokens (see "Batches" in `Transmuter.Generation`), so a group has at most five shapes for each capacity, 81 for a capacity of 4096 rows. A decoder in `:in_place` with ragged steps has the widths 1, 64 and 512, and its ragged steps have one shape for each chunk width of 16, 64 and 256 tokens. Without `compile_steps: true`, a step that meets a new shape compiles it while rows decode, for example about 3 s on CUDA for SmolLM2-135M.
 
-  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With `:prefix_cache`, the server also compiles the copies of each size of a stored prefix into the buffers and into the store, and the steps of new prompts alone after a prefix. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. These times are from widths 1, 64 and 512. The steps of new rows alone (see `:alone_prompts`) replace the widths 16 and 32 of a decoder in `:in_place`: for Qwen3-0.6B fp16 with 48 rows on CUDA, the start takes 284 s with them, against 288 s with those widths. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
+  With `compile_steps: true`, the server runs one step of each shape before it starts, with the writes of the rows of 1 to `:slots` requests that join together and a growth of the buffers from each capacity to the next, and the worker prepares one input of the task, such as a chat with a small image, so that the processor and the encoder compile too. The steps also compile for the encoder outputs of this input and for each larger encoder capacity. With `:prefix_cache`, the server also compiles the copies of each size of a stored prefix into the buffers and into the store,. With 8 rows and a capacity of 4096 rows, the start takes 12 s for SmolLM2-135M and 14 s for SmolVLM-256M on the GPU of a Mac, and 146 s and 153 s on CUDA (RTX 3060), against under 1 s and about 6 s without it. These times are from widths 1, 64 and 512. The ragged steps (see `:ragged_prompts`) replace the widths 16 and 32 of a decoder in `:in_place`. The image features of a group have a power of two of rows (see "Embeddings and image features" in `Transmuter.Generation`), so their merge compiles for few shapes. The processor and an encoder that takes images of each size in one call, such as that of Qwen2-VL, still compile for each new size of image.
 
   ## Prefix cache
 
@@ -164,7 +162,7 @@ defmodule Transmuter.ContinuousBatching do
 
     server_opts =
       server_opts ++
-        [device_memory: nil, compile_steps: false, prefix_cache: 0, alone_prompts: true] ++
+        [device_memory: nil, compile_steps: false, prefix_cache: 0] ++
         [ragged_prompts: true, capacity_costs: nil]
 
     opts =
