@@ -2266,7 +2266,9 @@ defmodule Transmuter.GenerationTest do
           static: Map.put(model.static, "mix.axes", Nx.tensor([1], backend: Nx.BinaryBackend))
       }
 
-      refute "transmuter.chunk_row" in context.(mixed).model.inputs, source
+      assert ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+               refute "transmuter.chunk_row" in context.(mixed).model.inputs, source
+             end) =~ "reads a value of class :mixed at input 0"
 
       assert ExUnit.CaptureLog.capture_log([level: :debug], fn ->
                assert context.(grow).mode == :grow

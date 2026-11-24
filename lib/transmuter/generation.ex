@@ -804,10 +804,13 @@ defmodule Transmuter.Generation do
   # steps of their rows (see prompt_path/1), such as a decoder whose position offset of
   # MergedDecoder cannot have a value for each token.
   defp chunk_steps(model) do
-    gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+    if reason = ragged_reason(model) do
+      Logger.debug(
+        "generation runs the prompts of new rows in steps of their rows, because #{reason}"
+      )
 
-    if @logit_index in model.inputs and gqas != [] and Enum.all?(gqas, &mask_lengths?(model, &1)) and
-         value_classes(model) do
+      model
+    else
       nodes =
         Enum.map(model.nodes, fn node ->
           if node.op_type == "GroupQueryAttention" do
@@ -824,8 +827,25 @@ defmodule Transmuter.Generation do
           inputs: model.inputs ++ [@chunk_row],
           input_types: Map.put(model.input_types, @chunk_row, {:s64, [1]})
       }
-    else
-      model
+    end
+  end
+
+  # Why the graph cannot run ragged steps, or nil when it can (see chunk_steps/1).
+  defp ragged_reason(model) do
+    gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+
+    cond do
+      @logit_index not in model.inputs ->
+        "the lm_head computes all positions"
+
+      gqas == [] ->
+        "it has no GroupQueryAttention"
+
+      node = Enum.find(gqas, &(not mask_lengths?(model, &1))) ->
+        "#{where(node)} does not count its rows from the mask, or has an input after the attention bias"
+
+      true ->
+        class_reason(model)
     end
   end
 
@@ -853,7 +873,7 @@ defmodule Transmuter.Generation do
   # Transmuter.Ops.Transformer). Its output has the batch of the tokens, and its present that of
   # the buffers. So a :mixed value reaches only an attention bias or no output, and the logits
   # have the batch of the tokens.
-  defp value_classes(model) do
+  defp class_reason(model) do
     constants =
       for %{op_type: "Constant", output: [name], attribute: [%{t: t}]} <- model.nodes,
           t != nil,
@@ -876,16 +896,50 @@ defmodule Transmuter.Generation do
 
     initial = Map.merge(Map.new(constants, fn {name, _} -> {name, :static} end), inputs)
 
-    classes =
+    result =
       Enum.reduce_while(model.nodes, initial, fn node, classes ->
         case node_classes(node, classes, constants) do
-          nil -> {:halt, nil}
-          outputs -> {:cont, Map.merge(classes, Map.new(Enum.zip(node.output, outputs)))}
+          {:error, input, class} ->
+            {:halt, "#{where(node)} reads a value of class #{inspect(class)} at input #{input}"}
+
+          outputs ->
+            {:cont, Map.merge(classes, Map.new(Enum.zip(node.output, outputs)))}
         end
       end)
 
-    classes != nil and classes["logits"] == :token and
-      Enum.all?(model.outputs, &(classes[&1] != :mixed))
+    with %{} = classes <- result,
+         output when output != nil <-
+           Enum.find(
+             model.outputs,
+             &(classes[&1] == :mixed or (&1 == "logits" and classes[&1] != :token))
+           ) do
+      "#{origin(model, classes, output)} gives #{output} a value of class #{inspect(plain(classes[output]))}"
+    else
+      nil -> nil
+      reason -> reason
+    end
+  end
+
+  # The first node that mixes the batches on the way to `output`, else the output.
+  defp origin(model, classes, output) do
+    producers = for node <- model.nodes, name <- node.output, into: %{}, do: {name, node}
+
+    ancestors =
+      Stream.iterate({[output], MapSet.new()}, fn {[name | rest], seen} ->
+        node = producers[name]
+        inputs = if node, do: Enum.reject(Transmuter.dependencies(node), &(&1 in seen)), else: []
+        {inputs ++ rest, MapSet.put(seen, name)}
+      end)
+      |> Enum.find(&match?({[], _seen}, &1))
+      |> elem(1)
+
+    node =
+      Enum.find(model.nodes, fn node ->
+        hd(node.output) in ancestors and plain(classes[hd(node.output)]) == :mixed and
+          not Enum.any?(Transmuter.dependencies(node), &(plain(classes[&1]) == :mixed))
+      end)
+
+    if node, do: where(node), else: output
   end
 
   # The classes of the inputs of GroupQueryAttention by index: the tokens, their positions and
@@ -897,12 +951,12 @@ defmodule Transmuter.Generation do
               )
 
   defp node_classes(node = %{op_type: "GroupQueryAttention"}, classes, _constants) do
-    allowed? =
-      node.input
-      |> Enum.with_index()
-      |> Enum.all?(fn {name, i} -> plain(classes[name]) in Map.get(@gqa_inputs, i, [:static]) end)
-
-    if allowed?, do: [:token | List.duplicate(:row, length(node.output) - 1)]
+    case Enum.find(Enum.with_index(node.input), fn {name, i} ->
+           plain(classes[name]) not in Map.get(@gqa_inputs, i, [:static])
+         end) do
+      nil -> [:token | List.duplicate(:row, length(node.output) - 1)]
+      {name, i} -> {:error, i, plain(classes[name])}
+    end
   end
 
   defp node_classes(node, classes, constants) do
