@@ -597,8 +597,9 @@ defmodule Transmuter.Ops.Transformer do
           chunk = Nx.slice_along_axis(q, rows, s - rows, axis: 2)
           row = Nx.as_type(row, :s64)
           [row_k, row_v] = for t <- [present_k, present_v], do: Nx.take(t, row, axis: 0)
-          tokens = attend_sequences(node, tokens, present_k, present_v, seqlens, nil)
-          chunk = attend_sequences(node, chunk, row_k, row_v, start, nil)
+          {token_bias, chunk_bias} = ragged_bias(attention_bias, rows, row, s)
+          tokens = attend_sequences(node, tokens, present_k, present_v, seqlens, token_bias)
+          chunk = attend_sequences(node, chunk, row_k, row_v, start, chunk_bias)
           tokens = tokens |> from_heads() |> Nx.reshape({1, rows, heads * head_size})
           Nx.concatenate([tokens, from_heads(chunk)], axis: 1)
 
@@ -609,6 +610,39 @@ defmodule Transmuter.Ops.Transformer do
       end
 
     [out, present_k, present_v]
+  end
+
+  # The attention bias of a ragged step for the token of each row and for the chunk. The graph
+  # gives the bias of each row of the buffers and each token of the sequence, {R, N, S, keys},
+  # with 1 on the axes that it broadcasts. Token t of the sequence reads the keys of its own
+  # row, so it takes the bias of the pair (row of t, t): the token of row r takes [r, :, r] and
+  # the chunk takes [row, :, rows..s - 1].
+  defp ragged_bias(nil, _rows, _row, _s), do: {nil, nil}
+
+  defp ragged_bias(bias, rows, row, s) do
+    {batch, heads, queries, keys} =
+      case Nx.shape(bias) do
+        {b, n, q, k} when b in [1, rows] and q in [1, s] ->
+          {b, n, q, k}
+
+        shape ->
+          raise ArgumentError,
+                "the attention bias of a ragged step of #{rows} rows and #{s} tokens must have the shape {1 or #{rows}, heads, 1 or #{s}, keys}, got: #{inspect(shape)}"
+      end
+
+    tokens = Nx.broadcast(bias, {rows, heads, queries, keys})
+
+    tokens =
+      if queries == s do
+        index = Nx.broadcast(Nx.iota({rows, 1, 1, 1}), {rows, heads, 1, keys})
+        Nx.take_along_axis(tokens, index, axis: 2)
+      else
+        tokens
+      end
+
+    chunk = if batch == rows, do: Nx.take(bias, row, axis: 0), else: bias
+    chunk = if queries == s, do: Nx.slice_along_axis(chunk, rows, s - rows, axis: 2), else: chunk
+    {tokens, chunk}
   end
 
   # The attention of the queries q, {B, N, S, H}, whose rows have the positions offsets + i,

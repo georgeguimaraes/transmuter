@@ -434,6 +434,99 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # A ragged step of GroupQueryAttention (domain transmuter, see Transmuter.Generation) has one
+  # sequence of a token for each of 3 rows and a chunk of 8 tokens of row 1, with a random
+  # bias for each row and each token of the sequence. The token of each other row gives the
+  # output and the present of a step of one token of the rows, with the bias of its own row and
+  # token, and the chunk gives those of a step of its row alone, with the bias of row 1 and
+  # the chunk tokens.
+  test "a ragged GroupQueryAttention step gives the outputs of its rows and its chunk apart" do
+    {heads, kv_heads, head_size, capacity} = {4, 2, 16, 64}
+    {pasts, row, chunk} = {[5, 10, 20], 1, 8}
+    {rows, s} = {length(pasts), length(pasts) + chunk}
+    int = &%Transmuter.Onnx.AttributeProto{name: &1, type: :INT, i: &2}
+    total = Nx.tensor(capacity, type: :s32, backend: Nx.BinaryBackend)
+
+    node = %Transmuter.Onnx.NodeProto{
+      op_type: "GroupQueryAttention",
+      domain: "com.microsoft",
+      input: ~w(q k v past_k past_v seqlens_k total cos sin positions bias),
+      output: ~w(y present_k present_v),
+      attribute: [int.("num_heads", heads), int.("kv_num_heads", kv_heads)]
+    }
+
+    key = Nx.Random.key(3)
+    {q, key} = Nx.Random.normal(key, shape: {1, s, heads * head_size})
+    {k, key} = Nx.Random.normal(key, shape: {1, s, kv_heads * head_size})
+    {v, key} = Nx.Random.normal(key, shape: {1, s, kv_heads * head_size})
+    {past_k, key} = Nx.Random.normal(key, shape: {rows, kv_heads, capacity, head_size})
+    {past_v, key} = Nx.Random.normal(key, shape: {rows, kv_heads, capacity, head_size})
+    {bias, _key} = Nx.Random.normal(key, shape: {rows, 1, s, capacity})
+
+    chunk_row = Nx.tensor([row], type: :s64)
+
+    run = fn node, q, k, v, past_k, past_v, seqlens, bias ->
+      Nx.Defn.jit_apply(
+        fn q, k, v, past_k, past_v, seqlens, bias, chunk_row ->
+          inputs = [q, k, v, past_k, past_v, seqlens, total, nil, nil, nil, bias]
+          inputs = if node.domain == "transmuter", do: inputs ++ [chunk_row], else: inputs
+          List.to_tuple(Transformer.apply(node, inputs, 21))
+        end,
+        Enum.map(
+          [q, k, v, past_k, past_v, seqlens, bias, chunk_row],
+          &Nx.backend_transfer(&1, @backend)
+        ),
+        @compiler
+      )
+    end
+
+    seqlens =
+      Nx.tensor(Enum.with_index(pasts, &if(&2 == row, do: &1 + chunk, else: &1)), type: :s32)
+
+    ragged = %{node | domain: "transmuter", input: node.input ++ ["row"]}
+    {y, present_k, present_v} = run.(ragged, q, k, v, past_k, past_v, seqlens, bias)
+
+    # The token of each row, as a step of one token of the rows.
+    tokens = &(&1 |> Nx.slice_along_axis(0, rows, axis: 1) |> Nx.reshape({rows, 1, :auto}))
+    index = Nx.iota({rows, 1, 1, 1}) |> Nx.broadcast({rows, 1, 1, capacity})
+    token_bias = Nx.take_along_axis(bias, index, axis: 2)
+    lengths = Nx.tensor(pasts, type: :s32)
+
+    {token_y, token_k, _token_v} =
+      run.(node, tokens.(q), tokens.(k), tokens.(v), past_k, past_v, lengths, token_bias)
+
+    # The chunk, as a step of its row alone.
+    part = &Nx.slice_along_axis(&1, rows, chunk, axis: 1)
+    past = &Nx.slice_along_axis(&1, row, 1, axis: 0)
+    chunk_bias = bias |> past.() |> Nx.slice_along_axis(rows, chunk, axis: 2)
+    chunk_lengths = Nx.tensor([Enum.at(pasts, row) + chunk - 1], type: :s32)
+
+    {chunk_y, chunk_k, chunk_v} =
+      run.(
+        node,
+        part.(q),
+        part.(k),
+        part.(v),
+        past.(past_k),
+        past.(past_v),
+        chunk_lengths,
+        chunk_bias
+      )
+
+    diff = &(Nx.subtract(&1, &2) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number())
+
+    for r <- 0..(rows - 1), r != row do
+      assert diff.(y[[0, r]], token_y[[r, 0]]) < 1.0e-5, "token of row #{r}"
+      at = Enum.at(pasts, r)
+      assert diff.(present_k[[r, .., at]], token_k[[r, .., at]]) == 0.0
+    end
+
+    assert diff.(y[[0, rows..(s - 1)]], chunk_y[0]) < 1.0e-5
+    span = Enum.at(pasts, row)..(Enum.at(pasts, row) + chunk - 1)
+    assert diff.(present_k[[row, .., span]], chunk_k[[0, .., span]]) == 0.0
+    assert diff.(present_v[[row, .., span]], chunk_v[[0, .., span]]) == 0.0
+  end
+
   # MLX 0.32.0 has fused kernels for some head sizes. A head size of 72 pads to 80 for the
   # "full" kernel, 64 takes it as it is, and 256 with 16 queries has no fused size within
   # 1.25 times, so the Nx core runs in chunks. Each case gives the values of the Nx core.

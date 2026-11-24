@@ -1844,9 +1844,10 @@ defmodule Transmuter.GenerationTest do
   # keep one shape over all joins, and the cursor of each row starts at its slot. The context
   # has a largest capacity of 512 rows, as in a server, so each slot has 512 rows. When no row
   # has a part of its prompt left, the group has no features. A row that ends before its prompt
-  # has run takes no more steps. These chats join with alone_prompts: false. With the default,
-  # one chat runs in a step of its own row, reads its features there and writes none into the
-  # group, and two chats that come together, as many as the rows, join and read their own slots.
+  # has run takes no more steps. These chats join in ragged steps, the default. With
+  # ragged_prompts: false and alone_prompts: true, one chat runs in a step of its own row, reads
+  # its features there and writes none into the group, and two chats that come together, as
+  # many as the rows, join and read their own slots.
   @tag ci_partition: 10
   test "each row of a group reads its image features from its own slot" do
     source = {:hf, "onnx-internal-testing/tiny-random-Gemma3ForConditionalGeneration"}
@@ -1868,19 +1869,15 @@ defmodule Transmuter.GenerationTest do
       end
     end
 
-    context = fn alone_prompts ->
-      opts = [
-        variant: variant,
-        strategy: :greedy,
-        max_new_tokens: 4,
-        alone_prompts: alone_prompts
-      ]
+    context = fn prompt_opts ->
+      opts = [variant: variant, strategy: :greedy, max_new_tokens: 4] ++ prompt_opts
 
       {ctx, _tokenizer, task} = ImageTextToText.task(source, opts ++ @opts)
       {Generation.compile(%{ctx | max_capacity: 512}, 2, @opts[:defn_options]), chats.(task)}
     end
 
-    {ctx, requests} = context.(false)
+    {ctx, requests} = context.([])
+    assert "transmuter.chunk_row" in ctx.model.inputs
 
     {group, shapes} =
       requests
@@ -1912,7 +1909,7 @@ defmodule Transmuter.GenerationTest do
     group = Generation.next(ctx, Generation.cancel(Generation.admit(ctx, group, rows), 0))
     assert Enum.at(group.state.lengths, 0) == 0
 
-    {ctx, requests} = context.(true)
+    {ctx, requests} = context.(ragged_prompts: false, alone_prompts: true)
     group = Generation.admit(ctx, Generation.open(ctx, 2), [Map.put(hd(requests), :row, 0)])
     assert {Enum.at(group.left, 0), length(Enum.at(group.ids, 0))} == {[], 1}
     assert {group.state.features, Enum.at(group.state.cursors, 0)} == {nil, {0, 0}}
@@ -2245,6 +2242,32 @@ defmodule Transmuter.GenerationTest do
       assert context.(model).mode == :in_place
       assert Generation.joins?(context.(model))
 
+      # A value of the mask that reaches the queries puts the batch of the buffers in a value
+      # of the tokens, so the decoder runs its prompts in the steps of its rows.
+      gqa = Enum.at(model.nodes, first)
+      cast = %AttributeProto{name: "to", type: :INT, i: 1}
+
+      mixing = [
+        %NodeProto{
+          op_type: "ReduceSum",
+          input: ~w(attention_mask mix.axes),
+          output: ["mix.rows"]
+        },
+        %NodeProto{op_type: "Cast", input: ["mix.rows"], output: ["mix.cast"], attribute: [cast]},
+        %NodeProto{op_type: "Add", input: [hd(gqa.input), "mix.cast"], output: ["mix.q"]}
+      ]
+
+      mixed = %{
+        model
+        | nodes:
+            List.insert_at(model.nodes, first, mixing)
+            |> List.flatten()
+            |> List.replace_at(first + length(mixing), %{gqa | input: ["mix.q" | tl(gqa.input)]}),
+          static: Map.put(model.static, "mix.axes", Nx.tensor([1], backend: Nx.BinaryBackend))
+      }
+
+      refute "transmuter.chunk_row" in context.(mixed).model.inputs, source
+
       assert ExUnit.CaptureLog.capture_log([level: :debug], fn ->
                assert context.(grow).mode == :grow
                refute Generation.joins?(context.(grow))
@@ -2263,6 +2286,27 @@ defmodule Transmuter.GenerationTest do
         diff = Enum.zip_with(row, exact, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
         assert diff < 1.0e-4, "#{source}: #{diff}"
       end
+
+      # The prompt of 20 tokens joins the row of 5 tokens that runs, in a ragged step, where
+      # the op takes the attention bias of the graph for each token by its row.
+      ctx = Generation.compile(context.(model), 2, @opts[:defn_options])
+      assert "transmuter.chunk_row" in ctx.model.inputs, source
+      [short, _, long] = prompts
+      request = &%{row: &1, prompt: &2, seed: 0, budget: 16}
+      group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, short)])
+      group = Generation.next(ctx, Generation.next(ctx, group))
+      group = Generation.admit(ctx, group, [request.(1, long)])
+      group = run_until(ctx, group, &Enum.all?(&1.done))
+
+      for {prompt, row} <- [{short, 0}, {long, 1}] do
+        [expected] = generate.(model, [prompt])
+        got = Generation.row_tokens(group, row)
+        assert Enum.map(got, &hd/1) == Enum.map(expected, &hd/1), source
+        diff = Enum.zip_with(got, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+        assert diff < 1.0e-4, "#{source}: #{diff}"
+      end
+
+      Generation.finish(group)
     end
   end
 

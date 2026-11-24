@@ -95,7 +95,7 @@ defmodule Transmuter.Generation do
 
   A step of a group runs all its rows at its width, also the rows that only take a new token, so a step of a short prompt in a group of many rows costs the width for each row: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), 49 ms at width 16 against 13 ms at width 1. So in `:in_place`, unless `alone_prompts: false`, when the new requests of an admission are fewer than the rows of the group in a power of 4, each prompt of at most 511 tokens runs whole in one step of the new rows alone. That step runs in a group of a power of 4 of rows, with the stored prefix of each row as its past (see "Prefixes"), at the smallest width of 16, 64, 256 and 512 tokens that holds the rest of each prompt and its first token. Its first token is read, and the cache, the selection state and the tokens of each row move into its row of the group, which starts at the first row of the buffers. The other rows take their next token in the next step of the group. On a mix of 512 ShareGPT prompts of 20 to 512 tokens with 16 rows of Qwen3-0.6B fp16 on CUDA, the prompt steps took 22 s against 58 s as joins, and the time for each output token was 15.7 ms against 20.6 ms (p50). A longer prompt, the prompts of `:append`, whose rows share one write offset, and the prompts of a merged decoder whose rows keep their own encoder outputs run in the steps of the group as above.
 
-  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: the values of the attention mask may reach only the lengths of GroupQueryAttention, and GroupQueryAttention may have no attention bias. Qwen3 and SmolLM2 pass this check. Apertus, whose positions take the position offset of each row, and Gemma 3, whose bias has the batch of the mask, run their prompts alone or in joins.
+  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: a value with the batch of the buffers, such as one of the attention mask, may reach only the past, the lengths and the attention bias of GroupQueryAttention. A bias that mixes the rows and the tokens, such as the key-padding bias of Gemma 3, is taken for each token from its own row. Qwen3, SmolLM2, SmolVLM and Gemma 3 pass this check. Apertus, whose positions take the position offset of each row, runs its prompts alone or in joins.
 
   ## Decode loops
 
@@ -136,6 +136,8 @@ defmodule Transmuter.Generation do
   # The row of the chunk of a ragged step, and the widths of the chunk, see chunk_steps/1.
   @chunk_row "transmuter.chunk_row"
   @chunk_widths [16, 64, 256]
+  # The static inputs of a step, see step_inputs/5.
+  @static_inputs ["use_cache_branch", "num_logits_to_keep"]
   # The most tokens of a prompt in a step where other rows take a new token, see plan/1.
   @join_tokens 64
 
@@ -795,23 +797,17 @@ defmodule Transmuter.Generation do
   # Gives each GroupQueryAttention the row of the chunk of a ragged step (see "Batches"): one
   # sequence of tokens, the token of each row and then a chunk of the prompt of one row. The op
   # splits the sequence by the rows of the buffers. So the other nodes must compute each token
-  # alone, without the batch of the buffers, which holds when:
-  #
-  #   * the lm_head reads one token of each row from @logit_index (see keep_last_logits/1),
-  #   * each GroupQueryAttention counts its rows from the values of the mask, as in :in_place,
-  #     and has no attention bias or other input after it, and
-  #   * the inputs with the batch of the buffers, all inputs but the tokens, their positions
-  #     and @logit_index, reach only the past and the lengths of each GroupQueryAttention,
-  #     through nodes that read no other values of the step, and its present reaches no node.
-  #
-  # Other decoders run their prompts in steps of their rows (see prompt_path/1), such as
-  # Gemma 3, whose bias has the batch of the mask and the length of the tokens, and Apertus,
-  # whose positions take the position offset of each row (see MergedDecoder).
+  # alone, without the batch of the buffers, which holds when the lm_head reads one token of
+  # each row from @logit_index (see keep_last_logits/1), each GroupQueryAttention counts its rows
+  # from the values of the mask, as in :in_place, and has no input after the attention bias, and
+  # the classes of the values allow it (see value_classes/1). Other decoders run their prompts in
+  # steps of their rows (see prompt_path/1), such as Apertus, whose positions take the position
+  # offset of each row (see MergedDecoder).
   defp chunk_steps(model) do
     gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
 
     if @logit_index in model.inputs and gqas != [] and Enum.all?(gqas, &mask_lengths?(model, &1)) and
-         rows_reach_attention?(model) do
+         value_classes(model) do
       nodes =
         Enum.map(model.nodes, fn node ->
           if node.op_type == "GroupQueryAttention" do
@@ -835,44 +831,113 @@ defmodule Transmuter.Generation do
 
   defp mask_lengths?(model, node) do
     reads_values?(model, Enum.at(node.input, 5), "attention_mask") and
-      Enum.all?(Enum.drop(node.input, 10), &(&1 == ""))
+      Enum.all?(Enum.drop(node.input, 11), &(&1 == ""))
   end
 
-  # The values of the nodes that read only static values, such as Constant nodes, are static.
-  defp rows_reach_attention?(model) do
-    static = MapSet.new(Map.keys(model.params) ++ Map.keys(model.static) ++ [""])
+  # Whether each value of the graph keeps the batch of the buffers apart from the batch of the
+  # tokens, with a class for each value:
+  #
+  #   * :static - the constants, the params, the static inputs of a step (@static_inputs) and
+  #     the values of the nodes that read only static values.
+  #   * :neutral - a value without a batch: an element other than the first of the shape of a
+  #     value, such as the capacity of the buffers or the count of the tokens.
+  #   * :row - the batch of the buffers: the mask, the past and the present.
+  #   * :token - the batch of the tokens: the tokens, their positions and @logit_index.
+  #   * :mixed - a value of both batches.
+  #
+  # Shape gives a vector whose first element has the batch of its input, and a Gather or a
+  # Slice of that vector at a static index past 0 is :neutral. Each other node gives the join
+  # of the classes of its inputs. Each GroupQueryAttention takes the queries, the keys, the
+  # values and its positions from the tokens, the past and its lengths from the buffers, and an
+  # attention bias of any class, which the op takes for each token by its row (see
+  # Transmuter.Ops.Transformer). Its output has the batch of the tokens, and its present that of
+  # the buffers. So a :mixed value reaches only an attention bias or no output, and the logits
+  # have the batch of the tokens.
+  defp value_classes(model) do
+    constants =
+      for %{op_type: "Constant", output: [name], attribute: [%{t: t}]} <- model.nodes,
+          t != nil,
+          into: Map.merge(model.params, model.static),
+          do: {name, Transmuter.Ops.tensor(t)}
+
     tokens = ["input_ids", "inputs_embeds", "position_ids", @logit_index]
 
-    reached =
-      Enum.reduce_while(model.nodes, {MapSet.new(model.inputs -- tokens), static}, fn
-        node, {rows, static} ->
-          dependencies = Transmuter.dependencies(node)
-          read = for {name, i} <- Enum.with_index(node.input), name in rows, do: i
-          add = &MapSet.union(&1, MapSet.new(&2))
+    inputs =
+      for input <- model.inputs, into: %{"" => :static} do
+        cond do
+          input in @static_inputs -> {input, :static}
+          input in tokens -> {input, :token}
+          true -> {input, :row}
+        end
+      end
 
-          cond do
-            Enum.all?(dependencies, &(&1 in static)) ->
-              {:cont, {rows, add.(static, node.output)}}
+    initial = Map.merge(Map.new(constants, fn {name, _} -> {name, :static} end), inputs)
 
-            node.op_type == "GroupQueryAttention" and read -- [3, 4, 5, 6] == [] ->
-              {:cont, {add.(rows, Enum.drop(node.output, 1)), static}}
-
-            not Enum.any?(dependencies, &(&1 in rows)) ->
-              {:cont, {rows, static}}
-
-            Enum.all?(dependencies, &(&1 in rows or &1 in static)) ->
-              {:cont, {add.(rows, node.output), static}}
-
-            true ->
-              {:halt, nil}
-          end
+    classes =
+      Enum.reduce_while(model.nodes, initial, fn node, classes ->
+        case node_classes(node, classes, constants) do
+          nil -> {:halt, nil}
+          outputs -> {:cont, Map.merge(classes, Map.new(Enum.zip(node.output, outputs)))}
+        end
       end)
 
-    case reached do
-      {rows, _static} -> "logits" not in rows
-      nil -> false
-    end
+    classes != nil and classes["logits"] == :token and
+      Enum.all?(model.outputs, &(classes[&1] != :mixed))
   end
+
+  # The classes of the inputs of GroupQueryAttention by index: the tokens, their positions and
+  # the rotary tables (0 to 2 and 7 to 9), the past and the lengths (3 to 6), and the bias (10).
+  @gqa_inputs Map.new(
+                Enum.map([0, 1, 2, 7, 8, 9], &{&1, [:static, :neutral, :token]}) ++
+                  Enum.map([3, 4, 5, 6], &{&1, [:static, :neutral, :row]}) ++
+                  [{10, [:static, :neutral, :row, :token, :mixed]}]
+              )
+
+  defp node_classes(node = %{op_type: "GroupQueryAttention"}, classes, _constants) do
+    allowed? =
+      node.input
+      |> Enum.with_index()
+      |> Enum.all?(fn {name, i} -> plain(classes[name]) in Map.get(@gqa_inputs, i, [:static]) end)
+
+    if allowed?, do: [:token | List.duplicate(:row, length(node.output) - 1)]
+  end
+
+  defp node_classes(node, classes, constants) do
+    inputs = Enum.map(node.input, &classes[&1])
+    outer = Enum.map(Transmuter.dependencies(node) -- node.input, &classes[&1])
+    class = Enum.reduce(Enum.map(inputs ++ outer, &plain/1), :static, &join/2)
+
+    class =
+      case {node.op_type, inputs} do
+        {_op, _inputs} when class == :static ->
+          :static
+
+        {"Shape", [input]} ->
+          start = Enum.find_value(node.attribute, 0, &(&1.name == "start" && &1.i))
+          if start > 0, do: :neutral, else: {:shape, plain(input)}
+
+        {op, [{:shape, _input}, :static | _]} when op in ["Gather", "Slice"] ->
+          index = constants[Enum.at(node.input, 1)]
+          past_first? = index != nil and Enum.all?(Nx.to_flat_list(index), &(&1 > 0))
+          if past_first?, do: :neutral, else: class
+
+        _other ->
+          class
+      end
+
+    List.duplicate(class, length(node.output))
+  end
+
+  defp plain({:shape, class}), do: class
+  defp plain(nil), do: :mixed
+  defp plain(class), do: class
+
+  defp join(class, class), do: class
+  defp join(:static, class), do: class
+  defp join(class, :static), do: class
+  defp join(:neutral, class), do: class
+  defp join(class, :neutral), do: class
+  defp join(_class, _other), do: :mixed
 
   # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do
@@ -4245,7 +4310,7 @@ defmodule Transmuter.Generation do
     flag = if cached?, do: 1, else: 0
 
     static =
-      for {name, value} <- [{"use_cache_branch", [flag]}, {"num_logits_to_keep", 0}],
+      for {name, value} <- Enum.zip(@static_inputs, [[flag], 0]),
           name in ctx.model.inputs,
           into: %{} do
         {type, _dims} = ctx.model.input_types[name]
