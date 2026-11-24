@@ -2259,18 +2259,10 @@ defmodule Transmuter.Generation do
           move <- [{capacity, next}, {next, capacity}],
           do: move
 
-    for {from, to} <- moves do
-      group = open(ctx, rows, from)
-      grown = ctx.grow.(buffer_tensors(ctx, group), Nx.iota({to}, backend: Nx.BinaryBackend))
-      release(Map.values(grown), [])
-      finish(group)
-    end
+    for {from, to} <- moves, do: finish(move(ctx, open(ctx, rows, from), to))
 
     for capacity <- capacities, ctx.mode == :append do
-      group = open(ctx, rows, capacity)
-      index = Nx.broadcast(Nx.tensor(0, type: :s32, backend: Nx.BinaryBackend), {rows, capacity})
-      release(Map.values(ctx.compact.(buffer_tensors(ctx, group), index)), [])
-      finish(group)
+      finish(move(ctx, open(ctx, rows, capacity), capacity))
     end
 
     length(shapes)
@@ -3916,8 +3908,11 @@ defmodule Transmuter.Generation do
 
   # Gives the buffers `capacity`: a compaction in :append, else a growth or a shrink. The group
   # keeps the time of each move and the rows of the capacities that it copies, for the costs of
-  # ContinuousBatching, which clears them. A read of one token waits for the copy to end.
-  defp move(ctx, group, capacity) do
+  # ContinuousBatching, which clears them. The device runs the calls in order, and the move
+  # ends with a copy of the tokens at the capacity, also when they keep it. So a read of one
+  # token waits for all calls of the move. A read of a buffer would copy all of it to the host.
+  @doc false
+  def move(ctx, group, capacity) do
     from = group.state.capacity
     start = System.monotonic_time()
 
@@ -3926,7 +3921,10 @@ defmodule Transmuter.Generation do
         do: compact(ctx, group, capacity),
         else: grow(ctx, group, capacity)
 
-    Nx.to_binary(group.state.history, limit: 1)
+    capacity_iota = Nx.iota({capacity}, backend: Nx.BinaryBackend)
+    history = move_tensor(group.state.history, &ctx.grow.(&1, capacity_iota))
+    group = put_in(group.state.history, history)
+    Nx.to_binary(history, limit: 1)
     ms = System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond) / 1000
     rows = max(Enum.sum(capacity_path(ctx, from, capacity)), capacity)
     %{group | moves: [%{from: from, to: capacity, rows: rows, ms: ms} | group.moves]}
@@ -4001,9 +3999,15 @@ defmodule Transmuter.Generation do
         rows ++ List.duplicate(0, state.capacity - length(rows))
       end
 
-    old = state.cache |> Map.take(ctx.buffers) |> Map.put(@history, state.history)
-    moved = ctx.compact.(old, Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend))
-    release(Map.values(old), Map.values(moved))
+    index = Nx.tensor(index, type: :s32, backend: ctx.backend)
+
+    moved =
+      Map.new(Map.take(state.cache, ctx.buffers), fn {name, buffer} ->
+        {name, move_tensor(buffer, &ctx.compact.(&1, index))}
+      end)
+
+    release([index], [])
+    moved = Map.put(moved, @history, state.history)
     {history, moved} = Map.pop!(resize_buffers(ctx, moved, state.capacity, capacity), @history)
 
     state = %{
@@ -4095,14 +4099,24 @@ defmodule Transmuter.Generation do
   end
 
   # Gives the buffers of `tensors` the capacity `to`, one step of capacity/2 at a time from the
-  # capacity `from`, so each growth or shrink compiles only between neighbour capacities (see
-  # compile_steps/3). Each step frees the buffers of the step before.
+  # capacity `from`, so each growth or shrink compiles only between neighbour capacities, once
+  # for each shape of buffer (see compile_steps/3). The buffers move one at a time.
   defp resize_buffers(ctx, tensors, from, to) do
-    Enum.reduce(capacity_path(ctx, from, to), tensors, fn capacity, tensors ->
-      resized = ctx.grow.(tensors, Nx.iota({capacity}, backend: Nx.BinaryBackend))
-      release(Map.values(tensors), Map.values(resized))
-      resized
+    steps =
+      for capacity <- capacity_path(ctx, from, to),
+          do: Nx.iota({capacity}, backend: Nx.BinaryBackend)
+
+    Map.new(tensors, fn {name, tensor} ->
+      {name, Enum.reduce(steps, tensor, &move_tensor(&2, fn t -> ctx.grow.(t, &1) end))}
     end)
+  end
+
+  # A call on one buffer, which frees the buffer after the call. A move of all buffers, one
+  # call at a time, then holds one buffer more than the buffers that it gives.
+  defp move_tensor(tensor, fun) do
+    moved = fun.(tensor)
+    release([tensor], [moved])
+    moved
   end
 
   # The capacities after `from` on the way to `to`, up or down, each one step of capacity/2.
@@ -4130,10 +4144,10 @@ defmodule Transmuter.Generation do
   end
 
   # The peak of device memory of a group of `rows` rows at `capacity`, with `live` bytes in
-  # use: the larger of a step at the capacity, with the temporary of the widest step, and a
-  # growth into it from the capacity before, which holds the buffers of both capacities.
+  # use: the buffers at the capacity, and the larger of the temporary of the widest step and
+  # the one buffer more that a move to the capacity holds (see resize_buffers/4).
   defp peak(ctx, rows, live, capacity) do
-    {position, cache_heads} = position_sizes(ctx)
+    {position, cache_heads, largest} = position_sizes(ctx)
 
     # The temporaries of the widest step, from the buffers that XLA gives it, which it reuses
     # for each layer: two outputs of the widest matmul for each token, such as the merged gate
@@ -4154,9 +4168,7 @@ defmodule Transmuter.Generation do
     scores = div(3 * chunk, 2)
     widened = if bf16_cache?(ctx), do: rows * capacity * 2 * (position - 4), else: 0
     temporary = 2 * rows * width * ctx.matmul_bytes + scores + widened
-    before = capacities(ctx, capacity - 1) |> List.last(0)
-    buffers = &(rows * position * &1)
-    live + max(buffers.(capacity) + temporary, buffers.(before) + buffers.(capacity))
+    live + rows * capacity * position + max(temporary, rows * capacity * largest)
   end
 
   @doc false
@@ -4164,7 +4176,8 @@ defmodule Transmuter.Generation do
   # history.
   def position_bytes(ctx), do: elem(position_sizes(ctx), 0)
 
-  # The bytes of one row and position of the buffers, and the most heads of a cache buffer.
+  # The bytes of one row and position of the buffers, the most heads of a cache buffer, and the
+  # bytes of one row and position of the largest buffer.
   defp position_sizes(ctx) do
     ctx.buffers
     |> Enum.filter(&(&1 in ctx.cache))
@@ -4173,7 +4186,9 @@ defmodule Transmuter.Generation do
       {_kind, bits} = Nx.Type.normalize!(type)
       {heads * head_dim * div(bits, 8), heads}
     end)
-    |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
+    |> Enum.reduce({4, 0, 4}, fn {bytes, h}, {sum, heads, largest} ->
+      {sum + bytes, max(heads, h), max(largest, bytes)}
+    end)
   end
 
   defp bf16_cache?(ctx) do
@@ -4214,9 +4229,7 @@ defmodule Transmuter.Generation do
     end
   end
 
-  defp grow_rows(tensors, capacity) do
-    Map.new(tensors, fn {name, tensor} -> {name, resize(tensor, Nx.axis_size(capacity, 0))} end)
-  end
+  defp grow_rows(tensor, capacity), do: resize(tensor, Nx.axis_size(capacity, 0))
 
   # Pads the rows of a tensor with free rows, or keeps its first rows.
   defp resize(tensor, capacity) do
@@ -4233,26 +4246,19 @@ defmodule Transmuter.Generation do
 
   # Each row of a buffer takes the rows of `index`, {batch, capacity}, on its rows axis: a take
   # on a view with the axes before the rows axis and the rows axis together. The tokens keep
-  # their places, and only their capacity follows the index.
-  defp compact_rows(tensors, index) do
+  # their places, so compact/3 does not give them to it.
+  defp compact_rows(tensor, index) do
     {batch, capacity} = Nx.shape(index)
-
-    Map.new(tensors, fn
-      {@history, tokens} ->
-        {@history, resize(tokens, capacity)}
-
-      {name, tensor} ->
-        axis = rows_axis(tensor)
-        dims = Tuple.to_list(Nx.shape(tensor))
-        rows = Enum.at(dims, axis)
-        inner = dims |> Enum.slice(1, axis - 1) |> Enum.product()
-        outer = Nx.iota({batch, inner, 1}, axis: 0) |> Nx.multiply(inner)
-        start = Nx.add(outer, Nx.iota({batch, inner, 1}, axis: 1)) |> Nx.multiply(rows)
-        flat = start |> Nx.add(Nx.new_axis(index, 1)) |> Nx.flatten()
-        view = Nx.reshape(tensor, {:auto, dims |> Enum.drop(axis + 1) |> Enum.product()})
-        shape = dims |> List.replace_at(axis, capacity) |> List.to_tuple()
-        {name, view |> Nx.take(flat) |> Nx.reshape(shape)}
-    end)
+    axis = rows_axis(tensor)
+    dims = Tuple.to_list(Nx.shape(tensor))
+    rows = Enum.at(dims, axis)
+    inner = dims |> Enum.slice(1, axis - 1) |> Enum.product()
+    outer = Nx.iota({batch, inner, 1}, axis: 0) |> Nx.multiply(inner)
+    start = Nx.add(outer, Nx.iota({batch, inner, 1}, axis: 1)) |> Nx.multiply(rows)
+    flat = start |> Nx.add(Nx.new_axis(index, 1)) |> Nx.flatten()
+    view = Nx.reshape(tensor, {:auto, dims |> Enum.drop(axis + 1) |> Enum.product()})
+    shape = dims |> List.replace_at(axis, capacity) |> List.to_tuple()
+    view |> Nx.take(flat) |> Nx.reshape(shape)
   end
 
   # The last rows of each present, as many as the tokens of the step, are the new rows:

@@ -673,6 +673,99 @@ defmodule Transmuter.GenerationTest do
     assert Enum.map(grown, &hd/1) == Enum.map(fits, &hd/1)
   end
 
+  # A move frees each buffer of the cache right after the call that reads it, while the call
+  # can still run on the device. Each buffer that it gives must equal the same rows of the
+  # buffers before the move bit for bit: a growth in :in_place from 256 to 384 rows pads each
+  # buffer and the tokens with zeros, in two steps, and a compaction in :append from 320 to 256
+  # rows takes the valid rows of each row to its front and keeps the first 256 rows. The
+  # buffers before the move are free after it.
+  test "a move of the buffers one at a time keeps each buffer bit for bit" do
+    for {source, mode, from, to} <- [
+          {"HuggingFaceTB/SmolLM2-135M-Instruct", :in_place, 256, 384},
+          {"onnx-community/SmolLM2-135M-Instruct-ONNX", :append, 320, 256}
+        ] do
+      opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+      {repo, model, _tokenizer} = Transmuter.Serving.load!({:hf, source}, opts, :fp32)
+      ctx = Generation.context(%{repo | generation_config: %{}}, model, [])
+      assert ctx.mode == mode
+      ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+      group = Generation.open(ctx, 3, from)
+      assert group.state.capacity == from
+      Generation.release(Map.values(Map.take(group.state.cache, ctx.buffers)), [])
+
+      filled = fn tensor, i ->
+        shape = Nx.shape(tensor)
+        iota = Nx.iota(shape, type: Nx.type(tensor), backend: ctx.backend)
+        Nx.add(iota, i * Nx.size(shape))
+      end
+
+      cache =
+        ctx.buffers
+        |> Enum.with_index(1)
+        |> Map.new(fn {name, i} -> {name, filled.(group.state.cache[name], i)} end)
+
+      history = filled.(group.state.history, 0)
+      valid = [[{200, 20}, {0, 40}], [{0, 150}], []]
+      state = %{group.state | cache: Map.merge(group.state.cache, cache), history: history}
+      group = %{group | state: %{state | valid: valid, used: 220}, done: [false, false, false]}
+
+      # The rows of each row after the move: all rows in :in_place, and the valid rows in
+      # :append, in their order, with row 0 after them, as in compact/3.
+      index =
+        for ranges <- valid do
+          rows = for {start, n} <- Enum.reverse(ranges), row <- start..(start + n - 1)//1, do: row
+          if mode == :append, do: rows ++ List.duplicate(0, from - length(rows)), else: []
+        end
+
+      resize = fn tensor, axis ->
+        if to > from do
+          padding = List.duplicate({0, 0, 0}, Nx.rank(tensor))
+          Nx.pad(tensor, 0, List.replace_at(padding, axis, {0, to - from, 0}))
+        else
+          Nx.slice_along_axis(tensor, 0, to, axis: axis)
+        end
+      end
+
+      expected =
+        Map.new(cache, fn {name, buffer} ->
+          taken =
+            if mode == :append,
+              do:
+                Nx.stack(
+                  for {rows, b} <- Enum.with_index(index),
+                      do: Nx.take(buffer[b], Nx.tensor(rows), axis: 1)
+                ),
+              else: buffer
+
+          {name, resize.(taken, 2)}
+        end)
+
+      expected_history = resize.(history, 1)
+      moved = Generation.move(ctx, group, to)
+      assert moved.state.capacity == to
+
+      for {name, buffer} <- expected do
+        assert Nx.to_binary(moved.state.cache[name]) == Nx.to_binary(buffer), name
+      end
+
+      assert Nx.to_binary(moved.state.history) == Nx.to_binary(expected_history)
+
+      # EMLX 0.5 raises on the deallocation of a free tensor, in EMLX.unwrap!/1.
+      freed? = fn tensor ->
+        try do
+          Nx.backend_deallocate(tensor) == :already_deallocated
+        rescue
+          FunctionClauseError -> true
+        end
+      end
+
+      assert Enum.all?([history | Map.values(cache)], freed?)
+
+      Generation.release([expected_history | Map.values(expected)], [])
+      Generation.finish(moved)
+    end
+  end
+
   # The step of a growth is a quarter of the power of two below the rows, at least 64 rows. An
   # answer of 600 tokens to a prompt of 10 tokens grows by 64 rows up to 512 rows, and then by
   # 128 rows, so it compiles 6 capacities. Steps of 64 rows would compile 7, and powers of two
@@ -3145,31 +3238,31 @@ defmodule Transmuter.GenerationCapacityTest do
   @live 1_000_000_000
   @scores_chunk 402_653_184
 
+  # A move holds the buffers at the capacity and one buffer more (see resize_buffers/4), 32,768
+  # bytes for each position of 8 rows. With steps of 1 token, the temporaries are smaller than
+  # that buffer, and the move decides.
   test "the largest capacity is the largest one whose peak fits 95% of the device memory" do
-    growth = @live + 917_536 * (1792 + 2048)
-
-    # The step at 2048 rows needs less than the growth into it, so the growth decides.
-    assert @live + 917_536 * 2048 + 2 * 4096 * 4096 + @scores_chunk < growth
-    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95) == 2048
-    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95 - 1) == 1792
-    assert Generation.largest_capacity(@ctx, 8, @live, 1.0e12) == 4096
-    assert Generation.largest_capacity(@ctx, 8, @live, nil) == 4096
+    narrow = %{@ctx | widths: %{with_cache: [1], without_cache: [1]}}
+    move = @live + (917_536 + 32_768) * 2048
+    assert 2 * 8 * 4096 + div(3 * 8 * 8 * 2048 * 4, 2) < 32_768 * 2048
+    assert Generation.largest_capacity(narrow, 8, @live, move / 0.95) == 2048
+    assert Generation.largest_capacity(narrow, 8, @live, move / 0.95 - 1) == 1792
+    assert Generation.largest_capacity(narrow, 8, @live, 1.0e12) == 4096
+    assert Generation.largest_capacity(narrow, 8, @live, nil) == 4096
   end
 
-  # The step decides when its temporaries are large: a wide matmul, or the f32 copy of a bf16
-  # cache (14 layers of bf16 caches hold 458,784 bytes for each position of 8 rows, and their
-  # f32 copy 917,504 bytes).
+  # The step decides when its temporaries are larger than one buffer: the steps of 512 tokens,
+  # or the f32 copy of a bf16 cache (14 layers of bf16 caches hold 458,784 bytes for each
+  # position of 8 rows, and their f32 copy 917,504 bytes).
   test "the step peak decides the capacity when the temporaries of the widest step are large" do
-    wide = %{@ctx | matmul_bytes: 200_000}
-    step = @live + 917_536 * 2048 + 2 * 4096 * 200_000 + @scores_chunk
-    assert @live + 917_536 * (1792 + 2048) < step
-    assert Generation.largest_capacity(wide, 8, @live, step / 0.95) == 2048
-    assert Generation.largest_capacity(wide, 8, @live, step / 0.95 - 1) == 1792
+    step = @live + 917_536 * 2048 + 2 * 4096 * 4096 + @scores_chunk
+    assert 32_768 * 2048 < 2 * 4096 * 4096 + @scores_chunk
+    assert Generation.largest_capacity(@ctx, 8, @live, step / 0.95) == 2048
+    assert Generation.largest_capacity(@ctx, 8, @live, step / 0.95 - 1) == 1792
 
     types = Map.new(@names, &{&1, {:bf16, ["batch", 8, "length", 128]}})
     bf16 = %{@ctx | model: %{input_types: types}}
     step = @live + (458_784 + 917_504) * 2048 + 2 * 4096 * 4096 + @scores_chunk
-    assert @live + 458_784 * (1792 + 2048) < step
     assert Generation.largest_capacity(bf16, 8, @live, step / 0.95) == 2048
     assert Generation.largest_capacity(bf16, 8, @live, step / 0.95 - 1) == 1792
   end
