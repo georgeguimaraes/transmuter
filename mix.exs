@@ -63,6 +63,7 @@ defmodule Transmuter.MixProject do
         "guides/vision_and_multimodal.md": [title: "Vision and multimodal"],
         "guides/backends_and_performance.md": [title: "Backends and performance"],
         "guides/distributed.md": [title: "Distributed nodes"],
+        "guides/telemetry.md": [title: "Telemetry in production"],
         "guides/supported_operators.md": [title: "Supported operators and data types"]
       ],
       groups_for_extras: [
@@ -75,6 +76,7 @@ defmodule Transmuter.MixProject do
           guides/vision_and_multimodal.md
           guides/backends_and_performance.md
           guides/distributed.md
+          guides/telemetry.md
           guides/supported_operators.md
         )
       ],

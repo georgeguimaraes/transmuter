@@ -162,7 +162,7 @@ See [Supported Operators and Data Types](guides/supported_operators.md) for deta
 
 ## Telemetry
 
-Transmuter emits `:telemetry` events when it loads, compiles and runs a model. The graph break events show which segment compiles again and for which shapes, which segment the cache evicts, and how long each break operator runs. `Transmuter.Telemetry` lists each event with its measurements and metadata.
+Transmuter emits `:telemetry` events when it loads, compiles and runs a model. A `Transmuter.ContinuousBatching` server emits the time to the first token, the time per output token, its queue and the use of its KV cache, and the servings of the tasks emit their batch sizes and latency. The graph break events show which segment compiles again and for which shapes. [Telemetry in production](guides/telemetry.md) shows the metrics for an application and how to send them to Prometheus. `Transmuter.Telemetry` lists each event with its measurements and metadata.
 
 To log the compile work, attach the logger when your application starts:
 
