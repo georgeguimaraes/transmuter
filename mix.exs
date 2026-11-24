@@ -31,6 +31,9 @@ defmodule Transmuter.MixProject do
       {:telemetry, "~> 1.3"},
       {:exla, "~> 1.0", optional: true},
       {:emlx, "~> 0.5", optional: true},
+      # EMLX 0.5.0 and EXLA 1.0.0 ask for fine ~> 0.1, but they do not compile with fine 0.2.
+      # An optional dep does not limit a fine that EMLX or EXLA bring to an application.
+      {:fine, "~> 0.1.6", runtime: false},
       {:stb_image, "~> 1.0", optional: true},
       {:tokenizers, "~> 0.5", optional: true},
       {:otera, "~> 0.1", optional: true},
