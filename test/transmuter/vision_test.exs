@@ -663,10 +663,13 @@ defmodule Transmuter.VisionTest do
   end
 
   @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
+  # The commit of the repository with which test/support/pipeline_references.py recorded the
+  # references. The chat template changed after it, on 2026-11-24.
+  @ministral_revision "e1128d389145f96bb1c3c2625cb8ca255ffa7034"
 
   @tag ci_partition: 15
   test "the Pixtral processor gives the blocks and the prompt of Python transformers" do
-    repo = Transmuter.Repo.load!(@ministral)
+    repo = Transmuter.Repo.load!(@ministral, revision: @ministral_revision)
     processor = PixtralProcessor.load!(repo)
     tokenizer = Tokenizer.load!(repo)
     image = StbImage.to_nx(@image)
@@ -1548,6 +1551,8 @@ defmodule Transmuter.VisionLargeModelTest do
   @qwen3_vl {:hf, "onnx-community/Qwen3-VL-2B-Instruct-ONNX"}
   @qwen2_5_vl {:hf, "onnx-community/Qwen2.5-VL-3B-Instruct-ONNX"}
   @ministral {:hf, "mistralai/Ministral-3-3B-Instruct-2512-ONNX"}
+  # The commit of the references, see the Pixtral processor test.
+  @ministral_revision "e1128d389145f96bb1c3c2625cb8ca255ffa7034"
 
   # The reference is the beam search of transformers on the export's image features, see
   # test/support/pipeline_references.py. Python runs each prompt without padding, and the
@@ -1970,7 +1975,8 @@ defmodule Transmuter.VisionLargeModelTest do
       [
         variant: %{vision_encoder: :q4, embed_tokens: :q4, decoder_model_merged: :q4},
         strategy: :greedy,
-        max_new_tokens: 24
+        max_new_tokens: 24,
+        revision: @ministral_revision
       ] ++ @opts
 
     serving = Vision.image_text_to_text(@ministral, opts)

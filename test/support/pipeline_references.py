@@ -659,8 +659,10 @@ for name, (embeds, position_ids, delta) in prepared.items():
 # pixel_values at (block, value), the mean of the absolute values, and the number and a
 # SHA-256 of the int64 input ids. The tile of 7x7 images gets smaller to 1176x1540.
 repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
+# The commit of the references. The chat template of the repository changed after it, on 2026-11-24.
+ministral_revision = "e1128d389145f96bb1c3c2625cb8ca255ffa7034"
 image = Image.open("test/fixtures/cats.png")
-processor = AutoProcessor.from_pretrained(repo)
+processor = AutoProcessor.from_pretrained(repo, revision=ministral_revision)
 chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Can you describe this image?"}]}]
 prompt = processor.apply_chat_template(chat, add_generation_prompt=True)
 pixtral_positions = [(0, 0), (1, 100), (-1, 2351), (50, 777)]
@@ -679,7 +681,7 @@ for name, picture in [("wide", image), ("tall", image.transpose(Image.Transpose.
 pixels = np.asarray(image)
 y, x = np.mgrid[0 : pixels.shape[0], 0 : pixels.shape[1]]
 rgba = Image.fromarray(np.dstack([pixels, ((7 * x + 3 * y) % 256).astype(np.uint8)]), "RGBA")
-slow = AutoProcessor.from_pretrained(repo, image_processor=AutoImageProcessor.from_pretrained(repo, use_fast=False))
+slow = AutoProcessor.from_pretrained(repo, revision=ministral_revision, image_processor=AutoImageProcessor.from_pretrained(repo, revision=ministral_revision, use_fast=False))
 for name, pixtral, picture, options in [("rgba slow", slow, rgba, {}), ("rgba fast", processor, rgba, {}), ("no resize", processor, image, {"do_resize": False})]:
     inputs = pixtral(text=prompt, images=[picture], add_special_tokens=False, return_tensors="pt", **options)
     ids, values = inputs["input_ids"][0].numpy().astype("<i8"), inputs["pixel_values"][0].numpy()
@@ -695,7 +697,7 @@ for name, pixtral, picture, options in [("rgba slow", slow, rgba, {}), ("rgba fa
 # accuracy_level 0. The data of the decoder is larger than 2 GB, so exact_session saves the
 # graph next to the data.
 repo = "mistralai/Ministral-3-3B-Instruct-2512-ONNX"
-directory = snapshot_download(repo, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
+directory = snapshot_download(repo, revision=ministral_revision, allow_patterns=["onnx/vision_encoder_q4.onnx*", "onnx/embed_tokens_q4.onnx*", "onnx/decoder_model_merged_q4.onnx*"], local_dir=tempfile.mkdtemp(dir=scratch.name))
 
 vision, embed, decoder = (exact_session(f"{directory}/onnx/{name}.onnx", next_to_data=True) for name in ["vision_encoder_q4", "embed_tokens_q4", "decoder_model_merged_q4"])
 names = [o.name for o in decoder.get_outputs()]
