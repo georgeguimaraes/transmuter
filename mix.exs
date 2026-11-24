@@ -64,7 +64,12 @@ defmodule Transmuter.MixProject do
         "guides/backends_and_performance.md": [title: "Backends and performance"],
         "guides/distributed.md": [title: "Distributed nodes"],
         "guides/telemetry.md": [title: "Telemetry in production"],
-        "guides/supported_operators.md": [title: "Supported operators and data types"]
+        "guides/supported_operators.md": [title: "Supported operators and data types"],
+        "notebooks/chat_server.livemd": [title: "A chat server with ContinuousBatching"],
+        "notebooks/embeddings_and_reranking.livemd": [
+          title: "Search with embeddings and reranking"
+        ],
+        "notebooks/speech_to_text.livemd": [title: "Speech to text"]
       ],
       groups_for_extras: [
         Guides: ~w(
@@ -78,6 +83,11 @@ defmodule Transmuter.MixProject do
           guides/distributed.md
           guides/telemetry.md
           guides/supported_operators.md
+        ),
+        Notebooks: ~w(
+          notebooks/chat_server.livemd
+          notebooks/embeddings_and_reranking.livemd
+          notebooks/speech_to_text.livemd
         )
       ],
       groups_for_modules: [

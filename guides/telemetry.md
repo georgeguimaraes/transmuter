@@ -2,6 +2,8 @@
 
 Transmuter emits `:telemetry` events when it loads, compiles and runs a model. This guide shows the events that an application needs to run a model in production, and how to turn them into metrics. `Transmuter.Telemetry` lists each event with all its measurements and metadata.
 
+Three Livebook notebooks show these events in an application: [a chat server with ContinuousBatching](../notebooks/chat_server.livemd), [search with embeddings and reranking](../notebooks/embeddings_and_reranking.livemd) and [speech to text](../notebooks/speech_to_text.livemd).
+
 ## The events for an application
 
 | Question | Event | Values |

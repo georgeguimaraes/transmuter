@@ -1,0 +1,120 @@
+# Speech to text
+
+```elixir
+# Choose :emlx on Apple silicon, or :exla on Linux.
+backend = :emlx
+
+{backend_dep, backend_opts} =
+  case backend do
+    :emlx -> {{:emlx, "~> 0.5"}, [backend: EMLX.Backend, defn_options: [compiler: EMLX]]}
+    :exla -> {{:exla, "~> 1.0"}, [backend: EXLA.Backend, defn_options: [compiler: EXLA]]}
+  end
+
+Mix.install([
+  # The telemetry events of this notebook are not on Hex yet. When a Hex release after 2.0.0
+  # has them, change this line to {:transmuter, "~> 2.1"}.
+  {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
+  backend_dep,
+  {:tokenizers, "~> 0.5"},
+  {:kino, "~> 0.19"}
+])
+
+if backend == :emlx, do: EMLX.set_cache_limit(1_000_000_000)
+```
+
+## Start the serving
+
+`Transmuter.Audio.speech_to_text/2` runs Whisper on PCM samples at 16 kHz. Long audio goes into windows of 30 seconds, and the serving joins their text. With `timestamps: :segments`, the result has one chunk for each segment of speech, with its start and end in seconds. The serving starts under the supervision of the notebook, so it compiles once.
+
+```elixir
+serving =
+  Transmuter.Audio.speech_to_text(
+    {:hf, "onnx-community/whisper-base"},
+    [timestamps: :segments] ++ backend_opts
+  )
+
+Kino.start_child({Nx.Serving, serving: serving, name: Speech, batch_timeout: 50})
+```
+
+## Measure each call
+
+Each call emits `[:transmuter, :serving, :request, :stop]` with its duration, and a generation serving such as Whisper adds the output tokens. This handler sends the values to the process of this notebook.
+
+```elixir
+parent = self()
+
+:telemetry.attach(
+  "speech-notebook",
+  [:transmuter, :serving, :request, :stop],
+  fn _event, measurements, _metadata, _config -> send(parent, {:speech_call, measurements}) end,
+  nil
+)
+
+report = fn seconds ->
+  receive do
+    {:speech_call, m} ->
+      duration = System.convert_time_unit(m.duration, :native, :millisecond) / 1000
+
+      Kino.Markdown.new("""
+      Audio: #{Float.round(seconds, 1)} s. Call: #{Float.round(duration, 2)} s. \
+      Output tokens: #{m[:output_tokens]}. \
+      The model ran #{Float.round(seconds / duration, 1)} times faster than the audio.
+      """)
+  after
+    5_000 -> Kino.Markdown.new("No call event came.")
+  end
+end
+```
+
+## Record your voice
+
+Record a few sentences, and then run the next cell.
+
+```elixir
+input = Kino.Input.audio("Speech", format: :pcm_f32, sampling_rate: 16_000)
+```
+
+```elixir
+%{file_ref: file_ref, num_channels: channels} = Kino.Input.read(input)
+
+samples =
+  file_ref
+  |> Kino.Input.file_path()
+  |> File.read!()
+  |> Nx.from_binary(:f32)
+  |> Nx.reshape({:auto, channels})
+  |> Nx.mean(axes: [1])
+
+%{chunks: chunks} = Nx.Serving.batched_run(Speech, samples)
+
+Kino.Layout.grid([
+  Kino.Markdown.new(Enum.map_join(chunks, " ", &String.trim(&1.text))),
+  report.(Nx.size(samples) / 16_000)
+])
+```
+
+## Transcribe a file
+
+The serving also reads an audio file through ffmpeg, which must be on the `PATH`. Choose a file, for example a recording of several minutes. The serving cuts it into windows of 30 seconds.
+
+```elixir
+file = Kino.Input.file("Audio file")
+```
+
+```elixir
+%{file_ref: file_ref} = Kino.Input.read(file)
+path = Kino.Input.file_path(file_ref)
+
+%{chunks: chunks} = Nx.Serving.batched_run(Speech, {:file, path})
+
+seconds = chunks |> List.last() |> Map.get(:end_timestamp_seconds) || 0.0
+
+rows =
+  for chunk <- chunks do
+    %{start: chunk.start_timestamp_seconds, end: chunk.end_timestamp_seconds, text: chunk.text}
+  end
+
+Kino.Layout.grid([Kino.DataTable.new(rows), report.(seconds)])
+```
+
+In an application, send these values to a metrics service with `Telemetry.Metrics`. The guide "Telemetry in production" shows how.

@@ -1,0 +1,171 @@
+# Search with embeddings and reranking
+
+```elixir
+# Choose :emlx on Apple silicon, or :exla on Linux.
+backend = :emlx
+
+{backend_dep, backend_opts} =
+  case backend do
+    :emlx -> {{:emlx, "~> 0.5"}, [backend: EMLX.Backend, defn_options: [compiler: EMLX]]}
+    :exla -> {{:exla, "~> 1.0"}, [backend: EXLA.Backend, defn_options: [compiler: EXLA]]}
+  end
+
+Mix.install([
+  # The telemetry events of this notebook are not on Hex yet. When a Hex release after 2.0.0
+  # has them, change this line to {:transmuter, "~> 2.1"}.
+  {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
+  backend_dep,
+  {:tokenizers, "~> 0.5"},
+  {:kino, "~> 0.19"}
+])
+
+if backend == :emlx, do: EMLX.set_cache_limit(1_000_000_000)
+```
+
+## Two servings
+
+A search has two steps:
+
+1. An embedding model gives a vector for each document and for the query. The documents with the nearest vectors are the candidates. This step is fast, so it can look at many documents.
+2. A reranking model reads the query and each candidate together, and gives a score of how well the candidate answers the query. This step is slower and more accurate, so it reads only the candidates.
+
+Each serving starts under the supervision of the notebook. It compiles its shapes once when it starts. Calls from many processes go into batches of up to 8 inputs, and a batch waits at most 20 ms for more inputs.
+
+```elixir
+embedding =
+  Transmuter.Text.text_embedding(
+    {:hf, "Xenova/bge-small-en-v1.5"},
+    [compile: [batch_size: 8, sequence_length: [32, 128]]] ++ backend_opts
+  )
+
+ranking =
+  Transmuter.Text.text_ranking(
+    {:hf, "Xenova/ms-marco-MiniLM-L-6-v2"},
+    [compile: [batch_size: 8, sequence_length: [64, 256]]] ++ backend_opts
+  )
+
+Kino.start_child({Nx.Serving, serving: embedding, name: Embedding, batch_timeout: 20})
+Kino.start_child({Nx.Serving, serving: ranking, name: Ranking, batch_timeout: 20})
+```
+
+## Collect the batch metrics
+
+Each batch of a serving emits `[:transmuter, :serving, :batch, :stop]` with its rows (`:batch_size`) and the batch size of the compiled model (`:padded_size`). Each call emits `[:transmuter, :serving, :request, :stop]` with the time that the caller waited. This handler keeps the events in an `Agent`.
+
+```elixir
+{:ok, events} = Agent.start_link(fn -> [] end)
+ms = &(System.convert_time_unit(&1, :native, :microsecond) / 1000)
+
+:telemetry.attach_many(
+  "search-notebook",
+  [[:transmuter, :serving, :batch, :stop], [:transmuter, :serving, :request, :stop]],
+  fn [_, _, kind, _], m, %{source: {:hf, repo, _file}}, agent ->
+    row =
+      case kind do
+        :batch -> %{model: repo, event: "batch", rows: "#{m.batch_size} of #{m.padded_size}", ms: ms.(m.duration)}
+        :request -> %{model: repo, event: "call", rows: "#{m[:inputs]} inputs", ms: ms.(m.duration)}
+      end
+
+    Agent.cast(agent, &[row | &1])
+  end,
+  events
+)
+```
+
+## Embed the documents
+
+```elixir
+documents = [
+  "Berlin has a population of 3.5 million registered inhabitants.",
+  "The Eiffel Tower is 330 metres tall.",
+  "Photosynthesis turns light, water and carbon dioxide into sugar.",
+  "The Pacific is the largest ocean on Earth.",
+  "A prime number has exactly two divisors: 1 and itself.",
+  "Mount Everest is the highest mountain above sea level.",
+  "Bees communicate the direction of food with a dance.",
+  "The heart pumps about 5 litres of blood each minute.",
+  "Paris is the capital and the largest city of France.",
+  "Water boils at 100 degrees Celsius at sea level.",
+  "The Amazon river carries more water than any other river.",
+  "Octopuses have three hearts and blue blood."
+]
+
+normalize = fn t -> Nx.divide(t, Nx.LinAlg.norm(t, axes: [-1], keep_axes: true)) end
+
+# A list of inputs gives a list of results. The serving cuts it into batches of 8.
+matrix =
+  Embedding
+  |> Nx.Serving.batched_run(documents)
+  |> Enum.map(& &1.embedding)
+  |> Nx.stack()
+  |> normalize.()
+```
+
+## Search
+
+The query gives the 5 nearest documents by cosine similarity. The reranking model then scores the 5 candidates against the query.
+
+```elixir
+query = "How many people live in Berlin?"
+
+%{embedding: vector} = Nx.Serving.batched_run(Embedding, query)
+similarity = Nx.dot(matrix, normalize.(vector))
+
+candidates =
+  similarity
+  |> Nx.argsort(direction: :desc)
+  |> Nx.to_list()
+  |> Enum.take(5)
+  |> Enum.map(&Enum.at(documents, &1))
+
+%{results: results} =
+  Nx.Serving.batched_run(Ranking, %{query: query, documents: candidates})
+
+Kino.DataTable.new(
+  for %{index: index, score: score} <- results,
+      do: %{document: Enum.at(candidates, index), score: Float.round(score, 2)}
+)
+```
+
+## Many searches at the same time
+
+20 searches run at the same time. Their calls go into shared batches, so the batches are fuller than with one search at a time.
+
+```elixir
+queries = [
+  "Which city is the capital of France?",
+  "How tall is the Eiffel Tower?",
+  "How do plants make food?",
+  "What is the biggest ocean?",
+  "What is a prime number?",
+  "Which mountain is the highest?",
+  "How do bees find food?",
+  "How much blood does the heart pump?",
+  "At what temperature does water boil?",
+  "Which animal has three hearts?"
+]
+
+queries
+|> Stream.cycle()
+|> Enum.take(20)
+|> Task.async_stream(
+  fn query ->
+    %{embedding: vector} = Nx.Serving.batched_run(Embedding, query)
+    [best | _] = matrix |> Nx.dot(normalize.(vector)) |> Nx.argsort(direction: :desc) |> Nx.to_list()
+    {query, Enum.at(documents, best)}
+  end,
+  max_concurrency: 20
+)
+|> Enum.map(fn {:ok, {query, document}} -> %{query: query, nearest: document} end)
+|> Kino.DataTable.new()
+```
+
+## The batches
+
+Each row is one event, the most recent first. The rows of a batch show how full it was.
+
+```elixir
+Kino.DataTable.new(Agent.get(events, & &1), name: "Batches and calls")
+```
+
+In an application, send these values to a metrics service with `Telemetry.Metrics`. The guide "Telemetry in production" shows how.

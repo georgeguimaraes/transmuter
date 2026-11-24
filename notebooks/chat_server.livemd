@@ -1,0 +1,162 @@
+# A chat server with ContinuousBatching
+
+```elixir
+# Choose :emlx on Apple silicon, or :exla on Linux.
+backend = :emlx
+
+{backend_dep, backend_opts} =
+  case backend do
+    :emlx -> {{:emlx, "~> 0.5"}, [backend: EMLX.Backend, defn_options: [compiler: EMLX]]}
+    :exla -> {{:exla, "~> 1.0"}, [backend: EXLA.Backend, defn_options: [compiler: EXLA]]}
+  end
+
+Mix.install([
+  # The telemetry events of this notebook are not on Hex yet. When a Hex release after 2.0.0
+  # has them, change this line to {:transmuter, "~> 2.1"}.
+  {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
+  backend_dep,
+  {:tokenizers, "~> 0.5"},
+  {:otera, "~> 0.1"},
+  {:kino, "~> 0.19"}
+])
+
+if backend == :emlx, do: EMLX.set_cache_limit(1_000_000_000)
+```
+
+## Start the server
+
+A `Transmuter.ContinuousBatching` server runs a language model for many callers at the same time. A request joins the running rows at the next step, so it does not wait for the other requests to end.
+
+This server has 4 rows (`slots: 4`). With `compile_steps: true`, it compiles each step shape before it starts, so the first requests do not wait for a compile.
+
+```elixir
+spec =
+  {Transmuter.ContinuousBatching,
+   [
+     name: Chat,
+     source: {:hf, "HuggingFaceTB/SmolLM2-360M-Instruct"},
+     slots: 4,
+     max_new_tokens: 200,
+     compile_steps: true
+   ] ++ backend_opts}
+
+{:ok, _pid} = Kino.start_child(spec)
+```
+
+## Collect the metrics
+
+The server emits telemetry events for each step and for each request. A handler runs in the process of the server, so this handler only sends a message to an `Agent`. The agent keeps the last values.
+
+```elixir
+{:ok, metrics} =
+  Agent.start_link(fn ->
+    %{requests: [], tokens: 0, running: 0, waiting: 0, kv_used: 0, kv_capacity: 0, started: nil}
+  end)
+
+ms = &System.convert_time_unit(&1, :native, :microsecond) / 1000
+
+handler = fn
+  [_, _, :step, :stop], m, metadata, agent ->
+    Agent.cast(agent, fn state ->
+      %{
+        state
+        | tokens: state.tokens + m.tokens,
+          running: m.running,
+          waiting: m.waiting,
+          kv_used: m.kv_used,
+          kv_capacity: metadata.slots * m.kv_capacity,
+          started: state.started || System.monotonic_time()
+      }
+    end)
+
+  [_, _, :request, :stop], m, %{result: :done}, agent ->
+    request = %{
+      time_to_first_token: ms.(m.time_to_first_token),
+      time_per_output_token: ms.(m.time_per_output_token),
+      output_tokens: m.output_tokens
+    }
+
+    Agent.cast(agent, &%{&1 | requests: [request | &1.requests]})
+
+  _event, _measurements, _metadata, _agent ->
+    :ok
+end
+
+:telemetry.attach_many(
+  "chat-notebook",
+  [
+    [:transmuter, :continuous_batching, :step, :stop],
+    [:transmuter, :continuous_batching, :request, :stop]
+  ],
+  handler,
+  metrics
+)
+```
+
+This frame shows the metrics each second.
+
+```elixir
+frame = Kino.Frame.new()
+
+Kino.listen(1_000, fn _tick ->
+  state = Agent.get(metrics, & &1)
+  done = state.requests
+  mean = fn key -> if done == [], do: 0, else: Enum.sum(Enum.map(done, & &1[key])) / length(done) end
+
+  seconds =
+    if state.started,
+      do: System.convert_time_unit(System.monotonic_time() - state.started, :native, :millisecond) / 1000,
+      else: 0
+
+  rows = [
+    %{metric: "Requests done", value: length(done)},
+    %{metric: "Mean time to first token (ms)", value: Float.round(mean.(:time_to_first_token) * 1.0, 1)},
+    %{metric: "Mean time per output token (ms)", value: Float.round(mean.(:time_per_output_token) * 1.0, 1)},
+    %{metric: "Tokens per second", value: if(seconds > 0, do: Float.round(state.tokens / seconds, 1), else: 0)},
+    %{metric: "Running rows", value: state.running},
+    %{metric: "Waiting requests", value: state.waiting},
+    %{metric: "KV cache in use", value: "#{state.kv_used} of #{state.kv_capacity} rows"}
+  ]
+
+  Kino.Frame.render(frame, Kino.DataTable.new(rows, name: "Server"))
+end)
+
+frame
+```
+
+## Chat with the server
+
+Each question streams its answer into its own frame. The 6 questions run at the same time, so the server runs 4 of them in its rows, and 2 wait in the queue. Look at the metrics above while the answers come.
+
+```elixir
+questions = [
+  "What is the capital of France?",
+  "Explain how a rainbow forms.",
+  "Write a haiku about the sea.",
+  "Why is the sky blue?",
+  "Give three tips to sleep well.",
+  "What is a prime number?"
+]
+
+frames = for _question <- questions, do: Kino.Frame.new()
+
+for {question, frame} <- Enum.zip(questions, frames) do
+  Task.start(fn ->
+    chat = %{messages: [%{role: "user", content: question}]}
+
+    Chat
+    |> Transmuter.ContinuousBatching.stream(chat)
+    |> Enum.reduce("", fn chunk, text ->
+      text = text <> chunk
+      Kino.Frame.render(frame, Kino.Markdown.new("**#{question}**\n\n#{text}"))
+      text
+    end)
+  end)
+end
+
+Kino.Layout.grid(frames, columns: 2)
+```
+
+## Use the metrics in an application
+
+In an application, define the metrics with `Telemetry.Metrics` and send them to a service such as Prometheus. The guide "Telemetry in production" shows how.
