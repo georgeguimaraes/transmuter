@@ -2358,6 +2358,25 @@ defmodule Transmuter.Generation do
   end
 
   @doc false
+  # Whether the rows of `prompts`, each with `budget` new tokens, fit a group where no other row
+  # runs: the rows that their steps write (see rows_written/2) are at most the largest capacity.
+  # Rows that ended write nothing, so these rows stand for that group, and the answer depends
+  # only on the request and the context.
+  def fits_alone?(ctx, prompts, budget) do
+    count = length(prompts)
+
+    rows = %{
+      left: prompts,
+      new: List.duplicate(nil, count),
+      done: List.duplicate(false, count),
+      lengths: List.duplicate(0, count),
+      remaining: List.duplicate(budget, count)
+    }
+
+    rows_written(ctx, rows) <= ctx.max_capacity
+  end
+
+  @doc false
   # The rows of cache that `group` needs to admit `requests` and to run each row to the end of
   # its budget: the rows that its steps write, see rows_written/2.
   def rows_needed(ctx, group, requests) do

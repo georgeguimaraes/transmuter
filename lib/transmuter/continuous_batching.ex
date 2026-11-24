@@ -855,9 +855,7 @@ defmodule Transmuter.ContinuousBatching do
         {:noreply, state}
 
       {{request, preparing}, {:ok, rows, runs}} ->
-        send(request.pid, {ref, {:run, runs}})
-        request = request |> Map.delete(:input) |> Map.put(:rows, Enum.with_index(rows))
-        {:noreply, kick(%{state | preparing: preparing, queue: :queue.in(request, state.queue)})}
+        enqueue_prepared(%{state | preparing: preparing}, request, rows, runs)
 
       {{request, preparing}, {:error, exception}} ->
         send(request.pid, {ref, {:error, exception}})
@@ -871,6 +869,21 @@ defmodule Transmuter.ContinuousBatching do
 
   defp on_info({:EXIT, worker, reason}, state = %{worker: worker}),
     do: {:stop, reason, state}
+
+  # A request whose rows do not fit a group where no other row runs never fits, so its caller
+  # gets an error before the request reaches the queue, which holds only requests that can run.
+  defp enqueue_prepared(state, request, rows, runs) do
+    if Generation.fits_alone?(state.ctx, Enum.map(rows, & &1.prompt), request.max_new_tokens) do
+      send(request.pid, {request.ref, {:run, runs}})
+      request = request |> Map.delete(:input) |> Map.put(:rows, Enum.with_index(rows))
+      {:noreply, kick(%{state | queue: :queue.in(request, state.queue)})}
+    else
+      longest = Enum.max_by(rows, &length(&1.prompt))
+      exception = ArgumentError.exception(too_long(state, Map.merge(request, longest)))
+      send(request.pid, {request.ref, {:error, exception}})
+      {:noreply, forget_callers(state)}
+    end
+  end
 
   @impl true
   # The worker holds the compiled encoder. It does not trap exits, so a stop with :normal
@@ -915,8 +928,8 @@ defmodule Transmuter.ContinuousBatching do
 
   # Gives the free rows to the rows of the waiting requests in their order, while the cache
   # fits them, and runs the step. A request stays first in the queue until all its rows have
-  # a row of the group. A row that does not fit a group without running rows never fits, so
-  # the caller of its request gets an error.
+  # a row of the group. Each request of the queue fits a group where no other row runs (see
+  # enqueue_prepared/4), so it runs when the rows before it end.
   defp step(state) do
     {admitted, state} = admissions(state)
 
@@ -1048,18 +1061,9 @@ defmodule Transmuter.ContinuousBatching do
         candidates = [{row, next} | admitted]
         requests = for {row, waiting} <- candidates, do: request(row, waiting)
 
-        cond do
-          Generation.rows_needed(state.ctx, state.group, requests) <= state.ctx.max_capacity ->
-            admissions(%{state | queue: queue}, free, candidates)
-
-          admitted == [] and not active?(state) ->
-            exception = ArgumentError.exception(too_long(state, next))
-            send(waiting.pid, {waiting.ref, {:error, exception}})
-            admissions(%{state | queue: rest}, [row | free], admitted)
-
-          true ->
-            {Enum.reverse(admitted), state}
-        end
+        if Generation.rows_needed(state.ctx, state.group, requests) <= state.ctx.max_capacity,
+          do: admissions(%{state | queue: queue}, free, candidates),
+          else: {Enum.reverse(admitted), state}
     end
   end
 

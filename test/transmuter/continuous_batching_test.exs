@@ -272,6 +272,38 @@ defmodule Transmuter.ContinuousBatchingTest do
     end
   end
 
+  # A request whose prompt and :max_new_tokens need more rows than the capacity never fits, so
+  # its caller gets the error when the request comes, also while other rows run. A server of 2
+  # rows with 256 rows of cache streams an answer of 150 tokens, and a prompt of more than 256
+  # tokens fails before that answer ends. A short request after it runs next to the stream.
+  test "a request that never fits fails at once while other rows run" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 150, min_new_tokens: 150] ++ @opts
+    spec = [source: source, slots: 2, capacity: 256] ++ opts
+    server = start_supervised!({ContinuousBatching, spec})
+    parent = self()
+
+    streamer =
+      Task.async(fn ->
+        server
+        |> ContinuousBatching.stream("Why is the sky blue?")
+        |> Enum.map_join(fn chunk ->
+          send(parent, :chunk)
+          chunk
+        end)
+      end)
+
+    assert_receive :chunk, 60_000
+
+    assert_raise ArgumentError, ~r/need more than the 256 rows/, fn ->
+      ContinuousBatching.run(server, String.duplicate(@fox, 10))
+    end
+
+    assert Task.yield(streamer, 0) == nil
+    assert %{results: [%{text: _text}]} = ContinuousBatching.run(server, "Once upon a time")
+    assert is_binary(Task.await(streamer, :infinity))
+  end
+
   # Requests cannot join a running batch of a merged decoder that grows its cache, such as
   # the merged llama2.c, whose rows need one length of the cache, or of beam search, whose rows
   # of a prompt move together. The error names the reason, with the node that reads the cache.
