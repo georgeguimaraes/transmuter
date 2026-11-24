@@ -44,6 +44,8 @@ defmodule Transmuter.ContinuousBatching do
 
     * `:capacity_costs` - fixed costs for the shrink of the buffers: `%{slope: ms, per_row: ms}`, the time that one row of capacity adds to a decode step and the time of a move for each row that it copies. The default is `nil`: the server measures them (see `Transmuter.ContinuousBatching.Costs`).
 
+    * `:ragged_prompts` - when `true`, the prompts of new requests run in the steps of the rows that run, in chunks of at most 256 tokens, for a decoder in `:in_place` whose graph allows it (see "Batches" in `Transmuter.Generation`). It takes the place of `:alone_prompts` for that decoder. The default is `true`.
+
     * `:alone_prompts` - when `true`, the prompts of the new requests of an admission run in a step of their own rows, and not in steps of all rows, for a decoder in `:in_place` (see "Batches" in `Transmuter.Generation`). On a mix of ShareGPT prompts with 16 rows of Qwen3-0.6B fp16 on CUDA, it gave 23% more output tokens per second with 8 decode steps for each call, and 34% with one. An admission of several requests then delays the running rows longer, up to 146 ms against 79 ms, while the 99th percentile of the gaps between chunks goes from 113 to 68 ms. The default is `true`.
 
   The other options are those of the function of the task, without `:compile`, `:stream` and `:stream_done`. The server loads the models and compiles the steps when it starts.
@@ -163,7 +165,7 @@ defmodule Transmuter.ContinuousBatching do
     server_opts =
       server_opts ++
         [device_memory: nil, compile_steps: false, prefix_cache: 0, alone_prompts: true] ++
-        [capacity_costs: nil]
+        [ragged_prompts: true, capacity_costs: nil]
 
     opts =
       opts |> Keyword.validate!(server_opts ++ module.options()) |> Serving.generation_options!()

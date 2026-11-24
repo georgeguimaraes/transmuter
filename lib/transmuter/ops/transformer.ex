@@ -103,76 +103,20 @@ defmodule Transmuter.Ops.Transformer do
   # total length minus one, so new keys are written at seqlens_k + 1 - seq_len. When the
   # buffer is as long as total_sequence_length it is a static cache, and every decode
   # step keeps the same shapes.
-  defp op(node = %{op_type: "GroupQueryAttention"}, [
-         q,
-         k,
-         v,
-         past_k,
-         past_v,
-         seqlens_k,
-         total_len | optional
-       ]) do
-    [cos_cache, sin_cache, position_ids, attention_bias] = optional(optional, 4)
-    heads = attr(node, "num_heads")
-    kv_heads = attr(node, "kv_num_heads")
-    {q, k, v} = split_packed_qkv(q, k, v, heads, kv_heads)
-    {b, s, _} = Nx.shape(q)
-    total_len = scalar!(total_len)
-
-    q = to_heads(q, heads)
-    k = to_heads(k, kv_heads)
-    v = to_heads(v, kv_heads)
-    offsets = seqlens_k |> Nx.as_type(:s32) |> Nx.reshape({b}) |> Nx.add(1 - s)
-
-    {q, k} =
-      if attr(node, "do_rotary", 0) == 1 do
-        positions =
-          if position_ids,
-            do: Nx.reshape(position_ids, {b, s}),
-            else: Nx.add(Nx.iota({b, s}, axis: 1), Nx.new_axis(offsets, 1))
-
-        {cos, sin} = {Nx.take(cos_cache, positions), Nx.take(sin_cache, positions)}
-        interleaved = attr(node, "rotary_interleaved", 0)
-        {rotate(q, cos, sin, interleaved), rotate(k, cos, sin, interleaved)}
-      else
-        {q, k}
-      end
-
-    capacity = max(elem(shape_of(past_k), 2), total_len)
-    present_k = write_cache(past_k, k, offsets, capacity)
-    present_v = write_cache(past_v, v, offsets, capacity)
-
-    # Each sequence has seqlens_k + 1 live keys, which the lengths give, and the query at row
-    # i has the position offset + i. A query does not see the keys after its position or, with
-    # a local window, the keys window or more before it. These keys get the lowest bias, so the
-    # masks of the core are one float bias and the lengths, for all query rows alike. The bias
-    # needs only the keys that the lengths do not hide: the keys after the position of a query
-    # and before the lengths, at most s - 1 of them, and the keys of the window. So with one
-    # query row and no window, there is no bias.
-    lengths = Nx.add(offsets, s)
-    positions = query_positions(s, Nx.reshape(offsets, {b, 1, 1, 1}))
-    keys = key_positions(capacity)
-    window = attr(node, "local_window_size", -1)
-    after_query = s - 1
-
-    hidden =
-      any_hidden([
-        after_query > 0 && Nx.greater(keys, positions),
-        window > 0 && Nx.less_equal(keys, Nx.add(positions, -window))
-      ])
-
-    opts = %{
-      scale: scale(node, q),
-      softcap: attr(node, "softcap", 0.0),
-      bias: any_bias([attention_bias, hidden && Nx.select(hidden, lowest(Nx.type(q)), 0)]),
-      hidden: nil,
-      causal: false,
-      lengths: lengths
-    }
-
-    out = q |> attend(present_k, present_v, opts) |> from_heads()
-    [out, present_k, present_v]
+  #
+  # Transmuter.Generation gives the node the domain transmuter and one more input, the row of
+  # the chunk of a ragged step (see "Batches" in Transmuter.Generation). A ragged step has a
+  # batch of one sequence of rows + C tokens for the rows of the buffers: the first token of
+  # each row, then C tokens of the chunk row. Each row writes its token at seqlens_k, and the
+  # chunk goes before the token of its row, at seqlens_k - C of that row. A step whose batch
+  # is the batch of the buffers runs as the ONNX op, and the row is not read.
+  defp op(node = %{op_type: "GroupQueryAttention", domain: "transmuter"}, inputs) do
+    {inputs, [row]} = Enum.split(inputs, -1)
+    group_query_attention(node, inputs, row)
   end
+
+  defp op(node = %{op_type: "GroupQueryAttention"}, inputs),
+    do: group_query_attention(node, inputs, nil)
 
   # com.microsoft MultiHeadAttention: query {B, S, N*H}, key/value {B, L, N*H} or {B, N, L, H}.
   defp op(node = %{op_type: "MultiHeadAttention"}, [q, k, v | optional]) do
@@ -594,22 +538,130 @@ defmodule Transmuter.Ops.Transformer do
         Nx.concatenate([rotated, Nx.slice_along_axis(x, rot, head_size - rot, axis: 3)], axis: 3)
   end
 
-  # Writes new {B, N, S, H} into a {B, N, capacity, H} buffer at the offset of each
-  # sequence: row offset + j takes the new row j, and the other rows keep the past. One
-  # scatter writes all sequences, and it reads and writes only the new rows. ONNX Runtime
+  defp group_query_attention(node, inputs, row) do
+    [q, k, v, past_k, past_v, seqlens_k, total_len | optional] = inputs
+    [cos_cache, sin_cache, position_ids, attention_bias] = optional(optional, 4)
+    heads = attr(node, "num_heads")
+    kv_heads = attr(node, "kv_num_heads")
+    {q, k, v} = split_packed_qkv(q, k, v, heads, kv_heads)
+    {b, s, _} = Nx.shape(q)
+    rows = elem(shape_of(past_k), 0)
+    total_len = scalar!(total_len)
+
+    q = to_heads(q, heads)
+    k = to_heads(k, kv_heads)
+    v = to_heads(v, kv_heads)
+    seqlens = seqlens_k |> Nx.as_type(:s64) |> Nx.reshape({:auto})
+    ragged? = row != nil and b != rows
+
+    # The row of the buffers of each token, its position, and the row where it writes, {b, s},
+    # and the position offset of the first query of each sequence of the attention.
+    {token_rows, positions, writes, offsets} =
+      if ragged? do
+        chunk = s - rows
+        row = Nx.as_type(row, :s64)
+        start = seqlens |> Nx.take(row) |> Nx.subtract(chunk)
+        token_rows = Nx.concatenate([Nx.iota({rows}, type: :s64), Nx.broadcast(row, {chunk})])
+        positions = Nx.concatenate([seqlens, Nx.add(start, Nx.iota({chunk}, type: :s64))])
+        positions = Nx.new_axis(positions, 0)
+        {Nx.new_axis(token_rows, 0), positions, positions, {seqlens, start}}
+      else
+        offsets = Nx.add(seqlens, 1 - s)
+        steps = Nx.iota({b, s}, type: :s64, axis: 1)
+        positions = Nx.add(Nx.new_axis(offsets, 1), steps)
+        writes = Nx.add(Nx.new_axis(Nx.max(offsets, 0), 1), steps)
+        {Nx.iota({b, s}, type: :s64, axis: 0), positions, writes, offsets}
+      end
+
+    {q, k} =
+      if attr(node, "do_rotary", 0) == 1 do
+        positions = if position_ids, do: Nx.reshape(position_ids, {b, s}), else: positions
+        {cos, sin} = {Nx.take(cos_cache, positions), Nx.take(sin_cache, positions)}
+        interleaved = attr(node, "rotary_interleaved", 0)
+        {rotate(q, cos, sin, interleaved), rotate(k, cos, sin, interleaved)}
+      else
+        {q, k}
+      end
+
+    capacity = max(elem(shape_of(past_k), 2), total_len)
+    present_k = write_cache(past_k, k, token_rows, writes, capacity)
+    present_v = write_cache(past_v, v, token_rows, writes, capacity)
+
+    out =
+      case offsets do
+        {seqlens, start} ->
+          # The token of each row is a query of one row on the buffer of its row, and the
+          # chunk is a query of C rows on the buffer of the chunk row.
+          head_size = elem(Nx.shape(q), 3)
+          tokens = q |> Nx.slice_along_axis(0, rows, axis: 2) |> Nx.transpose(axes: [2, 1, 0, 3])
+          chunk = Nx.slice_along_axis(q, rows, s - rows, axis: 2)
+          row = Nx.as_type(row, :s64)
+          [row_k, row_v] = for t <- [present_k, present_v], do: Nx.take(t, row, axis: 0)
+          tokens = attend_sequences(node, tokens, present_k, present_v, seqlens, nil)
+          chunk = attend_sequences(node, chunk, row_k, row_v, start, nil)
+          tokens = tokens |> from_heads() |> Nx.reshape({1, rows, heads * head_size})
+          Nx.concatenate([tokens, from_heads(chunk)], axis: 1)
+
+        offsets ->
+          node
+          |> attend_sequences(q, present_k, present_v, offsets, attention_bias)
+          |> from_heads()
+      end
+
+    [out, present_k, present_v]
+  end
+
+  # The attention of the queries q, {B, N, S, H}, whose rows have the positions offsets + i,
+  # {B}, on the buffers k and v. Each sequence has offsets + S live keys, which the lengths
+  # give. A query does not see the keys after its position or, with a local window, the keys
+  # window or more before it. These keys get the lowest bias, so the masks of the core are one
+  # float bias and the lengths, for all query rows alike. The bias needs only the keys that the
+  # lengths do not hide: the keys after the position of a query and before the lengths, at
+  # most S - 1 of them, and the keys of the window. So with one query row and no window, there
+  # is no bias.
+  defp attend_sequences(node, q, k, v, offsets, attention_bias) do
+    {b, _heads, s, _head_size} = Nx.shape(q)
+    offsets = Nx.as_type(offsets, :s32)
+    positions = query_positions(s, Nx.reshape(offsets, {b, 1, 1, 1}))
+    keys = key_positions(Nx.axis_size(k, 2))
+    window = attr(node, "local_window_size", -1)
+    after_query = s - 1
+
+    hidden =
+      any_hidden([
+        after_query > 0 && Nx.greater(keys, positions),
+        window > 0 && Nx.less_equal(keys, Nx.add(positions, -window))
+      ])
+
+    opts = %{
+      scale: scale(node, q),
+      softcap: attr(node, "softcap", 0.0),
+      bias: any_bias([attention_bias, hidden && Nx.select(hidden, lowest(Nx.type(q)), 0)]),
+      hidden: nil,
+      causal: false,
+      lengths: Nx.add(offsets, s)
+    }
+
+    attend(q, k, v, opts)
+  end
+
+  # Writes new {B, N, S, H} into a {R, N, capacity, H} buffer: token j of sequence i goes to the
+  # buffer of token_rows[i][j], at the row writes[i][j], and the other rows keep the past. In
+  # an ONNX step, R is B, sequence i writes its own buffer, and row offset + j takes its token
+  # j. One scatter writes all tokens, and it reads and writes only their rows. ONNX Runtime
   # gives zeros after the new rows, which no query reads, because each key after the newest
   # row of its sequence is hidden. A negative offset writes at 0, as the first prompt of ONNX
   # Runtime does. Generation gives buffers with room for the new rows, so none falls after
   # the buffer.
-  defp write_cache(past, new, offsets, capacity) do
-    {b, heads, past_len, head_size} = shape_of(past)
-    s = Nx.axis_size(new, 2)
+  defp write_cache(past, new, token_rows, writes, capacity) do
+    {rows, heads, past_len, head_size} = shape_of(past)
+    {b, _heads, s, _head_size} = Nx.shape(new)
     zero = Nx.tensor(0, type: Nx.type(new))
 
     past =
       cond do
         empty?(past) ->
-          Nx.broadcast(zero, {b, heads, capacity, head_size})
+          Nx.broadcast(zero, {rows, heads, capacity, head_size})
 
         past_len < capacity ->
           Nx.pad(past, zero, [{0, 0, 0}, {0, 0, 0}, {0, capacity - past_len, 0}, {0, 0, 0}])
@@ -618,16 +670,15 @@ defmodule Transmuter.Ops.Transformer do
           past
       end
 
-    # Row j of the step goes to row max(offset, 0) + j of its sequence. The scatter writes only
-    # these rows, so with a donated buffer the step does not read or write the other rows.
+    # The scatter writes only the rows of the tokens, so with a donated buffer the step does not
+    # read or write the other rows.
     # The indices name the leading axes (sequence, head, row), so each update is one row of
     # head_size values. Indices on the axes [0, 2] alone would give fewer updates, but the hex
     # release of EMLX 0.5.0 raises for indexed_put on axes that are not contiguous. EMLX
     # c10b272 (#145) fixes it, so this form can go after a release of EMLX with that commit.
     shape = {b, heads, s}
-    starts = offsets |> Nx.max(0) |> Nx.as_type(:s64) |> Nx.reshape({b, 1, 1})
-    rows = Nx.add(starts, Nx.iota(shape, type: :s64, axis: 2))
-    leading = [Nx.iota(shape, type: :s64, axis: 0), Nx.iota(shape, type: :s64, axis: 1), rows]
+    spread = &(&1 |> Nx.as_type(:s64) |> Nx.new_axis(1) |> Nx.broadcast(shape))
+    leading = [spread.(token_rows), Nx.iota(shape, type: :s64, axis: 1), spread.(writes)]
     indices = leading |> Nx.stack(axis: -1) |> Nx.reshape({b * heads * s, 3})
     updates = new |> Nx.as_type(Nx.type(past)) |> Nx.reshape({b * heads * s, head_size})
 

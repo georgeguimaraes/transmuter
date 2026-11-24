@@ -805,7 +805,8 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # With alone_prompts: true in :in_place, the new prompts of an admission run in one step of
+  # With ragged_prompts: false and alone_prompts: true in :in_place, the new prompts of an
+  # admission run in one step of
   # their own rows when they are fewer than the rows of the group. A group of 8 rows with a row that runs takes 3 prompts of
   # 5, 23 and 70 tokens, which run together in a small group of 4 rows at width 256, padded at
   # the end. Then 2 prompts start with the 64 tokens of a stored prefix and have 9 and 40 more
@@ -829,7 +830,8 @@ defmodule Transmuter.GenerationTest do
           strategy: strategy,
           max_new_tokens: 12,
           token_logprobs: true,
-          alone_prompts: true
+          alone_prompts: true,
+          ragged_prompts: false
         )
 
       assert ctx.mode == :in_place
@@ -877,11 +879,108 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # By default in :in_place, the prompt of a new row runs in the steps of the group: each step
+  # has the token of each row that runs and a chunk of at most 256 tokens of one prompt, as one
+  # sequence. A group of 8 rows with a row that runs takes 3 prompts of 5, 23 and 300 tokens.
+  # They run one after the other, in chunks of 5, 23, 256 and 44 tokens, and the row that runs
+  # takes a token in each of these 4 steps. The first 64 tokens of the prompt of 300 tokens go
+  # into the store from its row, which starts at the first row of the buffers. Then 2 prompts
+  # start with this stored prefix and run only the 9 and 40 tokens after it. Each row gives
+  # the tokens and the log-probabilities of its prompt alone, with greedy selection and with
+  # sampling.
+  @tag ci_partition: 10
+  test "new prompts run in ragged steps with the rows that run and give the tokens of each prompt" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{}}
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
+    [running | others] = for {n, k} <- [{30, 1}, {5, 2}, {23, 3}, {300, 4}], do: prompt.(n, k)
+    prefix = Enum.take(List.last(others), 64)
+    prefixed = for {n, k} <- [{9, 5}, {40, 6}], do: prefix ++ prompt.(n, k)
+
+    for strategy <- [:greedy, :sampling] do
+      ctx =
+        Generation.context(repo, model,
+          strategy: strategy,
+          max_new_tokens: 12,
+          token_logprobs: true
+        )
+
+      assert "transmuter.chunk_row" in ctx.model.inputs
+      single = Generation.compile(ctx, 1, @opts[:defn_options])
+      alone = &(single |> Generation.generate([&1], [&2]) |> hd())
+      ctx = Generation.compile(ctx, 8, @opts[:defn_options])
+      request = &%{row: &1, prompt: &2, seed: &1 + 3, budget: 12}
+
+      group = Generation.admit(ctx, Generation.open(ctx, 8), [request.(0, running)])
+      group = Generation.next(ctx, group)
+      new_rows = for {p, row} <- Enum.zip(others, 1..3), do: request.(row, p)
+      group = Generation.admit(ctx, group, new_rows)
+      first? = fn rows -> &Enum.all?(rows, fn row -> Enum.at(&1.ids, row) != [] end) end
+      {group, steps} = steps_until(ctx, group, first?.(1..3))
+      assert {steps, length(Enum.at(group.ids, 0))} == {4, 5}, inspect({strategy, steps})
+
+      store = Generation.prefix_store(ctx, 1, 512)
+      store = Generation.store_prefix(ctx, group, store, 3, 0, 64)
+
+      with_prefix =
+        for {p, row} <- Enum.zip(prefixed, 4..5),
+            do: Map.put(request.(row, p), :prefix, %{store: store, slot: 0, size: 64})
+
+      group = Generation.admit(ctx, group, with_prefix)
+      {group, steps} = steps_until(ctx, group, first?.(4..5))
+      assert steps == 2, inspect(strategy)
+      group = run_until(ctx, group, &Enum.all?(&1.done))
+
+      for {p, row} <- Enum.zip([running | others] ++ prefixed, 0..5) do
+        expected = alone.(p, row + 3)
+        got = Generation.row_tokens(group, row)
+        assert Enum.map(got, &hd/1) == Enum.map(expected, &hd/1), inspect({strategy, row})
+
+        for {[_id, a], [_id2, b]} <- Enum.zip(got, expected),
+            do: assert_in_delta(a, b, 1.0e-4, inspect({strategy, row}))
+      end
+
+      Generation.finish(group)
+      Generation.release(Map.values(store), [])
+    end
+  end
+
+  # In a ragged step, the token of the chunk row goes after its chunk (see step/5), so the
+  # chunk needs one more row than its width. A prompt of 256 tokens joins a row that runs in
+  # buffers of 256 rows: its chunk ends at row 255, the last row of the buffers, and its token
+  # at row 256, so the buffers grow to 320 rows before the step. Each row gives the tokens that
+  # it gives alone.
+  @tag ci_partition: 10
+  test "a chunk that ends at the last row of the buffers grows them for the token of its row" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    ctx = Generation.context(repo, model, max_new_tokens: 6)
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * k, 49_000) + 100 end
+    [short, long] = [prompt.(10, 37), prompt.(256, 53)]
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
+    ctx = Generation.compile(ctx, 2, @opts[:defn_options])
+    request = &%{row: &1, prompt: &2, seed: 0, budget: 6}
+
+    group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, short)])
+    group = Generation.next(ctx, group)
+    assert group.state.capacity == 256
+    group = Generation.next(ctx, Generation.admit(ctx, group, [request.(1, long)]))
+    assert {group.state.capacity, length(Enum.at(group.ids, 1))} == {320, 1}
+    group = run_until(ctx, group, &Enum.all?(&1.done))
+    assert row_tokens(group, 0) == alone.(short)
+    assert row_tokens(group, 1) == alone.(long)
+  end
+
   # In :in_place, each row writes from the first row of the buffers, so its valid rows start
   # there, also when it joins a group that runs, whose write offset is past them. A prompt of
   # 70 tokens joins a row that runs, in the steps of joins, and the first 64 rows of its row go
   # into the store. A later prompt starts with that prefix and gives the tokens that it gives
-  # alone.
+  # alone. With ragged_prompts: false, the prompt runs in joins.
   @tag ci_partition: 10
   test "a prefix stored from a row that joined a running group gives the tokens of its prompt" do
     opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
@@ -891,7 +990,14 @@ defmodule Transmuter.GenerationTest do
     prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
     [running, joining] = [prompt.(30, 1), prompt.(70, 2)]
     prefixed = Enum.take(joining, 64) ++ prompt.(9, 3)
-    ctx = Generation.context(repo, model, max_new_tokens: 6, alone_prompts: false)
+
+    ctx =
+      Generation.context(repo, model,
+        max_new_tokens: 6,
+        alone_prompts: false,
+        ragged_prompts: false
+      )
+
     assert ctx.mode == :in_place
     single = Generation.compile(ctx, 1, @opts[:defn_options])
     alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
@@ -1457,6 +1563,7 @@ defmodule Transmuter.GenerationTest do
     {result, received_capacities()}
   end
 
+  # With ragged_prompts: false, the prompts run alone or in joins.
   # A row that decodes takes a new token in each step of a join. A prompt of 37 tokens runs
   # alone in its admission, in a step of its own row, so it has its first token after no step
   # of the group and the row that decodes gets no token. A prompt of 600 tokens is longer than
@@ -1481,7 +1588,7 @@ defmodule Transmuter.GenerationTest do
 
     for strategy <- [:greedy, :sampling] do
       limits = [max_new_tokens: 80, min_new_tokens: 80]
-      ctx = Generation.context(repo, model, [strategy: strategy] ++ limits)
+      ctx = Generation.context(repo, model, [strategy: strategy, ragged_prompts: false] ++ limits)
       single = Generation.compile(ctx, 1, @opts[:defn_options])
       alone = &(single |> Generation.generate([&1], [&2]) |> hd() |> Enum.map(fn [id] -> id end))
       ctx = Generation.compile(ctx, 2, @opts[:defn_options])
@@ -1611,6 +1718,7 @@ defmodule Transmuter.GenerationTest do
     assert row_tokens(group, 1) == alone.(joining)
   end
 
+  # With ragged_prompts: false, the prompts run in joins.
   # A row can end early, here with a cancel as with an eos token, and then the next step can
   # be wider than the steps that the admission planned: no row takes a new token, so a prompt
   # with 512 tokens left takes a step of 512. The largest capacity is 2048 rows. In the first
@@ -1628,7 +1736,7 @@ defmodule Transmuter.GenerationTest do
       opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
       {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
       repo = %{repo | generation_config: %{}}
-      ctx = Generation.context(repo, model, max_new_tokens: 40)
+      ctx = Generation.context(repo, model, max_new_tokens: 40, ragged_prompts: false)
       ctx = %{ctx | max_capacity: 2048}
       prompt = fn n, k -> for i <- 1..n, do: rem(i * k, 49_000) end
       single = Generation.compile(ctx, 1, @opts[:defn_options])
@@ -1805,7 +1913,9 @@ defmodule Transmuter.GenerationTest do
   # a request needs count the widths, not only its tokens. With 32 new tokens:
   # - In a cache of 512 rows, a row with a prompt of 456 tokens is at 465 rows after 10 new
   #   tokens, and a request of 10 tokens that joins it needs a step of 64 rows there, so 529
-  #   rows, more than 512. The count of tokens gives 506.
+  #   rows, more than 512. The count of tokens gives 506. In :in_place, the request runs in a
+  #   ragged step, where the row that runs writes one token, so it needs the 487 rows of that
+  #   row.
   # - In a cache of 1000 rows, a prompt of 965 tokens ends with a part of 5 tokens at 960
   #   rows, which writes 64 rows, so 1024 rows.
   # - In a cache of 512 rows, a prompt of 450 tokens alone needs 512 rows: a last part of 2
@@ -1832,8 +1942,9 @@ defmodule Transmuter.GenerationTest do
       group = Generation.admit(batch, Generation.open(batch, 2), [request.(0, 456)])
       group = run_until(batch, group, &(length(Enum.at(&1.ids, 0)) == 10))
       # A prompt of 40 tokens joins in a step of width 64, which writes 64 rows after the 466
-      # rows of the running row.
-      assert Generation.rows_needed(batch, group, [request.(1, 40)]) == 529
+      # rows of the running row, or in a ragged step in :in_place.
+      needed = if mode == :in_place, do: 487, else: 529
+      assert Generation.rows_needed(batch, group, [request.(1, 40)]) == needed
       Generation.finish(group)
 
       # A prompt of 965 tokens in an idle group runs in parts of 512, 7 x 64 and 5 tokens. The

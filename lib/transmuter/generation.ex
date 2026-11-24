@@ -95,6 +95,8 @@ defmodule Transmuter.Generation do
 
   A step of a group runs all its rows at its width, also the rows that only take a new token, so a step of a short prompt in a group of many rows costs the width for each row: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), 49 ms at width 16 against 13 ms at width 1. So in `:in_place`, unless `alone_prompts: false`, when the new requests of an admission are fewer than the rows of the group in a power of 4, each prompt of at most 511 tokens runs whole in one step of the new rows alone. That step runs in a group of a power of 4 of rows, with the stored prefix of each row as its past (see "Prefixes"), at the smallest width of 16, 64, 256 and 512 tokens that holds the rest of each prompt and its first token. Its first token is read, and the cache, the selection state and the tokens of each row move into its row of the group, which starts at the first row of the buffers. The other rows take their next token in the next step of the group. On a mix of 512 ShareGPT prompts of 20 to 512 tokens with 16 rows of Qwen3-0.6B fp16 on CUDA, the prompt steps took 22 s against 58 s as joins, and the time for each output token was 15.7 ms against 20.6 ms (p50). A longer prompt, the prompts of `:append`, whose rows share one write offset, and the prompts of a merged decoder whose rows keep their own encoder outputs run in the steps of the group as above.
 
+  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: the values of the attention mask may reach only the lengths of GroupQueryAttention, and GroupQueryAttention may have no attention bias. Qwen3 and SmolLM2 pass this check. Apertus, whose positions take the position offset of each row, and Gemma 3, whose bias has the batch of the mask, run their prompts alone or in joins.
+
   ## Decode loops
 
   With `decode_steps: k` above 1 in the options of `context/4`, `compile/3` also compiles decode loops for `:in_place` and `:append` with greedy selection or sampling, without beams. A loop runs the decoder and the selection for 2, 4 ... up to `k` steps in one call, in a while loop with a static trip count (the `:repeat` option of `Transmuter.compile/3`). So the cost of a call on the host and in the launch of the program comes once for these steps. `:grow` has no loops, because its cache grows in each step, and the carry of a while loop keeps its shape. A decoder with `:embed` runs the nodes of the embedding model in the loop, before its own nodes.
@@ -131,6 +133,9 @@ defmodule Transmuter.Generation do
   @offset "transmuter.select.offset"
   # The position of the last token of each row in a step, see keep_last_logits/1.
   @logit_index "transmuter.logit_index"
+  # The row of the chunk of a ragged step, and the widths of the chunk, see chunk_steps/1.
+  @chunk_row "transmuter.chunk_row"
+  @chunk_widths [16, 64, 256]
   # The most tokens of a prompt in a step where other rows take a new token, see plan/1.
   @join_tokens 64
 
@@ -264,6 +269,7 @@ defmodule Transmuter.Generation do
       processors: processors(gen, opts, eos)
     }
     |> Map.merge(beam_search(gen, opts, sampling?))
+    |> ragged(Keyword.get(opts, :ragged_prompts, true))
     |> then(&put_in(&1.widths.with_cache, join_widths(&1, &1.widths.with_cache)))
   end
 
@@ -320,7 +326,7 @@ defmodule Transmuter.Generation do
   # steps take, or when all new rows run together, so its parts need no width below
   # @join_tokens. The steps of the group then have fewer shapes to compile.
   defp join_widths(ctx, widths) do
-    if runs_alone?(ctx),
+    if prompt_path(ctx) in [:ragged, :alone],
       do: Enum.reject(widths, &(&1 > 1 and &1 < @join_tokens)),
       else: widths
   end
@@ -786,6 +792,88 @@ defmodule Transmuter.Generation do
     end
   end
 
+  # Gives each GroupQueryAttention the row of the chunk of a ragged step (see "Batches"): one
+  # sequence of tokens, the token of each row and then a chunk of the prompt of one row. The op
+  # splits the sequence by the rows of the buffers. So the other nodes must compute each token
+  # alone, without the batch of the buffers, which holds when:
+  #
+  #   * the lm_head reads one token of each row from @logit_index (see keep_last_logits/1),
+  #   * each GroupQueryAttention counts its rows from the values of the mask, as in :in_place,
+  #     and has no attention bias or other input after it, and
+  #   * the inputs with the batch of the buffers, all inputs but the tokens, their positions
+  #     and @logit_index, reach only the past and the lengths of each GroupQueryAttention,
+  #     through nodes that read no other values of the step, and its present reaches no node.
+  #
+  # Other decoders run their prompts in steps of their rows (see prompt_path/1), such as
+  # Gemma 3, whose bias has the batch of the mask and the length of the tokens, and Apertus,
+  # whose positions take the position offset of each row (see MergedDecoder).
+  defp chunk_steps(model) do
+    gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
+
+    if @logit_index in model.inputs and gqas != [] and Enum.all?(gqas, &mask_lengths?(model, &1)) and
+         rows_reach_attention?(model) do
+      nodes =
+        Enum.map(model.nodes, fn node ->
+          if node.op_type == "GroupQueryAttention" do
+            inputs = node.input ++ List.duplicate("", 11 - length(node.input))
+            %{node | domain: "transmuter", input: inputs ++ [@chunk_row]}
+          else
+            node
+          end
+        end)
+
+      %{
+        model
+        | nodes: nodes,
+          inputs: model.inputs ++ [@chunk_row],
+          input_types: Map.put(model.input_types, @chunk_row, {:s64, [1]})
+      }
+    else
+      model
+    end
+  end
+
+  defp mask_lengths?(model, node) do
+    reads_values?(model, Enum.at(node.input, 5), "attention_mask") and
+      Enum.all?(Enum.drop(node.input, 10), &(&1 == ""))
+  end
+
+  # The values of the nodes that read only static values, such as Constant nodes, are static.
+  defp rows_reach_attention?(model) do
+    static = MapSet.new(Map.keys(model.params) ++ Map.keys(model.static) ++ [""])
+    tokens = ["input_ids", "inputs_embeds", "position_ids", @logit_index]
+
+    reached =
+      Enum.reduce_while(model.nodes, {MapSet.new(model.inputs -- tokens), static}, fn
+        node, {rows, static} ->
+          dependencies = Transmuter.dependencies(node)
+          read = for {name, i} <- Enum.with_index(node.input), name in rows, do: i
+          add = &MapSet.union(&1, MapSet.new(&2))
+
+          cond do
+            Enum.all?(dependencies, &(&1 in static)) ->
+              {:cont, {rows, add.(static, node.output)}}
+
+            node.op_type == "GroupQueryAttention" and read -- [3, 4, 5, 6] == [] ->
+              {:cont, {add.(rows, Enum.drop(node.output, 1)), static}}
+
+            not Enum.any?(dependencies, &(&1 in rows)) ->
+              {:cont, {rows, static}}
+
+            Enum.all?(dependencies, &(&1 in rows or &1 in static)) ->
+              {:cont, {add.(rows, node.output), static}}
+
+            true ->
+              {:halt, nil}
+          end
+      end)
+
+    case reached do
+      {rows, _static} -> "logits" not in rows
+      nil -> false
+    end
+  end
+
   # Whether the values of `name` depend on the values of `target`.
   defp reads_values?(model, name, target) do
     producers = for node <- model.nodes, output <- node.output, into: %{}, do: {output, node}
@@ -1165,6 +1253,8 @@ defmodule Transmuter.Generation do
       # from the device. A row without a new token has -1.
       seen = extra[@seen]
       {rows, vocab} = Nx.shape(seen)
+      # The logits of a ragged step are one sequence of a position of each row.
+      logits = Nx.reshape(logits, {rows, :auto, Nx.axis_size(logits, -1)})
       new = Nx.equal(Nx.iota({rows, vocab}, axis: 1), Nx.new_axis(extra[@tokens], 1))
       seen = seen |> Nx.logical_or(new) |> Nx.as_type(Nx.type(seen))
       row = append_token(extra[@history], extra[@count], extra[@tokens])
@@ -1607,7 +1697,28 @@ defmodule Transmuter.Generation do
   # token fit the widest of @alone_widths, and its group runs new prompts alone (see
   # runs_alone?/1).
   defp alone?(ctx, request),
-    do: length(request.prompt) < List.last(@alone_widths) and runs_alone?(ctx)
+    do: length(request.prompt) < List.last(@alone_widths) and prompt_path(ctx) == :alone
+
+  # How the prompts of new requests run while other rows of the group take new tokens: in the
+  # ragged steps of the group (:ragged, see chunk_steps/1), in a step of the new rows alone
+  # (:alone, see admit_alone/3), or as parts in the steps of all rows (:join, see plan/4).
+  defp prompt_path(ctx) do
+    cond do
+      @chunk_row in ctx.model.inputs -> :ragged
+      runs_alone?(ctx) -> :alone
+      true -> :join
+    end
+  end
+
+  # Unless `ragged_prompts: false`, a group in :in_place whose rows join runs the prompts of
+  # new rows in ragged steps, when its graph allows them (see chunk_steps/1).
+  defp ragged(ctx, true) do
+    if ctx.mode == :in_place and joins?(ctx) and not rows_keep_inputs?(ctx),
+      do: %{ctx | model: chunk_steps(ctx.model)},
+      else: ctx
+  end
+
+  defp ragged(ctx, false), do: ctx
 
   # The groups that run new prompts in steps of their own rows: unless `alone_prompts: false`,
   # rows that join, in :in_place, and that keep no encoder outputs of their own. The layout of the
@@ -1987,6 +2098,7 @@ defmodule Transmuter.Generation do
       end
 
     run_items(ctx, :run, step_items)
+    run_items(ctx, :run, chunk_items(ctx, rows, capacities))
 
     compile_alone(ctx, rows, capacities, opts[:prefixes])
 
@@ -2040,6 +2152,25 @@ defmodule Transmuter.Generation do
     end
 
     length(shapes)
+  end
+
+  # The ragged steps (see chunk_steps/1) of each width of @chunk_widths at each capacity that
+  # holds the chunk and the token of its row after it. Row 0 takes a new token, and row 1 the
+  # chunk. The step of row 0 before the chunk runs on `ctx`, so the compile of the calls
+  # records the ragged step (see run_items/3).
+  defp chunk_items(ctx, rows, capacities) do
+    if prompt_path(ctx) == :ragged and rows > 1 do
+      for capacity <- capacities, width <- @chunk_widths, width < capacity do
+        fn item_ctx ->
+          first = %{row: 0, prompt: [0], seed: 0, budget: 3}
+          group = next(ctx, admit(ctx, open(ctx, rows, capacity), [first]))
+          chunk = %{row: 1, prompt: List.duplicate(0, width), seed: 0, budget: 2}
+          finish(next(item_ctx, admit(item_ctx, group, [chunk])))
+        end
+      end
+    else
+      []
+    end
   end
 
   # The prompts that run in a step of their own rows (see admit_alone/3): each count of rows and
@@ -2116,7 +2247,7 @@ defmodule Transmuter.Generation do
   # The counts of rows of a step of new prompts alone, the powers of 4 below the rows of a group
   # (see admit/4).
   defp alone_counts(ctx, rows) do
-    if runs_alone?(ctx),
+    if prompt_path(ctx) == :alone,
       do: Stream.iterate(1, &(&1 * 4)) |> Enum.take_while(&(&1 < rows)),
       else: []
   end
@@ -2265,19 +2396,26 @@ defmodule Transmuter.Generation do
   # their own slots of the width of their step, so their writes and merges compile too.
   def compile_features(ctx, rows, features) do
     widths = ctx.widths.with_cache ++ if(merged?(ctx), do: ctx.widths.without_cache, else: [])
-    compile_slots(ctx, rows, power_of_two(ctx.max_capacity), Enum.uniq(widths), features)
+    chunks = if prompt_path(ctx) == :ragged, do: @chunk_widths, else: []
+
+    shapes =
+      for(width <- Enum.uniq(widths), do: {rows, width}) ++
+        for(width <- chunks, do: {1, rows + width})
+
+    compile_slots(ctx, rows, power_of_two(ctx.max_capacity), shapes, features)
 
     for count <- alone_counts(ctx, rows),
         width <- @alone_widths,
         width <= ctx.max_capacity,
-        do: compile_slots(ctx, count, width, [width], features)
+        do: compile_slots(ctx, count, width, [{count, width}], features)
 
     :ok
   end
 
   # The slots of `rows` rows of `slot` rows, a write of each power of two of rows up to a slot,
-  # and the merge at each of `widths`.
-  defp compile_slots(ctx, rows, slot, widths, features) do
+  # and the merge of tokens of each of `shapes`, {rows, width}, or {1, tokens} for one sequence
+  # of a ragged step (see step/5).
+  defp compile_slots(ctx, rows, slot, shapes, features) do
     slots = empty_slots(ctx, rows, slot, [%{features: features}])
     zero = Nx.tensor(0, type: Nx.type(features), backend: ctx.backend)
     hidden = Nx.axis_size(features, 1)
@@ -2287,10 +2425,10 @@ defmodule Transmuter.Generation do
       ctx.write_features.(slots, part, Nx.tensor(0, backend: Nx.BinaryBackend))
     end
 
-    for width <- widths do
-      embeds = ctx.embed.(List.duplicate(List.duplicate(0, width), rows))
-      index = Nx.broadcast(Nx.tensor(0, type: :s32, backend: Nx.BinaryBackend), {rows, width})
-      mask = Nx.broadcast(Nx.tensor(0, type: :u8, backend: Nx.BinaryBackend), {rows, width})
+    for {count, width} <- shapes do
+      embeds = ctx.embed.(List.duplicate(List.duplicate(0, width), count))
+      index = Nx.broadcast(Nx.tensor(0, type: :s32, backend: Nx.BinaryBackend), {count, width})
+      mask = Nx.broadcast(Nx.tensor(0, type: :u8, backend: Nx.BinaryBackend), {count, width})
       ctx.merge.(embeds, slots, index, mask)
     end
   end
@@ -2401,8 +2539,8 @@ defmodule Transmuter.Generation do
   end
 
   # The rows of cache that the steps of `rows` write until each row ends. The steps of the
-  # prompt parts are those of plan/2, each at the width of step_width/1, where each row of a
-  # step writes the width at its length. Then each row writes its new tokens, one in each step.
+  # prompt parts are those of plan/4, each of the shape of step_end/3. Then each row writes its
+  # new tokens, one in each step.
   # A row selects a token after the last part of its prompt and after each new token, until
   # its budget ends, and its last token is not written. The rows that ended do not count: a
   # compaction drops them in :append, and in :in_place they write from their first row (see
@@ -2416,8 +2554,8 @@ defmodule Transmuter.Generation do
       Enum.max(ends ++ Enum.map(running_lengths(rows), &(&1 + 1)), fn -> 0 end)
     else
       widths = branch_widths(ctx, rows, rows.lengths)
-      {parts, left} = plan(rows, room(ctx, rows), widths)
-      written = Enum.max(running_lengths(rows), fn -> 0 end) + step_width(parts, widths)
+      {parts, left, shape} = plan(rows, room(ctx, rows), widths, prompt_path(ctx))
+      written = step_end(Enum.max(running_lengths(rows), fn -> 0 end), rows.lengths, shape)
 
       [selects, remaining] =
         [parts, left, rows.done, rows.remaining]
@@ -3214,9 +3352,9 @@ defmodule Transmuter.Generation do
   # row and needs no rows of the buffers. In :append, a compaction drops it.
   defp advance(ctx, group) do
     group = fit_next(ctx, group)
-    {parts, left, width} = next_parts(ctx, group)
+    {parts, left, shape} = next_parts(ctx, group)
     group = %{group | left: left}
-    state = step(ctx, group.state, parts, selection(ctx, group), width)
+    state = step(ctx, group.state, parts, selection(ctx, group), shape)
 
     # The image features stay until the last part of a prompt has run.
     state = if Enum.all?(left, &(&1 == [])), do: %{state | features: nil}, else: state
@@ -3246,18 +3384,27 @@ defmodule Transmuter.Generation do
   # admission does not move the buffers. advance/2 calls it before each later step.
   defp fit_next(ctx, group) do
     group = if ctx.mode == :in_place, do: drop_ended(group), else: group
-    {_parts, _left, width} = next_parts(ctx, group)
-    fit(ctx, group, width)
+    {_parts, _left, shape} = next_parts(ctx, group)
+    longest = Enum.max(group.state.lengths)
+    fit(ctx, group, step_end(longest, group.state.lengths, shape) - longest)
   end
 
-  # The parts of the next step of a group (see plan/3), the prompts that are left after it, and
-  # its width, on the branch that the step runs on (see branch_widths/3).
+  # The parts of the next step of a group (see plan/4), the prompts that are left after it, and
+  # its shape, on the branch that the step runs on (see branch_widths/3).
   defp next_parts(ctx, group) do
     widths = branch_widths(ctx, group, group.state.lengths)
     rows = %{lengths: group.state.lengths, done: group.done}
-    {parts, left} = plan(group, room(ctx, rows), widths)
-    {parts, left, step_width(parts, widths)}
+    plan(group, room(ctx, rows), widths, prompt_path(ctx))
   end
+
+  # The rows that the buffers need after a step of `shape` (see plan/4), from rows of `lengths`
+  # whose longest row has `longest` rows. Each row writes the width of a step after its length.
+  # In a ragged step, each row writes one token after its length, and the chunk row writes the
+  # chunk and then its token (see chunk_steps/1).
+  defp step_end(longest, _lengths, width) when is_integer(width), do: longest + width
+
+  defp step_end(longest, lengths, {:chunk, row, width}),
+    do: max(longest + 1, Enum.at(lengths, row) + width + 1)
 
   # The tokens of each row in the next step, and the tokens of the prompts that are left after
   # it. A row with a new token takes it. A row with a prompt takes a part of it from the front:
@@ -3267,21 +3414,48 @@ defmodule Transmuter.Generation do
   # tokens at different positions, and a prompt of 37 tokens runs in one step with a new token
   # of each other row. A part is also at most the `room` that the largest capacity has after
   # the longest row that has not ended, except a part of @join_tokens, which the rows that
-  # admitted the request counted (see rows_needed/3).
-  defp plan(group, room, widths) do
+  # admitted the request counted (see rows_needed/3). The shape of such a step is its width
+  # (see step_width/2).
+  #
+  # With the :ragged path (see prompt_path/1), while a row takes a new token, the first row
+  # with a prompt left takes a chunk of at most 256 tokens of it instead, and the other rows
+  # with a prompt wait. The shape of that step is {:chunk, row, width}, with the smallest of
+  # @chunk_widths that holds the chunk (see chunk_steps/1). The rows that admitted the request
+  # counted that width (see rows_needed/3).
+  defp plan(group, room, widths, path) do
     running? =
       Enum.any?(Enum.zip(group.new, group.done), &match?({token, false} when token != nil, &1))
 
+    chunk_row = running? and path == :ragged and Enum.find_index(group.left, &(&1 != []))
     longest = group.left |> Enum.map(&length/1) |> Enum.max()
-    size = part_size(running?, longest, room, widths)
 
-    [group.left, group.new, group.done]
-    |> Enum.zip_with(fn
-      [[], token, false] when token != nil -> {[token], []}
-      [[], _token, _done?] -> {[], []}
-      [left, _token, _done?] -> Enum.split(left, size)
-    end)
-    |> Enum.unzip()
+    size =
+      if chunk_row,
+        do: List.last(@chunk_widths),
+        else: part_size(running?, longest, room, widths)
+
+    {parts, left} =
+      [group.left, group.new, group.done, Enum.to_list(0..(length(group.left) - 1))]
+      |> Enum.zip_with(fn
+        [[], token, false, _row] when token != nil ->
+          {[token], []}
+
+        [[], _token, _done?, _row] ->
+          {[], []}
+
+        [left, _token, _done?, row] when chunk_row == false or row == chunk_row ->
+          Enum.split(left, size)
+
+        [left, _token, _done?, _row] ->
+          {[], left}
+      end)
+      |> Enum.unzip()
+
+    if chunk_row,
+      do:
+        {parts, left,
+         {:chunk, chunk_row, width_for(length(Enum.at(parts, chunk_row)), @chunk_widths)}},
+      else: {parts, left, step_width(parts, widths)}
   end
 
   # The most tokens of a prompt in the next step, when the longest prompt has `longest` tokens
@@ -3407,12 +3581,15 @@ defmodule Transmuter.Generation do
   # Gives each row its tokens of `parts` and padding tokens after them, so that all rows
   # have the same number of tokens. The selection of the step reads the logits at the last
   # real token of each row.
-  defp step(ctx, state, parts, selection, width \\ 1) do
+  #
+  # A ragged step of the shape {:chunk, row, width} (see plan/4) has one sequence of tokens:
+  # the token of each row, a padding token for the chunk row, and then the chunk of the chunk
+  # row with padding tokens up to `width` (see chunk_steps/1).
+  defp step(ctx, state, parts, selection, shape \\ 1) do
     counts = Enum.map(parts, &length/1)
-    n = max(width, Enum.max(counts))
-    tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
-    {inputs, static} = step_inputs(ctx, state, tokens, counts)
-    {inputs, state} = embed(ctx, state, inputs, tokens)
+    {tokens, segments, n} = step_tokens(parts, counts, shape)
+    {inputs, static} = step_inputs(ctx, state, tokens, counts, shape)
+    {inputs, state} = embed(ctx, state, inputs, tokens, segments)
 
     # The selection takes the logits at the last real token of each row, which is this many
     # positions before the last position of the logits. With @logit_index, the logits have
@@ -3480,6 +3657,25 @@ defmodule Transmuter.Generation do
     }
   end
 
+  # The tokens of a step as the decoder takes them, {rows, n} or one sequence in a ragged step,
+  # the row and the tokens of each part of them in order, and the rows that the step writes
+  # after the write offset of :append.
+  defp step_tokens(parts, _counts, {:chunk, row, width}) do
+    firsts =
+      for {part, r} <- Enum.with_index(parts), do: if(r == row, do: 0, else: List.first(part, 0))
+
+    chunk = Enum.at(parts, row)
+    chunk = chunk ++ List.duplicate(0, width - length(chunk))
+    segments = for {token, r} <- Enum.with_index(firsts), do: {r, [token]}
+    {[firsts ++ chunk], segments ++ [{row, chunk}], width + 1}
+  end
+
+  defp step_tokens(parts, counts, width) do
+    n = max(width, Enum.max(counts))
+    tokens = Enum.map(parts, &(&1 ++ List.duplicate(0, n - length(&1))))
+    {tokens, Enum.with_index(tokens, &{&2, &1}), n}
+  end
+
   # The column of the buffers where each row writes the first token of a step: the write offset
   # of the group in :append, else the length of the row (see "Batches").
   defp columns(%{mode: :append}, state), do: List.duplicate(state.used, length(state.lengths))
@@ -3489,31 +3685,35 @@ defmodule Transmuter.Generation do
   # with image tokens, the features of the images replace their embeddings. The cursor of
   # a row is the index of the features of its next image token and the end of its features,
   # so the image tokens after its prompt, which the row generates, keep their embeddings.
-  defp embed(%{embed: nil}, state, inputs, _tokens), do: {inputs, state}
+  # The `segments` give the row of each part of the tokens, in their order.
+  defp embed(%{embed: nil}, state, inputs, _tokens, _segments), do: {inputs, state}
 
-  defp embed(ctx, state, inputs, tokens) do
+  defp embed(ctx, state, inputs, tokens, segments) do
     embeds = ctx.embed.(tokens)
 
-    {rows, cursors} =
-      Enum.zip_with(tokens, state.cursors, fn row, cursor ->
-        Enum.map_reduce(row, cursor, fn
-          id, {next, stop} when id == ctx.image_token and next < stop ->
-            {{next, 1}, {next + 1, stop}}
+    {entries, cursors} =
+      Enum.flat_map_reduce(segments, state.cursors, fn {row, ids}, cursors ->
+        {entries, cursor} =
+          Enum.map_reduce(ids, Enum.at(cursors, row), fn
+            id, {next, stop} when id == ctx.image_token and next < stop ->
+              {{next, 1}, {next + 1, stop}}
 
-          _id, cursor ->
-            {{0, 0}, cursor}
-        end)
+            _id, cursor ->
+              {{0, 0}, cursor}
+          end)
+
+        {entries, List.replace_at(cursors, row, cursor)}
       end)
-      |> Enum.unzip()
 
     embeds =
       if state.features == nil or cursors == state.cursors do
         embeds
       else
-        index = for row <- rows, do: Enum.map(row, &elem(&1, 0))
-        mask = for row <- rows, do: Enum.map(row, &elem(&1, 1))
-        index = Nx.tensor(index, type: :s32, backend: Nx.BinaryBackend)
-        mask = Nx.tensor(mask, type: :u8, backend: Nx.BinaryBackend)
+        shape = {length(tokens), length(hd(tokens))}
+        index = for {index, _mask} <- entries, do: index
+        mask = for {_index, mask} <- entries, do: mask
+        index = index |> Nx.tensor(type: :s32, backend: Nx.BinaryBackend) |> Nx.reshape(shape)
+        mask = mask |> Nx.tensor(type: :u8, backend: Nx.BinaryBackend) |> Nx.reshape(shape)
         merged = ctx.merge.(embeds, state.features, index, mask)
         release([embeds], [merged])
         merged
@@ -3971,7 +4171,12 @@ defmodule Transmuter.Generation do
   defp runs(values = [value | _]) when is_number(value), do: Enum.map(values, &{&1, 1})
   defp runs(lists), do: Enum.map(lists, &runs/1)
 
-  defp step_inputs(ctx, state, tokens, counts) do
+  #
+  # In a ragged step of the shape {:chunk, row, width} (see step/5), the mask of each row has
+  # ones for its valid rows and its token, and the mask of the chunk row also for the chunk,
+  # before its token. The logits of each row are at its token, and those of the chunk row at
+  # the last real token of the chunk.
+  defp step_inputs(ctx, state, tokens, counts, shape \\ 1) do
     n = length(hd(tokens))
 
     cached? =
@@ -3980,10 +4185,12 @@ defmodule Transmuter.Generation do
         for({past, count} <- Enum.zip(state.lengths, counts), count > 0, do: past)
       )
 
+    {ends, positions, logit_index, chunk_row} = step_layout(ctx, state, counts, n, shape)
+
     masks =
-      for {past, valid} <- Enum.zip(state.lengths, state.valid) do
+      for {past, valid, stop} <- Enum.zip([state.lengths, state.valid, ends]) do
         case ctx.mode do
-          :in_place -> [{1, past + n}, {0, state.capacity - past - n}]
+          :in_place -> [{1, stop}, {0, state.capacity - stop}]
           :append when cached? -> valid_runs(valid, state.capacity) ++ [{1, n}]
           :append -> [{1, n}]
           :grow -> [{1, past + n}]
@@ -3993,10 +4200,11 @@ defmodule Transmuter.Generation do
     values = %{
       "input_ids" => runs(tokens),
       "attention_mask" => masks,
-      "position_ids" => runs(positions(ctx, state, n)),
+      "position_ids" => runs(positions),
       @position_offset => runs(position_offset(ctx, state)),
       @key_mask => masks,
-      @logit_index => runs(for count <- counts, do: [[max(count - 1, 0)]])
+      @logit_index => runs(logit_index),
+      @chunk_row => runs([chunk_row])
     }
 
     inputs =
@@ -4063,6 +4271,38 @@ defmodule Transmuter.Generation do
       end)
 
     if count == 3, do: Enum.zip_with(rows, & &1), else: Enum.map(rows, &hd/1)
+  end
+
+  # The rows of the mask of each row of a step, the positions of the tokens, the index of the
+  # logits of each row and the chunk row (see step_inputs/5).
+  defp step_layout(ctx, state, counts, _n, {:chunk, row, width}) do
+    rows = length(counts)
+
+    ends =
+      for {past, r} <- Enum.with_index(state.lengths),
+          do: past + 1 + if(r == row, do: width, else: 0)
+
+    last = rows + Enum.at(counts, row) - 1
+    logit_index = [for(r <- 0..(rows - 1), do: [if(r == row, do: last, else: r)])]
+    {ends, chunk_positions(ctx, state, row, width), logit_index, row}
+  end
+
+  defp step_layout(ctx, state, counts, n, _width) do
+    logit_index = for count <- counts, do: [[max(count - 1, 0)]]
+    {Enum.map(state.lengths, &(&1 + n)), positions(ctx, state, n), logit_index, 0}
+  end
+
+  # The positions of a ragged step (see step_inputs/5): the position of the token of each row,
+  # and then those of the chunk of `row`, as one sequence.
+  defp chunk_positions(ctx, state, row, width) do
+    sequence = fn tokens, chunk -> [Enum.map(tokens, &hd/1) ++ Enum.at(chunk, row)] end
+    tokens = positions(ctx, state, 1)
+    chunk = positions(ctx, state, width)
+    {_type, dims} = Map.get(ctx.model.input_types, "position_ids", {:s64, [nil, nil]})
+
+    if length(dims) == 3,
+      do: Enum.zip_with(tokens, chunk, sequence),
+      else: sequence.(tokens, chunk)
   end
 
   # Selects the token of each row from its logits at `index`. The key of a step is the key
