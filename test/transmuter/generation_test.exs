@@ -877,6 +877,41 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
+  # In :in_place, each row writes from the first row of the buffers, so its valid rows start
+  # there, also when it joins a group that runs, whose write offset is past them. A prompt of
+  # 70 tokens joins a row that runs, in the steps of joins, and the first 64 rows of its row go
+  # into the store. A later prompt starts with that prefix and gives the tokens that it gives
+  # alone.
+  @tag ci_partition: 10
+  test "a prefix stored from a row that joined a running group gives the tokens of its prompt" do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
+    [running, joining] = [prompt.(30, 1), prompt.(70, 2)]
+    prefixed = Enum.take(joining, 64) ++ prompt.(9, 3)
+    ctx = Generation.context(repo, model, max_new_tokens: 6, alone_prompts: false)
+    assert ctx.mode == :in_place
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    alone = &(single |> Generation.generate([&1], [0]) |> hd() |> Enum.map(fn [id] -> id end))
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+    request = &%{row: &1, prompt: &2, seed: 0, budget: 6}
+
+    group = Generation.admit(ctx, Generation.open(ctx, 3), [request.(0, running)])
+    group = run_until(ctx, group, &(length(Enum.at(&1.ids, 0)) == 2))
+    group = Generation.admit(ctx, group, [request.(1, joining)])
+    group = run_until(ctx, group, &(Enum.at(&1.ids, 1) != []))
+    store = Generation.prefix_store(ctx, 1, 512)
+    store = Generation.store_prefix(ctx, group, store, 1, 0, 64)
+    prefix = %{store: store, slot: 0, size: 64}
+    group = Generation.admit(ctx, group, [Map.put(request.(2, prefixed), :prefix, prefix)])
+    group = run_until(ctx, group, &Enum.all?(&1.done))
+    assert row_tokens(group, 2) == alone.(prefixed)
+    Generation.finish(group)
+    Generation.release(Map.values(store), [])
+  end
+
   # A decode loop runs up to 4 steps in one call, and stops each row in the graph at an eos
   # token or at its budget. The rows get their first tokens in calls of 1, 2 and 4 steps, one
   # row stops at an eos token inside a call, and 10 new tokens are not a multiple of 4. The

@@ -1837,7 +1837,10 @@ defmodule Transmuter.Generation do
           state
           | lengths: Enum.zip_with(state.lengths, counts, &+/2),
             used: state.used + 1,
-            valid: Enum.zip_with(state.valid, counts, &add_rows(&1, state.used, &2))
+            valid:
+              Enum.zip_with([state.valid, columns(ctx, state), counts], fn [valid, at, count] ->
+                add_rows(valid, at, count)
+              end)
         }
 
         group = select_rows(ctx, %{group | state: state}, selected)
@@ -3466,13 +3469,21 @@ defmodule Transmuter.Generation do
         written: Map.keys(present),
         lengths: lengths,
         used: state.used + n,
-        valid: Enum.zip_with(state.valid, counts, &add_rows(&1, state.used, &2)),
+        valid:
+          Enum.zip_with([state.valid, columns(ctx, state), counts], fn [valid, at, count] ->
+            add_rows(valid, at, count)
+          end),
         selected: outputs[@selected],
         seen: outputs[@next_seen],
         history: outputs[@next_history],
         count: outputs[@next_count]
     }
   end
+
+  # The column of the buffers where each row writes the first token of a step: the write offset
+  # of the group in :append, else the length of the row (see "Batches").
+  defp columns(%{mode: :append}, state), do: List.duplicate(state.used, length(state.lengths))
+  defp columns(_ctx, state), do: state.lengths
 
   # A decoder with inputs_embeds gets the embeddings of the tokens. In a part of the prompt
   # with image tokens, the features of the images replace their embeddings. The cursor of
