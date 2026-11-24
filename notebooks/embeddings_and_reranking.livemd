@@ -15,6 +15,8 @@ Mix.install([
   # has them, change this line to {:transmuter, "~> 2.1"}.
   {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
   backend_dep,
+  # EMLX 0.5.0 and EXLA 1.0.0 do not compile with fine 0.2, which a new install takes.
+  {:fine, "~> 0.1.6", runtime: false},
   {:tokenizers, "~> 0.5"},
   {:kino, "~> 0.19"}
 ])
@@ -62,8 +64,8 @@ ms = &(System.convert_time_unit(&1, :native, :microsecond) / 1000)
   fn [_, _, kind, _], m, %{source: {:hf, repo, _file}}, agent ->
     row =
       case kind do
-        :batch -> %{model: repo, event: "batch", rows: "#{m.batch_size} of #{m.padded_size}", ms: ms.(m.duration)}
-        :request -> %{model: repo, event: "call", rows: "#{m[:inputs]} inputs", ms: ms.(m.duration)}
+        :batch -> %{model: repo, event: "batch", rows: "#{m.batch_size} of #{m.padded_size}", ms: Float.round(ms.(m.duration), 1)}
+        :request -> %{model: repo, event: "call", rows: "#{m[:inputs]} inputs", ms: Float.round(ms.(m.duration), 1)}
       end
 
     Agent.cast(agent, &[row | &1])
@@ -157,7 +159,7 @@ queries
   max_concurrency: 20
 )
 |> Enum.map(fn {:ok, {query, document}} -> %{query: query, nearest: document} end)
-|> Kino.DataTable.new()
+|> Kino.DataTable.new(keys: [:query, :nearest])
 ```
 
 ## The batches
@@ -165,7 +167,10 @@ queries
 Each row is one event, the most recent first. The rows of a batch show how full it was.
 
 ```elixir
-Kino.DataTable.new(Agent.get(events, & &1), name: "Batches and calls")
+Kino.DataTable.new(Agent.get(events, & &1),
+  name: "Batches and calls",
+  keys: [:model, :event, :rows, :ms]
+)
 ```
 
 In an application, send these values to a metrics service with `Telemetry.Metrics`. The guide "Telemetry in production" shows how.

@@ -15,6 +15,8 @@ Mix.install([
   # has them, change this line to {:transmuter, "~> 2.1"}.
   {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
   backend_dep,
+  # EMLX 0.5.0 and EXLA 1.0.0 do not compile with fine 0.2, which a new install takes.
+  {:fine, "~> 0.1.6", runtime: false},
   {:tokenizers, "~> 0.5"},
   {:otera, "~> 0.1"},
   {:kino, "~> 0.19"}
@@ -45,47 +47,53 @@ spec =
 
 ## Collect the metrics
 
-The server emits telemetry events for each step and for each request. A handler runs in the process of the server, so this handler only sends a message to an `Agent`. The agent keeps the last values.
+The server emits telemetry events for each step and for each request. A handler runs in the process of the server, so this handler only sends a message to an `Agent`. The agent keeps the finished requests, the tokens of the steps in the last 5 seconds, the rows that run and the last KV cache values.
 
 ```elixir
 {:ok, metrics} =
   Agent.start_link(fn ->
-    %{requests: [], tokens: 0, running: 0, waiting: 0, kv_used: 0, kv_capacity: 0, started: nil}
+    %{requests: [], steps: [], running: 0, waiting: 0, kv_used: 0, kv_capacity: 0}
   end)
 
-ms = &System.convert_time_unit(&1, :native, :microsecond) / 1000
+ms = &(System.convert_time_unit(&1, :native, :microsecond) / 1000)
 
 handler = fn
   [_, _, :step, :stop], m, metadata, agent ->
     Agent.cast(agent, fn state ->
+      since = m.monotonic_time - System.convert_time_unit(5, :second, :native)
+      steps = for {time, _tokens} = step <- state.steps, time > since, do: step
+
       %{
         state
-        | tokens: state.tokens + m.tokens,
-          running: m.running,
+        | steps: [{m.monotonic_time, m.tokens} | steps],
           waiting: m.waiting,
           kv_used: m.kv_used,
-          kv_capacity: metadata.slots * m.kv_capacity,
-          started: state.started || System.monotonic_time()
+          kv_capacity: metadata.slots * m.kv_capacity
       }
     end)
 
-  [_, _, :request, :stop], m, %{result: :done}, agent ->
-    request = %{
-      time_to_first_token: ms.(m.time_to_first_token),
-      time_per_output_token: ms.(m.time_per_output_token),
-      output_tokens: m.output_tokens
-    }
+  [_, _, :request, :admit], _m, _metadata, agent ->
+    Agent.cast(agent, &%{&1 | running: &1.running + 1})
 
-    Agent.cast(agent, &%{&1 | requests: [request | &1.requests]})
+  [_, _, :request, :stop], m, metadata, agent ->
+    Agent.cast(agent, fn state ->
+      # A request that the caller cancels before it gets a row has no :index.
+      running = if metadata.index, do: state.running - 1, else: state.running
 
-  _event, _measurements, _metadata, _agent ->
-    :ok
+      requests =
+        if metadata.result == :done,
+          do: [{ms.(m.time_to_first_token), ms.(m.time_per_output_token)} | state.requests],
+          else: state.requests
+
+      %{state | running: running, requests: requests}
+    end)
 end
 
 :telemetry.attach_many(
   "chat-notebook",
   [
     [:transmuter, :continuous_batching, :step, :stop],
+    [:transmuter, :continuous_batching, :request, :admit],
     [:transmuter, :continuous_batching, :request, :stop]
   ],
   handler,
@@ -93,32 +101,28 @@ end
 )
 ```
 
-This frame shows the metrics each second.
+This frame shows the metrics each second. The output rate counts the tokens of the last 5 seconds, so it goes to 0 when the server has no requests.
 
 ```elixir
 frame = Kino.Frame.new()
 
 Kino.listen(1_000, fn _tick ->
   state = Agent.get(metrics, & &1)
-  done = state.requests
-  mean = fn key -> if done == [], do: 0, else: Enum.sum(Enum.map(done, & &1[key])) / length(done) end
-
-  seconds =
-    if state.started,
-      do: System.convert_time_unit(System.monotonic_time() - state.started, :native, :millisecond) / 1000,
-      else: 0
+  since = System.monotonic_time() - System.convert_time_unit(5, :second, :native)
+  recent = for {time, tokens} <- state.steps, time > since, do: tokens
+  mean = fn values -> if values == [], do: 0.0, else: Float.round(Enum.sum(values) / length(values), 1) end
 
   rows = [
-    %{metric: "Requests done", value: length(done)},
-    %{metric: "Mean time to first token (ms)", value: Float.round(mean.(:time_to_first_token) * 1.0, 1)},
-    %{metric: "Mean time per output token (ms)", value: Float.round(mean.(:time_per_output_token) * 1.0, 1)},
-    %{metric: "Tokens per second", value: if(seconds > 0, do: Float.round(state.tokens / seconds, 1), else: 0)},
-    %{metric: "Running rows", value: state.running},
-    %{metric: "Waiting requests", value: state.waiting},
+    %{metric: "Requests done", value: "#{length(state.requests)}"},
+    %{metric: "Mean time to first token (ms)", value: "#{mean.(Enum.map(state.requests, &elem(&1, 0)))}"},
+    %{metric: "Mean time per output token (ms)", value: "#{mean.(Enum.map(state.requests, &elem(&1, 1)))}"},
+    %{metric: "Tokens per second (last 5 s)", value: "#{Enum.sum(recent) / 5}"},
+    %{metric: "Running rows", value: "#{state.running}"},
+    %{metric: "Waiting requests", value: "#{state.waiting}"},
     %{metric: "KV cache in use", value: "#{state.kv_used} of #{state.kv_capacity} rows"}
   ]
 
-  Kino.Frame.render(frame, Kino.DataTable.new(rows, name: "Server"))
+  Kino.Frame.render(frame, Kino.DataTable.new(rows, name: "Server", keys: [:metric, :value]))
 end)
 
 frame

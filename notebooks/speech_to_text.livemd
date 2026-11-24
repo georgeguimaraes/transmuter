@@ -15,6 +15,8 @@ Mix.install([
   # has them, change this line to {:transmuter, "~> 2.1"}.
   {:transmuter, github: "georgeguimaraes/transmuter", ref: "a093615e0b1fea902c1ba2bf395df0e0e6aa5e8a"},
   backend_dep,
+  # EMLX 0.5.0 and EXLA 1.0.0 do not compile with fine 0.2, which a new install takes.
+  {:fine, "~> 0.1.6", runtime: false},
   {:tokenizers, "~> 0.5"},
   {:kino, "~> 0.19"}
 ])
@@ -114,7 +116,7 @@ rows =
     %{start: chunk.start_timestamp_seconds, end: chunk.end_timestamp_seconds, text: chunk.text}
   end
 
-Kino.Layout.grid([Kino.DataTable.new(rows), report.(seconds)])
+Kino.Layout.grid([Kino.DataTable.new(rows, keys: [:start, :end, :text]), report.(seconds)])
 ```
 
 In an application, send these values to a metrics service with `Telemetry.Metrics`. The guide "Telemetry in production" shows how.
