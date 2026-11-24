@@ -95,7 +95,7 @@ defmodule Transmuter.Generation do
 
   A step of a group runs all its rows at its width, also the rows that only take a new token, so a step of a short prompt in a group of many rows costs the width for each row: for Qwen3-0.6B fp16 with 48 rows on CUDA (RTX 3060), 49 ms at width 16 against 13 ms at width 1. So in `:in_place`, unless `alone_prompts: false`, when the new requests of an admission are fewer than the rows of the group in a power of 4, each prompt of at most 511 tokens runs whole in one step of the new rows alone. That step runs in a group of a power of 4 of rows, with the stored prefix of each row as its past (see "Prefixes"), at the smallest width of 16, 64, 256 and 512 tokens that holds the rest of each prompt and its first token. Its first token is read, and the cache, the selection state and the tokens of each row move into its row of the group, which starts at the first row of the buffers. The other rows take their next token in the next step of the group. On a mix of 512 ShareGPT prompts of 20 to 512 tokens with 16 rows of Qwen3-0.6B fp16 on CUDA, the prompt steps took 22 s against 58 s as joins, and the time for each output token was 15.7 ms against 20.6 ms (p50). A longer prompt, the prompts of `:append`, whose rows share one write offset, and the prompts of a merged decoder whose rows keep their own encoder outputs run in the steps of the group as above.
 
-  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: a value with the batch of the buffers, such as one of the attention mask, may reach only the past, the lengths and the attention bias of GroupQueryAttention. A bias that mixes the rows and the tokens, such as the key-padding bias of Gemma 3, is taken for each token from its own row. Qwen3, SmolLM2, SmolVLM and Gemma 3 pass this check. Apertus, whose positions take the position offset of each row, runs its prompts alone or in joins.
+  In `:in_place`, unless `ragged_prompts: false`, a decoder whose graph allows it runs the prompts of new rows in ragged steps, and not alone or in joins. A ragged step has one sequence of tokens: the token of each row, and then a chunk of at most 256 tokens of the prompt of one row, padded to 16, 64 or 256 tokens. So the step reads the weights one time for the new tokens and for the chunk, and the chunk does not cost its width for each row. GroupQueryAttention splits the sequence by row: each row writes its token after its valid rows and reads its own buffer, and the chunk writes its rows after the valid rows of its row, with a causal mask. The token of the chunk row goes after the chunk, into a row that the next step overwrites, so the chunk needs its width and one more row. The lm_head reads the token of each row and the last real token of the chunk. The other rows with a prompt wait for the chunk row to end its prompt. The other nodes of the graph must compute each token alone: a value with the batch of the buffers, such as one of the attention mask, may reach only the past, the lengths and the attention bias of GroupQueryAttention. A bias that mixes the rows and the tokens, such as the key-padding bias of Gemma 3, is taken for each token from its own row. The position offset of `Transmuter.Generation.MergedDecoder`, as in Apertus, has a value for each token of a ragged step when its reads line up with the tokens. Qwen3, SmolLM2, SmolVLM, Gemma 3 and Apertus pass this check.
 
   ## Decode loops
 
@@ -801,8 +801,8 @@ defmodule Transmuter.Generation do
   # each row from @logit_index (see keep_last_logits/1), each GroupQueryAttention counts its rows
   # from the values of the mask, as in :in_place, and has no input after the attention bias, and
   # the classes of the values allow it (see value_classes/1). Other decoders run their prompts in
-  # steps of their rows (see prompt_path/1), such as Apertus, whose positions take the position
-  # offset of each row (see MergedDecoder).
+  # steps of their rows (see prompt_path/1), such as a decoder whose position offset of
+  # MergedDecoder cannot have a value for each token.
   defp chunk_steps(model) do
     gqas = Enum.filter(model.nodes, &(&1.op_type == "GroupQueryAttention"))
 
@@ -860,7 +860,10 @@ defmodule Transmuter.Generation do
           into: Map.merge(model.params, model.static),
           do: {name, Transmuter.Ops.tensor(t)}
 
-    tokens = ["input_ids", "inputs_embeds", "position_ids", @logit_index]
+    # The position offset of MergedDecoder has a value for each token of a ragged step when its
+    # reads line up with the tokens (see MergedDecoder.row_offsets/3), as the positions.
+    offsets = if model[:token_offsets], do: [@position_offset], else: []
+    tokens = ["input_ids", "inputs_embeds", "position_ids", @logit_index] ++ offsets
 
     inputs =
       for input <- model.inputs, into: %{"" => :static} do
@@ -4273,7 +4276,7 @@ defmodule Transmuter.Generation do
         for({past, count} <- Enum.zip(state.lengths, counts), count > 0, do: past)
       )
 
-    {ends, positions, logit_index, chunk_row} = step_layout(ctx, state, counts, n, shape)
+    {ends, positions, offsets, logit_index, chunk_row} = step_layout(ctx, state, counts, n, shape)
 
     masks =
       for {past, valid, stop} <- Enum.zip([state.lengths, state.valid, ends]) do
@@ -4289,7 +4292,7 @@ defmodule Transmuter.Generation do
       "input_ids" => runs(tokens),
       "attention_mask" => masks,
       "position_ids" => runs(positions),
-      @position_offset => runs(position_offset(ctx, state)),
+      @position_offset => runs(offsets),
       @key_mask => masks,
       @logit_index => runs(logit_index),
       @chunk_row => runs([chunk_row])
@@ -4361,8 +4364,11 @@ defmodule Transmuter.Generation do
     if count == 3, do: Enum.zip_with(rows, & &1), else: Enum.map(rows, &hd/1)
   end
 
-  # The rows of the mask of each row of a step, the positions of the tokens, the index of the
-  # logits of each row and the chunk row (see step_inputs/5).
+  # The rows of the mask of each row of a step, the positions of the tokens, the position offset
+  # of MergedDecoder, the index of the logits of each row and the chunk row (see step_inputs/5).
+  # The graph of a decoder with the offset counts the positions of a step from the capacity,
+  # so in a ragged step, token t of the sequence, at position capacity + t, takes the offset of
+  # its own position.
   defp step_layout(ctx, state, counts, _n, {:chunk, row, width}) do
     rows = length(counts)
 
@@ -4372,12 +4378,20 @@ defmodule Transmuter.Generation do
 
     last = rows + Enum.at(counts, row) - 1
     logit_index = [for(r <- 0..(rows - 1), do: [if(r == row, do: last, else: r)])]
-    {ends, chunk_positions(ctx, state, row, width), logit_index, row}
+    positions = chunk_positions(ctx, state, row, width)
+
+    offsets =
+      if @position_offset in ctx.model.inputs,
+        do: [Enum.with_index(hd(positions), fn p, t -> p - state.capacity - t end)],
+        else: []
+
+    {ends, positions, offsets, logit_index, row}
   end
 
   defp step_layout(ctx, state, counts, n, _width) do
     logit_index = for count <- counts, do: [[max(count - 1, 0)]]
-    {Enum.map(state.lengths, &(&1 + n)), positions(ctx, state, n), logit_index, 0}
+    offsets = position_offset(ctx, state)
+    {Enum.map(state.lengths, &(&1 + n)), positions(ctx, state, n), offsets, logit_index, 0}
   end
 
   # The positions of a ragged step (see step_inputs/5): the position of the token of each row,

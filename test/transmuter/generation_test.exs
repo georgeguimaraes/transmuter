@@ -2695,6 +2695,27 @@ defmodule Transmuter.GenerationBitsTest do
       diff = Enum.zip_with(row, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
       assert diff < 1.0e-4, "#{diff}"
     end
+
+    # In a ragged step, the position offset has a value for each token, so the prompt of 20
+    # tokens that joins the running row of 5 takes the positions of its own row.
+    if "transmuter.chunk_row" in ctx.model.inputs do
+      [short, _, long] = prompts
+      request = &%{row: &1, prompt: &2, seed: 0, budget: 16}
+      group = Generation.admit(ctx, Generation.open(ctx, 3), [request.(0, short)])
+      group = Generation.next(ctx, Generation.next(ctx, group))
+      group = Generation.admit(ctx, group, [request.(1, long)])
+      group = group |> Stream.iterate(&Generation.next(ctx, &1)) |> Enum.find(&Enum.all?(&1.done))
+
+      for {prompt, row} <- [{short, 0}, {long, 1}] do
+        expected = apertus_greedy(prompt)
+        got = Generation.row_tokens(group, row)
+        assert Enum.map(got, &hd/1) == Enum.map(expected, &hd/1), inspect({form, row})
+        diff = Enum.zip_with(got, expected, fn [_, a], [_, b] -> abs(a - b) end) |> Enum.max()
+        assert diff < 1.0e-4, "#{form} row #{row}: #{diff}"
+      end
+
+      Generation.finish(group)
+    end
   end
 
   defp apertus_context(model) do
@@ -2951,7 +2972,8 @@ defmodule Transmuter.GenerationBitsTest do
         "past_key_values.0.key" => cache,
         "past_key_values.0.value" => cache,
         "transmuter.position_offset" => host.(for p <- pasts, do: [p - capacity]),
-        "transmuter.logit_index" => host.(for _ <- rows, do: [[1]])
+        "transmuter.logit_index" => host.(for _ <- rows, do: [[1]]),
+        "transmuter.chunk_row" => host.([0])
       }
     end
 
