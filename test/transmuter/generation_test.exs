@@ -1018,6 +1018,67 @@ defmodule Transmuter.GenerationTest do
     Generation.release(Map.values(store), [])
   end
 
+  # A request with a stored prefix starts its row after the prefix, so the rows that it needs
+  # count its chunks from there (see rows_needed/3). A prompt of 300 tokens with a prefix of
+  # 128 runs the other 172 tokens in one chunk of 256 while row 0 runs, which writes up to row
+  # 385 (128 + 256 + 1). Its chunks from row 0 would write only 321 rows. The request then
+  # gives the tokens that it gives alone.
+  @tag ci_partition: 10
+  test "the rows that a request needs count its chunks from its stored prefix" do
+    {ctx, single, request} = ragged_context(%{"eos_token_id" => -1})
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
+    [running, prefixed] = [prompt.(20, 1), prompt.(300, 2)]
+    store = Generation.prefix_store(ctx, 1, 512)
+    first = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, prefixed, 6)])
+    first = run_until(ctx, first, &(Enum.at(&1.ids, 0) != []))
+    store = Generation.store_prefix(ctx, first, store, 0, 0, 128)
+    Generation.finish(first)
+
+    group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, running, 12)])
+    group = Generation.next(ctx, group)
+    joining = Map.put(request.(1, prefixed, 2), :prefix, %{store: store, slot: 0, size: 128})
+    assert Generation.rows_needed(ctx, group, [joining]) == 385
+    group = run_until(ctx, Generation.admit(ctx, group, [joining]), &Enum.all?(&1.done))
+    alone = single |> Generation.generate([prefixed], [0]) |> hd() |> Enum.map(&hd/1)
+    assert row_tokens(group, 1) == Enum.take(alone, 2)
+    Generation.finish(group)
+    Generation.release(Map.values(store), [])
+  end
+
+  # A chunk takes only the widths whose padded rows fit the largest capacity after its row
+  # (see plan/4). With 1024 rows, a prompt of 1000 tokens joins a row that runs in chunks of
+  # 256, 256 and 256, then of 64 up to row 960, then of 16, and its last chunk writes up to row
+  # 1009. With chunks of 256 only, its last chunk would need 1025 rows, and the request would
+  # wait for the group to end. It gives the tokens that it gives alone.
+  @tag ci_partition: 10
+  test "a chunk near the largest capacity takes a width that fits" do
+    {ctx, single, request} = ragged_context(%{"eos_token_id" => -1})
+    ctx = %{ctx | max_capacity: 1024}
+    prompt = fn n, k -> for i <- 1..n, do: rem(i * 37 + k * 101, 49_000) + 100 end
+    [running, long] = [prompt.(20, 1), prompt.(1000, 3)]
+    group = Generation.admit(ctx, Generation.open(ctx, 2), [request.(0, running, 30)])
+    group = Generation.next(ctx, group)
+    assert Generation.rows_needed(ctx, group, [request.(1, long, 4)]) == 1009
+    group = Generation.admit(ctx, group, [request.(1, long, 4)])
+    group = run_until(ctx, group, &(Enum.at(&1.ids, 1) != []))
+    assert length(Enum.at(group.ids, 0)) > 2
+    group = run_until(ctx, group, &Enum.at(&1.done, 1))
+    alone = single |> Generation.generate([long], [0]) |> hd() |> Enum.map(&hd/1)
+    assert row_tokens(group, 1) == Enum.take(alone, 4)
+    Generation.finish(group)
+  end
+
+  defp ragged_context(generation_config) do
+    opts = [outputs: &Generation.outputs/1, variant: :fp32] ++ @opts
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: generation_config}
+    ctx = Generation.context(repo, model, max_new_tokens: 30)
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    request = &%{row: &1, prompt: &2, seed: 0, budget: &3}
+    {Generation.compile(ctx, 2, @opts[:defn_options]), single, request}
+  end
+
   # A decode loop runs up to 4 steps in one call, and stops each row in the graph at an eos
   # token or at its budget. The rows get their first tokens in calls of 1, 2 and 4 steps, one
   # row stops at an eos token inside a call, and 10 new tokens are not a multiple of 4. The

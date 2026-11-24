@@ -316,7 +316,7 @@ defmodule Transmuter.Generation do
   defp exact_length(model, :grow), do: MergedDecoder.past_length(model)
   defp exact_length(model, _mode), do: model
 
-  # The widths of the steps on the branch with cache (see plan/3): one token for a merged decoder
+  # The widths of the steps on the branch with cache (see plan/4): one token for a merged decoder
   # whose branch with cache has no causal mask (see "Merged decoders").
   defp widths(%{causal: false}), do: [1]
   defp widths(_model), do: @step_widths
@@ -1660,7 +1660,7 @@ defmodule Transmuter.Generation do
     end
   end
 
-  # The prompts of `requests` join the steps of the group (see plan/3).
+  # The prompts of `requests` join the steps of the group (see plan/4).
   defp admit_joining(_ctx, group, [], _inputs), do: group
 
   defp admit_joining(ctx, group, requests, inputs) do
@@ -2354,7 +2354,7 @@ defmodule Transmuter.Generation do
 
   # The capacity and the width of each first step of a new group of a merged decoder, on its
   # branch without cache: for each prompt length up to the largest capacity, the width of the
-  # first part of plan/3 (part_size/4) and the capacity of fit_capacity/4 in a group that open/3
+  # first part of plan/4 (part_size/4) and the capacity of fit_capacity/4 in a group that open/3
   # just made, whose rows have no rows of cache: the room that fit_next/2 makes at the admission,
   # which the first step does not move.
   # The server opens a new group when no row runs (see Transmuter.ContinuousBatching), so its
@@ -2521,8 +2521,17 @@ defmodule Transmuter.Generation do
   # The rows of cache that `group` needs to admit `requests` and to run each row to the end of
   # its budget: the rows that its steps write, see rows_written/2.
   def rows_needed(ctx, group, requests) do
-    left = Enum.reduce(requests, group.left, &List.replace_at(&2, &1.row, &1.prompt))
+    # Each row starts after its stored prefix and runs the rest of its prompt, as in
+    # admit_joining/4.
+    left =
+      Enum.reduce(requests, group.left, fn request, left ->
+        List.replace_at(left, request.row, Enum.drop(request.prompt, prefix_size(request)))
+      end)
+
     group = %{reset_rows(group, requests) | left: left}
+
+    lengths =
+      Enum.reduce(requests, group.state.lengths, &List.replace_at(&2, &1.row, prefix_size(&1)))
 
     remaining =
       Enum.zip_with([group.done, group.budgets, group.ids], fn [done?, budget, ids] ->
@@ -2533,7 +2542,7 @@ defmodule Transmuter.Generation do
       left: group.left,
       new: group.new,
       done: group.done,
-      lengths: group.state.lengths,
+      lengths: lengths,
       remaining: remaining
     })
   end
@@ -2554,7 +2563,7 @@ defmodule Transmuter.Generation do
       Enum.max(ends ++ Enum.map(running_lengths(rows), &(&1 + 1)), fn -> 0 end)
     else
       widths = branch_widths(ctx, rows, rows.lengths)
-      {parts, left, shape} = plan(rows, room(ctx, rows), widths, prompt_path(ctx))
+      {parts, left, shape} = plan(ctx, rows, rows.lengths, widths)
       written = step_end(Enum.max(running_lengths(rows), fn -> 0 end), rows.lengths, shape)
 
       [selects, remaining] =
@@ -3393,8 +3402,7 @@ defmodule Transmuter.Generation do
   # its shape, on the branch that the step runs on (see branch_widths/3).
   defp next_parts(ctx, group) do
     widths = branch_widths(ctx, group, group.state.lengths)
-    rows = %{lengths: group.state.lengths, done: group.done}
-    plan(group, room(ctx, rows), widths, prompt_path(ctx))
+    plan(ctx, group, group.state.lengths, widths)
   end
 
   # The rows that the buffers need after a step of `shape` (see plan/4), from rows of `lengths`
@@ -3418,20 +3426,25 @@ defmodule Transmuter.Generation do
   # (see step_width/2).
   #
   # With the :ragged path (see prompt_path/1), while a row takes a new token, the first row
-  # with a prompt left takes a chunk of at most 256 tokens of it instead, and the other rows
-  # with a prompt wait. The shape of that step is {:chunk, row, width}, with the smallest of
-  # @chunk_widths that holds the chunk (see chunk_steps/1). The rows that admitted the request
-  # counted that width (see rows_needed/3).
-  defp plan(group, room, widths, path) do
+  # with a prompt left takes a chunk of it instead, and the other rows with a prompt wait. The
+  # chunk writes its padded width and the token of its row after the length of the row, so the
+  # widths of @chunk_widths that fit the largest capacity there are the ones it can take, or
+  # else the smallest. The chunk has at most the largest of them, and the shape of the step is
+  # {:chunk, row, width}, with the smallest of them that holds the chunk (see chunk_steps/1).
+  # The rows that admitted the request counted that width (see rows_needed/3).
+  defp plan(ctx, group, lengths, widths) do
     running? =
       Enum.any?(Enum.zip(group.new, group.done), &match?({token, false} when token != nil, &1))
 
-    chunk_row = running? and path == :ragged and Enum.find_index(group.left, &(&1 != []))
+    room = room(ctx, %{lengths: lengths, done: group.done})
+    ragged? = running? and prompt_path(ctx) == :ragged
+    chunk_row = ragged? and Enum.find_index(group.left, &(&1 != []))
+    chunks = chunk_row && chunk_widths(ctx, Enum.at(lengths, chunk_row))
     longest = group.left |> Enum.map(&length/1) |> Enum.max()
 
     size =
       if chunk_row,
-        do: List.last(@chunk_widths),
+        do: List.last(chunks),
         else: part_size(running?, longest, room, widths)
 
     {parts, left} =
@@ -3453,13 +3466,23 @@ defmodule Transmuter.Generation do
 
     if chunk_row,
       do:
-        {parts, left,
-         {:chunk, chunk_row, width_for(length(Enum.at(parts, chunk_row)), @chunk_widths)}},
+        {parts, left, {:chunk, chunk_row, width_for(length(Enum.at(parts, chunk_row)), chunks)}},
       else: {parts, left, step_width(parts, widths)}
   end
 
+  # The widths of @chunk_widths whose chunk and token fit the largest capacity after `length`
+  # rows, or else the smallest one (see plan/4).
+  defp chunk_widths(%{max_capacity: nil}, _length), do: @chunk_widths
+
+  defp chunk_widths(ctx, length) do
+    case Enum.filter(@chunk_widths, &(length + &1 + 1 <= ctx.max_capacity)) do
+      [] -> [hd(@chunk_widths)]
+      widths -> widths
+    end
+  end
+
   # The most tokens of a prompt in the next step, when the longest prompt has `longest` tokens
-  # left, see plan/3.
+  # left, see plan/4.
   defp part_size(running?, longest, room, widths) do
     join = min(@join_tokens, List.last(widths))
     fills = for width <- widths, width <= longest, width <= room, do: width
