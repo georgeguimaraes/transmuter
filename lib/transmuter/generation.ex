@@ -67,13 +67,13 @@ defmodule Transmuter.Generation do
 
   ## Beam search
 
-  With `num_beams` above 1, generation does the beam search of `_beam_search` in Python transformers 4.57. The beams of a prompt are rows of the batch: prompt `i` has the rows `i * num_beams` to `i * num_beams + num_beams - 1`, and its inputs, image features and positions repeat for each row. `compile/3` compiles the decoder for `batch_size * num_beams` rows. At the start, all beams of a prompt are equal, and only the first beam counts.
+  With `num_beams` above 1, generation does the beam search of `_beam_search` in Python transformers 4.57. The rows of a group are in slots of `num_beams` rows: slot `i` has the rows `i * num_beams` to `i * num_beams + num_beams - 1`. A request with beams takes the rows of one slot, and its prompt, inputs, image features and positions repeat for each row. `compile/3` compiles the decoder for `batch_size * num_beams` rows. At the start, all beams of a request are equal, and only the first beam counts. The prompts of the requests run as the prompts without beams do (see "Batches"), and each step takes the beam step of each slot whose request has no part of its prompt left. `generate/5` admits its prompts and runs the steps until all slots stop.
 
   Each step takes the log-softmax of the logits, applies the processors to it, and adds the score of the beam. Of the `num_beams * vocabulary` candidates of a prompt, the compiled selection keeps the best `max(2, 1 + eos tokens) * num_beams`. On the host:
 
     1. A candidate ends when its token is an eos token or when it is the last new token. The candidates that end among the first `num_beams` become finished hypotheses. The score of a hypothesis is its sum divided by its length to the power of `length_penalty`, and its length counts the eos token. A prompt keeps its best `num_beams` hypotheses.
     2. The best `num_beams` candidates that do not end are the next beams. Each row takes the cache and the tokens of the row of its beam. The cache entries that the step did not write, such as the cross-attention cache, are the same for all beams of a prompt, so they do not move.
-    3. A prompt stops when it cannot improve: it has `num_beams` hypotheses, and its best beam divided by the best length to the power of `length_penalty` scores less than the worst hypothesis. The best length is the length now, or the longest length for `early_stopping: :never` with a positive `length_penalty`. With `early_stopping: true`, a prompt stops when it has `num_beams` hypotheses. A stopped prompt has padding rows until all prompts stop.
+    3. A prompt stops when it cannot improve: it has `num_beams` hypotheses, and its best beam divided by the best length to the power of `length_penalty` scores less than the worst hypothesis. The best length is the length now, or the longest length for `early_stopping: :never` with a positive `length_penalty`. With `early_stopping: true`, a prompt stops when it has `num_beams` hypotheses. The rows of a stopped prompt end, and a slot without a request or with a stopped prompt keeps its rows in place.
 
   The result of a prompt is its best hypothesis. The scores are f32 as in transformers. Removed tokens have the smallest finite value in place of an infinite one, and a score never goes below it.
 
@@ -1657,26 +1657,41 @@ defmodule Transmuter.Generation do
 
     extras = %{features: features, positions: positions}
 
+    # With beams, prompt `i` takes the rows of slot `i`: its prompt, its inputs, its image
+    # features and its positions repeat for each of them (see "Beam search").
+    {rows, row_seeds, row_extras, row_inputs} = beam_rows(ctx, prompts, seeds, extras, inputs)
+
     ids =
-      for prompts <- groups(ctx, prompts) do
-        if ctx.num_beams == 1 do
-          lengths = for prompt <- prompts, prompt != [], do: length(prompt)
+      for rows <- groups(ctx, rows) do
+        lengths = for prompt <- rows, prompt != [], do: length(prompt)
 
-          group =
-            ctx
-            |> open(length(prompts), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
-            |> then(&admit(ctx, &1, requests(ctx, prompts, seeds, extras), inputs))
-            |> then(
-              &decode(ctx, &1, fn group -> notify(on_token, group, ctx.token_logprobs?) end)
-            )
+        group =
+          ctx
+          |> open(length(rows), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
+          |> then(&admit(ctx, &1, requests(ctx, rows, row_seeds, row_extras), row_inputs))
+          |> then(&decode(ctx, &1, fn group -> notify(on_token, group, ctx.token_logprobs?) end))
 
-          Enum.zip_with(group.ids, group.logprobs, &tokens/2)
-        else
-          search(ctx, prompts, seeds, inputs, extras)
-        end
+        if ctx.num_beams > 1,
+          do: search_results(group),
+          else: Enum.zip_with(group.ids, group.logprobs, &tokens/2)
       end
 
+    if ctx.num_beams > 1, do: release(Map.values(row_inputs), [])
+
     Enum.zip_with([Enum.map(prompts, fn _ -> [] end) | ids], &Enum.concat/1)
+  end
+
+  # The rows of `prompts`: num_beams rows for each prompt with beams, with its seed, its extras
+  # and its inputs. The inputs of these rows are copies, which generate/5 releases.
+  defp beam_rows(%{num_beams: 1}, prompts, seeds, extras, inputs),
+    do: {prompts, seeds, extras, inputs}
+
+  defp beam_rows(%{num_beams: beams}, prompts, seeds, extras, inputs) do
+    repeat = &Enum.flat_map(&1, fn value -> List.duplicate(value, beams) end)
+    index = Nx.tensor(repeat.(Enum.to_list(0..(length(prompts) - 1))), backend: Nx.BinaryBackend)
+    inputs = Map.new(inputs, fn {name, tensor} -> {name, Nx.take(tensor, index)} end)
+    extras = %{extras | features: repeat.(extras.features), positions: repeat.(extras.positions)}
+    {repeat.(prompts), repeat.(seeds), extras, inputs}
   end
 
   # The positions of the prompt of a request and the delta of the positions after it, which
@@ -1711,7 +1726,7 @@ defmodule Transmuter.Generation do
     count = length(lengths)
 
     rows =
-      if joins?(ctx) do
+      if rows_cannot_join(ctx) == nil do
         rows_written(ctx, %{
           left: Enum.map(lengths, &List.duplicate(0, &1)),
           new: List.duplicate(nil, count),
@@ -1791,7 +1806,8 @@ defmodule Transmuter.Generation do
       new: List.duplicate(nil, rows),
       done: List.duplicate(true, rows),
       budgets: List.duplicate(0, rows),
-      scores: nil,
+      scores: List.duplicate(0.0, rows),
+      beams: List.duplicate(nil, div(rows, ctx.num_beams)),
       steps: [],
       moves: []
     }
@@ -1818,12 +1834,12 @@ defmodule Transmuter.Generation do
     inputs = evaluated(inputs)
     pending = Enum.zip_with(group.new, group.done, &if(&2, do: nil, else: &1))
 
-    if not joins?(ctx) and Enum.any?(pending) do
+    if rows_cannot_join(ctx) != nil and Enum.any?(pending) do
       raise ArgumentError,
             "requests can join a group with other rows only when the rows of a step can have different lengths of the cache, without a merged decoder and without beams"
     end
 
-    if joins?(ctx) do
+    if rows_cannot_join(ctx) == nil do
       group = admit_joining(ctx, group, requests, inputs)
       %{group | steps: [%{view(group) | new: List.duplicate(nil, length(group.new))}]}
     else
@@ -2055,10 +2071,15 @@ defmodule Transmuter.Generation do
   # beams, and a merged decoder has a cross function or no cross-attention cache, so a row gets
   # its cache before its prompt runs on the branch with cache (see admit_inputs/3).
   def cannot_join(ctx) do
-    cond do
-      ctx.num_beams > 1 ->
-        "it has num_beams #{ctx.num_beams}, and the rows of a prompt move together as beams"
+    if ctx.num_beams > 1,
+      do: "it has num_beams #{ctx.num_beams}, and the rows of a prompt move together as beams",
+      else: rows_cannot_join(ctx)
+  end
 
+  # Why the rows of a step cannot have different lengths of the cache, or nil. Then a prompt
+  # cannot run in the steps of other rows (see admit/4).
+  defp rows_cannot_join(ctx) do
+    cond do
       one_length?(ctx) ->
         "the rows of a step need one length of the cache: " <>
           (ctx.one_length || "it keeps a cache of exact length")
@@ -2608,6 +2629,8 @@ defmodule Transmuter.Generation do
           new: List.replace_at(group.new, request.row, nil),
           done: List.replace_at(group.done, request.row, false),
           budgets: List.replace_at(group.budgets, request.row, request.budget),
+          scores: List.replace_at(group.scores, request.row, start_score(group, request.row)),
+          beams: start_beams(group, request),
           state: %{
             group.state
             | lengths: List.replace_at(group.state.lengths, request.row, 0),
@@ -2617,6 +2640,25 @@ defmodule Transmuter.Generation do
       }
     end)
   end
+
+  # The rows of a request with beams are the block of its slot (see "Beam search"). The first
+  # beam starts at 0 and the others at -1e9, so the first step of the block selects only from
+  # the first beam.
+  defp start_score(group, row) do
+    if rem(row, beams_per_slot(group)) == 0, do: 0.0, else: -1.0e9
+  end
+
+  defp start_beams(group, %{row: row, budget: budget}) do
+    n = beams_per_slot(group)
+
+    if rem(row, n) == 0,
+      do: List.replace_at(group.beams, div(row, n), new_search(budget)),
+      else: group.beams
+  end
+
+  defp beams_per_slot(group), do: div(length(group.done), length(group.beams))
+
+  defp new_search(budget), do: %{finished: [], open?: true, done?: false, step: 0, budget: budget}
 
   defp prefix_size(request), do: get_in(request, [:prefix, :size]) || 0
 
@@ -2967,7 +3009,9 @@ defmodule Transmuter.Generation do
     group
   end
 
-  # A row with a part of its prompt left gets no token, and has not ended.
+  # A row with a part of its prompt left gets no token, and has not ended. With beams, the
+  # selection gives the candidates of each slot (see select_searches/2).
+  defp select(ctx = %{num_beams: beams}, group) when beams > 1, do: select_searches(ctx, group)
   defp select(ctx, group), do: select_rows(ctx, group, Nx.to_list(group.state.selected))
 
   defp select_rows(ctx, group, selected) do
@@ -3003,57 +3047,26 @@ defmodule Transmuter.Generation do
   # it. next/3 gives one for each step, and the stream of each row reads them in order.
   defp view(group), do: Map.take(group, [:new, :done, :logprobs])
 
-  # Beam search as _beam_search of Python transformers 4.57. The rows of prompt `i` are
-  # `i * num_beams` to `i * num_beams + num_beams - 1`, and the inputs, the image features and
-  # the positions of the prompt repeat for each of them. Each step selects the best
-  # candidates of each prompt on the device, and the host keeps the beams, the finished
-  # hypotheses and their scores. Returns the tokens of the best hypothesis of each prompt.
-  defp search(ctx, prompts, seeds, inputs, extras) do
-    beams = ctx.num_beams
-    repeat = &Enum.flat_map(&1, fn value -> List.duplicate(value, beams) end)
-    index = Nx.tensor(repeat.(Enum.to_list(0..(length(prompts) - 1))), backend: Nx.BinaryBackend)
-    inputs = Map.new(inputs, fn {name, tensor} -> {name, Nx.take(tensor, index)} end)
-    extras = %{extras | features: repeat.(extras.features), positions: repeat.(extras.positions)}
-    # The first beam of each prompt starts at 0 and the others at -1e9, so the first step
-    # selects only from the first beam.
-    scores = Enum.flat_map(prompts, fn _ -> [0.0 | List.duplicate(-1.0e9, beams - 1)] end)
-    rows = repeat.(prompts)
-    lengths = for row <- rows, row != [], do: length(row)
-
-    group =
-      ctx
-      |> open(length(rows), Enum.sum(part_sizes(ctx, lengths)) + @capacity_margin)
-      |> Map.put(:scores, scores)
-      |> then(&prefill(ctx, &1, requests(ctx, rows, repeat.(seeds), extras), inputs))
-
-    items = Enum.map(prompts, &%{finished: [], open?: true, done?: &1 == []})
-
-    %{items: items} = search_steps(ctx, group, items, 0)
-
-    # The rows of each prompt are copies of its inputs that the search owns.
-    release(Map.values(inputs), [])
-
-    for item <- items do
-      case item.finished do
-        [] -> []
-        [{_score, ids, logprobs} | _] -> tokens(ids, logprobs)
-      end
-    end
-  end
-
-  defp search_steps(ctx, group, items, step) do
+  # Beam search as _beam_search of Python transformers 4.57 (see "Beam search"). The rows of
+  # slot `i` are `i * num_beams` to `i * num_beams + num_beams - 1`, and a request with beams
+  # takes the rows of one slot. The selection of a step gives the candidates of each slot. A
+  # slot whose request runs, with no part of its prompt left, takes the beam step of its search,
+  # and the host keeps its beams, its finished hypotheses and their scores. One reorder moves
+  # the rows of each such slot to its beams, and the other rows stay. When the search of a slot
+  # is done, its rows end.
+  defp select_searches(ctx, group) do
+    n = ctx.num_beams
     vocab = ctx.vocab
-    candidates = Nx.to_list(group.state.selected)
 
-    {items, beams} =
-      items
-      |> Enum.zip(candidates)
+    {searches, beams} =
+      group.beams
+      |> Enum.zip(Nx.to_list(group.state.selected))
       |> Enum.with_index()
-      |> Enum.map(fn {{item, columns}, i} ->
-        rows = Enum.to_list((i * ctx.num_beams)..(i * ctx.num_beams + ctx.num_beams - 1))
+      |> Enum.map(fn {{search, columns}, slot} ->
+        rows = Enum.to_list((slot * n)..(slot * n + n - 1))
 
-        if item.done? do
-          {item, Enum.map(rows, &padding_beam/1)}
+        if search == nil or search.done? or Enum.any?(rows, &(Enum.at(group.left, &1) != [])) do
+          {search, Enum.map(rows, &padding_beam(group, &1))}
         else
           candidates =
             columns
@@ -3065,31 +3078,38 @@ defmodule Transmuter.Generation do
               %{score: from_bits(score), row: row, token: token, logprob: from_bits(logprob)}
             end)
 
-          beam_step(ctx, item, rows, candidates, group, step)
+          beam_step(ctx, search, rows, candidates, group)
         end
       end)
       |> Enum.unzip()
 
-    if Enum.all?(items, & &1.done?) do
-      finish(group)
-      %{items: items}
-    else
-      beams = Enum.concat(beams)
-      group = reorder(ctx, group, Enum.map(beams, & &1.row))
-      new = Enum.map(beams, & &1.token)
+    beams = Enum.concat(beams)
+    group = reorder(ctx, group, Enum.map(beams, & &1.row))
+    new = Enum.map(beams, & &1.token)
 
-      group = %{
-        group
-        | new: new,
-          ids: push(group.ids, new, new),
-          logprobs: push(group.logprobs, new, Enum.map(beams, & &1.logprob)),
-          scores: Enum.map(beams, & &1.score)
-      }
+    done =
+      for search <- searches, _row <- 1..n//1, do: search == nil or search.done?
 
-      group = fit(ctx, group, 1)
-      selection = selection(ctx, group)
-      group = %{group | state: step(ctx, group.state, Enum.map(new, &List.wrap/1), selection)}
-      search_steps(ctx, group, items, step + 1)
+    group = %{
+      group
+      | new: new,
+        done: done,
+        beams: searches,
+        ids: push(group.ids, new, new),
+        logprobs: push(group.logprobs, new, Enum.map(beams, & &1.logprob)),
+        scores: Enum.map(beams, & &1.score)
+    }
+
+    %{group | steps: [view(group)]}
+  end
+
+  # The tokens of the best hypothesis of each slot, or [] for a slot without a request.
+  defp search_results(group) do
+    for search <- group.beams do
+      case search do
+        %{finished: [{_score, ids, logprobs} | _]} -> tokens(ids, logprobs)
+        _no_hypothesis -> []
+      end
     end
   end
 
@@ -3100,9 +3120,10 @@ defmodule Transmuter.Generation do
   # A hypothesis keeps the log-probability of each token, without the eos token. Returns the
   # item and, for each row of the prompt, its candidate: its source row, its token, its
   # log-probability and its score.
-  defp beam_step(ctx, item, rows, candidates, group, step) do
+  defp beam_step(ctx, item, rows, candidates, group) do
     %{num_beams: beams, length_penalty: penalty, early_stopping: early_stopping} = ctx
-    last? = step + 1 == ctx.max_new_tokens
+    step = item.step
+    last? = step + 1 == item.budget
     candidates = Enum.map(candidates, &Map.put(&1, :end?, last? or &1.token in ctx.eos))
 
     added =
@@ -3129,7 +3150,7 @@ defmodule Transmuter.Generation do
     # worst finished hypothesis. The best length is the longest one for "never" with a
     # positive length_penalty, else the length now.
     best_length =
-      if early_stopping == :never and penalty > 0, do: ctx.max_new_tokens, else: step + 1
+      if early_stopping == :never and penalty > 0, do: item.budget, else: step + 1
 
     open? =
       item.open? and not last? and
@@ -3138,15 +3159,17 @@ defmodule Transmuter.Generation do
              finished |> Enum.map(&elem(&1, 0)) |> Enum.min())
 
     done? = not open? or (early_stopping == true and length(finished) == beams)
-    item = %{item | finished: finished, open?: open?, done?: done?}
+    item = %{item | finished: finished, open?: open?, done?: done?, step: step + 1}
 
     if done?,
-      do: {item, Enum.map(rows, &padding_beam/1)},
+      do: {item, Enum.map(rows, &padding_beam(group, &1))},
       else: {item, running}
   end
 
-  # The beam of a row of a prompt that is done: the row keeps its cache and gets no token.
-  defp padding_beam(row), do: %{row: row, token: nil, logprob: [], score: 0.0}
+  # The beam of a row whose slot takes no beam step: the row keeps its cache and its score, and
+  # gets no token. A slot whose prompt has parts left keeps the scores of its first step.
+  defp padding_beam(group, row),
+    do: %{row: row, token: nil, logprob: [], score: Enum.at(group.scores, row)}
 
   # The tokens of a row from its ids and their log-probabilities, the last first. The
   # log-probability of a token is a list: empty without token_logprobs.

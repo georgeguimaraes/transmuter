@@ -16,7 +16,7 @@ defmodule Transmuter.GenerationTest do
   ]
 
   alias Transmuter.{Audio, Generation, Text}
-  alias Transmuter.Onnx.{AttributeProto, NodeProto}
+  alias Transmuter.Onnx.{AttributeProto, NodeProto, TensorProto, ValueInfoProto}
   alias Transmuter.Vision.ImageTextToText
 
   # The best beam of "What is 2 + 2?" ends with eos at the eighth token while the other
@@ -584,14 +584,96 @@ defmodule Transmuter.GenerationTest do
     end
   end
 
-  # With beam search, requests cannot join, so the prompts of a merged decoder run on the
-  # branch without cache, and the prompt step of each length writes its own rows of the buffer
-  # of GPT-2. So the rows of a group are the sum of its prompt lengths and the new tokens.
-  # Prompts of 600, 500 and 400 tokens with 16 new tokens need 1515 rows in one group, more than
-  # the 1023 rows of the causal table. So 600 runs alone, and 500 and 400 run as a group of 915
-  # rows: 1 + 15 and 2 + 15 steps, and each prompt gives the tokens that it gives alone.
+  # A merged decoder whose rows cannot join runs its prompts on the branch without cache, and
+  # the prompt step of each length writes its own rows of the buffer of GPT-2. So the rows of a
+  # group are the sum of its prompt lengths and the new tokens. GPT-2 gets one more cache entry
+  # that no attention reads: the branch without cache makes it from the tokens, and the branch
+  # with cache keeps it. So its cache reads other values than the outputs of an encoder, and
+  # its rows cannot join. Prompts of 600, 500
+  # and 400 tokens with 16 new tokens need 1515 rows in one group, more than the 1023 rows of
+  # the causal table. So 600 runs alone, and 500 and 400 run as a group of 915 rows: 1 + 15 and
+  # 2 + 15 steps, and each prompt gives the tokens that it gives alone.
   @tag ci_partition: 5
-  test "a merged decoder starts a new group when the prompt lengths do not fit its causal table" do
+  test "a merged decoder whose rows cannot join starts a new group when the prompts do not fit" do
+    {repo, model} = gpt2()
+    {extra, present} = {"past_key_values.extra.key", "present.extra.key"}
+    node = &%NodeProto{op_type: &1, name: &2, input: &3, output: [&4], attribute: &5}
+    axes = &%AttributeProto{name: "axes", type: :INTS, ints: &1}
+
+    # The branch without cache makes the entry from the tokens, and the branch with cache gives an
+    # empty present, so the entry keeps its value, as a cross-attention cache that does not come
+    # from an encoder.
+    branch = fn
+      graph, "then_branch" ->
+        shape = %TensorProto{dims: [4], data_type: 7, int64_data: [1, 1, 0, 1]}
+
+        nodes = [
+          node.("Constant", "extra_shape", [], "extra_shape", [
+            %AttributeProto{name: "value", type: :TENSOR, t: shape}
+          ]),
+          node.("ConstantOfShape", "extra", ["extra_shape"], present, [])
+        ]
+
+        %{
+          graph
+          | node: graph.node ++ nodes,
+            output: graph.output ++ [%ValueInfoProto{name: present}]
+        }
+
+      graph, "else_branch" ->
+        nodes = [
+          node.("Unsqueeze", "extra_axes", ["input_ids"], "extra_ids", [axes.([1, 3])]),
+          node.("Cast", "extra", ["extra_ids"], present, [
+            %AttributeProto{name: "to", type: :INT, i: 1}
+          ])
+        ]
+
+        %{
+          graph
+          | node: graph.node ++ nodes,
+            output: graph.output ++ [%ValueInfoProto{name: present}]
+        }
+    end
+
+    nodes =
+      Enum.map(model.nodes, fn
+        node = %{op_type: "If"} ->
+          attribute = Enum.map(node.attribute, &%{&1 | g: branch.(&1.g, &1.name)})
+          %{node | output: node.output ++ [present], attribute: attribute}
+
+        node ->
+          node
+      end)
+
+    model = %{
+      model
+      | nodes: nodes,
+        inputs: model.inputs ++ [extra],
+        input_types:
+          Map.put(model.input_types, extra, {:f32, ["batch_size", 1, "past_sequence_length", 1]}),
+        outputs: model.outputs ++ [present]
+    }
+
+    prompts = gpt2_prompts([600, 500, 400])
+    ctx = Generation.context(repo, model, max_new_tokens: 16)
+    assert Generation.cannot_join(ctx) =~ "reads other values than the outputs of the encoder"
+    single = Generation.compile(ctx, 1, @opts[:defn_options])
+    ctx = Generation.compile(ctx, 3, @opts[:defn_options])
+    {rows, calls} = count_calls(fn -> Generation.generate(ctx, prompts, [0, 0, 0]) end)
+
+    for {tokens, prompt} <- Enum.zip(rows, prompts) do
+      assert tokens == hd(Generation.generate(single, [prompt], [0]))
+    end
+
+    assert calls == 1 + 15 + 2 + 15
+  end
+
+  # A request with beams takes the rows of one slot, and its prompt runs in the steps of the
+  # group as a prompt without beams does (see "Beam search"). So each row of GPT-2 counts only
+  # its own rows, and prompts of 600, 500 and 400 tokens with 16 new tokens share one group,
+  # although their sum is more than the 1023 rows of the causal table: 3 prompt steps and 15
+  # steps of new tokens. Each prompt gives the tokens that it gives alone.
+  test "the beams of a merged decoder share one group when each row fits its causal table" do
     {repo, model} = gpt2()
     prompts = gpt2_prompts([600, 500, 400])
     ctx = Generation.context(repo, model, num_beams: 2, max_new_tokens: 16)
@@ -603,7 +685,7 @@ defmodule Transmuter.GenerationTest do
       assert tokens == hd(Generation.generate(single, [prompt], [0]))
     end
 
-    assert calls == 1 + 15 + 2 + 15
+    assert calls == 3 + 15
   end
 
   # When requests can join, each row of GPT-2 runs its prompt on the branch with cache and
