@@ -71,21 +71,80 @@ defmodule Transmuter.Telemetry do
 
   ### Continuous batching events
 
-    * `[:transmuter, :continuous_batching, :step, :start]` - a server of `Transmuter.ContinuousBatching` starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
-      * Metadata: `%{running: integer, admitted: integer, prompts: integer, waiting: integer, slots: integer, capacity: integer, encoder_capacity: integer}`
+  A server of `Transmuter.ContinuousBatching` emits these events. All of them have `:server` in the metadata: the `:name` of the server, or its pid when it has no name. All times are in `:native` time units.
+
+  #### The server
+
+    * `[:transmuter, :continuous_batching, :init, :start]` - the server starts: it compiles the decoder and takes its capacity, while the worker loads the models of the task.
+      * Metadata: `%{server: term, slots: integer, prefix_slots: integer, decode_steps: integer}`
+
+    * `[:transmuter, :continuous_batching, :init, :stop]` - the server is ready, or the worker failed.
+      * Metadata: the start metadata with `%{capacity: integer, live_bytes: integer, limit_bytes: integer | nil}`
+
+  `:capacity` is the largest number of rows of the KV cache of a row (see "Device memory" in `Transmuter.ContinuousBatching`). `:live_bytes` is the device memory in use before the server took the capacity, and `:limit_bytes` the limit of the allocator, `nil` when the backend gives none.
+
+    * `[:transmuter, :continuous_batching, :compile_steps, :start]` and `:stop` - with `compile_steps: true`, the server compiles each step shape before it starts (see "Compiles" in `Transmuter.ContinuousBatching`). The duration is the cost of this compile at the start.
+      * Metadata: `%{server: term, slots: integer, capacity: integer}`
+
+  #### Steps
+
+    * `[:transmuter, :continuous_batching, :step, :start]` - the server starts a step: the prompt parts of the requests that join, with the next token of the running rows, or the next token of the running rows.
+      * Metadata: `%{server: term, running: integer, admitted: integer, prefix_tokens: integer, prompts: integer, waiting: integer, slots: integer, capacity: integer, encoder_capacity: integer}`
 
     * `[:transmuter, :continuous_batching, :step, :stop]` - the step ends, and the server has sent its tokens.
-      * Metadata: the same as the start
+      * Measurements: `%{duration: integer, monotonic_time: integer, running: integer, admitted: integer, prefix_tokens: integer, prompts: integer, waiting: integer, preparing: integer, tokens: integer, kv_capacity: integer, kv_max_capacity: integer, kv_used: integer, kv_bytes: integer}`
+      * Metadata: the start metadata with `%{steps: integer, row_steps: integer}`
 
-  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:prefix_tokens` the tokens of their prompts whose keys and values come from the prefix cache (see "Prefix cache" in `Transmuter.ContinuousBatching`), `:prompts` the number of rows that run a part of their prompt in it, `:waiting` the number of requests in the queue after it, `:capacity` the rows of the buffers before it, and `:encoder_capacity` the rows of the encoder outputs of the rows before it, 0 for a model without an encoder. The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.ContinuousBatching`).
+  `:running` is the number of rows with a request before the step, `:admitted` the number of requests that join in it, `:prefix_tokens` the tokens of their prompts whose keys and values come from the prefix cache (see "Prefix cache" in `Transmuter.ContinuousBatching`), `:prompts` the number of rows that run a part of their prompt in it, `:waiting` the number of requests in the queue after it, and `:preparing` the number of requests in the worker. In the metadata, `:capacity` is the rows of the buffers before the step, and `:encoder_capacity` the rows of the encoder outputs of the rows before it, 0 for a model without an encoder. `:steps` is the number of decode steps of the call, and `:row_steps` the steps of the rows that had not ended before each step.
 
-    * `[:transmuter, :continuous_batching, :prepare, :start]` - the worker of a server of `Transmuter.ContinuousBatching` starts to prepare a request: it runs the processor and the tokenizer on its input, and the encoder, such as the vision encoder on its images (see "Encoders and images" in `Transmuter.ContinuousBatching`).
-      * Metadata: `%{wait: integer}`
+  `:tokens` is the number of tokens that the step sent to the callers, so the sum of `:tokens` over time is the output rate of the server. The `:kv_*` measurements show the KV cache after the step. `:kv_capacity` is the rows of the buffers of each row, and `:kv_max_capacity` the capacity of the server. `:kv_used` is the sum of the lengths of the rows that run: the keys and values in use. The server keeps these lengths on the host, so `:kv_used` reads nothing from the device. `:kv_used` is at most `:slots` times `:kv_capacity`. `:kv_bytes` is the size of the buffers: `:slots` times `:kv_capacity` times the bytes of one row and position, a row of each cache buffer and a token of history.
+
+  The duration of a step is the time between two tokens of a running row. When `:waiting` is above 0 and no request joins a free row, the requests wait for the running rows to end (see "The KV cache" in `Transmuter.ContinuousBatching`).
+
+  #### Requests
+
+  Each input of `Transmuter.ContinuousBatching.run/3` and `Transmuter.ContinuousBatching.stream/3` is a request. The input of a request can give more than one row, for example the windows of long audio. Then the request emits one `:admit`, `:first_token` and `:stop` event for each row, with the `:index` of the row. The events never carry the input or the tokens.
+
+    * `[:transmuter, :continuous_batching, :refuse]` - the queue of the server is full, so a call fails with `Transmuter.ContinuousBatching.QueueFullError`.
+      * Measurement: `%{count: integer}`, the number of requests of the call
+      * Metadata: `%{server: term, reason: :queue_full, max_queue: integer}`
+
+    * `[:transmuter, :continuous_batching, :request, :start]` - the server accepts a request, and the request goes to the worker.
+      * Measurements: `%{system_time: integer, monotonic_time: integer}`
+      * Metadata: `%{server: term, request: reference, stream: boolean, index: nil}`
+
+    * `[:transmuter, :continuous_batching, :request, :admit]` - a row of the request gets a row of the server.
+      * Measurements: `%{queue_time: integer, prepare_time: integer, prompt_tokens: integer, prefix_tokens: integer}`
+      * Metadata: `%{server: term, request: reference, stream: boolean, index: integer}`
+
+    * `[:transmuter, :continuous_batching, :request, :first_token]` - the server sends the first token of the row.
+      * Measurement: `%{time_to_first_token: integer}`
+      * Metadata: the same as `:admit`
+
+    * `[:transmuter, :continuous_batching, :request, :stop]` - the row ends, or the request ends before it runs.
+      * Measurements: `%{duration: integer, monotonic_time: integer, prompt_tokens: integer, output_tokens: integer, prefix_tokens: integer, time_to_first_token: integer, time_per_output_token: integer}`
+      * Metadata: the same as `:admit`, with `%{result: :done | :cancelled}`
+
+    * `[:transmuter, :continuous_batching, :request, :exception]` - the request fails before it runs: the worker raised on its input, or the request never fits (see "Device memory" in `Transmuter.ContinuousBatching`). The caller gets the same exception.
+      * Measurements: `%{duration: integer, monotonic_time: integer}`
+      * Metadata: `%{server: term, request: reference, stream: boolean, index: nil, kind: :error, reason: Exception.t(), stacktrace: []}`
+
+  `:prepare_time` is the time from the start of the request to the end of its preparation in the worker, with the wait for the requests before it. `:queue_time` is the time from then until the row gets a row of the server. `:time_to_first_token` is the time from the start of the request to its first token. `:time_per_output_token` is the time between the first and the last token, divided by the tokens after the first one, and 0 for a row of one token. `:duration` is the time from the start of the request to its last token.
+
+  `:result` is `:cancelled` when the caller exits, cancels or reaches its timeout. Then the measurements have only the values that exist, for example no `:time_to_first_token` for a row without a token, and no `:prompt_tokens` for a request that had not left the worker. Use `keep: &(&1.result == :done)` in a metric of the times.
+
+  With `decode_steps` above 1, the tokens of a decode loop leave the server together at the end of the call. So the times show when the caller gets each token.
+
+  All values of these events are on the host. The server reads the tokens of each step to the host before it sends them, so an event adds no read from the device and no wait for it. Each event costs about 0.3 microseconds without a handler. A handler runs in the process of the server, so a slow handler makes each step slower.
+
+    * `[:transmuter, :continuous_batching, :prepare, :start]` - the worker of the server starts to prepare a request: it runs the processor and the tokenizer on its input, and the encoder, such as the vision encoder on its images (see "Encoders and images" in `Transmuter.ContinuousBatching`).
+      * Metadata: `%{server: term, wait: integer}`
 
     * `[:transmuter, :continuous_batching, :prepare, :stop]` - the request is ready, and it goes to the queue of the server.
+      * Measurements: `%{duration: integer, monotonic_time: integer, queue_wait: integer}`
       * Metadata: the same as the start
 
-  `:wait` is the time from the call of the request to the start, in `:native` time units, so the time that the request waited for the requests before it in the worker.
+  `:wait` and `:queue_wait` are the time from the start of the request to the start of its preparation, so the time that the request waited for the requests before it in the worker.
 
   ### Graph break events
 

@@ -125,6 +125,50 @@ defmodule Transmuter.ContinuousBatchingTest do
     end
   end
 
+  # A stream and a run of 8 tokens each. Each row emits :start, :admit, :first_token and :stop
+  # in that order, with times that add up, and the steps send all 16 tokens. The cache in use
+  # is the sum of the lengths of the running rows, at most the rows of the buffers.
+  test "each row of a server emits its request events with its times and tokens" do
+    source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
+    opts = [strategy: :greedy, max_new_tokens: 8, min_new_tokens: 8] ++ @opts
+    server = start_supervised!({ContinuousBatching, [source: source, slots: 2] ++ opts})
+    names = [[:request, :start], [:request, :admit], [:request, :first_token], [:request, :stop]]
+
+    {_result, events} =
+      events([[:step, :stop] | names], fn ->
+        stream = Task.async(fn -> Enum.join(ContinuousBatching.stream(server, @fox)) end)
+        ContinuousBatching.run(server, "Once upon a time")
+        Task.await(stream, :infinity)
+      end)
+
+    {steps, requests} = Enum.split_with(events, &match?({[:step, :stop], _, _}, &1))
+
+    for {ref, events} <- Enum.group_by(requests, fn {_name, _m, metadata} -> metadata.request end) do
+      assert [[:request, :start], [:request, :admit], [:request, :first_token], [:request, :stop]] ==
+               Enum.map(events, &elem(&1, 0)),
+             inspect(ref)
+
+      [_start, {_, admit, _}, {_, first, _}, {_, stop, %{result: :done, server: ^server}}] =
+        events
+
+      assert admit.prompt_tokens > 0 and admit.prefix_tokens == 0
+      assert first.time_to_first_token == stop.time_to_first_token
+      assert stop.time_to_first_token >= admit.queue_time + admit.prepare_time
+      assert stop.time_to_first_token + 7 * stop.time_per_output_token <= stop.duration
+      assert %{output_tokens: 8, prompt_tokens: prompt} = stop
+      assert prompt == admit.prompt_tokens
+    end
+
+    assert Enum.sum(for {_, step, _} <- steps, do: step.tokens) == 16
+
+    for {_, step, metadata} <- steps do
+      assert step.kv_used <= 2 * step.kv_capacity
+      assert step.kv_capacity <= step.kv_max_capacity
+      assert step.kv_bytes > 2 * step.kv_capacity
+      assert step.running == metadata.running
+    end
+  end
+
   # A server of 1 row with a queue of 1 request. A stream that must give 200 tokens runs, a
   # second request waits, and a third raises QueueFullError, while the second is in the worker
   # and when it is in the queue. The caller of the stream exits
@@ -179,14 +223,29 @@ defmodule Transmuter.ContinuousBatchingTest do
           end
         end
 
-        full.()
+        {_full, refused} = events([[:refuse]], full)
+        assert [{[:refuse], %{count: 1}, %{reason: :queue_full, max_queue: 1}}] = refused
         send(worker, {id, :go})
         :telemetry.detach(id)
         wait_for(fn -> :queue.len(:sys.get_state(server).queue) == 1 end)
         full.()
 
-        Process.exit(streamer, :kill)
-        killed_at = calls.()
+        {killed_at, stops} =
+          events([[:request, :stop]], fn ->
+            Process.exit(streamer, :kill)
+            killed_at = calls.()
+
+            wait_for(fn ->
+              not Enum.any?(Map.values(:sys.get_state(server).rows), & &1.stream?)
+            end)
+
+            killed_at
+          end)
+
+        # The stream must give 200 tokens, and the server sees the exit at most 2 steps after
+        # the first chunk, so the row cannot end before it and its result is :cancelled.
+        assert [{_, %{output_tokens: tokens}, %{result: :cancelled, stream: true}} | _] = stops
+        assert tokens in 1..199
         {Task.await(waiting, :infinity), killed_at}
       end)
 
@@ -295,9 +354,15 @@ defmodule Transmuter.ContinuousBatchingTest do
 
     assert_receive :chunk, 60_000
 
-    assert_raise ArgumentError, ~r/need more than the 256 rows/, fn ->
-      ContinuousBatching.run(server, String.duplicate(@fox, 10))
-    end
+    {_raised, failed} =
+      events([[:request, :exception]], fn ->
+        assert_raise ArgumentError, ~r/need more than the 256 rows/, fn ->
+          ContinuousBatching.run(server, String.duplicate(@fox, 10))
+        end
+      end)
+
+    assert [{_, %{duration: duration}, %{kind: :error, reason: %ArgumentError{}}}] = failed
+    assert duration > 0
 
     assert Task.yield(streamer, 0) == nil
     assert %{results: [%{text: _text}]} = ContinuousBatching.run(server, "Once upon a time")
@@ -1208,6 +1273,34 @@ defmodule Transmuter.ContinuousBatchingTest do
   end
 
   # The result of `fun` and the metadata of the steps that `server` started while it ran.
+  # The events of `names` under [:transmuter, :continuous_batching] that `fun` makes, in order.
+  defp events(names, fun) do
+    parent = self()
+    id = make_ref()
+    events = for name <- names, do: [:transmuter, :continuous_batching | name]
+
+    :telemetry.attach_many(
+      id,
+      events,
+      fn [_, _ | name], measurements, metadata, _config ->
+        send(parent, {id, {name, measurements, metadata}})
+      end,
+      nil
+    )
+
+    result = fun.()
+    :telemetry.detach(id)
+    {result, receive_events(id)}
+  end
+
+  defp receive_events(id) do
+    receive do
+      {^id, event} -> [event | receive_events(id)]
+    after
+      0 -> []
+    end
+  end
+
   defp step_events(server, fun) do
     pid = GenServer.whereis(server)
     parent = self()

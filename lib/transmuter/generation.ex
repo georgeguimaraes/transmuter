@@ -4133,16 +4133,7 @@ defmodule Transmuter.Generation do
   # use: the larger of a step at the capacity, with the temporary of the widest step, and a
   # growth into it from the capacity before, which holds the buffers of both capacities.
   defp peak(ctx, rows, live, capacity) do
-    # Each row and position of a buffer holds a row of each cache buffer and a token of history.
-    {position, cache_heads} =
-      ctx.buffers
-      |> Enum.filter(&(&1 in ctx.cache))
-      |> Enum.map(fn name ->
-        {type, [_batch, heads, _length, head_dim]} = ctx.model.input_types[name]
-        {_kind, bits} = Nx.Type.normalize!(type)
-        {heads * head_dim * div(bits, 8), heads}
-      end)
-      |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
+    {position, cache_heads} = position_sizes(ctx)
 
     # The temporaries of the widest step, from the buffers that XLA gives it, which it reuses
     # for each layer: two outputs of the widest matmul for each token, such as the merged gate
@@ -4166,6 +4157,23 @@ defmodule Transmuter.Generation do
     before = capacities(ctx, capacity - 1) |> List.last(0)
     buffers = &(rows * position * &1)
     live + max(buffers.(capacity) + temporary, buffers.(before) + buffers.(capacity))
+  end
+
+  @doc false
+  # The bytes of one row and position of the buffers: a row of each cache buffer and a token of
+  # history.
+  def position_bytes(ctx), do: elem(position_sizes(ctx), 0)
+
+  # The bytes of one row and position of the buffers, and the most heads of a cache buffer.
+  defp position_sizes(ctx) do
+    ctx.buffers
+    |> Enum.filter(&(&1 in ctx.cache))
+    |> Enum.map(fn name ->
+      {type, [_batch, heads, _length, head_dim]} = ctx.model.input_types[name]
+      {_kind, bits} = Nx.Type.normalize!(type)
+      {heads * head_dim * div(bits, 8), heads}
+    end)
+    |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
   end
 
   defp bf16_cache?(ctx) do

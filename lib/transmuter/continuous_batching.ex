@@ -118,7 +118,7 @@ defmodule Transmuter.ContinuousBatching do
 
   ## Telemetry
 
-  Each step emits `[:transmuter, :continuous_batching, :step, :start]` and `:stop`, with the running rows, the requests that join and the waiting requests. The `:stop` event also has `:steps`, the decode steps of the call, and `:row_steps`, the steps of the rows that had not ended before each step. The duration of a step is the time between two tokens of a running row. The worker emits `[:transmuter, :continuous_batching, :prepare, :start]` and `:stop` for each request, with the time that the request waited for the worker. See `Transmuter.Telemetry`.
+  The server emits events for its start, for each step and for each request, with the time to the first token, the time per output token, the tokens and the use of the KV cache. A full queue emits `[:transmuter, :continuous_batching, :refuse]`, and a request that fails before it runs emits `[:transmuter, :continuous_batching, :request, :exception]`. All values are on the host, so the events add no wait for the device. See "Continuous batching events" in `Transmuter.Telemetry`.
 
   ## Distribution
 
@@ -586,6 +586,7 @@ defmodule Transmuter.ContinuousBatching do
     %{preprocess: preprocess, prepare: prepare, example: example} = state.task
     compile_steps? = state.compile_steps
     defn_options = state.defn_options
+    name = state.name || server
 
     # The worker loads the models of :prepare, such as the vision encoder, while the server
     # compiles the decoder. The server starts when both are ready, so an error of either fails
@@ -604,9 +605,25 @@ defmodule Transmuter.ContinuousBatching do
 
         send(server, {self(), :ready, example})
         :erlang.garbage_collect()
-        prepare_requests(task, server)
+        prepare_requests(task, server, name)
       end)
 
+    metadata = %{
+      server: state.name || self(),
+      slots: state.slots,
+      prefix_slots: state.prefix_slots,
+      decode_steps: state.ctx.decode_steps
+    }
+
+    :telemetry.span([:transmuter, :continuous_batching, :init], metadata, fn ->
+      {result, sizes} = boot(state, worker)
+      {result, Map.merge(metadata, sizes)}
+    end)
+  end
+
+  # Compiles the decoder, takes the capacity and, with :compile_steps, compiles the steps,
+  # while the worker loads the models of :prepare.
+  defp boot(state, worker) do
     ctx = Generation.compile(state.ctx, state.slots, state.defn_options)
 
     # The store is on the device before the choice of the capacity, so its bytes are in use.
@@ -626,18 +643,28 @@ defmodule Transmuter.ContinuousBatching do
         "with #{live} bytes of device memory in use and a limit of #{inspect(limit)} bytes"
     )
 
+    sizes = %{capacity: capacity, live_bytes: live, limit_bytes: limit}
+
     receive do
       {^worker, :ready, example} ->
         if example do
-          prefixes = state.prefix_slots > 0
-          compile_steps(ctx, state.slots, example.inputs, prefixes, {live, limit})
-          if example.features, do: Generation.compile_features(ctx, state.slots, example.features)
+          metadata = %{server: state.name || self(), slots: state.slots, capacity: capacity}
+
+          :telemetry.span([:transmuter, :continuous_batching, :compile_steps], metadata, fn ->
+            prefixes = state.prefix_slots > 0
+            compile_steps(ctx, state.slots, example.inputs, prefixes, {live, limit})
+
+            if example.features,
+              do: Generation.compile_features(ctx, state.slots, example.features)
+
+            {:ok, metadata}
+          end)
         end
 
-        {:ok, start(Map.put(state, :prefix, prefix), ctx, worker)}
+        {{:ok, start(Map.put(state, :prefix, prefix), ctx, worker)}, sizes}
 
       {:EXIT, ^worker, reason} ->
-        {:stop, reason}
+        {{:stop, reason}, sizes}
     end
   end
 
@@ -797,7 +824,9 @@ defmodule Transmuter.ContinuousBatching do
       queue: :queue.new(),
       callers: %{},
       stepping?: false,
-      load: info.load
+      load: info.load,
+      sent: 0,
+      position_bytes: Generation.position_bytes(ctx)
     })
     |> publish()
   end
@@ -827,10 +856,21 @@ defmodule Transmuter.ContinuousBatching do
   # The requests go to the worker, which sends each one back with its inputs.
   defp on_call({:enqueue, requests}, {pid, _tag}, state) do
     if :queue.len(state.queue) + map_size(state.preparing) + length(requests) > state.max_queue do
+      telemetry(state, [:refuse], %{count: length(requests)}, %{
+        reason: :queue_full,
+        max_queue: state.max_queue
+      })
+
       {:reply, {:error, :queue_full}, state}
     else
       now = System.monotonic_time()
       requests = Enum.map(requests, &Map.merge(&1, %{pid: pid, enqueued: now}))
+
+      for request <- requests do
+        measurements = %{system_time: System.system_time(), monotonic_time: now}
+        telemetry(state, [:request, :start], measurements, request_metadata(request))
+      end
+
       Enum.each(requests, &send(state.worker, {:prepare, &1}))
       preparing = Map.merge(state.preparing, Map.new(requests, &{&1.ref, &1}))
       callers = Map.put_new_lazy(state.callers, pid, fn -> Process.monitor(pid) end)
@@ -861,6 +901,7 @@ defmodule Transmuter.ContinuousBatching do
 
       {{request, preparing}, {:error, exception}} ->
         send(request.pid, {ref, {:error, exception}})
+        request_exception(state, request, exception)
         {:noreply, forget_callers(%{state | preparing: preparing})}
     end
   end
@@ -877,12 +918,18 @@ defmodule Transmuter.ContinuousBatching do
   defp enqueue_prepared(state, request, rows, runs) do
     if Generation.fits_alone?(state.ctx, Enum.map(rows, & &1.prompt), request.max_new_tokens) do
       send(request.pid, {request.ref, {:run, runs}})
-      request = request |> Map.delete(:input) |> Map.put(:rows, Enum.with_index(rows))
+
+      request =
+        request
+        |> Map.delete(:input)
+        |> Map.merge(%{rows: Enum.with_index(rows), prepared: System.monotonic_time()})
+
       {:noreply, kick(%{state | queue: :queue.in(request, state.queue)})}
     else
       longest = Enum.max_by(rows, &length(&1.prompt))
       exception = ArgumentError.exception(too_long(state, Map.merge(request, longest)))
       send(request.pid, {request.ref, {:error, exception}})
+      request_exception(state, request, exception)
       {:noreply, forget_callers(state)}
     end
   end
@@ -935,11 +982,19 @@ defmodule Transmuter.ContinuousBatching do
   defp step(state) do
     {admitted, state} = admissions(state)
 
+    now = System.monotonic_time()
+
     {admitted, prefix} =
       Enum.map_reduce(admitted, state.prefix, fn {row, request}, prefix ->
         {request, prefix} = with_prefix(request, prefix)
         store? = prefix != nil and request.features == nil and request.inputs == %{}
-        {{row, Map.put(request, :store?, store?)}, prefix}
+        prefix_tokens = get_in(request, [:prefix, :size]) || 0
+        admit(state, request, prefix_tokens, now)
+
+        request =
+          Map.merge(request, %{store?: store?, prefix_tokens: prefix_tokens, output_tokens: 0})
+
+        {{row, request}, prefix}
       end)
 
     state = %{state | prefix: prefix}
@@ -950,8 +1005,7 @@ defmodule Transmuter.ContinuousBatching do
       metadata = %{
         running: map_size(state.rows),
         admitted: length(admitted),
-        prefix_tokens:
-          Enum.sum(for {_row, request} <- admitted, do: get_in(request, [:prefix, :size]) || 0),
+        prefix_tokens: Enum.sum(for {_row, request} <- admitted, do: request.prefix_tokens),
         prompts: Enum.count(state.group.left, &(&1 != [])) + length(admitted),
         waiting: :queue.len(state.queue),
         slots: state.slots,
@@ -959,23 +1013,40 @@ defmodule Transmuter.ContinuousBatching do
         encoder_capacity: state.group.state.encoder_capacity
       }
 
-      live_keys =
-        Enum.sum(
-          Enum.zip_with(state.group.state.lengths, state.group.done, &if(&2, do: 0, else: &1))
-        )
+      live_keys = live_keys(state.group)
 
       :telemetry.span([:transmuter, :continuous_batching, :step], metadata, fn ->
         start = System.monotonic_time()
-        state = step(state, admitted)
+        state = step(%{state | sent: 0}, admitted)
 
         ms =
           System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond) / 1000
 
         state = costs(state, metadata, live_keys, ms)
-        {state, Map.merge(metadata, loop_metadata(state.group.steps, metadata.running))}
+        capacity = state.group.state.capacity
+
+        measurements =
+          metadata
+          |> Map.take([:running, :admitted, :prefix_tokens, :prompts, :waiting])
+          |> Map.merge(%{
+            preparing: map_size(state.preparing),
+            tokens: state.sent,
+            kv_capacity: capacity,
+            kv_max_capacity: state.ctx.max_capacity,
+            kv_used: live_keys(state.group),
+            kv_bytes: state.slots * capacity * state.position_bytes
+          })
+
+        {state, measurements,
+         Map.merge(metadata, loop_metadata(state.group.steps, metadata.running))}
       end)
     end
   end
+
+  # The keys and values of the rows that run: the sum of their lengths, which the group keeps
+  # on the host, so it reads nothing from the device.
+  defp live_keys(group),
+    do: Enum.sum(Enum.zip_with(group.state.lengths, group.done, &if(&2, do: 0, else: &1)))
 
   # The costs of the call: its moves, and the call itself when it only decodes. A call with a
   # prompt part or a move does not show the time of a decode step.
@@ -1089,14 +1160,17 @@ defmodule Transmuter.ContinuousBatching do
   # its caller. A row with a part of its prompt left has no token yet. A row that ends is free
   # for the next step.
   defp emit(state, group) do
-    rows = Enum.reduce(group.steps, state.rows, &emit_step(&2, Map.merge(group, &1)))
-    %{state | group: group, rows: rows}
+    now = System.monotonic_time()
+    state = %{state | group: group}
+    Enum.reduce(group.steps, state, &emit_step(&2, Map.merge(group, &1), now))
   end
 
-  defp emit_step(rows, group) do
-    Enum.reduce(rows, rows, fn {row, request}, rows ->
+  # All tokens of a call leave at its end, so they share the time `now`.
+  defp emit_step(state, group, now) do
+    Enum.reduce(state.rows, state, fn {row, request}, state ->
       token = Enum.at(group.new, row)
       done? = Enum.at(group.done, row)
+      request = if token, do: sent(state, request, now), else: request
 
       cond do
         token == nil and not done? ->
@@ -1114,15 +1188,97 @@ defmodule Transmuter.ContinuousBatching do
           :ok
       end
 
-      if done?, do: Map.delete(rows, row), else: rows
+      state = %{state | sent: state.sent + if(token, do: 1, else: 0)}
+
+      if done? do
+        request_stop(state, request, :done, now)
+        %{state | rows: Map.delete(state.rows, row)}
+      else
+        %{state | rows: Map.put(state.rows, row, request)}
+      end
     end)
   end
 
+  # Counts a token of the row of `request`, and emits the first-token event for its first one.
+  defp sent(state, request, now) do
+    request = Map.update!(request, :output_tokens, &(&1 + 1))
+
+    if Map.has_key?(request, :first_token) do
+      request
+    else
+      first = now - request.enqueued
+      metadata = request_metadata(request)
+      telemetry(state, [:request, :first_token], %{time_to_first_token: first}, metadata)
+      Map.put(request, :first_token, now)
+    end
+  end
+
+  defp telemetry(state, event, measurements, metadata) do
+    metadata = Map.put(metadata, :server, state.name || self())
+    :telemetry.execute([:transmuter, :continuous_batching | event], measurements, metadata)
+  end
+
+  # The metadata of the request events. They never carry the input or the tokens.
+  defp request_metadata(request),
+    do: %{request: request.ref, stream: request.stream?, index: Map.get(request, :index)}
+
+  defp admit(state, request, prefix_tokens, now) do
+    measurements = %{
+      queue_time: now - request.prepared,
+      prepare_time: request.prepared - request.enqueued,
+      prompt_tokens: length(request.prompt),
+      prefix_tokens: prefix_tokens
+    }
+
+    telemetry(state, [:request, :admit], measurements, request_metadata(request))
+  end
+
+  # A request that fails before it runs, in the worker or because it never fits.
+  defp request_exception(state, request, exception) do
+    now = System.monotonic_time()
+    measurements = %{duration: now - request.enqueued, monotonic_time: now}
+    metadata = %{kind: :error, reason: exception, stacktrace: []}
+
+    telemetry(
+      state,
+      [:request, :exception],
+      measurements,
+      Map.merge(request_metadata(request), metadata)
+    )
+  end
+
+  # A row that ends, or a request that ends without a row when `result` is :cancelled. The
+  # times of the first token are only there for a row that sent one.
+  defp request_stop(state, request, result, now) do
+    measurements =
+      %{duration: now - request.enqueued, monotonic_time: now}
+      |> Map.merge(Map.take(request, [:output_tokens, :prefix_tokens]))
+      |> Map.merge(row_measurements(request, now))
+
+    metadata = Map.put(request_metadata(request), :result, result)
+    telemetry(state, [:request, :stop], measurements, metadata)
+  end
+
+  defp row_measurements(request = %{first_token: first, output_tokens: tokens}, now) do
+    %{
+      prompt_tokens: length(request.prompt),
+      time_to_first_token: first - request.enqueued,
+      time_per_output_token: if(tokens > 1, do: div(now - first, tokens - 1), else: 0)
+    }
+  end
+
+  defp row_measurements(%{prompt: prompt}, _now), do: %{prompt_tokens: length(prompt)}
+  defp row_measurements(_request, _now), do: %{}
+
   # Ends the rows and removes the waiting requests that `drop?` selects.
   defp drop(state, drop?) do
-    queue = :queue.filter(&(not drop?.(&1)), state.queue)
-    preparing = Map.reject(state.preparing, fn {_ref, request} -> drop?.(request) end)
+    {queued, queue} = state.queue |> :queue.to_list() |> Enum.split_with(drop?)
+    {gone, preparing} = Map.split_with(state.preparing, fn {_ref, request} -> drop?.(request) end)
     {dropped, rows} = Enum.split_with(state.rows, fn {_row, request} -> drop?.(request) end)
+    now = System.monotonic_time()
+    requests = queued ++ Map.values(gone) ++ Enum.map(dropped, &elem(&1, 1))
+    Enum.each(requests, &request_stop(state, &1, :cancelled, now))
+    queue = :queue.from_list(queue)
 
     group =
       Enum.reduce(dropped, state.group, fn {row, _request}, group ->
@@ -1140,20 +1296,21 @@ defmodule Transmuter.ContinuousBatching do
   # it runs in a task as soon as the request comes, for up to one request for each scheduler
   # at a time. The worker runs :prepare, such as the vision encoder, on one request at a time
   # in the order of the requests, while the tasks preprocess the next requests.
-  defp prepare_requests({preprocess, prepare}, server) do
-    prepare_requests(preprocess, prepare, server, :queue.new(), :queue.new())
+  defp prepare_requests({preprocess, prepare}, server, name) do
+    prepare_requests(preprocess, prepare, {server, name}, :queue.new(), :queue.new())
   end
 
-  defp prepare_requests(preprocess, prepare, server, waiting, running) do
+  defp prepare_requests(preprocess, prepare, {server, name}, waiting, running) do
     waiting = receive_requests(waiting, :queue.is_empty(waiting) and :queue.is_empty(running))
     {waiting, running} = start_preprocess(preprocess, waiting, running)
     {{:value, {request, task}}, running} = :queue.out(running)
     runs = Task.await(task, :infinity)
-    metadata = %{wait: System.monotonic_time() - request.enqueued}
+    wait = System.monotonic_time() - request.enqueued
+    metadata = %{server: name, wait: wait}
 
     reply =
       :telemetry.span([:transmuter, :continuous_batching, :prepare], metadata, fn ->
-        {prepare_runs(prepare, runs), metadata}
+        {prepare_runs(prepare, runs), %{queue_wait: wait}, metadata}
       end)
 
     send(server, {:prepared, request.ref, reply})
@@ -1161,7 +1318,7 @@ defmodule Transmuter.ContinuousBatching do
     # and only a garbage collection frees them on EMLX. The worker makes little other
     # garbage, so without it they stay for many requests.
     :erlang.garbage_collect()
-    prepare_requests(preprocess, prepare, server, waiting, running)
+    prepare_requests(preprocess, prepare, {server, name}, waiting, running)
   end
 
   # The requests in the mailbox, after a wait for one when the worker has nothing to do.
