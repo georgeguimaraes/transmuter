@@ -6,7 +6,7 @@ defmodule Transmuter.Fusion do
 
     * `Pow(x, 2)`, `ReduceMean`, `Add(eps)`, `Sqrt`, then `x / sqrt`, `x * (1 / sqrt)` or `x * Reciprocal(sqrt)`, then `Mul(weight)` becomes `SimplifiedLayerNormalization`.
     * `ReduceMean`, `Sub`, the RMSNorm of the difference, then `Mul(gamma)` and `Add(beta)` becomes `LayerNormalization`.
-    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, optional `Cast`s to float types, an optional `Where(keep, scores, fill)`, an optional `Add(mask)`, optional `Cast`s to float types, `Softmax`, optional `Cast`s to float types, an optional pair of `Reshape` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way, T5 exports cast the masked scores, and llama2.c exports cast the probabilities two times. When q and k are both a `Mul` by a factor, as the scaled q and k of `scaled_dot_product_attention` in the Florence-2 and moonshine exports, the factors become inputs of `AttentionCore`.
+    * `MatMul(q, k)`, an optional `Mul` or `Div` by a scale, optional `Cast`s to float types, an optional `Where(keep, scores, fill)` (also before a constant scale, as in GPT-J exports), an optional `Add(mask)`, optional `Cast`s to float types, `Softmax`, optional `Cast`s to float types, an optional pair of `Reshape` and `MatMul(probabilities, v)` becomes `AttentionCore` (see `Transmuter.Ops.Transformer`). GPT-2 exports write the attention core in this way, T5 exports cast the masked scores, and llama2.c exports cast the probabilities two times. When q and k are both a `Mul` by a factor, as the scaled q and k of `scaled_dot_product_attention` in the Florence-2 and moonshine exports, the factors become inputs of `AttentionCore`.
 
   The operators then use the fused kernels of `EMLX.Fast` on EMLX (see `Transmuter.Ops.emlx?/1`), and every other backend runs the same function as before.
 
@@ -17,7 +17,7 @@ defmodule Transmuter.Fusion do
   A subgraph matches only when the replacement computes the same function:
 
     * The exponent is 2, the numerator of `1 / sqrt` is 1, and eps and a `Mul` scale are constants with one value. A `Div` by a value that is not a constant becomes the divisor input of `AttentionCore`, which reads it when the graph runs.
-    * The fill of the `Where` is a constant of at most -1.0e4, so the hidden keys get no weight.
+    * The fill of the `Where` is a constant of at most -1.0e4, so the hidden keys get no weight. A `Where` before a constant scale has a fill that is at most -1.0e4 after the scale.
     * Eps is an f32, f16 or bf16 value. It has the type of x, so x is not f64.
     * `ReduceMean` reduces the axis -1 and keeps it.
     * The weight, gamma and beta are constants of at most one axis, so they broadcast only along the last axis.
@@ -268,6 +268,14 @@ defmodule Transmuter.Fusion do
     {name, cast} = through_cast(ctx, name)
     {product, scale, divisor, scaled} = scaled(ctx, name)
 
+    # The Where can also come before a constant scale, as in the GPT-J exports: Where(keep, s,
+    # fill) * scale is Where(keep, s * scale, fill * scale), which hides the keys when the
+    # scaled fill is at most -1.0e4.
+    {product, keep, fill, kept} =
+      if kept == [] and divisor == "",
+        do: kept(ctx, product, scale),
+        else: {product, keep, fill, kept}
+
     if qk = op(ctx, product, "MatMul") do
       {operands, factored} = factors(ctx, qk.input)
 
@@ -299,10 +307,10 @@ defmodule Transmuter.Fusion do
 
   defp factored(ctx, [a, b]), do: if(scalar(ctx, a), do: [b, a], else: [a, b])
 
-  defp kept(ctx, name) do
+  defp kept(ctx, name, scale \\ 1.0) do
     with where = %{input: [keep, scores, fill]} <- op(ctx, name, "Where"),
-         value when is_float(value) and value <= -1.0e4 <- float_scalar(ctx, fill) do
-      {scores, keep, value, [where]}
+         value when is_float(value) and value * scale <= -1.0e4 <- float_scalar(ctx, fill) do
+      {scores, keep, value * scale, [where]}
     else
       _ -> {name, "", 0.0, []}
     end

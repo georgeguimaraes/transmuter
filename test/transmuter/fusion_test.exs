@@ -246,6 +246,51 @@ defmodule Transmuter.FusionTest do
     assert_same_outputs(model, Map.put(inputs, "sqrt_d", Nx.tensor(8.0)))
   end
 
+  # GPT-J exports hide the later keys with a Where before the scale, then divide the scores by
+  # a constant and add the padding mask. A Div by a constant and a Where with a large negative
+  # fill commute, so the core becomes AttentionCore when the scaled fill stays at most -1.0e4.
+  # A fill that the scale lifts above -1.0e4 would give the hidden keys weight, so that core
+  # stays as it is.
+  test "the attention core of GPT-J, with the Where before the scale, becomes AttentionCore",
+       %{tmp_dir: dir} do
+    core = [
+      node("Transpose", ["k"], ["kt"], perm: [0, 1, 3, 2]),
+      node("MatMul", ["q", "kt"], ["qk"]),
+      node("Where", ["keep", "qk", "fill"], ["kept"]),
+      node("Div", ["kept", "sqrt_d"], ["scaled"]),
+      node("Add", ["scaled", "mask"], ["masked"]),
+      node("Softmax", ["masked"], ["probs"], axis: -1),
+      node("MatMul", ["probs", "v"], ["y"])
+    ]
+
+    key = Nx.Random.key(2)
+    {q, key} = Nx.Random.normal(key, shape: {2, 4, 3, 64})
+    {k, key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+    {v, _key} = Nx.Random.normal(key, shape: {2, 4, 5, 64})
+
+    keep =
+      Nx.less_equal(Nx.iota({1, 1, 3, 5}, axis: 3), Nx.add(Nx.iota({1, 1, 3, 5}, axis: 2), 2))
+
+    mask = Nx.tensor([[0, 0, 0, -1.0e9, -1.0e9], [0, 0, 0, 0, 0]]) |> Nx.reshape({2, 1, 1, 5})
+    inputs = %{"q" => q, "k" => k, "v" => v, "keep" => keep, "mask" => mask}
+    constants = %{"sqrt_d" => Nx.tensor(8.0), "fill" => Nx.Constants.min_finite(:f32)}
+
+    model = write(dir, core, constants, ["q", "k", "v", "keep", "mask"], ["y"])
+    assert ops(model) == ["Transpose", "AttentionCore"]
+    assert_same_outputs(model, inputs)
+
+    model =
+      write(
+        dir,
+        core,
+        %{constants | "fill" => Nx.tensor(-2.0e4)},
+        ["q", "k", "v", "keep", "mask"],
+        ["y"]
+      )
+
+    assert ops(model) == Enum.map(core, & &1.op_type)
+  end
+
   # The forms of other exports: the scaled q and k of scaled_dot_product_attention, with a
   # factor from the head size as in Florence-2 and moonshine or a factor that the compiled
   # function does not know, T5 with a Cast of the masked scores, and llama2.c with two Casts
