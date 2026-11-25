@@ -223,13 +223,8 @@ defmodule Transmuter.Ops do
     Enum.map(target, &if(&1 == -1, do: div(Enum.product(dims), max(known, 1)), else: &1))
   end
 
-  # A dimension of 1 takes the target size, any other dimension stays, also 0.
-  defp empty_shape(%{op_type: "Expand"}, [x, shape]) do
-    {dims, target} = {shape_list(x), values!(shape)}
-    rank = max(length(dims), length(target))
-    pad = &(List.duplicate(1, rank - length(&1)) ++ &1)
-    Enum.zip_with(pad.(dims), pad.(target), fn d, t -> if d == 1, do: t, else: d end)
-  end
+  defp empty_shape(%{op_type: "Expand"}, [x, shape]),
+    do: Shape.expand_shape(shape_list(x), values!(shape)) |> Tuple.to_list()
 
   defp empty_shape(node = %{op_type: "Gather"}, [data, indices]) do
     dims = shape_list(data)

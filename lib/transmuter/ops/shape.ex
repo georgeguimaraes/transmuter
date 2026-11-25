@@ -7,7 +7,6 @@ defmodule Transmuter.Ops.Shape do
     only: [
       attr: 2,
       attr: 3,
-      broadcast_shape: 1,
       dtype: 1,
       empty?: 1,
       known!: 2,
@@ -78,7 +77,7 @@ defmodule Transmuter.Ops.Shape do
   end
 
   defp op(%{op_type: "Expand"}, [a, shape]) do
-    out = broadcast_shape([Nx.shape(a), List.to_tuple(values!(shape))])
+    out = expand_shape(Tuple.to_list(Nx.shape(a)), values!(shape))
     pad = List.duplicate(1, tuple_size(out) - Nx.rank(a)) ++ Tuple.to_list(Nx.shape(a))
 
     if 0 in Tuple.to_list(out),
@@ -625,5 +624,34 @@ defmodule Transmuter.Ops.Shape do
       _type ->
         Nx.indexed_put(data, indices, updates, opts)
     end
+  end
+
+  @doc false
+  # The output shape of Expand, the numpy broadcast of the shape of x and the target, aligned
+  # from the last axis. Two dimensions broadcast when they are equal or one of them is 1, so a
+  # dimension of 0 takes only 0 or 1. Other dimensions raise, as in ONNX Runtime: a silent
+  # shape gives wrong values far from its cause, such as the causal mask of the
+  # onnxruntime-genai export of DeepSeek-R1-Distill-Qwen, a [seq, seq] triangle that it
+  # expands to [seq, past + seq].
+  def expand_shape(dims, target) do
+    rank = max(length(dims), length(target))
+    pad = &(List.duplicate(1, rank - length(&1)) ++ &1)
+
+    pad.(dims)
+    |> Enum.zip_with(pad.(target), fn
+      d, d ->
+        d
+
+      1, t ->
+        t
+
+      d, 1 ->
+        d
+
+      _d, _t ->
+        raise ArgumentError,
+              "Expand cannot broadcast the shape #{inspect(List.to_tuple(dims))} to #{inspect(List.to_tuple(target))}"
+    end)
+    |> List.to_tuple()
   end
 end

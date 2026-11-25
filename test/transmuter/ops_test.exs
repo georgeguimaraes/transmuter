@@ -291,6 +291,41 @@ defmodule Transmuter.OpsTest do
     assert Transmuter.Ops.tensor_shape_type(proto) == {{2}, {:f, 32}}
   end
 
+  # Expand follows the numpy broadcast of ONNX: a dimension takes the target when it is 1 or
+  # equal to it, and the target can add axes in front. Other dimensions raise, also in the
+  # shape-only trace of debug_expr that Generation runs at load, and also for an empty tensor.
+  # The causal mask of the onnxruntime-genai export of DeepSeek-R1-Distill-Qwen expands a
+  # [seq, seq] triangle to [seq, past + seq], which got [seq, seq] back without a raise.
+  test "Expand broadcasts dimensions of 1 and equal ones, and raises on others" do
+    expand = fn x, target ->
+      node = %Transmuter.Onnx.NodeProto{op_type: "Expand", input: ["x", "shape"], output: ["y"]}
+      shape = Nx.tensor(target, type: :s64, backend: Nx.BinaryBackend)
+      ctx = %{opset: 17, compute_type: nil, key: nil, backend: Nx.BinaryBackend}
+      Transmuter.run_nodes([node], %{"x" => x, "shape" => shape}, ctx)["y"]
+    end
+
+    x = Nx.iota({2, 1}, backend: Nx.BinaryBackend)
+    assert Nx.shape(expand.(x, [3, 2, 4])) == {3, 2, 4}
+    assert Nx.shape(expand.(x, [2, 1])) == {2, 1}
+    assert Nx.shape(expand.(x, [1, 1])) == {2, 1}
+    assert Nx.to_list(expand.(x, [2, 3])) == [[0, 0, 0], [1, 1, 1]]
+
+    # The graph run gives the error of a node with its op type and its input shapes.
+    assert_raise RuntimeError, ~r/cannot broadcast the shape \{2, 1\} to \{3, 4\}/, fn ->
+      expand.(x, [3, 4])
+    end
+
+    assert_raise RuntimeError, ~r/cannot broadcast the shape \{2, 2\} to \{2, 3\}/, fn ->
+      Nx.Defn.debug_expr(&expand.(&1, [2, 3])).(Nx.template({2, 2}, :f32))
+    end
+
+    assert expand.({:empty, {0, 1}}, [0, 3]) == {:empty, {0, 3}}
+
+    assert_raise RuntimeError, ~r/cannot broadcast the shape \{0, 1\} to \{2, 3\}/, fn ->
+      expand.({:empty, {0, 1}}, [2, 3])
+    end
+  end
+
   # An export that a tool renamed, such as decoder_model_merged.onnx of Xenova/falcon-rw-1b,
   # keeps the location of its old name, model.onnx_data, while the Hub has its data in
   # decoder_model_merged.onnx_data. The tensor reads the file of the Hub convention, the model
