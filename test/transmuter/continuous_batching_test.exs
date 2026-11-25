@@ -175,7 +175,8 @@ defmodule Transmuter.ContinuousBatchingTest do
   # after its first chunk, at step k. The server sees the exit at most 2 steps later, so the
   # waiting request runs in its row and gives its result alone, at most k + 2 + its own steps
   # in total. A row that stays with the stream until its 200 tokens gives more. When the
-  # server stops, a waiting caller exits with the reason of the server.
+  # server stops, a waiting caller exits with the reason of the server, and the info of the
+  # server leaves :persistent_term.
   test "a server of one row frees the row of a caller that exits, and its queue has a limit" do
     source = {:hf, "HuggingFaceTB/SmolLM2-135M-Instruct"}
     opts = [strategy: :greedy, max_new_tokens: 200, min_new_tokens: 200] ++ @opts
@@ -254,11 +255,17 @@ defmodule Transmuter.ContinuousBatchingTest do
 
     {caller, monitor} = spawn_monitor(fn -> ContinuousBatching.run(server, @fox) end)
     wait_for(fn -> map_size(:sys.get_state(server).rows) == 1 end)
+    info = {ContinuousBatching, server}
+    assert %{pid: ^server} = :persistent_term.get(info)
     Process.exit(server, :kill)
 
     assert_receive {:DOWN, ^monitor, :process, ^caller,
                     {:killed, {ContinuousBatching, :run, _args}}},
                    60_000
+
+    # A killed server runs no terminate/2, and its scope still erases its info.
+    gone = Task.async(fn -> wait_for(fn -> :persistent_term.get(info, nil) == nil end) end)
+    Task.await(gone, 5_000)
   end
 
   # The server reads its mailbox only between two steps. A step that takes longer than the

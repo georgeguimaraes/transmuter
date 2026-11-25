@@ -6,6 +6,8 @@ defmodule Transmuter.Shared do
 
   A scope belongs to the process that makes it. When that process exits, a small process erases the terms of the scope. An erase makes each process check its heap for references to the term, so only terms that live long go here. The small process also owns the ETS tables of the scope (see `table/2`), so they end with the scope.
 
+  `publish/3` puts a term at a key that other processes know, such as the pid of the owner, and the scope erases that key too.
+
   A scope can also end before its owner, with `erase_scope/1`. `collect/1` gives the scopes that a function makes, so the code that runs the function can end them, for example at the end of a call of `Nx.Serving.run/2` that compiles in the caller.
   """
 
@@ -71,6 +73,21 @@ defmodule Transmuter.Shared do
   end
 
   @doc false
+  # Puts `term` at `key`, a key that readers know without the scope, such as one with the pid
+  # of the owner. A mark under the scope erases the key with the other terms of the scope.
+  def publish(scope, key, term) do
+    put(scope, {:published, key}, true)
+
+    # As in put/3, the owner can exit while the term goes in, after the scope erased the mark.
+    if get(scope, {:published, key}) do
+      :persistent_term.put(key, term)
+      unless get(scope, {:published, key}), do: :persistent_term.erase(key)
+    end
+
+    :ok
+  end
+
+  @doc false
   # Ends the scope: erases its terms and stops its small process, which ends its tables.
   def erase_scope(scope = {_owner, watcher}) do
     erase_terms(scope)
@@ -79,8 +96,10 @@ defmodule Transmuter.Shared do
   end
 
   defp erase_terms(scope) do
-    for {key = {__MODULE__, ^scope, _key}, _term} <- :persistent_term.get(),
-        do: :persistent_term.erase(key)
+    for {key = {__MODULE__, ^scope, name}, _term} <- :persistent_term.get() do
+      with {:published, published} <- name, do: :persistent_term.erase(published)
+      :persistent_term.erase(key)
+    end
 
     :ok
   end

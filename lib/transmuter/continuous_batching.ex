@@ -136,7 +136,7 @@ defmodule Transmuter.ContinuousBatching do
   require Logger
 
   alias Transmuter.ContinuousBatching.Costs
-  alias Transmuter.{Generation, Serving}
+  alias Transmuter.{Generation, Serving, Shared}
 
   @compile {:no_warn_undefined, [EXLA.Client, EMLX]}
   @default_capacity 4096
@@ -400,8 +400,8 @@ defmodule Transmuter.ContinuousBatching do
   end
 
   # The task, the tokenizer and the flags of a server on this node, which it puts in
-  # :persistent_term when it starts, so a caller does not wait for a step of the server to
-  # read them.
+  # :persistent_term when it starts (see Transmuter.Shared.publish/3), so a caller does not
+  # wait for a step of the server to read them.
   defp info!(pid, call), do: :persistent_term.get({__MODULE__, pid}, nil) || exit({:noproc, call})
 
   # The validation, the postprocessing and the tokenizer of a request stay on the node of the
@@ -809,7 +809,8 @@ defmodule Transmuter.ContinuousBatching do
       load: :atomics.new(1, signed: true)
     }
 
-    :persistent_term.put({__MODULE__, self()}, info)
+    # The scope erases the info when the server exits, also when it is killed.
+    Shared.publish(Shared.scope(), {__MODULE__, self()}, info)
     if state.name, do: :pg.join(Transmuter.PG, state.name, self())
 
     state
@@ -935,10 +936,7 @@ defmodule Transmuter.ContinuousBatching do
   @impl true
   # The worker holds the compiled encoder. It does not trap exits, so a stop with :normal
   # does not end it.
-  def terminate(_reason, state) do
-    Process.exit(state.worker, :kill)
-    :persistent_term.erase({__MODULE__, self()})
-  end
+  def terminate(_reason, state), do: Process.exit(state.worker, :kill)
 
   defp kick(state = %{stepping?: true}), do: state
 
