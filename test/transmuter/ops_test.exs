@@ -243,6 +243,27 @@ defmodule Transmuter.OpsTest do
     end
   end
 
+  # With compute_type :f16, a move gives a MatMulNBits node with f32 scales an f16 weight, with
+  # half of the bytes. It dequantizes in f16, as for the f16 scales of a q4f16 export. On the
+  # EMLX GPU, the weight stays an MLX quantized tensor.
+  test "a moved MatMulNBits weight takes the compute_type, also with f32 scales" do
+    model = Transmuter.load!(Path.join(@fixtures, "MatMulNBits_b4_bs256_packed/model.onnx"))
+
+    q4f16 = %{
+      model
+      | params: %{model.params | "scales" => Nx.as_type(model.params["scales"], :f16)}
+    }
+
+    if @backend != {EMLX.Backend, device: :gpu} do
+      [f32, f16, expected] =
+        for m <- [model, %{model | compute_type: :f16}, q4f16],
+            do: Transmuter.move(m, @backend).params["B:packed"]
+
+      assert {Nx.type(f32), Nx.type(f16)} == {{:f, 32}, {:f, 16}}
+      assert Nx.to_binary(f16) == Nx.to_binary(expected)
+    end
+  end
+
   # ONNX allows external data without a length, which goes to the end of the file. With a
   # backend, the loader defers the tensor and knows its shape and type before it reads it.
   test "an external tensor without a length reads to the end of the file" do

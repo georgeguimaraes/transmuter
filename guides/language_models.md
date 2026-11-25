@@ -122,7 +122,7 @@ model = Transmuter.load!(
 )
 ```
 
-With `backend: EMLX.Backend`, Transmuter keeps the 4-bit weights packed as MLX quantized tensors. MLX calls `mx::quantized_matmul` directly on the packed weights, so the float weights never exist in memory. On every other backend, such as EXLA, the weights become `{N, K}` float tensors when the model loads, so each forward pass runs one matmul for each weight and does not unpack it. These float weights take about 4 bytes per weight: Qwen3-1.7B q4 takes about 6.9 GB, and a 4B q4 model needs about 16 GB. A model loaded without a backend dequantizes the weights in the graph on each forward pass. See [Backends and performance](backends_and_performance.md).
+With `backend: EMLX.Backend`, Transmuter keeps the 4-bit weights packed as MLX quantized tensors. MLX calls `mx::quantized_matmul` directly on the packed weights, so the float weights never exist in memory. On every other backend, such as EXLA, the weights become `{N, K}` float tensors when the model loads, so each forward pass runs one matmul for each weight and does not unpack it. These float weights take about 4 bytes per weight: Qwen3-1.7B q4 takes about 6.9 GB, and a 4B q4 model needs about 16 GB. With `compute_type: :f16` or `:bf16`, these weights and the other f32 params take 2 bytes per weight: on EXLA CUDA, Qwen3-1.7B q4 takes 3.45 GB, and Phi-4-mini q4 takes 8.05 GB. A model loaded without a backend dequantizes the weights in the graph on each forward pass. See [Backends and performance](backends_and_performance.md).
 
 Performance comparison on Apple silicon GPU, one forward pass of 8 tokens:
 

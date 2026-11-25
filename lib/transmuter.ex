@@ -59,15 +59,21 @@ defmodule Transmuter do
       `Transmuter.EMLX`). On every other backend, also the EMLX CPU, these
       weights become float weights of shape `{N, K}` when the model loads, with
       the math of the graph, so each call runs one matmul and does not unpack
-      the weights. The float weights take about 4 bytes per weight (2 bytes
-      for a q4f16 export): a 4B q4 model needs about 16 GB. A model loaded
-      without a backend dequantizes the weights in the graph on each call. The
-      default is `Nx.BinaryBackend`.
+      the weights. The float weights have the type of the scales (f32 in a q4
+      export, f16 in a q4f16 export), or the `:compute_type`: about 4 bytes per
+      weight in f32 and 2 bytes in f16 or bf16. A 4B q4 model needs about 16 GB,
+      and about 8 GB with `compute_type: :f16`. A model loaded without a
+      backend dequantizes the weights in the graph on each call. The default is
+      `Nx.BinaryBackend`.
 
     * `:compute_type` (`t:atom/0`) - runs f16 and bf16 tensors in this type
-      through every operator. The default is `nil`, which keeps the types of the
-      graph. In native f16 and bf16, sums, normalizations, softmax and attention
-      scores run in f32. `:f32` converts half-precision weights to f32 when the
+      through every operator. With `:f16` or `:bf16`, the f32 params also take
+      this type when the model loads, and so do the float weights and the
+      scales of `MatMulNBits` (see `:backend`), so the weights of an f32 or q4
+      export take half of the memory. The graph inputs and the small static
+      values keep their types. The default is `nil`, which keeps the types of
+      the graph. In native f16 and bf16, sums, normalizations, softmax and
+      attention scores run in f32. `:f32` converts half-precision weights to f32 when the
       model loads, as ONNX Runtime on the CPU does, and uses as much memory as
       f32 weights. Use `:f32` when a deep half-precision graph drifts from the
       f32 result. See [Backends and performance](guides/backends_and_performance.md).
@@ -223,7 +229,7 @@ defmodule Transmuter do
         do: move(model, backend),
         else: %{
           model
-          | params: Map.new(model.params, fn {k, t} -> {k, upcast(t, compute_type)} end)
+          | params: Map.new(model.params, fn {k, t} -> {k, cast_param(t, compute_type)} end)
         }
 
     params = model.params
@@ -1095,7 +1101,7 @@ defmodule Transmuter do
   # A compatible MatMulNBits node (see packable?/2) gets one {N, K} weight when the model
   # moves, so the graph does not unpack the weight on each call: an MLX quantized tensor on
   # the EMLX GPU, or the float weights of Transmuter.Ops.Quantized.dequantize_weight/4, in the
-  # type of the scales after :compute_type, on every other backend. The node then reads A,
+  # type of the scales after cast_param/2, on every other backend. The node then reads A,
   # the weight under the name of B with ":packed" after it, and its bias, and its scales and
   # zero points inputs become empty names. The B, scales and zero points that no other node,
   # subgraph or graph output reads leave the params and the static values. Each name moves
@@ -1111,10 +1117,11 @@ defmodule Transmuter do
            &Transmuter.EMLX.weight/6, &Transmuter.EMLX.evaluate/1},
         else: {backend, fn _node -> true end, &dequantized_weight/6, & &1}
 
-    # Each param gets the compute_type of the model on the device. A param that the device
-    # computes, such as an upcast or the scales of a packed weight, is evaluated when it is
-    # made, one at a time, so the steps read its values and only one expression is alive.
-    finish = &(&1 |> upcast(model[:compute_type]) |> evaluate.())
+    # Each param gets the compute_type of the model on the device (see cast_param/2). A param
+    # that the device computes, such as a cast or the scales of a packed weight, is evaluated
+    # when it is made, one at a time, so the steps read its values and only one expression is
+    # alive.
+    finish = &(&1 |> cast_param(model[:compute_type]) |> evaluate.())
 
     packed = Enum.filter(model.nodes, &(packable?(&1, model) and compatible?.(&1)))
     packed_outputs = MapSet.new(packed, &hd(&1.output))
@@ -1150,11 +1157,15 @@ defmodule Transmuter do
     # Each name moves once, also when several packed nodes or other nodes read it. The scales
     # and the zero points are on the device, so their math runs there and not in the lists of
     # Nx.BinaryBackend.
-    device = names_on_device(model, quantization ++ kept, backend)
+    device = names_on_device(model, quantization ++ kept, backend, finish)
 
+    # The largest weights come first, while the device holds the fewest weights, so the
+    # temporaries of the largest weight meet the most free memory: those of the 200064 x 3072
+    # lm_head of Phi-4-mini take about 4 GB in f16.
     weights =
       packed
       |> Enum.uniq_by(&Enum.at(&1.input, 1))
+      |> Enum.sort_by(&weight_size/1, :desc)
       |> Map.new(fn node = %{input: [_a, b_name, scales | rest]} ->
         b = model.params |> Map.fetch!(b_name) |> DeferredTensor.value()
         zero_points = device[Enum.at(rest, 0, "")]
@@ -1181,6 +1192,12 @@ defmodule Transmuter do
     |> Transmuter.Fusion.matmuls(evaluate)
   end
 
+  # The weights of a MatMulNBits node: N x K.
+  defp weight_size(node) do
+    {k, n, _bits, _block_size} = Quantized.nbits_sizes(node)
+    k * n
+  end
+
   # The inputs of a packed node: the weight in place of B, and no scales or zero points.
   defp packed_inputs([a, b | rest], model) do
     name = packed_name(b)
@@ -1195,10 +1212,16 @@ defmodule Transmuter do
   defp packed_name(b), do: b <> ":packed"
 
   # The names on the device, each moved once. A packed weight B moves in the weight function.
-  defp names_on_device(model, names, backend) do
+  # Each value gets `finish` on the device, and the value before it leaves the device before
+  # the next name moves, so a load holds one value in the type of the file at a time: the f32
+  # embeddings of Phi-4-mini take 2.5 GB, and 1.2 GB in f16.
+  defp names_on_device(model, names, backend, finish) do
     for name <- Enum.uniq(names), into: %{} do
       value = Map.get(model.params, name) || Map.fetch!(model.static, name)
-      {name, value |> DeferredTensor.value() |> Nx.backend_transfer(backend)}
+      moved = value |> DeferredTensor.value() |> Nx.backend_transfer(backend)
+      finished = finish.(moved)
+      if finished != moved, do: Nx.backend_deallocate(moved)
+      {name, finished}
     end
   end
 
@@ -1224,12 +1247,14 @@ defmodule Transmuter do
     type == {:u, 8} and Tuple.product(shape) * 8 == bits
   end
 
-  # The float weights of a MatMulNBits node on the device, with the math of the graph. One
-  # evaluation per weight frees each intermediate value after its last use: the s16 and f32
-  # values of a 151936 x 2048 weight take gigabytes on the device.
+  # The float weights of a MatMulNBits node on the device, with the math of the graph in the
+  # type of the scales after cast_param/2. The f16 or bf16 math of a :compute_type rounds the
+  # scales first, as the graph of a q4f16 export does, and its temporary values take 2 bytes
+  # per weight too. One evaluation per weight frees each intermediate value after its last
+  # use: the s16 and f32 values of a 151936 x 2048 weight take gigabytes on the device.
   defp dequantized_weight(node, b, scales, zero_points, model, backend) do
     {k, n, bits, block_size} = Quantized.nbits_sizes(node)
-    scales = upcast(scales, model[:compute_type])
+    scales = cast_param(scales, model[:compute_type])
     sizes = {k, n, bits, block_size, Nx.type(scales)}
     b = Nx.backend_transfer(b, backend)
     jit = &Nx.Defn.jit(&1, compiler: Nx.Defn.Evaluator, garbage_collect: true)
@@ -1325,6 +1350,16 @@ defmodule Transmuter do
   end
 
   def upcast(t, _type), do: t
+
+  @doc false
+  # A param of the model in the compute type: each f16, bf16 or f32 param takes it, so with f16
+  # or bf16 the weights of an f32 or q4 export take its bytes. The graph inputs, the values of
+  # the nodes and the small static values only go up from f16 and bf16 (see upcast/2).
+  def cast_param(t = %Nx.Tensor{}, type) when type != nil do
+    if Nx.type(t) in [{:f, 16}, {:bf, 16}, {:f, 32}], do: Nx.as_type(t, type), else: t
+  end
+
+  def cast_param(t, _type), do: t
 
   # Runs Scan over the static length of its scan inputs, as a while loop when it is long
   # and traced, or else unrolled. Each step takes one slice of every scan input, and

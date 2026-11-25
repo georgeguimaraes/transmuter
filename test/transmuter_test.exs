@@ -843,6 +843,35 @@ defmodule TransmuterTest do
     assert_all_close(y, Nx.dot(Nx.tensor([[1.0, 2.0, 3.0, 4.0]]), Nx.as_type(weight, :f32)))
   end
 
+  # With compute_type :f16, an f32 param takes it too, so the weights of an f32 or q4 export
+  # take half of the bytes. The f32 graph input keeps its type (see Transmuter.upcast/2), so the
+  # MatMul gives f32.
+  test "compute_type :f16 converts the f32 params on the backend" do
+    weight = Nx.iota({4, 8}, type: :f32, backend: Nx.BinaryBackend) |> Nx.divide(8)
+
+    initializer = %TensorProto{
+      name: "w",
+      data_type: 1,
+      dims: [4, 8],
+      raw_data: Nx.to_binary(weight)
+    }
+
+    graph = %GraphProto{
+      input: [value("x", [1, 4], 1)],
+      output: [value("y")],
+      initializer: [initializer],
+      node: [node("MatMul", ["x", "w"], ["y"])]
+    }
+
+    model = Transmuter.load!(write_model(graph), backend: @backend, compute_type: :f16)
+    assert %Nx.Tensor{type: {:f, 16}} = model.params["w"]
+
+    x = Nx.tensor([[1.0, 2.0, 3.0, 4.0]], backend: @backend)
+    %{"y" => y} = Transmuter.run(model, model.params, %{"x" => x})
+    assert Nx.type(y) == {:f, 32}
+    assert_all_close(y, Nx.dot(Nx.tensor([[1.0, 2.0, 3.0, 4.0]]), weight))
+  end
+
   # A large value that a traced function folds from static values is known, but the device
   # builds it. A long Loop that carries it runs as a while loop and does not unroll.
   test "a long Loop over a large folded value runs as a while loop" do

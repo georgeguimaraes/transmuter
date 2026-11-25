@@ -31,9 +31,10 @@ if Code.ensure_loaded?(EMLX.Quantization) do
     On the GPU, compatible `MatMulNBits` weights become MLX quantized tensors, so
     `mx::quantized_matmul` reads the packed weights directly. This avoids
     materializing the float weights in memory on each forward pass. On the CPU,
-    these weights become float tensors of shape `{N, K}`, in the type of the
-    scales (or `:compute_type`), so the matmul uses BLAS. Other params are
-    transferred to EMLX with `Nx.backend_transfer/2`.
+    these weights become float tensors of shape `{N, K}`, in the `:compute_type`
+    of the load, or else in the type of the scales, so the matmul uses BLAS. On
+    both devices, the scales take the `:compute_type` (see `Transmuter.load!/2`).
+    Other params are transferred to EMLX with `Nx.backend_transfer/2`.
 
     A weight is compatible when:
 
@@ -124,7 +125,7 @@ if Code.ensure_loaded?(EMLX.Quantization) do
 
       scales =
         scales
-        |> Transmuter.upcast(model[:compute_type])
+        |> Transmuter.cast_param(model[:compute_type])
         |> Nx.reshape({n, blocks})
 
       biases =
