@@ -70,12 +70,13 @@ defmodule Transmuter do
       through every operator. With `:f16` or `:bf16`, the f32 params also take
       this type when the model loads, and so do the float weights and the
       scales of `MatMulNBits` (see `:backend`), so the weights of an f32 or q4
-      export take half of the memory. The graph inputs and the small static
-      values keep their types. The default is `nil`, which keeps the types of
-      the graph. In native f16 and bf16, sums, normalizations, softmax and
-      attention scores run in f32. `:f32` converts half-precision weights to f32 when the
-      model loads, as ONNX Runtime on the CPU does, and uses as much memory as
-      f32 weights. Use `:f32` when a deep half-precision graph drifts from the
+      export take half of the memory. An f32 param value above 65504 becomes
+      infinity in f16, so `:bf16` is the safer choice for an export with large
+      values. The graph inputs and the small static values keep their types.
+      The default is `nil`, which keeps the types of the graph. In native f16
+      and bf16, sums, normalizations, softmax and attention scores run in f32.
+      `:f32` converts half-precision weights to f32 when the model loads, as
+      ONNX Runtime on the CPU does, and uses as much memory as f32 weights. Use `:f32` when a deep half-precision graph drifts from the
       f32 result. See [Backends and performance](guides/backends_and_performance.md).
 
     * `:fuse` (`t:boolean/0`) - replaces normalizations and attention cores that
