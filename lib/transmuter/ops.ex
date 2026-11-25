@@ -3,6 +3,8 @@ defmodule Transmuter.Ops do
   ONNX operators as Nx calls. Values known at trace time live on Nx.BinaryBackend ("static"), so shape arithmetic folds to plain integers while tracing. Nx has no zero-size tensors, so a zero-size value is {:empty, shape}.
   """
 
+  require Logger
+
   alias Nx.Defn.Compiler
 
   alias Transmuter.Ops.{
@@ -594,15 +596,15 @@ defmodule Transmuter.Ops do
   end
 
   @doc false
-  def tensor(t, dir \\ nil)
+  def tensor(t, file \\ nil)
 
-  def tensor(t = %{data_location: :EXTERNAL}, dir), do: t |> read_external(dir) |> tensor(dir)
+  def tensor(t = %{data_location: :EXTERNAL}, file), do: t |> read_external(file) |> tensor(file)
 
-  def tensor(%{dims: dims} = t, dir) when dims != [] do
-    if 0 in dims, do: {:empty, List.to_tuple(dims)}, else: tensor_data(t, dir)
+  def tensor(%{dims: dims} = t, _file) when dims != [] do
+    if 0 in dims, do: {:empty, List.to_tuple(dims)}, else: tensor_data(t)
   end
 
-  def tensor(t, dir), do: tensor_data(t, dir)
+  def tensor(t, _file), do: tensor_data(t)
 
   @doc """
   The shape and the type of the tensor that `tensor/2` gives for `t`, from its dims and data_type, without its data. A string or an empty tensor gives `nil`.
@@ -626,11 +628,11 @@ defmodule Transmuter.Ops do
     end
   end
 
-  defp tensor_data(%{data_type: 8, string_data: values, dims: dims}, _dir),
+  defp tensor_data(%{data_type: 8, string_data: values, dims: dims}),
     do: {:strings, List.to_tuple(dims), values}
 
   # 4-bit tensors stay packed two values per byte: signed int4 as s8, uint4 as u8.
-  defp tensor_data(%{raw_data: raw, data_type: dt, dims: dims}, _dir) when dt in [21, 22] do
+  defp tensor_data(%{raw_data: raw, data_type: dt, dims: dims}) when dt in [21, 22] do
     {last, outer} = List.pop_at(dims, -1)
 
     raw
@@ -641,7 +643,7 @@ defmodule Transmuter.Ops do
   # FP8 data loads as f16, which holds every FLOAT8E4M3FN and FLOAT8E5M2 value exactly.
   # A table maps each byte to its f16 value. Without raw data, int32_data holds one byte
   # in each element.
-  defp tensor_data(t = %{data_type: dt, dims: dims}, _dir) when is_map_key(@fp8_to_f16, dt) do
+  defp tensor_data(t = %{data_type: dt, dims: dims}) when is_map_key(@fp8_to_f16, dt) do
     table = @fp8_to_f16[dt]
 
     bytes =
@@ -654,7 +656,7 @@ defmodule Transmuter.Ops do
     |> Nx.reshape(List.to_tuple(dims))
   end
 
-  defp tensor_data(t = %{raw_data: raw, data_type: dt, dims: dims}, _dir) do
+  defp tensor_data(t = %{raw_data: raw, data_type: dt, dims: dims}) do
     type = dtype(dt)
 
     flat =
@@ -677,9 +679,9 @@ defmodule Transmuter.Ops do
   @doc """
   Reads the data of a tensor that keeps it in a file next to the model.
   """
-  def read_external(t = %{data_location: :EXTERNAL, external_data: entries}, dir) do
+  def read_external(t = %{data_location: :EXTERNAL, external_data: entries}, file) do
     entries = Map.new(entries, &{&1.key, &1.value})
-    path = Path.join(dir, entries["location"])
+    path = external_path(file, entries["location"])
     offset = String.to_integer(entries["offset"] || "0")
 
     # Without a length, the data goes to the end of the file.
@@ -694,7 +696,27 @@ defmodule Transmuter.Ops do
     %{t | data_location: :DEFAULT, external_data: [], raw_data: raw}
   end
 
-  def read_external(t, _dir), do: t
+  def read_external(t, _file), do: t
+
+  # The external data of a tensor of the model file `file`: its location in the directory of the
+  # file. A location that does not exist falls back to the file of the Hub convention, the model
+  # file name with "_data" after it, as transformers.js reads it. An export that a tool renamed
+  # can keep the location of its old name, such as "model.onnx_data" in
+  # decoder_model_merged.onnx of Xenova/falcon-rw-1b.
+  defp external_path(file, location) do
+    path = Path.join(Path.dirname(file), location)
+    sibling = file <> "_data"
+
+    if not File.exists?(path) and File.exists?(sibling) do
+      Logger.debug(
+        "Transmuter: the external data #{location} does not exist, so #{Path.basename(file)} reads #{Path.basename(sibling)}"
+      )
+
+      sibling
+    else
+      path
+    end
+  end
 
   @doc false
   def dtype(4), do: :u16

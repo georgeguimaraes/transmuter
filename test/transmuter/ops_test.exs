@@ -109,7 +109,10 @@ defmodule Transmuter.OpsTest do
 
       deferred = %{
         model
-        | params: %{model.params | "B" => Transmuter.DeferredTensor.new(proto, dir)}
+        | params: %{
+            model.params
+            | "B" => Transmuter.DeferredTensor.new(proto, Path.join(dir, "model.onnx"))
+          }
       }
 
       from_file = Transmuter.EMLX.move(deferred, device: :cpu)
@@ -284,8 +287,40 @@ defmodule Transmuter.OpsTest do
       ]
     }
 
-    assert Nx.to_list(Transmuter.Ops.tensor(proto, dir)) == [1.5, 2.5]
+    assert Nx.to_list(Transmuter.Ops.tensor(proto, Path.join(dir, "model.onnx"))) == [1.5, 2.5]
     assert Transmuter.Ops.tensor_shape_type(proto) == {{2}, {:f, 32}}
+  end
+
+  # An export that a tool renamed, such as decoder_model_merged.onnx of Xenova/falcon-rw-1b,
+  # keeps the location of its old name, model.onnx_data, while the Hub has its data in
+  # decoder_model_merged.onnx_data. The tensor reads the file of the Hub convention, the model
+  # file name with "_data" after it. A location that exists wins over that file.
+  test "an external tensor whose location does not exist reads the data file of its model file" do
+    dir =
+      Path.join(System.tmp_dir!(), "transmuter-renamed-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+
+    File.write!(
+      Path.join(dir, "decoder.onnx_data"),
+      <<1.5::float-32-little, 2.5::float-32-little>>
+    )
+
+    proto = %Transmuter.Onnx.TensorProto{
+      name: "w",
+      dims: [2],
+      data_type: 1,
+      data_location: :EXTERNAL,
+      external_data: [
+        %Transmuter.Onnx.StringStringEntryProto{key: "location", value: "model.onnx_data"}
+      ]
+    }
+
+    file = Path.join(dir, "decoder.onnx")
+    assert Nx.to_list(Transmuter.Ops.tensor(proto, file)) == [1.5, 2.5]
+
+    File.write!(Path.join(dir, "model.onnx_data"), <<3.5::float-32-little, 4.5::float-32-little>>)
+    assert Nx.to_list(Transmuter.Ops.tensor(proto, file)) == [3.5, 4.5]
   end
 
   # A budget of 5 rows of scores gives 3 chunks of 5 rows. The 13 query rows then run as

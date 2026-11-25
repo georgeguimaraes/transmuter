@@ -9,22 +9,22 @@ defmodule Transmuter.DeferredTensor do
 
   alias Transmuter.Ops
 
-  defstruct [:shape, :type, :proto, :dir]
+  defstruct [:shape, :type, :proto, :file]
 
   @doc false
   # The deferred tensor of an external initializer, or nil for a string or an empty tensor.
-  def new(proto = %{data_location: :EXTERNAL}, dir) do
+  def new(proto = %{data_location: :EXTERNAL}, file) do
     case Ops.tensor_shape_type(proto) do
-      {shape, type} -> %__MODULE__{shape: shape, type: type, proto: proto, dir: dir}
+      {shape, type} -> %__MODULE__{shape: shape, type: type, proto: proto, file: file}
       nil -> nil
     end
   end
 
-  def new(_proto, _dir), do: nil
+  def new(_proto, _file), do: nil
 
   @doc false
-  # The tensor of a param: a deferred tensor reads it from the file.
-  def value(%__MODULE__{proto: proto, dir: dir}), do: Ops.tensor(proto, dir)
+  # The tensor of a param: a deferred tensor reads it from the external file of its model file.
+  def value(%__MODULE__{proto: proto, file: file}), do: Ops.tensor(proto, file)
   def value(tensor), do: tensor
 
   @doc false

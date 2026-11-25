@@ -159,13 +159,12 @@ defmodule Transmuter do
   defp path!(path, _opts) when is_binary(path), do: path
 
   defp read!(path, opts) do
-    dir = Path.dirname(path)
     model = ModelProto.decode!(File.read!(path))
 
     opset =
       Enum.find_value(model.opset_import, &(&1.domain in [nil, "", "ai.onnx"] && &1.version))
 
-    graph = inline_external(model.graph, dir)
+    graph = inline_external(model.graph, path)
     check_outputs!(graph, "the graph")
 
     known = Enum.map(graph.input, & &1.name) ++ Enum.map(graph.initializer, & &1.name)
@@ -196,7 +195,7 @@ defmodule Transmuter do
     {static, params} =
       graph.initializer
       |> Enum.map(
-        &{&1.name, (opts[:backend] && DeferredTensor.new(&1, dir)) || Ops.tensor(&1, dir)}
+        &{&1.name, (opts[:backend] && DeferredTensor.new(&1, path)) || Ops.tensor(&1, path)}
       )
       |> Enum.split_with(fn {_, t} -> static_initializer?(t, trainable) end)
 
@@ -265,20 +264,24 @@ defmodule Transmuter do
 
   # Tensors in node attributes, such as the value of a Constant, and the initializers of
   # subgraphs can also keep their data in the external file. Only the loader knows the
-  # directory of that file, so it reads them here, and every operator gets plain tensors.
+  # model file, whose directory holds that file, so it reads them here, and every operator
+  # gets plain tensors.
   # The initializers of the main graph stay external, because the loader reads them once.
-  defp inline_external(graph, dir) do
+  defp inline_external(graph, file) do
     node =
       Enum.map(graph.node, fn node ->
         attribute =
           Enum.map(node.attribute, fn a ->
             %{
               a
-              | t: a.t && Ops.read_external(a.t, dir),
-                tensors: Enum.map(a.tensors, &Ops.read_external(&1, dir)),
-                g: a.g && inline_subgraph(a.g, dir, "the #{a.name} of #{where(node)}"),
+              | t: a.t && Ops.read_external(a.t, file),
+                tensors: Enum.map(a.tensors, &Ops.read_external(&1, file)),
+                g: a.g && inline_subgraph(a.g, file, "the #{a.name} of #{where(node)}"),
                 graphs:
-                  Enum.map(a.graphs, &inline_subgraph(&1, dir, "the #{a.name} of #{where(node)}"))
+                  Enum.map(
+                    a.graphs,
+                    &inline_subgraph(&1, file, "the #{a.name} of #{where(node)}")
+                  )
             }
           end)
 
@@ -288,10 +291,10 @@ defmodule Transmuter do
     %{graph | node: node}
   end
 
-  defp inline_subgraph(graph, dir, where) do
-    graph = inline_external(graph, dir)
+  defp inline_subgraph(graph, file, where) do
+    graph = inline_external(graph, file)
     check_outputs!(graph, where)
-    %{graph | initializer: Enum.map(graph.initializer, &Ops.read_external(&1, dir))}
+    %{graph | initializer: Enum.map(graph.initializer, &Ops.read_external(&1, file))}
   end
 
   # Each output of a graph is a value of the graph: an input, an initializer or the output
