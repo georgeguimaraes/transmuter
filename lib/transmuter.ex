@@ -1470,9 +1470,12 @@ defmodule Transmuter do
   def value_dependencies(%{op_type: op_type}) when op_type in ["Shape", "Size"], do: []
   def value_dependencies(node), do: dependencies(node)
 
+  # The names that a subgraph reads from the graph around it: the inputs of its nodes and its
+  # outputs, such as a branch of an If that gives a param of the graph, less its own values.
   defp outer_reads(graph) do
     local = Enum.map(graph.initializer, & &1.name) ++ Enum.map(graph.input, & &1.name)
     produced = Enum.flat_map(graph.node, & &1.output)
-    Enum.uniq(Enum.flat_map(graph.node, &dependencies/1)) -- (local ++ produced)
+    reads = Enum.flat_map(graph.node, &dependencies/1) ++ Enum.map(graph.output, & &1.name)
+    Enum.uniq(reads) -- (local ++ produced)
   end
 end

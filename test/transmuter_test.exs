@@ -657,6 +657,52 @@ defmodule TransmuterTest do
     end
   end
 
+  # A branch can give one of its initializers as its output with no node, as the rotary
+  # caches of Phi-4-mini do. The initializer becomes a param, and a compiled call reads it as a
+  # value that the If reads from the graph around it.
+  test "a branch that gives a param as its output reads it from the graph" do
+    table =
+      &%TensorProto{
+        name: &1,
+        dims: [32],
+        data_type: 1,
+        float_data: Enum.map(&2, fn v -> v * 1.0 end)
+      }
+
+    branch = &%GraphProto{name: &1, initializer: [table.(&2, &3)], output: [value(&2)]}
+
+    graph = %GraphProto{
+      input: [value("x", [32]), value("flag", [1], 9)],
+      output: [value("y")],
+      node: [
+        node("If", ["flag"], ["b"],
+          attribute: [
+            %AttributeProto{
+              name: "then_branch",
+              type: :GRAPH,
+              g: branch.("then", "then_w", 0..31)
+            },
+            %AttributeProto{
+              name: "else_branch",
+              type: :GRAPH,
+              g: branch.("else", "else_w", 31..0//-1)
+            }
+          ]
+        ),
+        node("Mul", ["b", "x"], ["y"])
+      ]
+    }
+
+    model = graph |> write_model() |> Transmuter.load!(backend: @backend)
+    assert Enum.sort(Map.keys(model.params)) == ["else_w", "then_w"]
+    x = Nx.iota({32}, type: :f32, backend: @backend)
+
+    for {flag, w} <- [{1, x}, {0, Nx.subtract(31, x)}] do
+      flag = Nx.tensor([flag], type: :u8, backend: Nx.BinaryBackend)
+      assert_all_close(run(model, %{"x" => x}, %{"flag" => flag})["y"], Nx.multiply(w, x))
+    end
+  end
+
   # Where broadcasts its inputs. In a traced function, the static scalar is a literal, so
   # the trace broadcasts it, and the program holds no literal of the 8192 elements of x.
   test "a traced node expands its static inputs in the trace" do
