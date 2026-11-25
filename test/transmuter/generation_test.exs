@@ -1190,6 +1190,108 @@ defmodule Transmuter.GenerationTest do
     assert_close_logprobs(List.flatten(logprobs), List.flatten(step_logprobs))
   end
 
+  # The onnxruntime-genai export of DeepSeek-R1-Distill-Qwen builds its causal mask as a
+  # [seq, seq] triangle that an Expand broadcasts to [batch, 1, seq, past + seq] and adds to a
+  # mask of [seq, past + seq], which holds only for a step of one token or a step without a
+  # past. The tiny Phi-3 gets that sum before an output, so a trace of a step of 2 tokens on a past of 1 row fails at load, and the
+  # steps on the branch with cache take one token. The prompts then run one token in each step
+  # and give the tokens of the decoder without the Expand.
+  test "a decoder whose steps of several tokens fail on a past takes steps of one token" do
+    source = {:hf, "Xenova/tiny-random-Phi3ForCausalLM"}
+    opts = [outputs: &Generation.outputs/1] ++ Keyword.take(@opts, [:backend])
+    {repo, model, _tokenizer} = Transmuter.Serving.load!(source, opts, :fp32)
+    repo = %{repo | generation_config: %{"eos_token_id" => -1}}
+    [past | _] = Enum.filter(model.inputs, &String.starts_with?(&1, "past_key_values."))
+
+    triangle = [
+      %NodeProto{
+        op_type: "Shape",
+        name: "ids_shape",
+        input: ["input_ids"],
+        output: ["ids_shape"]
+      },
+      %NodeProto{op_type: "Shape", name: "past_shape", input: [past], output: ["past_shape"]},
+      %NodeProto{
+        op_type: "Slice",
+        name: "seq",
+        input: ["ids_shape", "one", "two"],
+        output: ["seq"]
+      },
+      %NodeProto{
+        op_type: "Slice",
+        name: "past_len",
+        input: ["past_shape", "two", "three"],
+        output: ["past_len"]
+      },
+      %NodeProto{op_type: "Add", name: "total", input: ["seq", "past_len"], output: ["total"]},
+      %NodeProto{
+        op_type: "Concat",
+        name: "square",
+        input: ["seq", "seq"],
+        output: ["square"],
+        attribute: [%AttributeProto{name: "axis", type: :INT, i: 0}]
+      },
+      %NodeProto{
+        op_type: "ConstantOfShape",
+        name: "causal",
+        input: ["square"],
+        output: ["causal"]
+      },
+      %NodeProto{
+        op_type: "Concat",
+        name: "wide",
+        input: ["seq", "total"],
+        output: ["wide"],
+        attribute: [%AttributeProto{name: "axis", type: :INT, i: 0}]
+      },
+      %NodeProto{
+        op_type: "Expand",
+        name: "expand",
+        input: ["causal", "wide"],
+        output: ["expanded"]
+      },
+      %NodeProto{
+        op_type: "ConstantOfShape",
+        name: "padding",
+        input: ["wide"],
+        output: ["padding"]
+      },
+      %NodeProto{op_type: "Add", name: "bias", input: ["padding", "expanded"], output: ["bias"]}
+    ]
+
+    shape = &Nx.tensor(&1, type: :s64, backend: Nx.BinaryBackend)
+
+    static =
+      Map.merge(model.static, %{
+        "one" => shape.([1]),
+        "two" => shape.([2]),
+        "three" => shape.([3])
+      })
+
+    expanded = %{
+      model
+      | nodes: model.nodes ++ triangle,
+        static: static,
+        outputs: model.outputs ++ ["bias"]
+    }
+
+    generate = fn model ->
+      ctx = Generation.context(repo, model, strategy: :greedy, max_new_tokens: 8)
+
+      {ctx.widths.with_cache,
+       ctx
+       |> Generation.compile(2, @opts[:defn_options])
+       |> Generation.generate([[5, 9, 13, 17], [7, 11]], [0, 0])}
+    end
+
+    {widths, rows} = generate.(model)
+    {one, expanded_rows} = generate.(expanded)
+
+    assert length(widths) > 1
+    assert one == [1]
+    assert expanded_rows == rows
+  end
+
   # In :append, all rows of a step write at one offset, so a group that lives on passes the
   # rows of all its steps. The fox runs 100 steps. The essay of 229 tokens ends after 30 tokens
   # at 259 rows, and its row stays ended. The third row takes a new prompt every 4 tokens, so

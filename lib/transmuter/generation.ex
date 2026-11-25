@@ -317,7 +317,71 @@ defmodule Transmuter.Generation do
   # The widths of the steps on the branch with cache (see plan/4): one token for a merged decoder
   # whose branch with cache has no causal mask (see "Merged decoders").
   defp widths(%{causal: false}), do: [1]
-  defp widths(_model), do: @step_widths
+  defp widths(model), do: if(steps_on_past?(model), do: @step_widths, else: [1])
+
+  # Whether a step of several tokens runs on a past, from a trace of the graph with templates: a
+  # step of 2 tokens on a past of 1 row. The trace gives only shapes, so it compiles nothing and
+  # does no work on the device. A graph that takes several tokens only without a past, as the
+  # causal mask of the onnxruntime-genai export of DeepSeek-R1-Distill-Qwen, which expands a
+  # [seq, seq] triangle to [seq, past + seq], fails it, and its steps on the branch with cache
+  # then take one token.
+  defp steps_on_past?(model) do
+    # The static inputs of a step on the branch with cache, as step_inputs/4 gives them.
+    static =
+      for {name, value} <- [{"use_cache_branch", [1]}, {"num_logits_to_keep", 0}],
+          name in model.inputs,
+          into: %{} do
+        {type, _dims} = model.input_types[name]
+        {name, Nx.tensor(value, type: type, backend: Nx.BinaryBackend)}
+      end
+
+    inputs =
+      for name <- model.inputs -- Map.keys(static),
+          into: %{},
+          do: {name, trace_template(model.input_types[name])}
+
+    params = Map.new(model.params, fn {name, t} -> {name, trace_template(t)} end)
+    Nx.Defn.debug_expr(&Transmuter.run(model, &1, &2, static)).(params, inputs)
+    true
+  rescue
+    # A value that only a run knows, such as the limit of a Range, leaves the shapes open.
+    Transmuter.UnknownValueError ->
+      true
+
+    error in [ArgumentError, RuntimeError] ->
+      Logger.debug(
+        "generation runs the prompts of new rows in steps of one token on the branch with cache, because a step of 2 tokens on a past of 1 row fails: #{Exception.message(error)}"
+      )
+
+      false
+  end
+
+  # The template of an input for steps_on_past?/1: a symbolic dimension of a past takes 1 row,
+  # of a total length or a mask takes 3 rows, of a sequence takes 2 tokens, and else 1.
+  defp trace_template({type, dims}) do
+    shape =
+      dims
+      |> Enum.map(fn
+        size when is_integer(size) -> size
+        name when is_binary(name) -> symbolic_size(name)
+        nil -> 1
+      end)
+      |> List.to_tuple()
+
+    Nx.template(shape, type)
+  end
+
+  defp trace_template(tensor = %Nx.Tensor{}), do: Nx.to_template(tensor)
+  defp trace_template(value), do: value
+
+  defp symbolic_size(name) do
+    cond do
+      name =~ ~r/total|mask|\+/ -> 3
+      name =~ ~r/past/ -> 1
+      name =~ ~r/seq/ -> 2
+      true -> 1
+    end
+  end
 
   # The widths of the steps of a group with ragged steps (see chunk_steps/1): a prompt joins the
   # steps of the group only when no row takes a new token, so its parts need no width below
