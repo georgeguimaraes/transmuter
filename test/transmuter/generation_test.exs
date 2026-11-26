@@ -3323,31 +3323,32 @@ defmodule Transmuter.GenerationCapacityTest do
   @live 1_000_000_000
   @scores_chunk 402_653_184
 
-  # A move holds the buffers at the capacity and one buffer more (see resize_buffers/4), 32,768
-  # bytes for each position of 8 rows. With steps of 1 token, the temporaries are smaller than
-  # that buffer, and the move decides.
+  # A growth holds the buffers at the capacity and at the capacity before it (see peak/4).
   test "the largest capacity is the largest one whose peak fits 95% of the device memory" do
-    narrow = %{@ctx | widths: %{with_cache: [1], without_cache: [1]}}
-    move = @live + (917_536 + 32_768) * 2048
-    assert 2 * 8 * 4096 + div(3 * 8 * 8 * 2048 * 4, 2) < 32_768 * 2048
-    assert Generation.largest_capacity(narrow, 8, @live, move / 0.95) == 2048
-    assert Generation.largest_capacity(narrow, 8, @live, move / 0.95 - 1) == 1792
-    assert Generation.largest_capacity(narrow, 8, @live, 1.0e12) == 4096
-    assert Generation.largest_capacity(narrow, 8, @live, nil) == 4096
+    growth = @live + 917_536 * (1792 + 2048)
+
+    # The step at 2048 rows needs less than the growth into it, so the growth decides.
+    assert @live + 917_536 * 2048 + 2 * 4096 * 4096 + @scores_chunk < growth
+    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95) == 2048
+    assert Generation.largest_capacity(@ctx, 8, @live, growth / 0.95 - 1) == 1792
+    assert Generation.largest_capacity(@ctx, 8, @live, 1.0e12) == 4096
+    assert Generation.largest_capacity(@ctx, 8, @live, nil) == 4096
   end
 
-  # The step decides when its temporaries are larger than one buffer: the steps of 512 tokens,
-  # or the f32 copy of a bf16 cache (14 layers of bf16 caches hold 458,784 bytes for each
-  # position of 8 rows, and their f32 copy 917,504 bytes).
+  # The step decides when its temporaries are large: a wide matmul, or the f32 copy of a bf16
+  # cache (14 layers of bf16 caches hold 458,784 bytes for each position of 8 rows, and their
+  # f32 copy 917,504 bytes).
   test "the step peak decides the capacity when the temporaries of the widest step are large" do
-    step = @live + 917_536 * 2048 + 2 * 4096 * 4096 + @scores_chunk
-    assert 32_768 * 2048 < 2 * 4096 * 4096 + @scores_chunk
-    assert Generation.largest_capacity(@ctx, 8, @live, step / 0.95) == 2048
-    assert Generation.largest_capacity(@ctx, 8, @live, step / 0.95 - 1) == 1792
+    wide = %{@ctx | matmul_bytes: 200_000}
+    step = @live + 917_536 * 2048 + 2 * 4096 * 200_000 + @scores_chunk
+    assert @live + 917_536 * (1792 + 2048) < step
+    assert Generation.largest_capacity(wide, 8, @live, step / 0.95) == 2048
+    assert Generation.largest_capacity(wide, 8, @live, step / 0.95 - 1) == 1792
 
     types = Map.new(@names, &{&1, {:bf16, ["batch", 8, "length", 128]}})
     bf16 = %{@ctx | model: %{input_types: types}}
     step = @live + (458_784 + 917_504) * 2048 + 2 * 4096 * 4096 + @scores_chunk
+    assert @live + 458_784 * (1792 + 2048) < step
     assert Generation.largest_capacity(bf16, 8, @live, step / 0.95) == 2048
     assert Generation.largest_capacity(bf16, 8, @live, step / 0.95 - 1) == 1792
   end

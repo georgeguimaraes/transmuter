@@ -3982,10 +3982,15 @@ defmodule Transmuter.Generation do
   end
 
   # The peak of device memory of a group of `rows` rows at `capacity`, with `live` bytes in
-  # use: the buffers at the capacity, and the larger of the temporary of the widest step and
-  # the one buffer more that a move to the capacity holds (see resize_buffers/4).
+  # use: the larger of a step at the capacity, with the temporary of the widest step, and a
+  # growth into it from the capacity before. A growth moves the buffers one at a time and frees
+  # each old buffer after its copy (see resize_buffers/4), but the allocator of the device does
+  # not give the room of a smaller old buffer to a larger new one. So a growth needs the room of
+  # the buffers at both capacities. On an RTX 3060, 16 rows of Qwen3-0.6B fp16 with 11.29 GB
+  # of :device_memory ran out of memory on one new buffer of 128 MiB in a growth from 3584 to
+  # 4096 rows, while the live buffers held 8.5 GB and the device was full.
   defp peak(ctx, rows, live, capacity) do
-    {position, cache_heads, largest} = position_sizes(ctx)
+    {position, cache_heads} = position_sizes(ctx)
 
     # The temporaries of the widest step, from the buffers that XLA gives it, which it reuses
     # for each layer: two outputs of the widest matmul for each token, such as the merged gate
@@ -4006,7 +4011,9 @@ defmodule Transmuter.Generation do
     scores = div(3 * chunk, 2)
     widened = if bf16_cache?(ctx), do: rows * capacity * 2 * (position - 4), else: 0
     temporary = 2 * rows * width * ctx.matmul_bytes + scores + widened
-    live + rows * capacity * position + max(temporary, rows * capacity * largest)
+    before = capacities(ctx, capacity - 1) |> List.last(0)
+    buffers = &(rows * position * &1)
+    live + max(buffers.(capacity) + temporary, buffers.(before) + buffers.(capacity))
   end
 
   @doc false
@@ -4014,8 +4021,7 @@ defmodule Transmuter.Generation do
   # history.
   def position_bytes(ctx), do: elem(position_sizes(ctx), 0)
 
-  # The bytes of one row and position of the buffers, the most heads of a cache buffer, and the
-  # bytes of one row and position of the largest buffer.
+  # The bytes of one row and position of the buffers, and the most heads of a cache buffer.
   defp position_sizes(ctx) do
     ctx.buffers
     |> Enum.filter(&(&1 in ctx.cache))
@@ -4024,9 +4030,7 @@ defmodule Transmuter.Generation do
       {_kind, bits} = Nx.Type.normalize!(type)
       {heads * head_dim * div(bits, 8), heads}
     end)
-    |> Enum.reduce({4, 0, 4}, fn {bytes, h}, {sum, heads, largest} ->
-      {sum + bytes, max(heads, h), max(largest, bytes)}
-    end)
+    |> Enum.reduce({4, 0}, fn {bytes, h}, {sum, heads} -> {sum + bytes, max(heads, h)} end)
   end
 
   defp bf16_cache?(ctx) do
